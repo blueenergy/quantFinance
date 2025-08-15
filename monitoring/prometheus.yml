@@ -1,0 +1,149 @@
+# Prometheus监控配置文件
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files:
+  # - "first_rules.yml"
+  # - "second_rules.yml"
+
+scrape_configs:
+  # 监控Prometheus自身
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+
+  # 监控悟空量化API服务
+  - job_name: 'quant-api'
+    static_configs:
+      - targets: ['api:3001']
+    metrics_path: '/metrics'
+    scrape_interval: 30s
+    scrape_timeout: 10s
+
+  # 监控Nginx
+  - job_name: 'nginx'
+    static_configs:
+      - targets: ['web:80']
+    metrics_path: '/nginx_status'
+    scrape_interval: 30s
+
+  # 监控MongoDB (需要MongoDB Exporter)
+  - job_name: 'mongodb'
+    static_configs:
+      - targets: ['mongodb-exporter:9216']
+    scrape_interval: 30s
+
+  # 监控Redis (需要Redis Exporter)
+  - job_name: 'redis'
+    static_configs:
+      - targets: ['redis-exporter:9121']
+    scrape_interval: 30s
+
+  # 监控节点指标 (需要Node Exporter)
+  - job_name: 'node'
+    static_configs:
+      - targets: ['node-exporter:9100']
+    scrape_interval: 30s
+
+# 告警配置
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+          # - alertmanager:9093
+
+# 记录规则配置
+recording_rules:
+  # API响应时间
+  - name: api_performance
+    rules:
+      - record: api_request_duration_seconds_avg
+        expr: rate(http_request_duration_seconds_sum[5m]) / rate(http_request_duration_seconds_count[5m])
+      
+      - record: api_request_rate
+        expr: rate(http_requests_total[5m])
+
+  # 错误率统计
+  - name: error_rates
+    rules:
+      - record: api_error_rate
+        expr: rate(http_requests_total{status=~"5.."}[5m]) / rate(http_requests_total[5m])
+      
+      - record: api_4xx_rate
+        expr: rate(http_requests_total{status=~"4.."}[5m]) / rate(http_requests_total[5m])
+
+# 告警规则
+alert_rules:
+  # API服务告警
+  - name: api_alerts
+    rules:
+      - alert: APIDown
+        expr: up{job="quant-api"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "悟空量化API服务下线"
+          description: "API服务已下线超过1分钟"
+
+      - alert: HighErrorRate
+        expr: api_error_rate > 0.1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "API错误率过高"
+          description: "5分钟内API错误率超过10%"
+
+      - alert: HighResponseTime
+        expr: api_request_duration_seconds_avg > 2
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "API响应时间过慢"
+          description: "5分钟内平均响应时间超过2秒"
+
+  # 数据库告警
+  - name: database_alerts
+    rules:
+      - alert: MongoDBDown
+        expr: up{job="mongodb"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "MongoDB数据库下线"
+          description: "MongoDB数据库已下线超过1分钟"
+
+  # 系统资源告警
+  - name: system_alerts
+    rules:
+      - alert: HighCPUUsage
+        expr: 100 - (avg by(instance) (rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100) > 80
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "CPU使用率过高"
+          description: "CPU使用率超过80%持续5分钟"
+
+      - alert: HighMemoryUsage
+        expr: (1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)) * 100 > 90
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "内存使用率过高"
+          description: "内存使用率超过90%持续5分钟"
+
+      - alert: DiskSpaceLow
+        expr: 100 - ((node_filesystem_avail_bytes * 100) / node_filesystem_size_bytes) > 90
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "磁盘空间不足"
+          description: "磁盘使用率超过90%"
