@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Query, HTTPException, Depends
+from fastapi import FastAPI, Query, HTTPException, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pymongo import MongoClient
 from typing import List, Optional, Dict, Any
@@ -14,7 +14,9 @@ from llm_service import llm_manager
 from auth import (
     UserCreate, UserLogin, Token, UserResponse,
     authenticate_user, create_access_token, create_user,
-    get_current_active_user, ACCESS_TOKEN_EXPIRE_MINUTES
+    get_current_active_user, get_current_admin_user, 
+    log_login_attempt, log_admin_action, create_admin_user,
+    ACCESS_TOKEN_EXPIRE_MINUTES
 )
 from external_data import external_market_data
 from market_analysis_cache import market_analysis_cache
@@ -82,15 +84,36 @@ def register(user: UserCreate):
     return create_user(user)
 
 @app.post("/api/login", response_model=Token)
-def login(user_data: UserLogin):
+def login(user_data: UserLogin, request: Request):
     """用户登录"""
+    # 获取客户端信息
+    ip_address = request.client.host if request.client else "unknown"
+    user_agent = request.headers.get("user-agent", "unknown")
+    
     user = authenticate_user(user_data.username, user_data.password)
     if not user:
+        # 记录失败的登录尝试
+        log_login_attempt(
+            username=user_data.username,
+            ip_address=ip_address,
+            user_agent=user_agent,
+            success=False,
+            failure_reason="Incorrect username or password"
+        )
         raise HTTPException(
             status_code=401,
             detail="Incorrect username or password",
             headers={"WWW-Authenticate": "Bearer"},
         )
+    
+    # 记录成功的登录
+    log_login_attempt(
+        username=user_data.username,
+        ip_address=ip_address,
+        user_agent=user_agent,
+        success=True
+    )
+    
     access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     access_token = create_access_token(
         data={"sub": user["username"]}, expires_delta=access_token_expires
@@ -103,7 +126,9 @@ def login(user_data: UserLogin):
         email=user["email"],
         full_name=user.get("full_name"),
         is_active=user.get("is_active", True),
-        created_at=user["created_at"]
+        is_admin=user.get("is_admin", False),
+        created_at=user["created_at"],
+        last_login=user.get("last_login")
     )
     
     return Token(
@@ -121,7 +146,9 @@ def get_profile(current_user: dict = Depends(get_current_active_user)):
         email=current_user["email"],
         full_name=current_user.get("full_name"),
         is_active=current_user.get("is_active", True),
-        created_at=current_user["created_at"]
+        is_admin=current_user.get("is_admin", False),
+        created_at=current_user["created_at"],
+        last_login=current_user.get("last_login")
     )
 
 # 用户自选股管理API
@@ -332,6 +359,9 @@ db = client["quant"]
 collection = db["volume_price"]
 stock_info_collection = db["stock_info"]  # 新增：股票信息集合
 user_watchlists_collection = db["user_watchlists"]  # 新增：用户自选股集合
+
+# 导入管理员功能需要的集合
+from auth import users_collection, login_logs_collection, admin_logs_collection
 
 def serialize_doc(doc):
     doc["_id"] = str(doc["_id"])
@@ -716,5 +746,374 @@ def get_available_llm_providers():
         }
     except Exception as e:
         return {"providers": [], "error": str(e)}
+
+# ===========================================
+# 管理员API端点
+# ===========================================
+
+@app.get("/api/admin/users")
+def get_all_users(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+    search: str = Query(""),
+    admin_user: dict = Depends(get_current_admin_user)
+):
+    """管理员获取所有用户列表"""
+    try:
+        # 记录管理员操作
+        log_admin_action(
+            admin_user=admin_user,
+            action="VIEW_USERS",
+            details=f"Page: {page}, Search: {search}"
+        )
+        
+        # 构建查询条件
+        query = {}
+        if search:
+            query = {
+                "$or": [
+                    {"username": {"$regex": search, "$options": "i"}},
+                    {"email": {"$regex": search, "$options": "i"}},
+                    {"full_name": {"$regex": search, "$options": "i"}}
+                ]
+            }
+        
+        # 计算总数
+        total = users_collection.count_documents(query)
+        
+        # 分页查询
+        skip = (page - 1) * page_size
+        users = list(users_collection.find(
+            query,
+            {"hashed_password": 0}  # 不返回密码哈希
+        ).sort("created_at", -1).skip(skip).limit(page_size))
+        
+        # 处理用户数据
+        for user in users:
+            user["id"] = str(user["_id"])
+            del user["_id"]
+        
+        return {
+            "success": True,
+            "data": {
+                "users": users,
+                "pagination": {
+                    "page": page,
+                    "page_size": page_size,
+                    "total": total,
+                    "total_pages": (total + page_size - 1) // page_size
+                }
+            }
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"获取用户列表失败: {str(e)}")
+
+@app.get("/api/admin/users/{user_id}")
+def get_user_detail(
+    user_id: str,
+    admin_user: dict = Depends(get_current_admin_user)
+):
+    """管理员获取用户详细信息"""
+    try:
+        from bson import ObjectId
+        
+        # 记录管理员操作
+        log_admin_action(
+            admin_user=admin_user,
+            action="VIEW_USER_DETAIL",
+            target_user_id=user_id,
+            details=f"View user {user_id} details"
+        )
+        
+        # 查找用户
+        user = users_collection.find_one(
+            {"_id": ObjectId(user_id)},
+            {"hashed_password": 0}
+        )
+        
+        if not user:
+            raise HTTPException(status_code=404, detail="用户不存在")
+        
+        user["id"] = str(user["_id"])
+        del user["_id"]
+        
+        # 获取用户的自选股信息
+        watchlist_doc = user_watchlists_collection.find_one({"user_id": user["id"]})
+        watchlist_count = len(watchlist_doc.get("symbols", [])) if watchlist_doc else 0
+        
+        # 获取用户的最近登录记录
+        recent_logins = list(login_logs_collection.find(
+            {"user_id": user["id"]},
+            sort=[("login_time", -1)]
+        ).limit(5))
+        
+        for login in recent_logins:
+            login["_id"] = str(login["_id"])
+        
+        return {
+            "success": True,
+            "data": {
+                "user": user,
+                "statistics": {
+                    "watchlist_count": watchlist_count,
+                    "recent_logins": recent_logins
+                }
+            }
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"获取用户详情失败: {str(e)}")
+
+@app.get("/api/admin/login-logs")
+def get_login_logs(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=200),
+    user_id: str = Query(""),
+    success_only: bool = Query(False),
+    admin_user: dict = Depends(get_current_admin_user)
+):
+    """管理员获取登录日志"""
+    try:
+        # 记录管理员操作
+        log_admin_action(
+            admin_user=admin_user,
+            action="VIEW_LOGIN_LOGS",
+            details=f"Page: {page}, UserID: {user_id}, SuccessOnly: {success_only}"
+        )
+        
+        # 构建查询条件
+        query = {}
+        if user_id:
+            query["user_id"] = user_id
+        if success_only:
+            query["success"] = True
+        
+        # 计算总数
+        total = login_logs_collection.count_documents(query)
+        
+        # 分页查询
+        skip = (page - 1) * page_size
+        logs = list(login_logs_collection.find(query).sort("login_time", -1).skip(skip).limit(page_size))
+        
+        # 处理日志数据
+        for log in logs:
+            log["_id"] = str(log["_id"])
+        
+        return {
+            "success": True,
+            "data": {
+                "logs": logs,
+                "pagination": {
+                    "page": page,
+                    "page_size": page_size,
+                    "total": total,
+                    "total_pages": (total + page_size - 1) // page_size
+                }
+            }
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"获取登录日志失败: {str(e)}")
+
+@app.get("/api/admin/statistics")
+def get_admin_statistics(admin_user: dict = Depends(get_current_admin_user)):
+    """管理员获取系统统计信息"""
+    try:
+        # 记录管理员操作
+        log_admin_action(
+            admin_user=admin_user,
+            action="VIEW_STATISTICS",
+            details="View system statistics"
+        )
+        
+        # 用户统计
+        total_users = users_collection.count_documents({})
+        active_users = users_collection.count_documents({"is_active": True})
+        admin_users = users_collection.count_documents({"is_admin": True})
+        
+        # 今日新注册用户
+        today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        today_new_users = users_collection.count_documents({
+            "created_at": {"$gte": today}
+        })
+        
+        # 登录统计
+        total_logins = login_logs_collection.count_documents({})
+        successful_logins = login_logs_collection.count_documents({"success": True})
+        failed_logins = login_logs_collection.count_documents({"success": False})
+        
+        # 今日登录统计
+        today_logins = login_logs_collection.count_documents({
+            "login_time": {"$gte": today}
+        })
+        today_successful_logins = login_logs_collection.count_documents({
+            "login_time": {"$gte": today},
+            "success": True
+        })
+        
+        # 自选股统计
+        total_watchlists = user_watchlists_collection.count_documents({})
+        
+        # 最近7天的登录趋势
+        seven_days_ago = datetime.now() - timedelta(days=7)
+        daily_logins = []
+        for i in range(7):
+            day_start = seven_days_ago + timedelta(days=i)
+            day_end = day_start + timedelta(days=1)
+            day_count = login_logs_collection.count_documents({
+                "login_time": {"$gte": day_start, "$lt": day_end},
+                "success": True
+            })
+            daily_logins.append({
+                "date": day_start.strftime("%Y-%m-%d"),
+                "count": day_count
+            })
+        
+        return {
+            "success": True,
+            "data": {
+                "users": {
+                    "total": total_users,
+                    "active": active_users,
+                    "admin": admin_users,
+                    "today_new": today_new_users
+                },
+                "logins": {
+                    "total": total_logins,
+                    "successful": successful_logins,
+                    "failed": failed_logins,
+                    "today_total": today_logins,
+                    "today_successful": today_successful_logins
+                },
+                "watchlists": {
+                    "total": total_watchlists
+                },
+                "trends": {
+                    "daily_logins": daily_logins
+                }
+            }
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"获取统计信息失败: {str(e)}")
+
+@app.put("/api/admin/users/{user_id}/status")
+def update_user_status(
+    user_id: str,
+    is_active: bool,
+    admin_user: dict = Depends(get_current_admin_user)
+):
+    """管理员更新用户状态（激活/禁用）"""
+    try:
+        from bson import ObjectId
+        
+        # 不能禁用自己
+        if user_id == admin_user["id"]:
+            raise HTTPException(status_code=400, detail="不能禁用自己的账户")
+        
+        # 查找目标用户
+        target_user = users_collection.find_one({"_id": ObjectId(user_id)})
+        if not target_user:
+            raise HTTPException(status_code=404, detail="用户不存在")
+        
+        # 更新用户状态
+        result = users_collection.update_one(
+            {"_id": ObjectId(user_id)},
+            {"$set": {"is_active": is_active}}
+        )
+        
+        if result.modified_count == 0:
+            raise HTTPException(status_code=400, detail="更新失败")
+        
+        # 记录管理员操作
+        log_admin_action(
+            admin_user=admin_user,
+            action="UPDATE_USER_STATUS",
+            target_user_id=user_id,
+            target_username=target_user.get("username"),
+            details=f"Set user active status to {is_active}"
+        )
+        
+        return {
+            "success": True,
+            "message": f"用户状态已更新为 {'激活' if is_active else '禁用'}"
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"更新用户状态失败: {str(e)}")
+
+@app.get("/api/admin/actions")
+def get_admin_actions(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=200),
+    admin_user: dict = Depends(get_current_admin_user)
+):
+    """管理员获取管理员操作日志"""
+    try:
+        # 记录管理员操作
+        log_admin_action(
+            admin_user=admin_user,
+            action="VIEW_ADMIN_LOGS",
+            details=f"Page: {page}"
+        )
+        
+        # 计算总数
+        total = admin_logs_collection.count_documents({})
+        
+        # 分页查询
+        skip = (page - 1) * page_size
+        actions = list(admin_logs_collection.find({}).sort("timestamp", -1).skip(skip).limit(page_size))
+        
+        # 处理日志数据
+        for action in actions:
+            action["_id"] = str(action["_id"])
+        
+        return {
+            "success": True,
+            "data": {
+                "actions": actions,
+                "pagination": {
+                    "page": page,
+                    "page_size": page_size,
+                    "total": total,
+                    "total_pages": (total + page_size - 1) // page_size
+                }
+            }
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"获取管理员日志失败: {str(e)}")
+
+# 创建初始管理员用户的端点（仅用于初始化）
+@app.post("/api/admin/init")
+def initialize_admin():
+    """初始化管理员账户（仅限初次使用）"""
+    try:
+        # 检查是否已有管理员
+        existing_admin = users_collection.find_one({"is_admin": True})
+        if existing_admin:
+            raise HTTPException(status_code=400, detail="管理员账户已存在")
+        
+        # 创建默认管理员
+        result = create_admin_user(
+            username="admin",
+            password="admin123",  # 默认密码，需要立即修改
+            email="admin@quantfinance.com",
+            full_name="系统管理员"
+        )
+        
+        return {
+            "success": True,
+            "message": "管理员账户创建成功",
+            "warning": "请立即修改默认密码！",
+            "credentials": {
+                "username": "admin",
+                "password": "admin123"
+            }
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"初始化管理员失败: {str(e)}")
 
 # Run with: uvicorn main:app --reload
