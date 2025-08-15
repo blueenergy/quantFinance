@@ -138,7 +138,8 @@ class ExternalMarketData:
             '399001': '深证成指',
             '399006': '创业板指'
         }
-    
+     
+     
     def get_real_market_data(self) -> Dict[str, Any]:
         """获取实时市场数据"""
         market_data = {}
@@ -178,6 +179,7 @@ class ExternalMarketData:
                         'low': data.get('low', data.get('current', 0)),
                         'close': data.get('current', 0),
                         'volume': data.get('volume', 0),
+                        'amount': data.get('amount', 0),  # 添加成交额字段
                         'change': data.get('change', 0),
                         'change_percent': data.get('change_percent', 0)
                     },
