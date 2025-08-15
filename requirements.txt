@@ -1,0 +1,11 @@
+akshare
+tqdm
+pandas
+numpy
+pymongo
+efinance
+fastapi 
+uvicorn
+httpx
+pydantic
+python-dotenv
