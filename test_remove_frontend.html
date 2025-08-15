@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>测试自选股移除功能</title>
+    <script src="https://cdn.jsdelivr.net/npm/axios/dist/axios.min.js"></script>
+</head>
+<body>
+    <h1>自选股移除功能测试</h1>
+    <div id="output"></div>
+    
+    <script>
+        const API_BASE = 'http://localhost:3001';
+        
+        async function testRemoveFunction() {
+            const output = document.getElementById('output');
+            
+            try {
+                // 模拟登录获取token（实际应用中从localStorage获取）
+                const loginResponse = await axios.post(`${API_BASE}/api/login`, {
+                    username: 'testuser_watchlist',
+                    password: 'testpass123'
+                });
+                
+                const token = loginResponse.data.access_token;
+                const headers = {
+                    'Authorization': `Bearer ${token}`,
+                    'Content-Type': 'application/json'
+                };
+                
+                output.innerHTML += '<p>✅ 登录成功</p>';
+                
+                // 测试移除功能
+                const removeResponse = await axios({
+                    method: 'DELETE',
+                    url: `${API_BASE}/api/user/watchlist/remove`,
+                    headers: headers,
+                    data: { symbol: '000001' }
+                });
+                
+                output.innerHTML += `<p>移除响应: ${JSON.stringify(removeResponse.data)}</p>`;
+                
+                if (removeResponse.data.success) {
+                    output.innerHTML += '<p>✅ 前端移除功能正常</p>';
+                } else {
+                    output.innerHTML += '<p>❌ 前端移除功能异常</p>';
+                }
+                
+            } catch (error) {
+                output.innerHTML += `<p>❌ 错误: ${error.message}</p>`;
+                console.error('测试失败:', error);
+            }
+        }
+        
+        // 页面加载后立即测试
+        testRemoveFunction();
+    </script>
+</body>
+</html>
