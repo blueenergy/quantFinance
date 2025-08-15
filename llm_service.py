@@ -148,9 +148,22 @@ class LLMService:
         
         # 获取分析日期和市场数据
         analysis_date = market_data.get("analysis_date", "未知日期")
-        data = market_data.get("market_data", market_data)  # 兼容新旧数据格式
+        
+        # 处理不同的数据格式
+        if "market_data" in market_data:
+            # 新格式：有 market_data 嵌套字段
+            data = market_data["market_data"]
+        else:
+            # 旧格式：直接包含指数数据
+            data = {k: v for k, v in market_data.items() 
+                   if k not in ["analysis_date", "data_source"] and isinstance(v, dict)}
+        
+        # 添加当前时间信息
+        from datetime import datetime
+        current_date = datetime.now().strftime('%Y年%m月%d日')
         
         prompt_parts = [
+            f"当前时间：{current_date}\n",
             f"你是一位资深的证券分析师，请对{analysis_date}的A股市场表现进行全面分析。\n",
             f"以下是{analysis_date}的主要指数数据：\n"
         ]
