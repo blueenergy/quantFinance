@@ -96,6 +96,7 @@ def get_profile(current_user: dict = Depends(get_current_active_user)):
 client = MongoClient(os.getenv("MONGO_URI", "mongodb://localhost:27017/"))
 db = client["quant"]
 collection = db["volume_price"]
+stock_info_collection = db["stock_info"]  # 新增：股票信息集合
 
 def serialize_doc(doc):
     doc["_id"] = str(doc["_id"])
@@ -121,6 +122,100 @@ def get_record(record_id: str):
     if doc:
         return serialize_doc(doc)
     return {"error": "Not found"}
+
+@app.get("/api/stock-info/{symbol}")
+def get_stock_info(symbol: str):
+    """获取股票基本信息（包括名称）"""
+    try:
+        # 先从股票信息集合获取
+        stock_info = stock_info_collection.find_one({"symbol": symbol})
+        if stock_info:
+            return {
+                "success": True,
+                "data": {
+                    "symbol": stock_info["symbol"],
+                    "name": stock_info["name"],
+                    "update_time": stock_info.get("update_time")
+                }
+            }
+        
+        # 如果没有找到，从价格数据中获取
+        price_record = collection.find_one(
+            {"symbol": symbol}, 
+            sort=[("trade_date", -1)]
+        )
+        if price_record and "stock_name" in price_record:
+            return {
+                "success": True,
+                "data": {
+                    "symbol": symbol,
+                    "name": price_record["stock_name"],
+                    "update_time": price_record.get("update_time")
+                }
+            }
+        
+        return {
+            "success": False,
+            "message": f"未找到股票 {symbol} 的信息"
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "message": f"获取股票信息失败: {str(e)}"
+        }
+
+@app.get("/api/watchlist-stocks")
+def get_watchlist_stocks(symbols: str = Query(..., description="逗号分隔的股票代码列表")):
+    """批量获取自选股的基本信息和最新价格"""
+    try:
+        symbol_list = [s.strip() for s in symbols.split(",") if s.strip()]
+        result = []
+        
+        for symbol in symbol_list:
+            # 获取最新价格数据
+            latest_record = collection.find_one(
+                {"symbol": symbol},
+                sort=[("trade_date", -1)]
+            )
+            
+            if latest_record:
+                stock_data = {
+                    "symbol": symbol,
+                    "name": latest_record.get("stock_name", symbol),
+                    "close": latest_record.get("close"),
+                    "trade_date": latest_record.get("trade_date"),
+                    "volume": latest_record.get("volume"),
+                    "high": latest_record.get("high"),
+                    "low": latest_record.get("low"),
+                    "open": latest_record.get("open")
+                }
+                
+                # 计算涨跌幅（需要前一日数据）
+                prev_record = collection.find_one(
+                    {"symbol": symbol, "trade_date": {"$lt": latest_record["trade_date"]}},
+                    sort=[("trade_date", -1)]
+                )
+                
+                if prev_record:
+                    change = latest_record["close"] - prev_record["close"]
+                    change_percent = (change / prev_record["close"]) * 100
+                    stock_data["change"] = round(change, 2)
+                    stock_data["change_percent"] = round(change_percent, 2)
+                else:
+                    stock_data["change"] = 0
+                    stock_data["change_percent"] = 0
+                
+                result.append(stock_data)
+        
+        return {
+            "success": True,
+            "data": result
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "message": f"获取自选股信息失败: {str(e)}"
+        }
 
 @app.post("/api/analyze-market")
 async def analyze_market(
