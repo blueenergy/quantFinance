@@ -135,8 +135,8 @@ async def analyze_stock(
         
         # 获取LLM服务
         llm_service = llm_manager.get_service(
-            provider=request.provider or "openai",
-            model=request.model or "gpt-3.5-turbo"
+            provider=request.provider or os.getenv('DEFAULT_LLM_PROVIDER', 'openai'),
+            model=request.model or os.getenv('DEFAULT_MODEL', 'gpt-3.5-turbo')
         )
         
         # 调用LLM分析
