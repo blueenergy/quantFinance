@@ -12,12 +12,94 @@ class VolumePriceCollector:
         self.client = MongoClient('mongodb://localhost:27017/')
         self.db = self.client['quant']
         self.collection = self.db['volume_price']
+        self.stock_info_collection = self.db['stock_info']  # 新增：股票基本信息集合
+        
         # 创建复合索引（提升查询效率）
         self.collection.create_index([
             ("symbol", 1), 
             ("trade_date", 1)
         ])
+        
+        # 为股票信息集合创建索引
+        self.stock_info_collection.create_index([("symbol", 1)], unique=True)
+        
         print("MongoDB连接成功!数据库索引已创建")
+        
+        # 股票名称缓存
+        self._stock_name_cache = {}
+
+    def get_stock_name(self, symbol):
+        """获取股票名称"""
+        try:
+            # 1. 先检查缓存
+            if symbol in self._stock_name_cache:
+                return self._stock_name_cache[symbol]
+            
+            # 2. 检查数据库中是否已有该股票信息
+            stock_info = self.stock_info_collection.find_one({"symbol": symbol})
+            if stock_info and 'name' in stock_info:
+                name = stock_info['name']
+                self._stock_name_cache[symbol] = name
+                return name
+            
+            # 3. 从API获取股票基本信息
+            print(f"🔍 获取股票 {symbol} 的名称信息...")
+            base_info = ef.stock.get_base_info(symbol)
+            
+            if '股票名称' in base_info.index:
+                name = base_info['股票名称']
+                
+                # 保存到数据库
+                self.stock_info_collection.update_one(
+                    {"symbol": symbol},
+                    {
+                        "$set": {
+                            "symbol": symbol,
+                            "name": name,
+                            "update_time": datetime.now()
+                        }
+                    },
+                    upsert=True
+                )
+                
+                # 更新缓存
+                self._stock_name_cache[symbol] = name
+                print(f"✅ 获取股票名称: {symbol} -> {name}")
+                return name
+            else:
+                print(f"⚠️ 无法获取股票 {symbol} 的名称")
+                return symbol  # 返回股票代码作为fallback
+                
+        except Exception as e:
+            print(f"⚠️ 获取股票 {symbol} 名称失败: {str(e)}")
+            return symbol  # 返回股票代码作为fallback
+
+    def batch_update_stock_names(self, symbols=None):
+        """批量更新股票名称"""
+        try:
+            if symbols is None:
+                # 获取所有已有股票代码
+                symbols = self.collection.distinct("symbol")
+            
+            print(f"🔄 开始批量更新 {len(symbols)} 只股票的名称信息...")
+            
+            updated_count = 0
+            for symbol in tqdm(symbols, desc="更新股票名称"):
+                try:
+                    name = self.get_stock_name(symbol)
+                    if name != symbol:  # 成功获取到名称
+                        updated_count += 1
+                    time.sleep(0.2)  # 避免请求过快
+                except Exception as e:
+                    print(f"⚠️ 更新 {symbol} 名称失败: {str(e)}")
+                    continue
+            
+            print(f"✅ 股票名称更新完成！成功更新 {updated_count} 只股票")
+            return updated_count
+            
+        except Exception as e:
+            print(f"❌ 批量更新股票名称失败: {str(e)}")
+            return 0
 
     def close(self):
         self.client.close()
@@ -93,6 +175,10 @@ class VolumePriceCollector:
             df_result['symbol'] = symbol
             df_result['update_time'] = datetime.now()
             
+            # 获取并添加股票名称
+            stock_name = self.get_stock_name(symbol)
+            df_result['stock_name'] = stock_name
+            
             # 类型转换
             df_result['open'] = df_result['open'].astype(float)
             df_result['volume'] = df_result['volume'].astype(int)
@@ -128,6 +214,11 @@ class VolumePriceCollector:
             # 添加元数据
             df['symbol'] = symbol
             df['update_time'] = datetime.now()
+            
+            # 获取并添加股票名称
+            stock_name = self.get_stock_name(symbol)
+            df['stock_name'] = stock_name
+            
             # 类型转换
             df['open'] = df['open'].astype(float)
             df['volume'] = df['volume'].astype(int)
@@ -378,6 +469,7 @@ if __name__ == "__main__":
     force_update = "--force" in sys.argv
     update_existing = "--update-existing" in sys.argv
     incremental_sync = "--incremental" in sys.argv
+    update_names = "--update-names" in sys.argv
     
     # 解析增量同步天数
     incremental_days = None  # 默认None，自动计算
@@ -394,7 +486,9 @@ if __name__ == "__main__":
     print("📊 股票数据收集器")
     print("=" * 60)
     
-    if incremental_sync:
+    if update_names:
+        print("📝 股票名称更新模式：批量更新所有股票的名称信息")
+    elif incremental_sync:
         if incremental_days is None:
             print("🔄 智能增量同步模式：为每只股票单独计算需要同步的天数")
         else:
@@ -409,23 +503,28 @@ if __name__ == "__main__":
     print("\n可用参数:")
     print("  --incremental         智能增量同步（为每只股票单独计算需要同步的天数）")
     print("  --days=N             统一增量同步天数（配合--incremental使用）")
+    print("  --update-names       批量更新所有股票的名称信息")
     print("  --force              强制更新所有股票数据")
     print("  --update-existing    仅更新已有股票数据")
     print("  (无参数)              智能跳过已有数据")
     print("\n使用示例:")
     print("  python volume_price_collector.py --incremental          # 智能计算每只股票的同步天数")
     print("  python volume_price_collector.py --incremental --days=3 # 统一同步3天")
+    print("  python volume_price_collector.py --update-names         # 批量更新股票名称")
     print("  python volume_price_collector.py --force                # 强制全量更新")
     print("\n智能增量同步说明:")
     print("  • 自动检测每只股票的最后更新日期")
     print("  • 根据距离今天的天数差异，为每只股票计算最优同步天数")
     print("  • 避免重复同步已经是最新的股票数据")
     print("  • 确保落后较多的股票能够追上最新数据")
+    print("  • 同步过程中自动获取和保存股票名称信息")
     print("-" * 60)
     
     collector = VolumePriceCollector()
     try:
-        if incremental_sync:
+        if update_names:
+            collector.batch_update_stock_names()
+        elif incremental_sync:
             collector.incremental_sync_all(incremental_days)
         else:
             collector.batch_update(
