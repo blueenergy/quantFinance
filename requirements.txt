@@ -5,7 +5,7 @@ numpy
 pymongo
 efinance
 fastapi 
-uvicorn
+uvicorn[standard]
 httpx
 pydantic
 python-dotenv
@@ -13,3 +13,20 @@ PyJWT
 passlib[bcrypt]
 python-multipart
 email-validator
+
+# 生产环境额外依赖
+motor>=3.3.2                    # MongoDB异步驱动
+slowapi>=0.1.8                  # FastAPI限流
+prometheus-fastapi-instrumentator>=6.1.0  # Prometheus监控
+gunicorn>=21.2.0                # WSGI服务器
+redis>=5.0.1                    # Redis缓存
+aioredis>=2.0.1                 # Redis异步客户端
+
+# 安全和性能
+cryptography>=41.0.7            # 加密库
+python-jose[cryptography]>=3.3.0  # JWT处理
+python-multipart>=0.0.6         # 文件上传支持
+
+# 监控和日志
+structlog>=23.2.0               # 结构化日志
+sentry-sdk[fastapi]>=1.38.0     # 错误监控
