@@ -8,7 +8,7 @@ import httpx
 import json
 from pydantic import BaseModel
 from fastapi.staticfiles import StaticFiles
-from datetime import timedelta, date
+from datetime import timedelta, date, datetime
 from dotenv import load_dotenv
 from llm_service import llm_manager
 from auth import (
@@ -27,17 +27,49 @@ app = FastAPI()
 # CORS middleware for Vue.js frontend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://localhost:5173"],
+    allow_origins=[
+        "http://localhost:3000", 
+        "http://localhost:5173",
+        "http://10.181.200.185:5173",
+        "http://10.181.200.185:3000"
+    ],
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["*"],
 )
+
+# 添加OPTIONS预检请求处理器
+@app.options("/api/user/watchlist")
+async def watchlist_options():
+    """处理自选股相关的OPTIONS预检请求"""
+    return {"message": "OK"}
+
+@app.options("/api/user/watchlist/add")
+async def add_watchlist_options():
+    """处理添加自选股的OPTIONS预检请求"""
+    return {"message": "OK"}
+
+@app.options("/api/user/watchlist/remove/{symbol}")
+async def remove_watchlist_options(symbol: str):
+    """处理移除自选股的OPTIONS预检请求"""
+    return {"message": "OK"}
+
+@app.options("/api/user/watchlist-stocks")
+async def watchlist_stocks_options():
+    """处理自选股详情的OPTIONS预检请求"""
+    return {"message": "OK"}
 
 # Request models
 class StockAnalysisRequest(BaseModel):
     symbol: str
     provider: Optional[str] = "openai"  # 默认使用OpenAI
     model: Optional[str] = None
+
+class WatchlistRequest(BaseModel):
+    symbol: str
+
+class WatchlistUpdateRequest(BaseModel):
+    symbols: List[str]
 
 @app.get("/")
 def read_root():
@@ -92,11 +124,214 @@ def get_profile(current_user: dict = Depends(get_current_active_user)):
         created_at=current_user["created_at"]
     )
 
+# 用户自选股管理API
+@app.get("/api/user/watchlist")
+def get_user_watchlist(current_user: dict = Depends(get_current_active_user)):
+    """获取当前用户的自选股列表"""
+    try:
+        user_id = current_user["id"]
+        watchlist_doc = user_watchlists_collection.find_one({"user_id": user_id})
+        
+        if watchlist_doc:
+            symbols = watchlist_doc.get("symbols", [])
+        else:
+            symbols = []
+            
+        return {
+            "success": True,
+            "data": {
+                "symbols": symbols,
+                "count": len(symbols)
+            }
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "message": f"获取自选股列表失败: {str(e)}"
+        }
+
+@app.post("/api/user/watchlist/add")
+def add_to_watchlist(
+    request: WatchlistRequest,
+    current_user: dict = Depends(get_current_active_user)
+):
+    """添加股票到自选股"""
+    try:
+        user_id = current_user["id"]
+        symbol = request.symbol.strip().upper()
+        
+        # 检查股票代码是否有效（可以通过检查是否有数据来验证）
+        stock_exists = collection.find_one({"symbol": symbol}) is not None
+        if not stock_exists:
+            return {
+                "success": False,
+                "message": f"股票代码 {symbol} 不存在或暂无数据"
+            }
+        
+        # 更新用户自选股，使用upsert和addToSet避免重复
+        result = user_watchlists_collection.update_one(
+            {"user_id": user_id},
+            {
+                "$addToSet": {"symbols": symbol},
+                "$set": {"updated_at": datetime.now()}
+            },
+            upsert=True
+        )
+        
+        return {
+            "success": True,
+            "message": f"股票 {symbol} 已添加到自选股",
+            "data": {"symbol": symbol}
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "message": f"添加自选股失败: {str(e)}"
+        }
+
+@app.delete("/api/user/watchlist/remove/{symbol}")
+def remove_from_watchlist(
+    symbol: str,
+    current_user: dict = Depends(get_current_active_user)
+):
+    """从自选股中移除股票"""
+    try:
+        user_id = current_user["id"]
+        symbol = symbol.strip().upper()
+        
+        result = user_watchlists_collection.update_one(
+            {"user_id": user_id},
+            {
+                "$pull": {"symbols": symbol},
+                "$set": {"updated_at": datetime.now()}
+            }
+        )
+        
+        return {
+            "success": True,
+            "message": f"股票 {symbol} 已从自选股中移除",
+            "data": {"symbol": symbol}
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "message": f"移除自选股失败: {str(e)}"
+        }
+
+@app.put("/api/user/watchlist")
+def update_watchlist(
+    request: WatchlistUpdateRequest,
+    current_user: dict = Depends(get_current_active_user)
+):
+    """批量更新用户自选股"""
+    try:
+        user_id = current_user["id"]
+        symbols = [s.strip().upper() for s in request.symbols if s.strip()]
+        
+        # 验证所有股票代码
+        invalid_symbols = []
+        for symbol in symbols:
+            if not collection.find_one({"symbol": symbol}):
+                invalid_symbols.append(symbol)
+        
+        if invalid_symbols:
+            return {
+                "success": False,
+                "message": f"以下股票代码无效: {', '.join(invalid_symbols)}"
+            }
+        
+        # 更新自选股列表
+        user_watchlists_collection.update_one(
+            {"user_id": user_id},
+            {
+                "$set": {
+                    "symbols": symbols,
+                    "updated_at": datetime.now()
+                }
+            },
+            upsert=True
+        )
+        
+        return {
+            "success": True,
+            "message": f"自选股列表已更新，共 {len(symbols)} 只股票",
+            "data": {"symbols": symbols, "count": len(symbols)}
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "message": f"更新自选股失败: {str(e)}"
+        }
+
+@app.get("/api/user/watchlist-stocks")
+def get_user_watchlist_stocks(current_user: dict = Depends(get_current_active_user)):
+    """获取当前用户自选股的详细信息"""
+    try:
+        user_id = current_user["id"]
+        
+        # 获取用户自选股列表
+        watchlist_doc = user_watchlists_collection.find_one({"user_id": user_id})
+        if not watchlist_doc or not watchlist_doc.get("symbols"):
+            return {
+                "success": True,
+                "data": []
+            }
+        
+        symbols = watchlist_doc["symbols"]
+        result = []
+        
+        for symbol in symbols:
+            # 获取最新价格数据
+            latest_record = collection.find_one(
+                {"symbol": symbol},
+                sort=[("trade_date", -1)]
+            )
+            
+            if latest_record:
+                stock_data = {
+                    "symbol": symbol,
+                    "name": latest_record.get("stock_name", symbol),
+                    "close": latest_record.get("close"),
+                    "trade_date": latest_record.get("trade_date"),
+                    "volume": latest_record.get("volume"),
+                    "high": latest_record.get("high"),
+                    "low": latest_record.get("low"),
+                    "open": latest_record.get("open")
+                }
+                
+                # 计算涨跌幅（需要前一日数据）
+                prev_record = collection.find_one(
+                    {"symbol": symbol, "trade_date": {"$lt": latest_record["trade_date"]}},
+                    sort=[("trade_date", -1)]
+                )
+                
+                if prev_record:
+                    change = latest_record["close"] - prev_record["close"]
+                    change_percent = (change / prev_record["close"]) * 100
+                    stock_data["change"] = round(change, 2)
+                    stock_data["change_percent"] = round(change_percent, 2)
+                else:
+                    stock_data["change"] = 0
+                    stock_data["change_percent"] = 0
+                
+                result.append(stock_data)
+        
+        return {
+            "success": True,
+            "data": result
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "message": f"获取用户自选股信息失败: {str(e)}"
+        }
+
 # MongoDB connection
 client = MongoClient(os.getenv("MONGO_URI", "mongodb://localhost:27017/"))
 db = client["quant"]
 collection = db["volume_price"]
 stock_info_collection = db["stock_info"]  # 新增：股票信息集合
+user_watchlists_collection = db["user_watchlists"]  # 新增：用户自选股集合
 
 def serialize_doc(doc):
     doc["_id"] = str(doc["_id"])

@@ -3,8 +3,34 @@
 本目录包含量化金融系统的测试文件和数据管理工具，按功能分类如下：
 
 ## 📊 数据收集测试
-- `test_collector.py` - 股票数据收集器的基础测试
-- `test_incremental_sync.py` - 增量同步功能测试
+- `test_collector.py` - ### 📊 数据同步测试
+
+#### 测试智能增量同步
+```bash
+python tests/test_smart_sync.py
+```
+
+#### 测试数据收集器
+```bash
+python tests/test_collector.py
+```
+
+### 👥 用户自选股管理工具
+
+#### 测试用户自选股功能
+```bash
+python tests/test_user_watchlist.py
+```
+
+#### 运行完整功能演示
+```bash
+python tests/demo_user_watchlist.py
+```
+
+#### 快速系统状态检查
+```bash
+python tests/quick_test.py
+```test_incremental_sync.py` - 增量同步功能测试
 - `test_auto_incremental.py` - 自动计算增量同步天数测试
 - `test_smart_sync.py` - 智能增量同步功能测试
 
@@ -15,6 +41,11 @@
 - `batch_update_stock_names.py` - 批量更新股票名称的优化工具
 - `update_single_stock_name.py` - 为特定股票添加名称信息
 - `update_stock_names.py` - 股票名称更新脚本
+
+## 👥 用户自选股管理
+- `test_user_watchlist.py` - 用户自选股API功能测试
+- `demo_user_watchlist.py` - 完整的用户自选股功能演示
+- `quick_test.py` - 快速系统状态验证
 
 ## 🤖 AI/LLM 相关测试
 - `test_llm.py` - LLM服务基础测试
@@ -77,16 +108,21 @@ python tests/update_single_stock_name.py 300347
 python tests/update_stock_names.py
 ```
 
-### 📊 数据同步测试
+### � 用户自选股管理工具
 
-#### 测试智能增量同步
+#### 测试用户自选股功能
 ```bash
-python tests/test_smart_sync.py
+python tests/test_user_watchlist.py
 ```
 
-#### 测试数据收集器
+#### 运行完整功能演示
 ```bash
-python tests/test_collector.py
+python tests/demo_user_watchlist.py
+```
+
+#### 快速系统状态检查
+```bash
+python tests/quick_test.py
 ```
 
 ## 📈 工具特性
@@ -162,6 +198,11 @@ tests/
 ├── update_stock_names.py
 ├── test_stock_name_sync.py
 ├── test_stock_names.py
+├── 
+├── 👥 用户自选股管理
+├── test_user_watchlist.py
+├── demo_user_watchlist.py
+├── quick_test.py
 ├── 
 ├── 🤖 AI/LLM测试
 ├── test_llm.py
