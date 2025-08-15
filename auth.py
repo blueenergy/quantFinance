@@ -12,6 +12,10 @@ from passlib.context import CryptContext
 import jwt
 import os
 from pymongo import MongoClient
+from dotenv import load_dotenv
+
+# 加载环境变量
+load_dotenv()
 
 # JWT配置
 SECRET_KEY = os.getenv("JWT_SECRET_KEY", "your-secret-key-change-in-production")

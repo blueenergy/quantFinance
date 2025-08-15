@@ -9,12 +9,16 @@ import json
 from pydantic import BaseModel
 from fastapi.staticfiles import StaticFiles
 from datetime import timedelta
+from dotenv import load_dotenv
 from llm_service import llm_manager
 from auth import (
     UserCreate, UserLogin, Token, UserResponse,
     authenticate_user, create_access_token, create_user,
     get_current_active_user, ACCESS_TOKEN_EXPIRE_MINUTES
 )
+
+# 加载环境变量
+load_dotenv()
 
 app = FastAPI()
 
