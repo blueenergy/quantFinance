@@ -8,7 +8,7 @@ import httpx
 import json
 from pydantic import BaseModel
 from fastapi.staticfiles import StaticFiles
-from datetime import timedelta
+from datetime import timedelta, date
 from dotenv import load_dotenv
 from llm_service import llm_manager
 from auth import (
@@ -17,6 +17,7 @@ from auth import (
     get_current_active_user, ACCESS_TOKEN_EXPIRE_MINUTES
 )
 from external_data import external_market_data
+from market_analysis_cache import market_analysis_cache
 
 # 加载环境变量
 load_dotenv()
@@ -126,11 +127,52 @@ async def analyze_market(
     request: dict,
     current_user: dict = Depends(get_current_active_user)
 ):
-    """AI市场分析 (需要登录)"""
+    """AI市场分析 (需要登录) - 带缓存和交易日检查"""
     try:
-        # 获取市场数据（主要指数的数据）
-        market_data = get_market_data_for_analysis()
+        today = date.today()
+        analysis_date = today.strftime('%Y-%m-%d')
         
+        # 1. 检查是否需要进行市场分析
+        should_analyze, reason = market_analysis_cache.should_analyze_market(today)
+        
+        if not should_analyze:
+            print(f"[市场分析] {reason}")
+            
+            # 如果是非交易日，尝试返回最近交易日的分析结果
+            if "非交易日" in reason:
+                latest_analysis = market_analysis_cache.get_latest_trading_day_analysis()
+                if latest_analysis:
+                    result = latest_analysis['analysis_result']
+                    result['cache_info'] = {
+                        'from_cache': True,
+                        'cache_date': latest_analysis['analysis_date'],
+                        'reason': f"{reason}，返回最近交易日({latest_analysis['analysis_date']})的分析结果"
+                    }
+                    return result
+                else:
+                    return {
+                        "success": False,
+                        "error": f"{reason}，且未找到最近的交易日分析结果",
+                        "is_trading_day": False
+                    }
+            
+            # 如果是交易日但有缓存，直接返回缓存结果
+            elif "缓存" in reason:
+                cached_analysis = market_analysis_cache.get_cached_analysis(analysis_date)
+                if cached_analysis:
+                    result = cached_analysis['analysis_result']
+                    result['cache_info'] = {
+                        'from_cache': True,
+                        'cache_date': analysis_date,
+                        'reason': reason
+                    }
+                    return result
+        
+        # 2. 需要进行新的市场分析
+        print(f"[市场分析] {reason}，开始新的分析...")
+        
+        # 获取市场数据
+        market_data = get_market_data_for_analysis()
         if not market_data:
             raise HTTPException(status_code=404, detail="未找到市场数据")
         
@@ -147,22 +189,34 @@ async def analyze_market(
             # 提取分析内容
             analysis = analysis_result.get("analysis", {})
             
-            # 记录分析历史
+            # 构建结果
             result = {
                 "success": True,
-                "analysis_date": market_data.get("analysis_date", "未知"),  # 添加分析基准日期
+                "analysis_date": market_data.get("analysis_date", analysis_date),
                 "mood": analysis.get("mood", "市场情绪复杂"),
                 "summary": analysis.get("summary", "市场分析结果"),
                 "keyPoints": analysis.get("keyPoints", []),
                 "outlook": analysis.get("outlook", "请关注市场动态"),
                 "riskLevel": analysis.get("riskLevel", "medium"),
                 "riskNote": analysis.get("riskNote", "注意投资风险"),
-                "user_id": current_user["id"],
-                "username": current_user["username"],
                 "analysis_type": "market_overview",
                 "provider": analysis_result.get("provider"),
-                "model": analysis_result.get("model")
+                "model": analysis_result.get("model"),
+                "cache_info": {
+                    'from_cache': False,
+                    'cache_date': analysis_date,
+                    'reason': "新生成的分析结果"
+                }
             }
+            
+            # 3. 保存分析结果到缓存
+            cache_success = market_analysis_cache.save_analysis(result, analysis_date)
+            if cache_success:
+                print(f"[市场分析] 分析结果已缓存到数据库")
+            else:
+                print(f"[市场分析] 缓存保存失败，但分析正常返回")
+            
+            return result
         else:
             # 分析失败时返回错误
             result = {
@@ -170,10 +224,10 @@ async def analyze_market(
                 "error": analysis_result.get("error", "分析失败"),
                 "error_type": analysis_result.get("error_type", "Unknown")
             }
-        
-        return result
+            return result
         
     except Exception as e:
+        print(f"[市场分析] 异常: {str(e)}")
         raise HTTPException(status_code=500, detail=f"市场分析失败: {str(e)}")
 
 def get_market_data_for_analysis() -> Optional[Dict[str, Any]]:
