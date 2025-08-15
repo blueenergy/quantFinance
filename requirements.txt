@@ -9,3 +9,7 @@ uvicorn
 httpx
 pydantic
 python-dotenv
+PyJWT
+passlib[bcrypt]
+python-multipart
+email-validator
