@@ -16,6 +16,7 @@ from auth import (
     authenticate_user, create_access_token, create_user,
     get_current_active_user, ACCESS_TOKEN_EXPIRE_MINUTES
 )
+from external_data import external_market_data
 
 # 加载环境变量
 load_dotenv()
@@ -119,6 +120,148 @@ def get_record(record_id: str):
     if doc:
         return serialize_doc(doc)
     return {"error": "Not found"}
+
+@app.post("/api/analyze-market")
+async def analyze_market(
+    request: dict,
+    current_user: dict = Depends(get_current_active_user)
+):
+    """AI市场分析 (需要登录)"""
+    try:
+        # 获取市场数据（主要指数的数据）
+        market_data = get_market_data_for_analysis()
+        
+        if not market_data:
+            raise HTTPException(status_code=404, detail="未找到市场数据")
+        
+        # 获取LLM服务
+        llm_service = llm_manager.get_service(
+            provider=os.getenv('DEFAULT_LLM_PROVIDER', 'openai'),
+            model=os.getenv('DEFAULT_MODEL', 'gpt-3.5-turbo')
+        )
+        
+        # 调用LLM分析市场
+        analysis_result = await llm_service.analyze_market(market_data)
+        
+        if analysis_result.get("success"):
+            # 提取分析内容
+            analysis = analysis_result.get("analysis", {})
+            
+            # 记录分析历史
+            result = {
+                "success": True,
+                "analysis_date": market_data.get("analysis_date", "未知"),  # 添加分析基准日期
+                "mood": analysis.get("mood", "市场情绪复杂"),
+                "summary": analysis.get("summary", "市场分析结果"),
+                "keyPoints": analysis.get("keyPoints", []),
+                "outlook": analysis.get("outlook", "请关注市场动态"),
+                "riskLevel": analysis.get("riskLevel", "medium"),
+                "riskNote": analysis.get("riskNote", "注意投资风险"),
+                "user_id": current_user["id"],
+                "username": current_user["username"],
+                "analysis_type": "market_overview",
+                "provider": analysis_result.get("provider"),
+                "model": analysis_result.get("model")
+            }
+        else:
+            # 分析失败时返回错误
+            result = {
+                "success": False,
+                "error": analysis_result.get("error", "分析失败"),
+                "error_type": analysis_result.get("error_type", "Unknown")
+            }
+        
+        return result
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"市场分析失败: {str(e)}")
+
+def get_market_data_for_analysis() -> Optional[Dict[str, Any]]:
+    """获取用于市场分析的数据 - 优先使用外部数据源"""
+    try:
+        print("[市场数据] 开始获取分析数据...")
+        
+        # 首先尝试获取外部实时数据
+        try:
+            external_data = external_market_data.get_real_market_data()
+            if external_data and external_data.get('market_data'):
+                print(f"[市场数据] 外部数据获取成功，包含 {len(external_data['market_data'])} 个指数")
+                return external_data
+        except Exception as e:
+            print(f"[市场数据] 外部数据获取失败，尝试本地数据: {e}")
+        
+        # 备用方案：从本地数据库获取
+        print("[市场数据] 使用本地数据库数据...")
+        index_symbols = ['1A0001', '399001', '399006', '899050']  # 上证指数、深证成指、创业板指、北证50
+        market_data = {}
+        analysis_date = None
+        
+        for symbol in index_symbols:
+            # 获取最新记录
+            latest_record = collection.find_one(
+                {"symbol": symbol},
+                sort=[("trade_date", -1)]
+            )
+            
+            if latest_record:
+                # 记录最新的交易日期作为分析基准日期
+                if analysis_date is None or latest_record["trade_date"] > analysis_date:
+                    analysis_date = latest_record["trade_date"]
+                
+                # 获取最近10天的历史记录
+                historical_records = list(collection.find(
+                    {"symbol": symbol},
+                    sort=[("trade_date", -1)]
+                ).limit(10))
+                
+                market_data[symbol] = {
+                    "symbol": symbol,
+                    "latest_record": serialize_doc(latest_record),
+                    "historical_records": [serialize_doc(doc) for doc in historical_records]
+                }
+        
+        # 如果本地数据库也没有指数数据，使用有代表性的个股
+        if not market_data:
+            print("[市场数据] 无指数数据，使用代表性个股...")
+            representative_stocks = ['000001', '000002', '300347']  # 平安、万科、代表性创业板股票
+            
+            for symbol in representative_stocks:
+                latest_record = collection.find_one(
+                    {"symbol": symbol},
+                    sort=[("trade_date", -1)]
+                )
+                
+                if latest_record:
+                    if analysis_date is None or latest_record["trade_date"] > analysis_date:
+                        analysis_date = latest_record["trade_date"]
+                    
+                    historical_records = list(collection.find(
+                        {"symbol": symbol},
+                        sort=[("trade_date", -1)]
+                    ).limit(10))
+                    
+                    market_data[symbol] = {
+                        "symbol": symbol,
+                        "latest_record": serialize_doc(latest_record),
+                        "historical_records": [serialize_doc(doc) for doc in historical_records]
+                    }
+        
+        # 添加分析基准日期信息
+        if market_data and analysis_date:
+            result = {
+                "analysis_date": analysis_date.strftime("%Y-%m-%d") if hasattr(analysis_date, 'strftime') else str(analysis_date),
+                "market_data": market_data,
+                "data_source": "local_database"
+            }
+            print(f"[市场数据] 本地数据获取成功，包含 {len(market_data)} 个品种")
+            return result
+        
+        print("[市场数据] 无法获取到有效的市场数据")
+        return None
+        
+    except Exception as e:
+        print(f"[市场数据] 获取失败: {e}")
+        return None
 
 @app.post("/api/analyze-stock")
 async def analyze_stock(
