@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Query, HTTPException
+from fastapi import FastAPI, Query, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pymongo import MongoClient
 from typing import List, Optional, Dict, Any
@@ -8,7 +8,13 @@ import httpx
 import json
 from pydantic import BaseModel
 from fastapi.staticfiles import StaticFiles
+from datetime import timedelta
 from llm_service import llm_manager
+from auth import (
+    UserCreate, UserLogin, Token, UserResponse,
+    authenticate_user, create_access_token, create_user,
+    get_current_active_user, ACCESS_TOKEN_EXPIRE_MINUTES
+)
 
 app = FastAPI()
 
@@ -30,6 +36,55 @@ class StockAnalysisRequest(BaseModel):
 @app.get("/")
 def read_root():
     return {"message": "Welcome to the FastAPI MongoDB Data Service!"}
+
+# 用户认证路由
+@app.post("/api/register", response_model=UserResponse)
+def register(user: UserCreate):
+    """用户注册"""
+    return create_user(user)
+
+@app.post("/api/login", response_model=Token)
+def login(user_data: UserLogin):
+    """用户登录"""
+    user = authenticate_user(user_data.username, user_data.password)
+    if not user:
+        raise HTTPException(
+            status_code=401,
+            detail="Incorrect username or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token(
+        data={"sub": user["username"]}, expires_delta=access_token_expires
+    )
+    
+    # 准备用户响应数据
+    user_response = UserResponse(
+        id=user["id"],
+        username=user["username"],
+        email=user["email"],
+        full_name=user.get("full_name"),
+        is_active=user.get("is_active", True),
+        created_at=user["created_at"]
+    )
+    
+    return Token(
+        access_token=access_token,
+        token_type="bearer",
+        user=user_response
+    )
+
+@app.get("/api/profile", response_model=UserResponse)
+def get_profile(current_user: dict = Depends(get_current_active_user)):
+    """获取当前用户信息"""
+    return UserResponse(
+        id=current_user["id"],
+        username=current_user["username"],
+        email=current_user["email"],
+        full_name=current_user.get("full_name"),
+        is_active=current_user.get("is_active", True),
+        created_at=current_user["created_at"]
+    )
 
 # MongoDB connection
 client = MongoClient(os.getenv("MONGO_URI", "mongodb://localhost:27017/"))
@@ -62,8 +117,11 @@ def get_record(record_id: str):
     return {"error": "Not found"}
 
 @app.post("/api/analyze-stock")
-async def analyze_stock(request: StockAnalysisRequest):
-    """使用外部LLM API分析股票数据"""
+async def analyze_stock(
+    request: StockAnalysisRequest,
+    current_user: dict = Depends(get_current_active_user)
+):
+    """使用外部LLM API分析股票数据 (需要登录)"""
     try:
         # 获取股票数据
         stock_data = get_stock_data_for_analysis(request.symbol)
@@ -79,6 +137,10 @@ async def analyze_stock(request: StockAnalysisRequest):
         
         # 调用LLM分析
         analysis_result = await llm_service.analyze_stock(request.symbol, stock_data)
+        
+        # 记录分析历史
+        analysis_result["user_id"] = current_user["id"]
+        analysis_result["username"] = current_user["username"]
         
         return analysis_result
         
