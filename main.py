@@ -187,13 +187,16 @@ def add_to_watchlist(
         user_id = current_user["id"]
         symbol = request.symbol.strip().upper()
         
-        # 检查股票代码是否有效（可以通过检查是否有数据来验证）
-        stock_exists = collection.find_one({"symbol": symbol}) is not None
+        # 检查股票代码是否有效（优先检查stock_info，如果没有则检查volume_price）
+        stock_exists = stock_info_collection.find_one({"symbol": symbol}) is not None
         if not stock_exists:
-            return {
-                "success": False,
-                "message": f"股票代码 {symbol} 不存在或暂无数据"
-            }
+            # 如果股票信息表中没有，再检查价格数据表
+            stock_exists = collection.find_one({"symbol": symbol}) is not None
+            if not stock_exists:
+                return {
+                    "success": False,
+                    "message": f"股票代码 {symbol} 不存在或暂无数据"
+                }
         
         # 更新用户自选股，使用upsert和addToSet避免重复
         result = user_watchlists_collection.update_one(
@@ -355,7 +358,7 @@ def get_user_watchlist_stocks(current_user: dict = Depends(get_current_active_us
 
 # MongoDB connection
 client = MongoClient(os.getenv("MONGO_URI", "mongodb://localhost:27017/"))
-db = client["quant"]
+db = client[os.getenv("MONGO_DB", "finance")]  # 使用与认证系统相同的数据库
 collection = db["volume_price"]
 stock_info_collection = db["stock_info"]  # 新增：股票信息集合
 user_watchlists_collection = db["user_watchlists"]  # 新增：用户自选股集合
