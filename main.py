@@ -362,6 +362,7 @@ db = client[os.getenv("MONGO_DB", "finance")]  # 使用与认证系统相同的�
 collection = db["volume_price"]
 stock_info_collection = db["stock_info"]  # 新增：股票信息集合
 user_watchlists_collection = db["user_watchlists"]  # 新增：用户自选股集合
+analysis_history_collection = db["analysis_history"]
 
 # 导入管理员功能需要的集合
 from auth import users_collection, login_logs_collection, admin_logs_collection
@@ -1118,5 +1119,45 @@ def initialize_admin():
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"初始化管理员失败: {str(e)}")
+
+# 在 main.py 适当位置添加
+analysis_history_collection = db["analysis_history"]
+
+from pydantic import BaseModel
+
+class AnalysisHistoryRequest(BaseModel):
+    symbol: str
+    analysis_result: dict
+    provider: str
+    model: str
+    timestamp: str  # ISO 格式
+
+@app.post("/api/analysis-history")
+def save_analysis_history(
+    req: AnalysisHistoryRequest,
+    current_user: dict = Depends(get_current_active_user)
+):
+    doc = {
+        "user_id": current_user["id"],
+        "symbol": req.symbol,
+        "analysis_result": req.analysis_result,
+        "provider": req.provider,
+        "model": req.model,
+        "timestamp": req.timestamp
+    }
+    analysis_history_collection.insert_one(doc)
+    return {"success": True}
+
+@app.get("/api/analysis-history")
+def get_analysis_history(
+    symbol: str,
+    current_user: dict = Depends(get_current_active_user)
+):
+    docs = list(analysis_history_collection.find(
+        {"user_id": current_user["id"], "symbol": symbol}
+    ).sort("timestamp", -1))
+    for doc in docs:
+        doc["_id"] = str(doc["_id"])
+    return {"success": True, "data": docs}
 
 # Run with: uvicorn main:app --reload
