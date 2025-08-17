@@ -14,12 +14,12 @@ from dotenv import load_dotenv
 load_dotenv()
 
 async def test_qwen_model():
-    """测试qwen3-30b模型"""
-    print("🧪 测试qwen3-30b模型")
+    """测试qwen-plus模型"""
+    print("🧪 测试qwen-plus模型")
     print("-" * 40)
     
-    api_key = os.getenv('OPENAI_API_KEY')
-    base_url = os.getenv('OPENAI_BASE_URL', 'https://api.openai.com/v1')
+    api_key = os.getenv('CUSTOM_LLM_API_KEY')
+    base_url = os.getenv('CUSTOM_LLM_BASE_URL', 'https://api.openai.com/v1')
     
     print(f"API Base URL: {base_url}")
     print(f"API Key: {api_key[:10]}..." if api_key else "API Key: 未设置")
@@ -31,7 +31,7 @@ async def test_qwen_model():
     
     # 简单的测试请求
     payload = {
-        "model": "qwen3-30b",
+        "model": "qwen-plus",
         "messages": [
             {
                 "role": "system",
@@ -78,8 +78,8 @@ async def test_model_list():
     print("\n🧪 测试可用模型列表")
     print("-" * 40)
     
-    api_key = os.getenv('OPENAI_API_KEY')
-    base_url = os.getenv('OPENAI_BASE_URL', 'https://api.openai.com/v1')
+    api_key = os.getenv('CUSTOM_LLM_API_KEY')
+    base_url = os.getenv('CUSTOM_LLM_BASE_URL', 'https://api.openai.com/v1')
     
     headers = {
         "Authorization": f"Bearer {api_key}",
