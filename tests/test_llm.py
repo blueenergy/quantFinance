@@ -5,11 +5,16 @@
 
 import os
 import sys
-sys.path.append('/home/shuyolin/workbench/own/quntFinance')
+sys.path.append('/home/shuyolin/workbench/own/quantFinance')
 
 from llm_service import llm_manager
 import asyncio
 import json
+import requests
+import time
+from dotenv import load_dotenv
+
+load_dotenv()
 
 async def test_llm_providers():
     """测试LLM服务提供商"""
@@ -92,7 +97,7 @@ def check_env_file():
     env_files = ['.env', '.env.example', '.env.template']
     
     for env_file in env_files:
-        env_path = f'/home/shuyolin/workbench/own/quntFinance/{env_file}'
+        env_path = f'/home/shuyolin/workbench/own/quantFinance/{env_file}'
         if os.path.exists(env_path):
             print(f"✅ 找到 {env_file}")
         else:
@@ -134,5 +139,35 @@ async def main():
         print("2. 在 .env 文件中填入真实的API密钥")
         print("3. 重新启动FastAPI服务器")
 
+API_URL = "http://10.70.50.68:8080/v1/chat/completions"
+API_TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6ImM3MjhjMWI1LWNlMDQtNGFjMS05MDA2LWNkODFlYjFlYmFjMCJ9.0eL_ukYP4flldwj5OhKFCi2s1ErXFQ1lNOjhIhoQ9NA"
+payload = {
+    "model": "qwen3-30b",
+    "messages": [
+        {"role": "user", "content": "你好，请简单介绍一下A股市场。"}
+    ],
+    "temperature": 0.3,
+    "max_tokens": 2000
+}
+headers = {
+    "Content-Type": "application/json"
+}
+if API_TOKEN:
+    headers["Authorization"] = f"Bearer {API_TOKEN}"
+
+def test_llm_api():
+    print("开始测试 LLM 服务...")
+    start = time.time()
+    try:
+        response = requests.post(API_URL, json=payload, headers=headers, timeout=60)
+        elapsed = time.time() - start
+        print(f"响应状态码: {response.status_code}")
+        print(f"耗时: {elapsed:.2f} 秒")
+        print("响应内容:")
+        print(response.text)
+    except Exception as e:
+        print(f"请求失败: {e}")
+
 if __name__ == "__main__":
     asyncio.run(main())
+    test_llm_api()
