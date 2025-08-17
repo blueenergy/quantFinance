@@ -79,7 +79,7 @@ async def test_model_list():
     print("-" * 40)
     
     api_key = os.getenv('CUSTOM_LLM_API_KEY')
-    base_url = os.getenv('CUSTOM_LLM_BASE_URL', 'https://api.openai.com/v1')
+    base_url = os.getenv('CUSTOM_LLM_BASE_URL')
     
     headers = {
         "Authorization": f"Bearer {api_key}",
