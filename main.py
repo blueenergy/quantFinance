@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Query, HTTPException, Depends, Request
+from fastapi import FastAPI, Query, HTTPException, Depends, Request, APIRouter
 from fastapi.middleware.cors import CORSMiddleware
 from pymongo import MongoClient
 from typing import List, Optional, Dict, Any
@@ -25,6 +25,7 @@ from market_analysis_cache import market_analysis_cache
 load_dotenv()
 
 app = FastAPI()
+router = APIRouter()
 
 # CORS middleware for Vue.js frontend
 app.add_middleware(
@@ -72,6 +73,10 @@ class WatchlistRequest(BaseModel):
 
 class WatchlistUpdateRequest(BaseModel):
     symbols: List[str]
+
+class MarketAnalysisRequest(BaseModel):
+    type: str
+    force_refresh: bool = False
 
 @app.get("/")
 def read_root():
@@ -488,52 +493,51 @@ def get_watchlist_stocks(symbols: str = Query(..., description="逗号分隔的�
 
 @app.post("/api/analyze-market")
 async def analyze_market(
-    request: dict,
+    request: MarketAnalysisRequest,
     current_user: dict = Depends(get_current_active_user)
 ):
     """AI市场分析 (需要登录) - 带缓存和交易日检查"""
     try:
         today = date.today()
         analysis_date = today.strftime('%Y-%m-%d')
-        
-        # 1. 检查是否需要进行市场分析
-        should_analyze, reason = market_analysis_cache.should_analyze_market(today)
-        
-        if not should_analyze:
-            print(f"[市场分析] {reason}")
-            
-            # 如果是非交易日，尝试返回最近交易日的分析结果
-            if "非交易日" in reason:
-                latest_analysis = market_analysis_cache.get_latest_trading_day_analysis()
-                if latest_analysis:
-                    result = latest_analysis['analysis_result']
-                    result['cache_info'] = {
-                        'from_cache': True,
-                        'cache_date': latest_analysis['analysis_date'],
-                        'reason': f"{reason}，返回最近交易日({latest_analysis['analysis_date']})的分析结果"
-                    }
-                    return result
-                else:
-                    return {
-                        "success": False,
-                        "error": f"{reason}，且未找到最近的交易日分析结果",
-                        "is_trading_day": False
-                    }
-            
-            # 如果是交易日但有缓存，直接返回缓存结果
-            elif "缓存" in reason:
-                cached_analysis = market_analysis_cache.get_cached_analysis(analysis_date)
-                if cached_analysis:
-                    result = cached_analysis['analysis_result']
-                    result['cache_info'] = {
-                        'from_cache': True,
-                        'cache_date': analysis_date,
-                        'reason': reason
-                    }
-                    return result
-        
-        # 2. 需要进行新的市场分析
-        print(f"[市场分析] {reason}，开始新的分析...")
+
+        # 如果force_refresh为True，强制跳过缓存，直接分析
+        if getattr(request, 'force_refresh', False):
+            print("[市场分析] 用户强制刷新，跳过缓存，直接分析...")
+        else:
+            # 1. 检查是否需要进行市场分析
+            should_analyze, reason = market_analysis_cache.should_analyze_market(today)
+            if not should_analyze:
+                print(f"[市场分析] {reason}")
+                # 如果是非交易日，尝试返回最近交易日的分析结果
+                if "非交易日" in reason:
+                    latest_analysis = market_analysis_cache.get_latest_trading_day_analysis()
+                    if latest_analysis:
+                        result = latest_analysis['analysis_result']
+                        result['cache_info'] = {
+                            'from_cache': True,
+                            'cache_date': latest_analysis['analysis_date'],
+                            'reason': f"{reason}，返回最近交易日({latest_analysis['analysis_date']})的分析结果"
+                        }
+                        return result
+                    else:
+                        return {
+                            "success": False,
+                            "error": f"{reason}，且未找到最近的交易日分析结果",
+                            "is_trading_day": False
+                        }
+                # 如果是交易日但有缓存，直接返回缓存结果
+                elif "缓存" in reason:
+                    cached_analysis = market_analysis_cache.get_cached_analysis(analysis_date)
+                    if cached_analysis:
+                        result = cached_analysis['analysis_result']
+                        result['cache_info'] = {
+                            'from_cache': True,
+                            'cache_date': analysis_date,
+                            'reason': reason
+                        }
+                        return result
+            print(f"[市场分析] {reason}，开始新的分析...")
         
         # 获取市场数据
         market_data = get_market_data_for_analysis()
@@ -542,7 +546,7 @@ async def analyze_market(
         
         # 获取LLM服务
         llm_service = llm_manager.get_service(
-            provider=os.getenv('DEFAULT_LLM_PROVIDER', 'openai'),
+            provider=os.getenv('DEFAULT_LLM_PROVIDER', 'custom'),
             model=os.getenv('DEFAULT_MODEL', 'gpt-3.5-turbo')
         )
         
