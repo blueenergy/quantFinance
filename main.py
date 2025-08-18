@@ -10,6 +10,7 @@ from pydantic import BaseModel
 from fastapi.staticfiles import StaticFiles
 from datetime import timedelta, date, datetime
 from dotenv import load_dotenv
+import efinance as ef
 from llm_service import llm_manager
 from auth import (
     UserCreate, UserLogin, Token, UserResponse,
@@ -314,41 +315,36 @@ def get_user_watchlist_stocks(current_user: dict = Depends(get_current_active_us
         
         symbols = watchlist_doc["symbols"]
         result = []
-        
+        quotes = ef.stock.get_realtime_quotes()
+        filtered = quotes[quotes['股票代码'].isin(symbols)]
         for symbol in symbols:
             # 获取最新价格数据
-            latest_record = collection.find_one(
-                {"symbol": symbol},
-                sort=[("trade_date", -1)]
-            )
-            
-            if latest_record:
+            # latest_record = collection.find_one(
+            #     {"symbol": symbol},
+            #     sort=[("trade_date", -1)]
+            # )
+            latest_record = filtered[filtered['股票代码'] == symbol].iloc[0]
+
+            if latest_record.all():
                 stock_data = {
                     "symbol": symbol,
-                    "name": latest_record.get("stock_name", symbol),
-                    "close": latest_record.get("close"),
-                    "trade_date": latest_record.get("trade_date"),
-                    "volume": latest_record.get("volume"),
-                    "high": latest_record.get("high"),
-                    "low": latest_record.get("low"),
-                    "open": latest_record.get("open")
+                    "name": latest_record.get("股票名称", symbol),
+                    "close": latest_record.get("最新价"),
+                    "trade_date": latest_record.get("最新交易日"),
+                    "volume": latest_record.get("成交量"),
+                    "turnover": latest_record.get("成交额"),
+                    "high": latest_record.get("最高"),
+                    "low": latest_record.get("最低"),
+                    "open": latest_record.get("今开"),
+                    "change": latest_record.get("涨跌额"),
+                    "change_percent": latest_record.get("涨跌幅"),
+                    "turnover_rate": latest_record.get("换手率"),
+                    "pe": latest_record.get("动态市盈率"),
+                    #"pb": latest_record.get("市净率"),
+                    "market_cap": latest_record.get("总市值"),
+                    "circ_market_cap": latest_record.get("流通市值")
                 }
-                
-                # 计算涨跌幅（需要前一日数据）
-                prev_record = collection.find_one(
-                    {"symbol": symbol, "trade_date": {"$lt": latest_record["trade_date"]}},
-                    sort=[("trade_date", -1)]
-                )
-                
-                if prev_record:
-                    change = latest_record["close"] - prev_record["close"]
-                    change_percent = (change / prev_record["close"]) * 100
-                    stock_data["change"] = round(change, 2)
-                    stock_data["change_percent"] = round(change_percent, 2)
-                else:
-                    stock_data["change"] = 0
-                    stock_data["change_percent"] = 0
-                
+
                 result.append(stock_data)
         
         return {
