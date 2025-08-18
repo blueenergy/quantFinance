@@ -85,8 +85,9 @@ def test_user_watchlist():
     # 6. 测试获取自选股详细信息
     print("\n6️⃣ 测试获取自选股详细信息...")
     response = requests.get(f"{API_BASE}/api/user/watchlist-stocks", headers=headers)
-    if response.status_code == 200:
-        result = response.json()
+    result = response.json()
+    if response.status_code == 200 and (len(result.get('data', [])) >0) :
+        print(len(result.get('data', []))> 0)
         print(f"   ✅ 获取成功，共 {len(result.get('data', []))} 只股票")
         for stock in result.get("data", [])[:3]:  # 只显示前3只
             print(f"      {stock['symbol']} - {stock['name']}: {stock['close']}")
