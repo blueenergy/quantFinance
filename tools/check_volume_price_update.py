@@ -1,7 +1,7 @@
 from pymongo import MongoClient
 from datetime import date
 
-mongo_url = "mongodb://localhost:27017"
+mongo_url = "mongodb://10.181.200.185:27017"
 client = MongoClient(mongo_url)
 db = client["finance"]
 collection = db["volume_price"]

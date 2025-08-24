@@ -6,7 +6,7 @@ import time
 
 class FactorCalculator:
     def __init__(self, db_name='quant', collection_name='volume_price'):
-        self.client = MongoClient('mongodb://localhost:27017/')
+        self.client = MongoClient('mongodb://10.181.200.185:27017/')
         self.db = self.client[db_name]
         self.collection = self.db[collection_name]
 
