@@ -1,11 +1,16 @@
 from pymongo import MongoClient
+from pymongo.errors import ConnectionFailure
 
-client = MongoClient("mongodb://localhost:27017/")
-db = client["finance"]
-collection = db["analysis_history"]
+try:
+    client = MongoClient("mongodb://localhost:27017/", serverSelectionTimeoutMS=3000)
+    client.admin.command('ping')
+    print("MongoDB is usable.")
+except ConnectionFailure:
+    print("MongoDB is not usable or not running.")
 
-for doc in collection.find({"symbol": "603022"}):
-    print(doc.keys())
-    print(doc["analysis_result"]["analysis"])
-    print(doc["analysis_result"]["analysis"].keys())
-    print(doc["model"])
+
+
+
+# db = client['quant']
+# for doc in db['volume_price'].find().limit(100000):
+#     print(doc)

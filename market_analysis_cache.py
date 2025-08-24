@@ -17,9 +17,9 @@ class MarketAnalysisCache:
     
     def __init__(self):
         # MongoDB连接
-        mongodb_url = os.getenv('MONGODB_URL', 'mongodb://localhost:27017')
+        mongodb_url = os.getenv('MONGO_URL', 'mongodb://localhost:27017')
         client = MongoClient(mongodb_url)
-        db_name = os.getenv('DATABASE_NAME', 'quantFinance')
+        db_name = os.getenv('MONGO_DB', 'finance')
         self.db = client[db_name]
         self.collection = self.db['market_analysis_cache']
         
