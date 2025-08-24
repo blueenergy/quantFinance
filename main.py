@@ -358,7 +358,7 @@ def get_user_watchlist_stocks(current_user: dict = Depends(get_current_active_us
         }
 
 # MongoDB connection
-client = MongoClient(os.getenv("MONGO_URI", "mongodb://localhost:27017/"))
+client = MongoClient(os.getenv("MONGO_URL", "mongodb://localhost:27017/"))
 db = client[os.getenv("MONGO_DB", "finance")]  # 使用与认证系统相同的数据库
 collection = db["volume_price"]
 stock_info_collection = db["stock_info"]  # 新增：股票信息集合
