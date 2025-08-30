@@ -1,24 +1,26 @@
 version: 1
-disable_existing_loggers: false
 formatters:
   default:
-    format: "%(levelname)s %(asctime)s %(message)s"
-    datefmt: "%Y-%m-%d %H:%M:%S"
+    format: "%(asctime)s %(levelname)s %(name)s %(message)s"
 handlers:
-  default:
-    class: logging.StreamHandler
+  file:
+    class: logging.FileHandler
     formatter: default
-    stream: ext://sys.stdout
+    filename: /var/log/uvicorn.log
+    mode: a
 loggers:
   uvicorn:
-    handlers: [default]
+    handlers: [file]
     level: INFO
+    propagate: no
   uvicorn.error:
-    handlers: [default]
+    handlers: [file]
     level: INFO
+    propagate: no
   uvicorn.access:
-    handlers: [default]
+    handlers: [file]
     level: INFO
+    propagate: no
 root:
-  handlers: [default]
-  level: INFO
+  handlers: [file]
+  level: INFO[
