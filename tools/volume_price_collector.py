@@ -5,7 +5,7 @@ from datetime import datetime, date, timedelta
 import time
 from tqdm import tqdm
 import efinance as ef
-
+import traceback
 class VolumePriceCollector:
     def __init__(self):
         # MongoDB连接配置
@@ -128,24 +128,30 @@ class VolumePriceCollector:
         try:
             # 检查本地最新数据日期
             local_count, latest_date = self.check_local_data(symbol)
-            
-            # 计算需要同步的开始日期
-            today = date.today()
+            start_date, today = self.get_sync_dates(latest_date)
+            if start_date is None:
+                #print(f"📚 {symbol} 数据已是最新，无需同步")
+                return pd.DataFrame()
+
             if latest_date:
                 # 从最新数据的下一天开始同步
-                start_date = (latest_date + timedelta(days=1)).date()
+                start_date = (latest_date + timedelta(days=1)).date() if isinstance(latest_date, datetime) else latest_date + timedelta(days=1)
                 if start_date > today:
-                    print(f"📚 {symbol} 数据已是最新，无需同步")
+                    #print(f"📚 {symbol} 数据已是最新，无需同步")
                     return pd.DataFrame()
             else:
                 # 如果没有历史数据，从指定天数前开始
                 start_date = today - timedelta(days=days_back)
+
+            # 格式化日期为字符串
+            beg = start_date.strftime('%Y-%m-%d')
+            end = today.strftime('%Y-%m-%d')
             
             print(f"🔄 {symbol} 增量同步: 从 {start_date} 到 {today}")
             
             # 获取全量数据
             try:
-                df = ef.stock.get_quote_history(symbol)
+                df = ef.stock.get_quote_history(symbol, beg=beg, end=end)
             except Exception as api_error:
                 print(f"   ⚠️ {symbol} API获取失败: {str(api_error)}")
                 return pd.DataFrame()
@@ -187,6 +193,7 @@ class VolumePriceCollector:
             return df_result
             
         except Exception as e:
+            traceback.print_exc()
             print(f"⚠️ {symbol} 增量同步失败: {str(e)}")
             return pd.DataFrame()
 
@@ -332,6 +339,11 @@ class VolumePriceCollector:
             return 90
         
         today = date.today()
+        # 如果今天是周日，则回退两天；如果是周六，则回退一天
+        if today.weekday() == 6:  # Sunday
+            today = today - timedelta(days=2)
+        elif today.weekday() == 5:  # Saturday
+            today = today - timedelta(days=1)
         delta = (today - last_date).days
         return max(1, delta)  # 至少同步1天
 
@@ -415,7 +427,7 @@ class VolumePriceCollector:
                     else:
                         skipped_count += 1
                     
-                    time.sleep(0.1)  # 增量同步可以稍快一些
+                    time.sleep(0.1) # 增量同步可以稍快一些
                 except Exception as e:
                     print(f"⚠️ 增量同步 {symbol} 失败: {str(e)}")
                     error_count += 1
@@ -461,6 +473,17 @@ class VolumePriceCollector:
         except Exception as e:
             print(f"❌ 增量同步失败: {str(e)}")
             return 0
+
+    def get_sync_dates(self,latest_date):
+        today = date.today()
+        if today.weekday() == 6:
+            today -= timedelta(days=2)
+        elif today.weekday() == 5:
+            today -= timedelta(days=1)
+        if latest_date == today or (isinstance(latest_date, datetime) and latest_date.date() == today):
+            return None, None  # 已是最新
+        start_date = (latest_date + timedelta(days=1)).date() if isinstance(latest_date, datetime) else latest_date + timedelta(days=1)
+        return start_date, today
 
 if __name__ == "__main__":
     import sys
