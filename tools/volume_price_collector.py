@@ -4,8 +4,12 @@ from pymongo import MongoClient
 from datetime import datetime, date, timedelta
 import time
 from tqdm import tqdm
-import efinance as ef
-import traceback
+import tushare as ts
+
+# 初始化 tushare
+ts.set_token('1e703f9c93103a9266af23e98e606fc5cfec17649184f04e78e2226d')  # 请替换为你的真实 token
+pro = ts.pro_api()
+
 class VolumePriceCollector:
     def __init__(self):
         # MongoDB连接配置
@@ -29,50 +33,34 @@ class VolumePriceCollector:
         self._stock_name_cache = {}
 
     def get_stock_name(self, symbol):
-        """获取股票名称"""
+        """获取股票名称（tushare实现）"""
         try:
-            # 1. 先检查缓存
             if symbol in self._stock_name_cache:
                 return self._stock_name_cache[symbol]
-            
-            # 2. 检查数据库中是否已有该股票信息
             stock_info = self.stock_info_collection.find_one({"symbol": symbol})
             if stock_info and 'name' in stock_info:
                 name = stock_info['name']
                 self._stock_name_cache[symbol] = name
                 return name
-            
-            # 3. 从API获取股票基本信息
             print(f"🔍 获取股票 {symbol} 的名称信息...")
-            base_info = ef.stock.get_base_info(symbol)
-            
-            if '股票名称' in base_info.index:
-                name = base_info['股票名称']
-                
-                # 保存到数据库
+            # tushare 股票列表接口
+            df = pro.stock_basic(ts_code=symbol, fields='ts_code,name')
+            if not df.empty:
+                name = df.iloc[0]['name']
                 self.stock_info_collection.update_one(
                     {"symbol": symbol},
-                    {
-                        "$set": {
-                            "symbol": symbol,
-                            "name": name,
-                            "update_time": datetime.now()
-                        }
-                    },
+                    {"$set": {"symbol": symbol, "name": name, "update_time": datetime.now()}},
                     upsert=True
                 )
-                
-                # 更新缓存
                 self._stock_name_cache[symbol] = name
                 print(f"✅ 获取股票名称: {symbol} -> {name}")
                 return name
             else:
                 print(f"⚠️ 无法获取股票 {symbol} 的名称")
-                return symbol  # 返回股票代码作为fallback
-                
+                return symbol
         except Exception as e:
             print(f"⚠️ 获取股票 {symbol} 名称失败: {str(e)}")
-            return symbol  # 返回股票代码作为fallback
+            return symbol
 
     def batch_update_stock_names(self, symbols=None):
         """批量更新股票名称"""
@@ -124,109 +112,74 @@ class VolumePriceCollector:
             return 0, None
 
     def get_incremental_data(self, symbol, days_back=1):
-        """获取增量数据 - 只获取最近几天的缺失数据"""
+        """使用tushare获取增量数据"""
         try:
-            # 检查本地最新数据日期
             local_count, latest_date = self.check_local_data(symbol)
-            start_date, today = self.get_sync_dates(latest_date)
-            if start_date is None:
-                #print(f"📚 {symbol} 数据已是最新，无需同步")
-                return pd.DataFrame()
-
+            today = date.today()
             if latest_date:
-                # 从最新数据的下一天开始同步
-                start_date = (latest_date + timedelta(days=1)).date() if isinstance(latest_date, datetime) else latest_date + timedelta(days=1)
+                start_date = (latest_date + timedelta(days=1)).date()
                 if start_date > today:
                     #print(f"📚 {symbol} 数据已是最新，无需同步")
                     return pd.DataFrame()
             else:
-                # 如果没有历史数据，从指定天数前开始
                 start_date = today - timedelta(days=days_back)
-
-            # 格式化日期为字符串
-            beg = start_date.strftime('%Y-%m-%d')
-            end = today.strftime('%Y-%m-%d')
-            
             print(f"🔄 {symbol} 增量同步: 从 {start_date} 到 {today}")
-            
-            # 获取全量数据
+            # tushare 需要日期格式为 YYYYMMDD
+            start_str = start_date.strftime('%Y%m%d')
+            end_str = today.strftime('%Y%m%d')
             try:
-                df = ef.stock.get_quote_history(symbol, beg=beg, end=end)
+                tu_symbol = symbol + '.SH' if symbol.startswith('6') else symbol+'.SZ'
+                df = pro.daily(ts_code=tu_symbol, start_date=start_str, end_date=end_str)
             except Exception as api_error:
-                print(f"   ⚠️ {symbol} API获取失败: {str(api_error)}")
+                print(f"   ⚠️ {tu_symbol} API获取失败: {str(api_error)}")
                 return pd.DataFrame()
-            
             if df is None or len(df) == 0:
-                print(f"   ⚠️ {symbol} 无法获取数据")
+                print(f"   ⚠️ {tu_symbol} 无法获取数据")
                 return pd.DataFrame()
-            
-            # 转换为pandas DataFrame并过滤日期
-            df_copy = df.copy()
-            df_copy['日期'] = pd.to_datetime(df_copy['日期'])
-            
-            # 过滤指定日期之后的数据
-            date_mask = df_copy['日期'].dt.date >= start_date
-            df_filtered = df_copy[date_mask].copy()
-            
-            if len(df_filtered) == 0:
-                print(f"   📚 {symbol} 无新增数据")
-                return pd.DataFrame()
-            
             # 字段筛选与重命名
-            required_columns = ['日期', '开盘', '最高', '最低', '收盘', '成交量']
-            df_result = df_filtered[required_columns].copy()
-            df_result.columns = ['trade_date', 'open', 'high', 'low', 'close', 'volume']
-            
+            required_columns = ['trade_date', 'open', 'high', 'low', 'close', 'vol']
+            df_result = df[required_columns].copy()
+            df_result.rename(columns={'vol': 'volume'}, inplace=True)
             # 添加元数据
             df_result['symbol'] = symbol
             df_result['update_time'] = datetime.now()
-            
             # 获取并添加股票名称
             stock_name = self.get_stock_name(symbol)
             df_result['stock_name'] = stock_name
-            
             # 类型转换
             df_result['open'] = df_result['open'].astype(float)
             df_result['volume'] = df_result['volume'].astype(int)
-            
             print(f"   ✅ 获取到 {len(df_result)} 条新数据")
             return df_result
-            
         except Exception as e:
             traceback.print_exc()
             print(f"⚠️ {symbol} 增量同步失败: {str(e)}")
             return pd.DataFrame()
 
     def get_clean_data(self, symbol, force_update=False):
-        """使用efinance获取清洗后的量价数据"""
+        """使用tushare获取清洗后的量价数据"""
         try:
-            # 检查本地数据
             if not force_update:
                 local_count, latest_date = self.check_local_data(symbol)
                 if local_count > 0:
                     print(f"📚 {symbol} 已有 {local_count} 条本地数据，最新日期: {latest_date.strftime('%Y-%m-%d') if latest_date else '未知'}，跳过API请求")
-                    return pd.DataFrame()  # 返回空DataFrame，表示跳过
-            
-            # 如果没有本地数据或强制更新，则请求API
+                    return pd.DataFrame()
             print(f"🌐 正在从API获取 {symbol} 数据...")
-            
-            # efinance股票历史行情（默认前复权）
-            df = ef.stock.get_quote_history(symbol)
-            
-            # 字段筛选与重命名
-            df = df[['日期', '开盘', '最高', '最低', '收盘', '成交量']].copy()
-            df.columns = ['trade_date', 'open', 'high', 'low', 'close', 'volume']
-            # 转换日期格式
+            today = date.today()
+            start_str = (today - timedelta(days=365*5)).strftime('%Y%m%d')  # 默认取近5年
+            end_str = today.strftime('%Y%m%d')
+            df = pro.daily(ts_code=symbol, start_date=start_str, end_date=end_str)
+            if df is None or len(df) == 0:
+                print(f"⚠️ {symbol} 无法获取数据")
+                return pd.DataFrame()
+            required_columns = ['trade_date', 'open', 'high', 'low', 'close', 'vol']
+            df = df[required_columns].copy()
+            df.rename(columns={'vol': 'volume'}, inplace=True)
             df['trade_date'] = pd.to_datetime(df['trade_date'])
-            # 添加元数据
             df['symbol'] = symbol
             df['update_time'] = datetime.now()
-            
-            # 获取并添加股票名称
             stock_name = self.get_stock_name(symbol)
             df['stock_name'] = stock_name
-            
-            # 类型转换
             df['open'] = df['open'].astype(float)
             df['volume'] = df['volume'].astype(int)
             return df
@@ -280,9 +233,11 @@ class VolumePriceCollector:
                     if not clean_df.empty:
                         records = clean_df.to_dict('records')
                         for record in records:
-                            if isinstance(record['trade_date'], date):
+                            date_str = record['trade_date']
+                            date_obj = datetime.strptime(date_str, '%Y%m%d').date()
+                            if isinstance(date_obj, date):
                                 record['trade_date'] = datetime.combine(
-                                    record['trade_date'], datetime.min.time())
+                                    date_obj, datetime.min.time())
                             self.collection.update_one(
                                 {
                                     "symbol": record['symbol'],
@@ -412,9 +367,11 @@ class VolumePriceCollector:
                     if not clean_df.empty:
                         records = clean_df.to_dict('records')
                         for record in records:
-                            if isinstance(record['trade_date'], date):
+                            date_str = record['trade_date']
+                            date_obj = datetime.strptime(date_str, '%Y%m%d').date()
+                            if isinstance(date_obj, date):
                                 record['trade_date'] = datetime.combine(
-                                    record['trade_date'], datetime.min.time())
+                                    date_obj, datetime.min.time())
                             self.collection.update_one(
                                 {
                                     "symbol": record['symbol'],
