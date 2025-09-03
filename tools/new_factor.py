@@ -3,10 +3,13 @@ import pandas as pd
 import numpy as np
 from tqdm import tqdm
 import time
-
+import os
+from dotenv import load_dotenv
+load_dotenv()
+mongo_url = os.getenv("MONGO_URL", "mongodb://localhost:27017")
 class FactorCalculator:
     def __init__(self, db_name='quant', collection_name='volume_price'):
-        self.client = MongoClient('mongodb://10.181.200.185:27017/')
+        self.client = MongoClient(mongo_url)
         self.db = self.client[db_name]
         self.collection = self.db[collection_name]
 

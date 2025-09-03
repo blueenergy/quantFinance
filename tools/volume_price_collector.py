@@ -1,3 +1,4 @@
+import os
 import pandas as pd
 import akshare as ak
 from pymongo import MongoClient
@@ -5,6 +6,12 @@ from datetime import datetime, date, timedelta
 import time
 from tqdm import tqdm
 import tushare as ts
+from dotenv import load_dotenv
+load_dotenv()
+
+
+
+mongo_url = os.getenv("MONGO_URL", "mongodb://localhost:27017")
 
 # 初始化 tushare
 ts.set_token('1e703f9c93103a9266af23e98e606fc5cfec17649184f04e78e2226d')  # 请替换为你的真实 token
@@ -13,7 +20,7 @@ pro = ts.pro_api()
 class VolumePriceCollector:
     def __init__(self):
         # MongoDB连接配置
-        self.client = MongoClient('mongodb://10.181.200.185:27017/')
+        self.client = MongoClient(mongo_url)
         self.db = self.client['finance']
         self.collection = self.db['volume_price']
         self.stock_info_collection = self.db['stock_info']  # 新增：股票基本信息集合
