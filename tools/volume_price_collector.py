@@ -14,7 +14,7 @@ load_dotenv()
 mongo_url = os.getenv("MONGO_URL", "mongodb://localhost:27017")
 
 # 初始化 tushare
-ts.set_token('1e703f9c93103a9266af23e98e606fc5cfec17649184f04e78e2226d')  # 请替换为你的真实 token
+ts.set_token(os.getenv("TUSHARE_TOKEN"))  # 请替换为你的真实 token
 pro = ts.pro_api()
 
 class VolumePriceCollector:
