@@ -1,8 +1,10 @@
-
+import os
 import tushare as ts
+from dotenv import load_dotenv
+load_dotenv()
 
 # Replace with your own token
-ts.set_token('1e703f9c93103a9266af23e98e606fc5cfec17649184f04e78e2226d')
+ts.set_token(os.getenv("TUSHARE_TOKEN"))
 pro = ts.pro_api()
 
 # Example: get daily stock data
