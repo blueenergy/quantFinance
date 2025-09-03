@@ -135,7 +135,12 @@ class VolumePriceCollector:
             start_str = start_date.strftime('%Y%m%d')
             end_str = today.strftime('%Y%m%d')
             try:
-                tu_symbol = symbol + '.SH' if symbol.startswith('6') else symbol+'.SZ'
+                if symbol.startswith('6'):
+                    tu_symbol = symbol + '.SH'
+                elif symbol.startswith('0') or symbol.startswith('3'):
+                    tu_symbol = symbol + '.SZ'
+                elif symbol.startswith('9') or symbol.startswith('8') or symbol.startswith('4'):
+                    tu_symbol = symbol + '.BJ'
                 df = pro.daily(ts_code=tu_symbol, start_date=start_str, end_date=end_str)
             except Exception as api_error:
                 print(f"   ⚠️ {tu_symbol} API获取失败: {str(api_error)}")
