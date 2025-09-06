@@ -1,12 +1,15 @@
+import os
 from pymongo import MongoClient
 from typing import Dict
+from dotenv import load_dotenv
+load_dotenv()
 
 # MongoDB connection settings
-MONGO_URI = "mongodb://localhost:27017"
+mongo_url = os.getenv("MONGO_URL", "mongodb://localhost:27017")
 DB_NAME = "finance"
 
 # Singleton client (reuse across app)
-client = MongoClient(MONGO_URI)
+client = MongoClient(mongo_url)
 db = client[DB_NAME]
 
 def get_db_collections() -> Dict[str, object]:
