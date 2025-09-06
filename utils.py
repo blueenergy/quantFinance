@@ -1,4 +1,7 @@
 
+from datetime import datetime, date
+
+
 def serialize_doc(doc):
     doc["_id"] = str(doc["_id"])
     return doc
@@ -13,3 +16,10 @@ def get_ts_code(symbol):
     else:
         raise Exception("Not supported symbols")
     return tu_symbol
+
+def format_trade_date(dt):
+    if isinstance(dt, str):
+        return dt
+    elif isinstance(dt, (datetime, date)):
+        return dt.strftime('%Y%m%d')
+    return str(dt)
