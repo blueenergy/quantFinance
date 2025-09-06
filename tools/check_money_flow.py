@@ -7,12 +7,18 @@ load_dotenv()
 mongo_url = os.getenv("MONGO_URL", "mongodb://localhost:27017")
 client = MongoClient(mongo_url)
 db = client["finance"]
-money_flow_collection = db["money_flow"]
-count = money_flow_collection.count_documents({'trade_date': '20250804'})
+money_flow_collection = db["money_flow_test"]
+count = money_flow_collection.count_documents({'trade_date': '20250728'})
 print(f"Total records in money_flow_collection: {count}")
-for doc in money_flow_collection.find({"symbol": '000002','trade_date': '20250804'}):
+for doc in money_flow_collection.find({"symbol": '000002','trade_date': '20250728'}):
     print(doc)
 
+
+# money_flow_records = list(money_flow_collection.find(
+#             {"symbol": '000002'},
+#             sort=[("trade_date", -1)]
+#         ).limit(30))
+# print(money_flow_records)
 # # 查找所有 trade_date 重复的记录
 # from collections import defaultdict
 

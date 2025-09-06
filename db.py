@@ -27,7 +27,8 @@ def get_db_collections() -> Dict[str, object]:
         "login_logs": db["login_logs"],
         "admin_logs": db["admin_logs"],
         "market_analysis_cache": db["market_analysis_cache"],
-        "user_watchlists": db["user_watchlists"],  # <--- 补充这一行
+        "user_watchlists": db["user_watchlists"],
+        "money_flow": db["money_flow"]  # <--- 补充这一行
         # Add more collections as needed
     }
 

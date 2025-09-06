@@ -19,19 +19,30 @@ stock_info_collection = db["stock_info"]
 money_flow_collection = db["money_flow"]
 
 
-df = pro.moneyflow(ts_code= '000002.SZ', start_date='20250101', end_date='20250103')
-records = df.to_dict(orient='records')
-for record in records:
-    money_flow_collection.insert_one({"symbol": '000002', **record})
+# df = pro.moneyflow(ts_code= '000002.SZ', start_date='20250101', end_date='20250103')
+# records = df.to_dict(orient='records')
+# for record in records:
+#     money_flow_collection.insert_one({"symbol": '000002', **record})
 
 # for doc in money_flow_collection.find():
 #     print(doc)
+# for doc in stock_info_collection.find():
+#     ts_code = get_ts_code(doc['symbol'])
+#     df = pro.moneyflow(ts_code= ts_code, start_date='20250903', end_date='20250905')
+#     records = df.to_dict(orient='records')
+#     for record in records:
+#         money_flow_collection.insert_one({"symbol": doc['symbol'], **record})
+
 for doc in stock_info_collection.find():
     ts_code = get_ts_code(doc['symbol'])
-    df = pro.moneyflow(ts_code= ts_code, start_date='20250101', end_date='20250903')
+    df = pro.moneyflow(ts_code=ts_code, start_date='20250720', end_date='20250905')
     records = df.to_dict(orient='records')
+    # 给每条记录加 symbol 字段
     for record in records:
-        money_flow_collection.insert_one({"symbol": doc['symbol'], **record})
+        record["symbol"] = doc["symbol"]
+    if records:
+        money_flow_collection.insert_many(records)
+
 
 
 #获取单日全部股票数据
@@ -39,5 +50,5 @@ for doc in stock_info_collection.find():
 
 #获取单个股票数据
 #df = pro.moneyflow(ts_code='002149.SZ', start_date='20190115', end_date='20190315')
-for doc in money_flow_collection.find({"symbol": '000002'}):
-    print(doc)
+# for doc in money_flow_collection.find({"symbol": '000002'}):
+#     print(doc)

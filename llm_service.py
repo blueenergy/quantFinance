@@ -272,11 +272,24 @@ class LLMService:
         # 构建历史价格趋势
         price_trend = []
         if historical_data:
-            for record in historical_data[-10:]:  # 最近10天
+            for record in historical_data[:10]:  # 最近10天
+                volume_price = record.get('volume_price', {})
+                money_flow = record.get('money_flow', {})
                 price_trend.append({
-                    'date': record.get('date', ''),
-                    'close': record.get('close', 0),
-                    'volume': record.get('volume', 0)
+                    'date': record.get('trade_date', ''),
+                    'close': volume_price.get('close', 0),
+                    'volume': volume_price.get('volume', 0),
+                # 资金流相关字段（如有则加入）
+                # 小单：5万以下 中单：5万～20万 大单：20万～100万 特大单：成交额>=100万 ，数据基于主动买卖单统计
+                'net_mf_amount': money_flow.get('net_mf_amount') if money_flow else None,
+                'buy_sm_amount': money_flow.get('buy_sm_amount') if money_flow else None,
+                'sell_sm_amount': money_flow.get('sell_sm_amount') if money_flow else None,
+                'buy_md_amount': money_flow.get('buy_md_amount') if money_flow else None,
+                'sell_md_amount': money_flow.get('sell_md_amount') if money_flow else None,
+                'buy_lg_amount': money_flow.get('buy_lg_amount') if money_flow else None,
+                'sell_lg_amount': money_flow.get('sell_lg_amount') if money_flow else None,
+                'buy_elg_amount': money_flow.get('buy_elg_amount') if money_flow else None,
+                'sell_elg_amount': money_flow.get('sell_elg_amount') if money_flow else None,
                 })
         
         prompt = f"""
@@ -314,6 +327,7 @@ class LLMService:
 
 请确保返回的是有效的JSON格式。
 """
+        print(prompt)
         return prompt
     
     async def _call_llm_api(self, prompt: str) -> str:
