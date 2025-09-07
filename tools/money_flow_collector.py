@@ -2,7 +2,7 @@ import os
 import sys
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 import tushare as ts
-from pymongo import MongoClient
+from pymongo import MongoClient, UpdateOne
 from datetime import date
 from utils import get_ts_code
 from dotenv import load_dotenv
@@ -37,12 +37,26 @@ for doc in stock_info_collection.find():
     ts_code = get_ts_code(doc['symbol'])
     df = pro.moneyflow(ts_code=ts_code, start_date='20250720', end_date='20250905')
     records = df.to_dict(orient='records')
+    
     # 给每条记录加 symbol 字段
     for record in records:
         record["symbol"] = doc["symbol"]
+    
     if records:
-        money_flow_collection.insert_many(records)
-
+        # ✅ 使用 bulk_write 批量 upsert
+        operations = []
+        for record in records:
+            operations.append(
+                UpdateOne(
+                    {"symbol": record["symbol"], "trade_date": record["trade_date"]},
+                    {"$set": record},
+                    upsert=True
+                )
+            )
+        
+        if operations:
+            result = money_flow_collection.bulk_write(operations)
+            print(f"股票 {doc['symbol']}: 插入 {result.upserted_count} 条，更新 {result.modified_count} 条")
 
 
 #获取单日全部股票数据
