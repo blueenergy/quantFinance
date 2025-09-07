@@ -6,6 +6,7 @@ from datetime import datetime, date, timedelta
 import time
 from tqdm import tqdm
 import tushare as ts
+from utils import get_ts_code
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -135,21 +136,16 @@ class VolumePriceCollector:
             start_str = start_date.strftime('%Y%m%d')
             end_str = today.strftime('%Y%m%d')
             try:
-                if symbol.startswith('6'):
-                    tu_symbol = symbol + '.SH'
-                elif symbol.startswith('0') or symbol.startswith('3'):
-                    tu_symbol = symbol + '.SZ'
-                elif symbol.startswith('9') or symbol.startswith('8') or symbol.startswith('4'):
-                    tu_symbol = symbol + '.BJ'
-                df = pro.daily(ts_code=tu_symbol, start_date=start_str, end_date=end_str)
+                ts_code = get_ts_code(symbol)
+                df = pro.daily(ts_code=ts_code, start_date=start_str, end_date=end_str)
             except Exception as api_error:
-                print(f"   ⚠️ {tu_symbol} API获取失败: {str(api_error)}")
+                print(f"   ⚠️ {ts_code} API获取失败: {str(api_error)}")
                 return pd.DataFrame()
             if df is None or len(df) == 0:
-                print(f"   ⚠️ {tu_symbol} 无法获取数据")
+                print(f"   ⚠️ {ts_code} 无法获取数据")
                 return pd.DataFrame()
             # 字段筛选与重命名
-            required_columns = ['trade_date', 'open', 'high', 'low', 'close', 'vol']
+            required_columns = ['trade_date', 'open', 'high', 'low', 'close','pre_close','change','pct_chg', 'vol','amount']
             df_result = df[required_columns].copy()
             df_result.rename(columns={'vol': 'volume'}, inplace=True)
             # 添加元数据
@@ -160,7 +156,14 @@ class VolumePriceCollector:
             df_result['stock_name'] = stock_name
             # 类型转换
             df_result['open'] = df_result['open'].astype(float)
+            df_result['high'] = df_result['high'].astype(float)
+            df_result['low'] = df_result['low'].astype(float)
+            df_result['close'] = df_result['close'].astype(float)
+            df_result['pre_close'] = df_result['pre_close'].astype(float)
+            df_result['change'] = df_result['change'].astype(float)
+            df_result['pct_chg'] = df_result['pct_chg'].astype(float)
             df_result['volume'] = df_result['volume'].astype(int)
+            df_result['amount'] = df_result['amount'].astype(float)
             print(f"   ✅ 获取到 {len(df_result)} 条新数据")
             return df_result
         except Exception as e:
@@ -184,7 +187,7 @@ class VolumePriceCollector:
             if df is None or len(df) == 0:
                 print(f"⚠️ {symbol} 无法获取数据")
                 return pd.DataFrame()
-            required_columns = ['trade_date', 'open', 'high', 'low', 'close', 'vol']
+            required_columns = ['trade_date', 'open', 'high', 'low', 'close','pre_close','change','pct_chg', 'vol','amount']
             df = df[required_columns].copy()
             df.rename(columns={'vol': 'volume'}, inplace=True)
             df['trade_date'] = pd.to_datetime(df['trade_date'])
@@ -193,7 +196,14 @@ class VolumePriceCollector:
             stock_name = self.get_stock_name(symbol)
             df['stock_name'] = stock_name
             df['open'] = df['open'].astype(float)
+            df['high'] = df['high'].astype(float)
+            df['low'] = df['low'].astype(float)
+            df['close'] = df['close'].astype(float)
+            df['pre_close'] = df['pre_close'].astype(float)
+            df['change'] = df['change'].astype(float)
+            df['pct_chg'] = df['pct_chg'].astype(float)
             df['volume'] = df['volume'].astype(int)
+            df['amount'] = df['amount'].astype(float)
             return df
         except Exception as e:
             print(f"⚠️ 获取 {symbol} 数据失败: {str(e)}")
