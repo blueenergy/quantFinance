@@ -5,6 +5,7 @@ from routers.market import router as market_router
 from routers.admin import router as admin_router
 from routers.analysis import router as analysis_router
 from routers.records import router as records_router
+from routers.stock_ranking import router as stock_ranking_router
 
 app = FastAPI()
 
@@ -15,3 +16,4 @@ app.include_router(market_router, prefix="/api", tags=["市场分析"])
 app.include_router(admin_router, prefix="/api/admin", tags=["管理员"])
 app.include_router(analysis_router, prefix="/api", tags=["AI分析"])
 app.include_router(records_router, prefix="/api", tags=["记录查询"])
+app.include_router(stock_ranking_router, prefix="/api", tags=["股票排名"])

@@ -1,5 +1,7 @@
 from pymongo import MongoClient
 import os
+from dotenv import load_dotenv
+load_dotenv()
 
 # 获取MongoDB连接信息
 mongo_url = os.getenv("MONGO_URL", "mongodb://localhost:27017")

@@ -1,4 +1,5 @@
-import os
+import os,sys
+sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 import pandas as pd
 import akshare as ak
 from pymongo import MongoClient
