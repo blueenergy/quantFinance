@@ -17,7 +17,7 @@ pro = ts.pro_api()
 
 class StockScoringSystem:
     def __init__(self,base_date=None):
-        self.client = MongoClient('mongodb://localhost:27017/')
+        self.client = client
         self.db = self.client['finance']
         self.stock_scores = self.db['stock_scores']  # 新集合：股票评分
         self.stock_info = self.db['stock_info']
@@ -843,7 +843,7 @@ class StockScoringSystem:
                     print(score_data['symbol'], score_data['total_score'])
                     # 更新数据库
                     self.stock_scores.replace_one(
-                        {"symbol": symbol, "score_date": self.base_date},  # 按日期区分评分记录
+                        {"symbol": symbol, "name": name, "score_date": self.base_date},  # 按日期区分评分记录
                         score_data,
                         upsert=True
                     )
@@ -1022,17 +1022,17 @@ if __name__ == "__main__":
     # 创建评分系统实例
     scorer = StockScoringSystem(base_date=base_date)
     
-    # 示例1: 使用指定日期进行评分
-    print("\n🔍 示例1: 使用指定日期评分万科")
-    result = scorer.calculate_stock_score("000002")
-    if result:
-        print(f"万科 ({base_date}) 综合评分: {result['total_score']}")
+    # # 示例1: 使用指定日期进行评分
+    # print("\n🔍 示例1: 使用指定日期评分万科")
+    # result = scorer.calculate_stock_score("000002")
+    # if result:
+    #     print(f"万科 ({base_date}) 综合评分: {result['total_score']}")
     
-    # 示例2: 使用不同日期进行评分
-    print("\n🔍 示例2: 使用不同日期评分万科")
-    result_20250902 = scorer.calculate_stock_score("000002", base_date="20250902")
-    if result_20250902:
-        print(f"万科 (20250902) 综合评分: {result_20250902['total_score']}")
+    # # 示例2: 使用不同日期进行评分
+    # print("\n🔍 示例2: 使用不同日期评分万科")
+    # result_20250902 = scorer.calculate_stock_score("000002", base_date="20250902")
+    # if result_20250902:
+    #     print(f"万科 (20250902) 综合评分: {result_20250902['total_score']}")
     
     # 示例3: 批量评分所有股票
     print("\n🔍 示例3: 批量评分所有股票")
@@ -1040,21 +1040,21 @@ if __name__ == "__main__":
     if choice.lower() == 'y':
         scorer.score_all_stocks(base_date=base_date)
     
-    # 示例4: 详细分析
-    print("\n🔍 示例4: 详细分析万科")
-    scorer.analyze_stock_detailed("000002", base_date=base_date)
+    # # 示例4: 详细分析
+    # print("\n🔍 示例4: 详细分析万科")
+    # scorer.analyze_stock_detailed("000002", base_date=base_date)
     
-    # 示例5: 查看Top股票
-    print("\n🔍 示例5: 查看Top 10股票")
-    top_stocks = scorer.get_top_stocks(limit=10, score_date=base_date)
-    for i, stock in enumerate(top_stocks, 1):
-        print(f"{i}. {stock['symbol']} - {stock['name']} | 评分: {stock['total_score']}")
+    # # 示例5: 查看Top股票
+    # print("\n🔍 示例5: 查看Top 10股票")
+    # top_stocks = scorer.get_top_stocks(limit=10, score_date=base_date)
+    # for i, stock in enumerate(top_stocks, 1):
+    #     print(f"{i}. {stock['symbol']} - {stock['name']} | 评分: {stock['total_score']}")
     
-    # 示例6: 历史评分对比
-    print("\n🔍 示例6: 万科历史评分")
-    history = scorer.get_stock_score_history("000002", days=10)
-    for record in history:
-        print(f"{record['score_date']}: {record['total_score']:.2f}")
+    # # 示例6: 历史评分对比
+    # print("\n🔍 示例6: 万科历史评分")
+    # history = scorer.get_stock_score_history("000002", days=10)
+    # for record in history:
+    #     print(f"{record['score_date']}: {record['total_score']:.2f}")
 
 
     # # 测试万科数据
