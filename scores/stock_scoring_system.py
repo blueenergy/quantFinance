@@ -842,9 +842,9 @@ class StockScoringSystem:
                 if score_data:
                     print(score_data['symbol'], score_data['total_score'])
                     # 更新数据库
-                    self.stock_scores.replace_one(
-                        {"symbol": symbol, "name": name, "score_date": self.base_date},  # 按日期区分评分记录
-                        score_data,
+                    self.stock_scores.update_one(
+                        {"symbol": symbol, "score_date": self.base_date},  # 只用 symbol + score_date 作为唯一键
+                        {"$set": score_data},
                         upsert=True
                     )
                     results.append(score_data)
@@ -1005,6 +1005,65 @@ class StockScoringSystem:
             # ✅ 恢复原始的基准日期
             self.base_date = original_base_date
 
+    def score_specific_stocks(self, symbols, save_to_db=True):
+        """
+        ✅ 只对指定的股票进行评分
+        
+        Args:
+            symbols: 股票代码列表
+            save_to_db: 是否保存到数据库
+            
+        Returns:
+            评分结果字典
+        """
+        results = {}
+        stats = {"successful": 0, "failed": 0}
+        
+        print(f"🎯 开始对指定 {len(symbols)} 只股票进行评分")
+        
+        for symbol in symbols:
+            try:
+                print(f"📊 评分股票: {symbol}")
+                
+                # 计算评分
+                score_data = self.calculate_stock_score(symbol)
+                
+                if score_data:
+                    results[symbol] = score_data
+                    stats["successful"] += 1
+                    
+                    if save_to_db:
+                        # 保存到数据库
+                        document = {
+                            "symbol": symbol,
+                            "score_date": self.base_date,
+                            **score_data,  # 展开所有评分数据
+                            "updated_at": datetime.now()
+                        }
+                        
+                        # 使用 upsert 确保唯一性
+                        result = self.stock_scores.update_one(
+                            {"symbol": symbol, "score_date": self.base_date},
+                            {"$set": document},
+                            upsert=True
+                        )
+                        
+                        if result.upserted_id:
+                            print(f"✅ 新增 {symbol} 评分")
+                        elif result.modified_count > 0:
+                            print(f"🔄 更新 {symbol} 评分")
+                        else:
+                            print(f"ℹ️ {symbol} 评分无变化")
+                else:
+                    stats["failed"] += 1
+                    print(f"❌ {symbol} 评分失败")
+                    
+            except Exception as e:
+                stats["failed"] += 1
+                print(f"❌ 评分 {symbol} 时出错: {e}")
+        
+        print(f"📊 评分完成 - 成功: {stats['successful']}, 失败: {stats['failed']}")
+        return results
 
 
 # 在主程序部分添加万科的详细分析
