@@ -1,9 +1,12 @@
 # routers/stock_scoring.py
 from fastapi import APIRouter, HTTPException, Depends, Query
 from db import get_db_collections
-from typing import Optional
+from typing import Optional,List
+from pydantic import BaseModel
 from datetime import datetime, timedelta
 from scores.stock_scoring_system import StockScoringSystem
+
+
 
 # 添加tools目录到Python路径
 # sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'scores'))
@@ -115,7 +118,8 @@ async def get_stock_rankings(
         print(error_detail)
         raise HTTPException(status_code=500, detail=f"获取股票排行失败: {str(e)}")
 
-@router.post("/refresh")
+# ✅ 修改现有的刷新端点路径
+@router.post("/stock-rankings/refresh")  # 原来是 "/refresh"
 async def refresh_stock_scores(
     symbols: Optional[list] = None,
     date: Optional[str] = Query(None, description="指定日期 YYYYMMDD,默认为昨天")
@@ -351,3 +355,86 @@ async def get_current_date():
         },
         "message": "获取默认日期成功"
     }
+
+# ✅ 添加请求模型
+class SelectedStocksRequest(BaseModel):
+    symbols: List[str]
+
+# ✅ 修复 selected 端点
+@router.post("/stock-rankings/selected")
+async def get_selected_stock_rankings(
+    request: SelectedStocksRequest,  # ✅ 使用 Pydantic 模型接收请求体
+    date: Optional[str] = Query(None, description="指定日期 YYYYMMDD,默认为昨天")
+):
+    """
+    获取指定股票的评分
+    
+    Args:
+        request: 包含股票代码列表的请求体
+        date: 指定评分日期，默认为昨天
+    """
+    try:
+        symbols = request.symbols  # ✅ 从请求体中获取 symbols
+        print(f"✅ 接收到股票代码: {symbols}") 
+        
+        if not symbols:
+            raise HTTPException(status_code=400, detail="股票代码列表不能为空")
+        
+        scoring_system = get_scoring_system(date)
+        
+        # 构建查询条件
+        query = {"symbol": {"$in": symbols}}
+        if scoring_system.base_date:
+            query["score_date"] = scoring_system.base_date
+        
+        # 查询指定股票的评分
+        selected_stocks = list(scoring_system.stock_scores.find(query))
+        
+        # 添加股票名称和行业信息
+        for stock in selected_stocks:
+            stock_info = scoring_system.stock_info.find_one({"symbol": stock['symbol']})
+            if stock_info:
+                stock['name'] = stock_info.get('name', '')
+                stock['industry'] = stock_info.get('industry', '')
+            else:
+                stock['name'] = ''
+                stock['industry'] = ''
+        
+        # 按总分降序排序
+        selected_stocks.sort(key=lambda x: x.get('total_score', 0), reverse=True)
+        
+        # 格式化返回数据
+        formatted_stocks = []
+        for stock in selected_stocks:
+            # 处理 ObjectId
+            if '_id' in stock:
+                stock['_id'] = str(stock['_id'])
+            
+            formatted_stock = {
+                "symbol": stock.get("symbol", ""),
+                "name": stock.get("name", ""),
+                "industry": stock.get("industry", ""),
+                "total_score": round(stock.get("total_score", 0), 2),
+                "cycle_score": round(stock.get("cycle_score", 0), 2),
+                "fundamental_score": round(stock.get("fundamental_score", 0), 2),
+                "technical_score": round(stock.get("technical_score", 0), 2),
+                "money_flow_score": round(stock.get("money_flow_score", 0), 2),
+                "score_date": stock.get("score_date", scoring_system.base_date)
+            }
+            formatted_stocks.append(formatted_stock)
+        
+        return {
+            "success": True,
+            "data": formatted_stocks,
+            "total": len(formatted_stocks),
+            "date": scoring_system.base_date,
+            "message": f"成功获取 {len(formatted_stocks)} 只指定股票评分"
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback
+        error_detail = f"获取指定股票评分失败: {str(e)}\n{traceback.format_exc()}"
+        print(error_detail)
+        raise HTTPException(status_code=500, detail=f"获取指定股票评分失败: {str(e)}")
