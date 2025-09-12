@@ -11,8 +11,6 @@ from utils import get_ts_code
 from dotenv import load_dotenv
 load_dotenv()
 
-
-
 mongo_url = os.getenv("MONGO_URL", "mongodb://localhost:27017")
 
 # 初始化 tushare
@@ -25,12 +23,12 @@ class VolumePriceCollector:
         self.client = MongoClient(mongo_url)
         self.db = self.client['finance']
         self.collection = self.db['volume_price']
-        self.stock_info_collection = self.db['stock_info']  # 新增：股票基本信息集合
+        self.stock_info_collection = self.db['stock_info']
         
-        # 创建复合索引（提升查询效率）
+        # ✅ 创建复合索引（针对字符串日期格式优化）
         self.collection.create_index([
             ("symbol", 1), 
-            ("trade_date", 1)
+            ("trade_date", 1)  # trade_date 现在是字符串格式
         ])
         
         # 为股票信息集合创建索引
@@ -40,6 +38,48 @@ class VolumePriceCollector:
         
         # 股票名称缓存
         self._stock_name_cache = {}
+
+    # ✅ 新增：时间格式转换工具方法
+    def date_to_str(self, date_obj):
+        """将 date 或 datetime 对象转换为 YYYYMMDD 字符串"""
+        if isinstance(date_obj, str):
+            # 如果已经是字符串，验证格式
+            if len(date_obj) == 8 and date_obj.isdigit():
+                return date_obj
+            # 尝试解析其他格式
+            try:
+                parsed_date = datetime.strptime(date_obj, '%Y-%m-%d')
+                return parsed_date.strftime('%Y%m%d')
+            except:
+                return date_obj
+        elif isinstance(date_obj, datetime):
+            return date_obj.strftime('%Y%m%d')
+        elif isinstance(date_obj, date):
+            return date_obj.strftime('%Y%m%d')
+        else:
+            return str(date_obj)
+
+    def str_to_date(self, date_str):
+        """将 YYYYMMDD 字符串转换为 date 对象"""
+        try:
+            if isinstance(date_str, str) and len(date_str) == 8 and date_str.isdigit():
+                return datetime.strptime(date_str, '%Y%m%d').date()
+            elif isinstance(date_str, (date, datetime)):
+                return date_str.date() if isinstance(date_str, datetime) else date_str
+            else:
+                return None
+        except:
+            return None
+
+    def get_today_str(self):
+        """获取今天的日期字符串 YYYYMMDD"""
+        today = date.today()
+        # 如果是周末，调整到最近的交易日
+        if today.weekday() == 6:  # Sunday
+            today = today - timedelta(days=2)
+        elif today.weekday() == 5:  # Saturday
+            today = today - timedelta(days=1)
+        return self.date_to_str(today)
 
     def get_stock_name(self, symbol):
         """获取股票名称（tushare实现）"""
@@ -58,7 +98,11 @@ class VolumePriceCollector:
                 name = df.iloc[0]['name']
                 self.stock_info_collection.update_one(
                     {"symbol": symbol},
-                    {"$set": {"symbol": symbol, "name": name, "update_time": datetime.now()}},
+                    {"$set": {
+                        "symbol": symbol, 
+                        "name": name, 
+                        "update_time": datetime.now().strftime('%Y%m%d %H:%M:%S')  # ✅ 字符串格式
+                    }},
                     upsert=True
                 )
                 self._stock_name_cache[symbol] = name
@@ -108,13 +152,13 @@ class VolumePriceCollector:
             # 检查是否存在该股票的任何记录
             count = self.collection.count_documents({"symbol": symbol})
             if count > 0:
-                # 获取最新记录日期
+                # ✅ 获取最新记录日期（字符串格式）
                 latest_record = self.collection.find_one(
                     {"symbol": symbol}, 
-                    sort=[("trade_date", -1)]
+                    sort=[("trade_date", -1)]  # 字符串也可以正确排序 YYYYMMDD
                 )
-                latest_date = latest_record['trade_date'] if latest_record else None
-                return count, latest_date
+                latest_date_str = latest_record['trade_date'] if latest_record else None
+                return count, latest_date_str
             return 0, None
         except Exception as e:
             print(f"⚠️ 检查 {symbol} 本地数据失败: {str(e)}")
@@ -123,39 +167,52 @@ class VolumePriceCollector:
     def get_incremental_data(self, symbol, days_back=1):
         """使用tushare获取增量数据"""
         try:
-            local_count, latest_date = self.check_local_data(symbol)
-            today = date.today()
-            if latest_date:
-                start_date = (latest_date + timedelta(days=1)).date()
-                if start_date > today:
+            local_count, latest_date_str = self.check_local_data(symbol)
+            today_str = self.get_today_str()
+            
+            if latest_date_str:
+                # ✅ 计算开始日期（字符串格式）
+                latest_date = self.str_to_date(latest_date_str)
+                start_date = latest_date + timedelta(days=1)
+                start_str = self.date_to_str(start_date)
+                
+                if start_str > today_str:
                     #print(f"📚 {symbol} 数据已是最新，无需同步")
                     return pd.DataFrame()
             else:
-                start_date = today - timedelta(days=days_back)
-            print(f"🔄 {symbol} 增量同步: 从 {start_date} 到 {today}")
-            # tushare 需要日期格式为 YYYYMMDD
-            start_str = start_date.strftime('%Y%m%d')
-            end_str = today.strftime('%Y%m%d')
+                start_date = date.today() - timedelta(days=days_back)
+                start_str = self.date_to_str(start_date)
+            
+            print(f"🔄 {symbol} 增量同步: 从 {start_str} 到 {today_str}")
+            
             try:
                 ts_code = get_ts_code(symbol)
-                df = pro.daily(ts_code=ts_code, start_date=start_str, end_date=end_str)
+                df = pro.daily(ts_code=ts_code, start_date=start_str, end_date=today_str)
             except Exception as api_error:
                 print(f"   ⚠️ {ts_code} API获取失败: {str(api_error)}")
                 return pd.DataFrame()
+            
             if df is None or len(df) == 0:
                 print(f"   ⚠️ {ts_code} 无法获取数据")
                 return pd.DataFrame()
+            
             # 字段筛选与重命名
             required_columns = ['trade_date', 'open', 'high', 'low', 'close','pre_close','change','pct_chg', 'vol','amount']
             df_result = df[required_columns].copy()
             df_result.rename(columns={'vol': 'volume'}, inplace=True)
+            
+            # ✅ 确保 trade_date 为字符串格式
+            df_result['trade_date'] = df_result['trade_date'].astype(str)
+            
             # 添加元数据
             df_result['symbol'] = symbol
-            df_result['update_time'] = datetime.now()
+            df_result['update_time'] = datetime.now().strftime('%Y%m%d %H:%M:%S')  # ✅ 字符串格式
+            
             # 获取并添加股票名称
             stock_name = self.get_stock_name(symbol)
             df_result['stock_name'] = stock_name
-            # 类型转换
+            
+            # ✅ 类型转换
             df_result['open'] = df_result['open'].astype(float)
             df_result['high'] = df_result['high'].astype(float)
             df_result['low'] = df_result['low'].astype(float)
@@ -165,9 +222,11 @@ class VolumePriceCollector:
             df_result['pct_chg'] = df_result['pct_chg'].astype(float)
             df_result['volume'] = df_result['volume'].astype(int)
             df_result['amount'] = df_result['amount'].astype(float)
+            
             print(f"   ✅ 获取到 {len(df_result)} 条新数据")
             return df_result
         except Exception as e:
+            import traceback
             traceback.print_exc()
             print(f"⚠️ {symbol} 增量同步失败: {str(e)}")
             return pd.DataFrame()
@@ -176,26 +235,37 @@ class VolumePriceCollector:
         """使用tushare获取清洗后的量价数据"""
         try:
             if not force_update:
-                local_count, latest_date = self.check_local_data(symbol)
+                local_count, latest_date_str = self.check_local_data(symbol)
                 if local_count > 0:
-                    print(f"📚 {symbol} 已有 {local_count} 条本地数据，最新日期: {latest_date.strftime('%Y-%m-%d') if latest_date else '未知'}，跳过API请求")
+                    print(f"📚 {symbol} 已有 {local_count} 条本地数据，最新日期: {latest_date_str}，跳过API请求")
                     return pd.DataFrame()
+            
             print(f"🌐 正在从API获取 {symbol} 数据...")
-            today = date.today()
-            start_str = (today - timedelta(days=365*5)).strftime('%Y%m%d')  # 默认取近5年
-            end_str = today.strftime('%Y%m%d')
-            df = pro.daily(ts_code=symbol, start_date=start_str, end_date=end_str)
+            today_str = self.get_today_str()
+            
+            # ✅ 默认取近5年，使用字符串格式
+            start_date = date.today() - timedelta(days=365*5)
+            start_str = self.date_to_str(start_date)
+            
+            df = pro.daily(ts_code=symbol, start_date=start_str, end_date=today_str)
             if df is None or len(df) == 0:
                 print(f"⚠️ {symbol} 无法获取数据")
                 return pd.DataFrame()
+            
             required_columns = ['trade_date', 'open', 'high', 'low', 'close','pre_close','change','pct_chg', 'vol','amount']
             df = df[required_columns].copy()
             df.rename(columns={'vol': 'volume'}, inplace=True)
-            df['trade_date'] = pd.to_datetime(df['trade_date'])
+            
+            # ✅ 保持 trade_date 为字符串格式，不转换为 datetime
+            df['trade_date'] = df['trade_date'].astype(str)
+            
             df['symbol'] = symbol
-            df['update_time'] = datetime.now()
+            df['update_time'] = datetime.now().strftime('%Y%m%d %H:%M:%S')  # ✅ 字符串格式
+            
             stock_name = self.get_stock_name(symbol)
             df['stock_name'] = stock_name
+            
+            # 类型转换
             df['open'] = df['open'].astype(float)
             df['high'] = df['high'].astype(float)
             df['low'] = df['low'].astype(float)
@@ -205,6 +275,7 @@ class VolumePriceCollector:
             df['pct_chg'] = df['pct_chg'].astype(float)
             df['volume'] = df['volume'].astype(int)
             df['amount'] = df['amount'].astype(float)
+            
             return df
         except Exception as e:
             print(f"⚠️ 获取 {symbol} 数据失败: {str(e)}")
@@ -212,7 +283,7 @@ class VolumePriceCollector:
 
     def batch_update(self, force_update=False, update_existing=False, incremental_days=None):
         """
-        批量更新全市场数据（efinance实现）
+        批量更新全市场数据
         
         Args:
             force_update: 是否强制更新所有股票（忽略本地数据）
@@ -220,7 +291,7 @@ class VolumePriceCollector:
             incremental_days: 增量同步天数，如果指定则只同步最近N天的缺失数据
         """
         try:
-            # 获取全A股代码列表（efinance）
+            # 获取全A股代码列表
             stock_df = ak.stock_info_a_code_name()
             total_stocks = len(stock_df)
             print(f"获取到 {total_stocks} 只A股代码")
@@ -256,11 +327,15 @@ class VolumePriceCollector:
                     if not clean_df.empty:
                         records = clean_df.to_dict('records')
                         for record in records:
-                            date_str = record['trade_date']
-                            date_obj = datetime.strptime(date_str, '%Y%m%d').date()
-                            if isinstance(date_obj, date):
-                                record['trade_date'] = datetime.combine(
-                                    date_obj, datetime.min.time())
+                            # ✅ trade_date 已经是字符串格式，直接使用
+                            trade_date_str = record['trade_date']
+                            # 确保格式正确
+                            if len(trade_date_str) == 8 and trade_date_str.isdigit():
+                                record['trade_date'] = trade_date_str
+                            else:
+                                # 如果格式不对，尝试转换
+                                record['trade_date'] = self.date_to_str(trade_date_str)
+                            
                             self.collection.update_one(
                                 {
                                     "symbol": record['symbol'],
@@ -289,7 +364,7 @@ class VolumePriceCollector:
             return 0
 
     def get_last_trade_date(self, symbol=None):
-        """获取数据库中最后一天的交易日期
+        """获取数据库中最后一天的交易日期（字符串格式）
         
         Args:
             symbol: 股票代码，如果指定则获取该股票的最后日期，否则获取全库最新日期
@@ -300,10 +375,8 @@ class VolumePriceCollector:
             latest_record = list(latest_record)
             
             if latest_record:
-                last_date = latest_record[0]['trade_date']
-                if isinstance(last_date, datetime):
-                    return last_date.date()
-                return last_date
+                last_date_str = latest_record[0]['trade_date']
+                return last_date_str  # ✅ 直接返回字符串
             return None
         except Exception as e:
             print(f"❌ 获取最后交易日期失败: {str(e)}")
@@ -311,9 +384,14 @@ class VolumePriceCollector:
 
     def get_stock_missing_days(self, symbol):
         """计算指定股票从最后一天到今天需要同步的天数"""
-        last_date = self.get_last_trade_date(symbol)
-        if last_date is None:
+        last_date_str = self.get_last_trade_date(symbol)
+        if last_date_str is None:
             # 该股票没有数据，返回较大值进行全量同步
+            return 90
+        
+        # ✅ 将字符串日期转换为 date 对象进行计算
+        last_date = self.str_to_date(last_date_str)
+        if last_date is None:
             return 90
         
         today = date.today()
@@ -322,21 +400,27 @@ class VolumePriceCollector:
             today = today - timedelta(days=2)
         elif today.weekday() == 5:  # Saturday
             today = today - timedelta(days=1)
+        
         delta = (today - last_date).days
         return max(1, delta)  # 至少同步1天
 
     def calculate_missing_days(self):
         """计算从数据库最后一天到今天的天数差值（全库统计）"""
-        last_date = self.get_last_trade_date()
-        if last_date is None:
+        last_date_str = self.get_last_trade_date()
+        if last_date_str is None:
             print("📊 数据库中没有数据，建议进行全量同步")
             return 30  # 默认同步30天
+        
+        # ✅ 字符串转日期
+        last_date = self.str_to_date(last_date_str)
+        if last_date is None:
+            return 30
         
         today = date.today()
         delta = (today - last_date).days
         
-        print(f"📅 数据库最后日期: {last_date}")
-        print(f"📅 当前日期: {today}")
+        print(f"📅 数据库最后日期: {last_date_str}")
+        print(f"📅 当前日期: {self.date_to_str(today)}")
         print(f"📊 计算得出需要同步: {delta} 天")
         
         return max(1, delta)  # 至少同步1天
@@ -377,9 +461,9 @@ class VolumePriceCollector:
                     # 为每只股票单独计算需要同步的天数
                     if per_stock_calculation and days is None:
                         stock_days = self.get_stock_missing_days(symbol)
-                        last_date = self.get_last_trade_date(symbol)
+                        last_date_str = self.get_last_trade_date(symbol)
                         sync_stats[symbol] = {
-                            'last_date': last_date,
+                            'last_date': last_date_str,
                             'days_to_sync': stock_days
                         }
                     else:
@@ -390,11 +474,14 @@ class VolumePriceCollector:
                     if not clean_df.empty:
                         records = clean_df.to_dict('records')
                         for record in records:
-                            date_str = record['trade_date']
-                            date_obj = datetime.strptime(date_str, '%Y%m%d').date()
-                            if isinstance(date_obj, date):
-                                record['trade_date'] = datetime.combine(
-                                    date_obj, datetime.min.time())
+                            # ✅ trade_date 已经是字符串格式，直接使用
+                            trade_date_str = record['trade_date']
+                            # 确保格式正确
+                            if len(trade_date_str) == 8 and trade_date_str.isdigit():
+                                record['trade_date'] = trade_date_str
+                            else:
+                                record['trade_date'] = self.date_to_str(trade_date_str)
+                            
                             self.collection.update_one(
                                 {
                                     "symbol": record['symbol'],
@@ -454,16 +541,60 @@ class VolumePriceCollector:
             print(f"❌ 增量同步失败: {str(e)}")
             return 0
 
-    def get_sync_dates(self,latest_date):
-        today = date.today()
-        if today.weekday() == 6:
-            today -= timedelta(days=2)
-        elif today.weekday() == 5:
-            today -= timedelta(days=1)
-        if latest_date == today or (isinstance(latest_date, datetime) and latest_date.date() == today):
+    def get_sync_dates(self, latest_date_str):
+        """获取同步日期范围（字符串格式）"""
+        today_str = self.get_today_str()
+        
+        if latest_date_str == today_str:
             return None, None  # 已是最新
-        start_date = (latest_date + timedelta(days=1)).date() if isinstance(latest_date, datetime) else latest_date + timedelta(days=1)
-        return start_date, today
+        
+        # ✅ 字符串日期计算
+        latest_date = self.str_to_date(latest_date_str)
+        if latest_date is None:
+            return None, None
+        
+        start_date = latest_date + timedelta(days=1)
+        start_str = self.date_to_str(start_date)
+        
+        return start_str, today_str
+
+    # ✅ 新增：数据验证方法
+    def validate_date_format(self, symbol_limit=100):
+        """验证数据库中的日期格式"""
+        try:
+            print("🔍 验证数据库中的日期格式...")
+            
+            # 随机抽取一些记录进行验证
+            pipeline = [
+                {"$sample": {"size": symbol_limit}},
+                {"$project": {"symbol": 1, "trade_date": 1, "_id": 0}}
+            ]
+            
+            samples = list(self.collection.aggregate(pipeline))
+            
+            valid_count = 0
+            invalid_count = 0
+            
+            for record in samples:
+                symbol = record.get('symbol', 'Unknown')
+                trade_date = record.get('trade_date')
+                
+                if isinstance(trade_date, str) and len(trade_date) == 8 and trade_date.isdigit():
+                    valid_count += 1
+                    print(f"✅ {symbol}: {trade_date} (有效)")
+                else:
+                    invalid_count += 1
+                    print(f"❌ {symbol}: {trade_date} (无效，类型: {type(trade_date)})")
+            
+            print(f"\n📊 日期格式验证结果:")
+            print(f"   有效格式: {valid_count} 条")
+            print(f"   无效格式: {invalid_count} 条")
+            
+            return valid_count, invalid_count
+            
+        except Exception as e:
+            print(f"❌ 日期格式验证失败: {str(e)}")
+            return 0, 0
 
 if __name__ == "__main__":
     import sys
@@ -473,6 +604,7 @@ if __name__ == "__main__":
     update_existing = "--update-existing" in sys.argv
     incremental_sync = "--incremental" in sys.argv
     update_names = "--update-names" in sys.argv
+    validate_dates = "--validate-dates" in sys.argv  # ✅ 新增日期验证参数
     
     # 解析增量同步天数
     incremental_days = None  # 默认None，自动计算
@@ -486,10 +618,12 @@ if __name__ == "__main__":
                 incremental_days = None
     
     print("=" * 60)
-    print("📊 股票数据收集器")
+    print("📊 股票数据收集器 (字符串日期格式版本)")
     print("=" * 60)
     
-    if update_names:
+    if validate_dates:
+        print("🔍 日期格式验证模式：检查数据库中的日期格式")
+    elif update_names:
         print("📝 股票名称更新模式：批量更新所有股票的名称信息")
     elif incremental_sync:
         if incremental_days is None:
@@ -504,28 +638,26 @@ if __name__ == "__main__":
         print("🧠 智能模式：跳过已有数据的股票，只处理新股票")
     
     print("\n可用参数:")
-    print("  --incremental         智能增量同步（为每只股票单独计算需要同步的天数）")
-    print("  --days=N             统一增量同步天数（配合--incremental使用）")
-    print("  --update-names       批量更新所有股票的名称信息")
-    print("  --force              强制更新所有股票数据")
-    print("  --update-existing    仅更新已有股票数据")
-    print("  (无参数)              智能跳过已有数据")
-    print("\n使用示例:")
-    print("  python volume_price_collector.py --incremental          # 智能计算每只股票的同步天数")
-    print("  python volume_price_collector.py --incremental --days=3 # 统一同步3天")
-    print("  python volume_price_collector.py --update-names         # 批量更新股票名称")
-    print("  python volume_price_collector.py --force                # 强制全量更新")
-    print("\n智能增量同步说明:")
-    print("  • 自动检测每只股票的最后更新日期")
-    print("  • 根据距离今天的天数差异，为每只股票计算最优同步天数")
-    print("  • 避免重复同步已经是最新的股票数据")
-    print("  • 确保落后较多的股票能够追上最新数据")
-    print("  • 同步过程中自动获取和保存股票名称信息")
+    print("  --validate-dates     验证数据库中的日期格式")
+    print("  --incremental        智能增量同步（为每只股票单独计算需要同步的天数）")
+    print("  --days=N            统一增量同步天数（配合--incremental使用）")
+    print("  --update-names      批量更新所有股票的名称信息")
+    print("  --force             强制更新所有股票数据")
+    print("  --update-existing   仅更新已有股票数据")
+    print("  (无参数)             智能跳过已有数据")
+    print("\n📅 日期格式说明:")
+    print("  • 所有日期字段现在都使用字符串格式 YYYYMMDD")
+    print("  • trade_date: '20240911' (交易日期)")
+    print("  • update_time: '20240911 14:30:25' (更新时间)")
+    print("  • 这样可以避免时区和日期解析问题")
+    print("  • 查询时直接使用字符串比较，效率更高")
     print("-" * 60)
     
     collector = VolumePriceCollector()
     try:
-        if update_names:
+        if validate_dates:
+            collector.validate_date_format()
+        elif update_names:
             collector.batch_update_stock_names()
         elif incremental_sync:
             collector.incremental_sync_all(incremental_days)
