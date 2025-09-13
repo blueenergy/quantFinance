@@ -1,7 +1,7 @@
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
-from . import BaseScorer
+from .base_scorer import BaseScorer
 
 class CycleScorer(BaseScorer):
     """
@@ -35,7 +35,7 @@ class CycleScorer(BaseScorer):
             # 转换为DataFrame
             df = pd.DataFrame(price_data)
             df['close'] = pd.to_numeric(df['close'])
-            df['volume'] = pd.to_numeric(df['vol'])
+            df['volume'] = pd.to_numeric(df['volume'])
             df['high'] = pd.to_numeric(df['high'])
             df['low'] = pd.to_numeric(df['low'])
             

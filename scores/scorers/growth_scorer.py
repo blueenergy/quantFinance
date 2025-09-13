@@ -12,7 +12,7 @@
 
 import pandas as pd
 import numpy as np
-from . import BaseScorer
+from .base_scorer import BaseScorer
 from datetime import datetime, timedelta
 
 class GrowthScorer(BaseScorer):
@@ -47,7 +47,22 @@ class GrowthScorer(BaseScorer):
             
             # 转换为DataFrame便于分析
             fin_df = pd.DataFrame(financial_data)
-            fin_df = fin_df.sort_values('end_date')
+            print(f"📊 原始数据字段: {list(fin_df.columns)}")
+            print(f"📊 数据形状: {fin_df.shape}")
+            
+            # 🔧 修复字段名问题 - 检测实际的日期字段
+            date_field = None
+            for field in ['end_date', 'report_date', 'ann_date', 'f_ann_date']:
+                if field in fin_df.columns:
+                    date_field = field
+                    break
+            
+            if date_field:
+                print(f"📅 使用日期字段: {date_field}")
+                fin_df = fin_df.sort_values(date_field)
+            else:
+                print("⚠️ 未找到日期字段，使用原始顺序")
+                # 如果没有日期字段，假设数据已经按时间排序
             
             score = 0
             

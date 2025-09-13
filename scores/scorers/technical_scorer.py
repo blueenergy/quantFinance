@@ -1,6 +1,6 @@
 import numpy as np
 import pandas as pd
-from . import BaseScorer
+from .base_scorer import BaseScorer
 
 class TechnicalScorer(BaseScorer):
     """
@@ -30,12 +30,13 @@ class TechnicalScorer(BaseScorer):
             # 获取价量数据
             price_data = self.get_volume_price_data(symbol, 60)
             if not price_data or len(price_data) < 20:
+                print("价量数据不足")
                 return 50.0, {"错误": "价量数据不足"}
             
             # 转换为DataFrame便于计算
             df = pd.DataFrame(price_data)
             df['close'] = pd.to_numeric(df['close'])
-            df['volume'] = pd.to_numeric(df['vol'])
+            df['volume'] = pd.to_numeric(df['volume'])
             df['high'] = pd.to_numeric(df['high'])
             df['low'] = pd.to_numeric(df['low'])
             df['open'] = pd.to_numeric(df['open'])

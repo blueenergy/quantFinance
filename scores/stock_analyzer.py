@@ -20,11 +20,12 @@ class StockAnalyzer:
     
     整合所有评分器，提供全面的股票分析
     """    
-    def __init__(self, db_manager, base_date=None, max_workers: int = 4):
+    def __init__(self, db_manager, base_date=None, max_workers: int = 4, save_to_db=True):
         """初始化分析器"""
         self.db_manager = db_manager
         self.base_date = base_date or datetime.now().strftime('%Y%m%d')
         self.max_workers = max_workers
+        self.save_to_db = save_to_db
         
         # 初始化所有评分器 - 包括 fundamental_scorer
         self.scorers = {
@@ -134,7 +135,7 @@ class StockAnalyzer:
             'recommendations': {}
         }
         
-        total_score = 0
+        composite_score = 0
         valid_scores = 0
         
         # 逐个评分器分析
@@ -147,7 +148,7 @@ class StockAnalyzer:
                 analysis_result['scores'][scorer_name] = score
                 analysis_result['details'][scorer_name] = details
                 
-                total_score += score * self.weights[scorer_name]
+                composite_score += score * self.weights[scorer_name]
                 valid_scores += 1
                 
                 print(f"    ✅ {scorer_name}: {score:.2f}分")
@@ -156,10 +157,10 @@ class StockAnalyzer:
                 print(f"    ❌ {scorer_name} 分析失败: {e}")
                 analysis_result['scores'][scorer_name] = 50.0
                 analysis_result['details'][scorer_name] = {"错误": str(e)}
-                total_score += 50.0 * self.weights[scorer_name]  # 使用默认分数
+                composite_score += 50.0 * self.weights[scorer_name]  # 使用默认分数
         
         # 计算综合评分
-        analysis_result['composite_score'] = round(total_score, 2)
+        analysis_result['composite_score'] = round(composite_score, 2)
         analysis_result['valid_scorers'] = valid_scores
         
         # 生成投资建议
@@ -170,36 +171,88 @@ class StockAnalyzer:
         
         return analysis_result
     
-    def analyze_single_stock(self, symbol: str) -> Dict:
+    def analyze_single_stock(self, symbol: str, force_refresh=False) -> Dict:
         """
-        分析单只股票 - 兼容 daily_screening.py 的接口
+        分析单只股票 - 支持数据库缓存，兼容 daily_screening.py 的接口
         
         Args:
             symbol: 股票代码
+            force_refresh: 是否强制刷新（忽略缓存）
             
         Returns:
             包含所有评分和分析结果的字典
         """
-        result = self.analyze_stock(symbol)
-        
-        # 转换为与原系统兼容的格式
-        compatible_result = {
-            'symbol': symbol,
-            'analysis_date': self.base_date,
-            'timestamp': result['timestamp'],
-            'composite_score': result['composite_score'],
-            'overall_rating': result['recommendations']['overall_rating']
-        }
-        
-        # 添加各维度评分
-        for scorer_name, score in result['scores'].items():
-            compatible_result[f'{scorer_name}_score'] = score
-        
-        # 添加分析详情
-        for scorer_name, details in result['details'].items():
-            compatible_result[f'{scorer_name}_analysis'] = details
-        
-        return compatible_result
+        try:
+            from datetime import datetime
+            score_date = datetime.now().strftime('%Y%m%d')
+            
+            # 🔧 检查是否已有今日评分（避免重复计算）
+            if (not force_refresh and self.save_to_db and 
+                self.db_manager.check_score_exists(symbol, score_date)):
+                
+                print(f"📋 {symbol} 今日评分已存在，从数据库获取...")
+                cached_result = self._load_score_from_db(symbol, score_date)
+                if cached_result:
+                    return cached_result
+                else:
+                    print(f"⚠️ 数据库读取失败，重新计算 {symbol}")
+            
+            # 执行分析计算
+            print(f"🔧 计算 {symbol} 评分...")
+            result = self._perform_analysis(symbol)
+            
+            # 🔧 保存到数据库
+            if self.save_to_db and result:
+                success = self.db_manager.save_stock_score(symbol, result, score_date)
+                if success:
+                    result["data_source"] = "实时计算并已保存"
+                else:
+                    result["data_source"] = "实时计算但保存失败"
+            else:
+                result["data_source"] = "实时计算"
+            
+            return result
+            
+        except Exception as e:
+            print(f"❌ 分析失败 {symbol}: {e}")
+            return self._get_default_result(symbol)
+    
+    def _load_score_from_db(self, symbol, score_date):
+        """从现有 stock_scores 表加载评分"""
+        try:
+            score_record = self.db_manager.db.stock_scores.find_one({
+                "symbol": symbol,
+                "score_date": score_date
+            })
+            
+            if score_record:
+                result = {
+                    "symbol": symbol,
+                    "composite_score": score_record.get("composite_score", 0),
+                    "overall_rating": score_record.get("overall_rating", "未评级"),
+                    "data_source": "数据库缓存",
+                    "score_date": score_date,
+                    "cache_time": score_record.get("created_at", "未知")
+                }
+                
+                # 🔧 如果有详细评分，也加载
+                if "score_details" in score_record:
+                    details = score_record["score_details"]
+                    result.update({
+                        "technical_score": details.get("technical_details", {}),
+                        "fundamental_score": details.get("fundamental_details", {}),
+                        "money_flow_score": details.get("money_flow_details", {}),
+                        "market_sentiment_score": details.get("market_sentiment_details", {})
+                    })
+                
+                print(f"✅ {symbol} 从数据库加载: {result['composite_score']:.2f}分")
+                return result
+            
+            return None
+            
+        except Exception as e:
+            print(f"❌ 从数据库加载评分失败: {e}")
+            return None
     
     def _generate_recommendations(self, analysis_result: Dict) -> Dict:
         """生成投资建议"""
@@ -337,37 +390,37 @@ class StockAnalyzer:
         
         return df
     
-    def get_top_stocks(self, df: pd.DataFrame = None, symbols: List[str] = None, 
-                      top_n: int = 10, min_score: float = 60.0) -> pd.DataFrame:
-        """
-        获取评分最高的股票 - 兼容原接口
+    # def get_top_stocks(self, df: pd.DataFrame = None, symbols: List[str] = None, 
+    #                   top_n: int = 10, min_score: float = 60.0) -> pd.DataFrame:
+    #     """
+    #     获取评分最高的股票 - 兼容原接口
         
-        Args:
-            df: 已分析的DataFrame，如果为None则使用symbols重新分析
-            symbols: 股票代码列表  
-            top_n: 返回股票数量
-            min_score: 最低评分要求
+    #     Args:
+    #         df: 已分析的DataFrame，如果为None则使用symbols重新分析
+    #         symbols: 股票代码列表  
+    #         top_n: 返回股票数量
+    #         min_score: 最低评分要求
             
-        Returns:
-            筛选后的 DataFrame
-        """
-        if df is None:
-            if symbols is None:
-                raise ValueError("df 和 symbols 不能同时为 None")
-            df = self.batch_analyze(symbols)
+    #     Returns:
+    #         筛选后的 DataFrame
+    #     """
+    #     if df is None:
+    #         if symbols is None:
+    #             raise ValueError("df 和 symbols 不能同时为 None")
+    #         df = self.batch_analyze(symbols)
         
-        try:
-            # 筛选符合条件的股票
-            if 'composite_score' in df.columns:
-                filtered_df = df[df['composite_score'] >= min_score].copy()
-                return filtered_df.head(top_n)
-            else:
-                print("⚠️ DataFrame 中缺少 composite_score 列")
-                return pd.DataFrame()
+    #     try:
+    #         # 筛选符合条件的股票
+    #         if 'composite_score' in df.columns:
+    #             filtered_df = df[df['composite_score'] >= min_score].copy()
+    #             return filtered_df.head(top_n)
+    #         else:
+    #             print("⚠️ DataFrame 中缺少 composite_score 列")
+    #             return pd.DataFrame()
                 
-        except Exception as e:
-            print(f"❌ 筛选股票失败: {e}")
-            return pd.DataFrame()
+    #     except Exception as e:
+    #         print(f"❌ 筛选股票失败: {e}")
+    #         return pd.DataFrame()
     
     def export_results(self, df: pd.DataFrame, output_file: str = None) -> str:
         """
@@ -635,88 +688,96 @@ class StockAnalyzer:
             print(f"❌ 生成摘要失败: {e}")
             return {'error': str(e)}
 
-# ==================== 兼容性接口 ====================
+    def _get_default_result(self, symbol):
+        """获取默认分析结果（当分析失败时使用）"""
+        try:
+            return {
+                'symbol': symbol,
+                'analysis_date': self.base_date,
+                'timestamp': datetime.now().isoformat(),
+                'composite_score': 50.0,  # 默认中性评分
+                'overall_rating': '❌ 分析失败',
+                'data_source': '默认结果',
+                'error': '分析过程中发生错误',
+                
+                # 各维度默认评分
+                'technical_score': 50.0,
+                'fundamental_score': 50.0,
+                'value_score': 50.0,
+                'growth_score': 50.0,
+                'money_flow_score': 50.0,
+                'cycle_score': 50.0,
+                
+                # 默认分析详情
+                'technical_analysis': {'错误': '技术分析失败'},
+                'fundamental_analysis': {'错误': '基本面分析失败'},
+                'value_analysis': {'错误': '价值分析失败'},
+                'growth_analysis': {'错误': '成长分析失败'},
+                'money_flow_analysis': {'错误': '资金流分析失败'},
+                'cycle_analysis': {'错误': '周期分析失败'},
+            }
+        except Exception as e:
+            # 如果连默认结果都创建失败，返回最基础的结果
+            return {
+                'symbol': symbol,
+                'composite_score': 50.0,
+                'overall_rating': '❌ 严重错误',
+                'error': f'无法创建默认结果: {e}'
+            }
 
-class StockScoringSystem:
-    """
-    兼容性类 - 为了平滑迁移
-    将来可以移除
-    """
-    
-    def __init__(self, db_manager, base_date=None):
-        print("⚠️ StockScoringSystem 已弃用，请使用 StockAnalyzer")
-        self.analyzer = StockAnalyzer(db_manager, base_date)
-    
-    def __getattr__(self, name):
-        # 代理所有方法调用到新的 StockAnalyzer
-        return getattr(self.analyzer, name)
-
-# ==================== 测试函数 ====================
-
-def test_stock_analyzer():
-    """测试修复后的 StockAnalyzer"""
-    print("🧪 测试修复后的 StockAnalyzer...")
-    
-    from unittest.mock import Mock
-    
-    # 创建模拟数据库
-    mock_db = Mock()
-    
-    try:
-        # 创建分析器
-        analyzer = StockAnalyzer(mock_db, "20250910")
-        
-        print(f"\n📊 评分器列表: {list(analyzer.scorers.keys())}")
-        print(f"⚖️ 权重配置: {analyzer.weights}")
-        
-        # 验证权重总和
-        total_weight = sum(analyzer.weights.values())
-        print(f"✅ 权重总和: {total_weight:.3f}")
-        
-        # 测试单股票分析
-        print("\n📊 测试单股票分析:")
-        result = analyzer.analyze_single_stock("000002")
-        print(f"000002 综合评分: {result.get('composite_score', 'N/A')}")
-        print(f"包含的评分维度: {[k for k in result.keys() if k.endswith('_score')]}")
-        
-        # 测试批量分析
-        test_symbols = ["000002", "000001", "000858"]
-        print(f"\n📊 测试批量分析:")
-        df = analyzer.batch_analyze(test_symbols, show_progress=True)
-        
-        if not df.empty:
-            available_score_cols = [col for col in ['symbol', 'composite_score', 'overall_rating'] if col in df.columns]
-            print(f"批量分析结果:\n{df[available_score_cols].head()}")
-        
-        # 测试策略应用
-        print(f"\n📊 测试策略应用:")
-        analyzer.apply_strategy('value_oriented')
-        
-        # 测试权重更新
-        print(f"\n📊 测试权重更新:")
-        analyzer.set_custom_weights(
-            technical=0.2,
-            fundamental=0.25,
-            value=0.2,
-            growth=0.15,
-            money_flow=0.1,
-            cycle=0.1
-        )
-        
-        # 测试分析摘要
-        print(f"\n📊 测试分析摘要:")
-        summary = analyzer.get_analysis_summary(df)
-        print(f"分析摘要: {summary}")
-        
-        print(f"\n✅ 所有测试通过！")
-        return True
-        
-    except Exception as e:
-        print(f"❌ 测试失败: {e}")
-        import traceback
-        traceback.print_exc()
-        return False
-
-if __name__ == "__main__":
-    test_stock_analyzer()
+    def _perform_analysis(self, symbol):
+        """执行实际的股票分析计算"""
+        try:
+            print(f"🔍 开始分析股票: {symbol}")
+            
+            analysis_result = {
+                'symbol': symbol,
+                'analysis_date': self.base_date,
+                'timestamp': datetime.now().isoformat(),
+                'scores': {},
+                'details': {},
+                'recommendations': {}
+            }
+            
+            composite_score = 0
+            valid_scores = 0
+            
+            # 逐个评分器分析
+            for scorer_name, scorer in self.scorers.items():
+                try:
+                    print(f"  📊 {scorer_name} 分析中...")
+                    
+                    score, details = scorer.calculate_score_detailed(symbol)
+                    
+                    analysis_result['scores'][scorer_name] = score
+                    analysis_result['details'][scorer_name] = details
+                    
+                    composite_score += score * self.weights[scorer_name]
+                    valid_scores += 1
+                    
+                    print(f"    ✅ {scorer_name}: {score:.2f}分")
+                    
+                except Exception as e:
+                    print(f"    ❌ {scorer_name} 分析失败: {e}")
+                    analysis_result['scores'][scorer_name] = 50.0
+                    analysis_result['details'][scorer_name] = {"错误": str(e)}
+                    composite_score += 50.0 * self.weights[scorer_name]  # 使用默认分数
+            
+            # 计算综合评分
+            analysis_result['composite_score'] = round(composite_score, 2)
+            analysis_result['valid_scorers'] = valid_scores
+            analysis_result['weights'] = self.weights
+            
+            # 生成投资建议
+            analysis_result['recommendations'] = self._generate_recommendations(analysis_result)
+            
+            
+            print(f"  🎯 综合评分: {analysis_result['composite_score']:.2f}分")
+            print(f"  📋 投资评级: {analysis_result['recommendations']['overall_rating']}")
+            
+            return analysis_result
+            
+        except Exception as e:
+            print(f"❌ 分析计算失败 {symbol}: {e}")
+            raise e  # 重新抛出异常，让调用者处理
 

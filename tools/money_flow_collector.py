@@ -35,7 +35,7 @@ money_flow_collection = db["money_flow"]
 
 for doc in stock_info_collection.find():
     ts_code = get_ts_code(doc['symbol'])
-    df = pro.moneyflow(ts_code=ts_code, start_date='20250720', end_date='20250905')
+    df = pro.moneyflow(ts_code=ts_code, start_date='20250906', end_date='20250913')
     records = df.to_dict(orient='records')
     
     # 给每条记录加 symbol 字段

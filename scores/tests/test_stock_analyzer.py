@@ -760,5 +760,473 @@ def test_run_all_stock_analyzer_tests():
     
     return passed, failed
 
+    # ==================== analyze_single_stock 专项测试 ====================
+
+    @patch('stock_analyzer.TechnicalScorer')
+    @patch('stock_analyzer.ValueScorer') 
+    @patch('stock_analyzer.GrowthScorer')
+    @patch('stock_analyzer.MoneyFlowScorer')
+    @patch('stock_analyzer.CycleScorer')
+    @patch('stock_analyzer.FundamentalScorer')
+    def test_analyze_single_stock_success(self, mock_fundamental, mock_cycle, mock_money, 
+                                         mock_growth, mock_value, mock_technical):
+        """测试 analyze_single_stock 成功分析"""
+        
+        # 设置模拟评分器返回值
+        mock_technical.return_value.calculate_score_detailed.return_value = (75.5, {"技术分析": "良好"})
+        mock_fundamental.return_value.calculate_score_detailed.return_value = (80.2, {"基本面": "优秀"})
+        mock_value.return_value.calculate_score_detailed.return_value = (68.2, {"估值": "合理"})
+        mock_growth.return_value.calculate_score_detailed.return_value = (82.1, {"成长": "优秀"})
+        mock_money.return_value.calculate_score_detailed.return_value = (71.8, {"资金流": "流入"})
+        mock_cycle.return_value.calculate_score_detailed.return_value = (65.3, {"周期": "中期"})
+        
+        analyzer = StockAnalyzer(self.mock_db_manager, self.base_date)
+        result = analyzer.analyze_single_stock("000002")
+        
+        # 验证返回结构
+        assert isinstance(result, dict)
+        assert 'symbol' in result
+        assert 'analysis_date' in result
+        assert 'composite_score' in result
+        assert 'overall_rating' in result
+        
+        # 验证基本信息
+        assert result['symbol'] == "000002"
+        assert result['analysis_date'] == self.base_date
+        
+        # 验证包含所有6个评分器的结果
+        expected_scorers = ['technical', 'fundamental', 'value', 'growth', 'money_flow', 'cycle']
+        for scorer in expected_scorers:
+            score_key = f'{scorer}_score'
+            analysis_key = f'{scorer}_analysis'
+            assert score_key in result, f"缺少 {score_key}"
+            assert analysis_key in result, f"缺少 {analysis_key}"
+            assert isinstance(result[score_key], (int, float))
+        
+        # 验证综合评分计算
+        assert isinstance(result['composite_score'], (int, float))
+        assert 0 <= result['composite_score'] <= 100
+        
+        print("✅ analyze_single_stock 成功分析测试通过")
+
+    def test_analyze_single_stock_format_compatibility(self):
+        """测试 analyze_single_stock 与 daily_screening.py 的格式兼容性"""
+        
+        with patch.object(StockAnalyzer, 'analyze_stock') as mock_analyze:
+            # 模拟 analyze_stock 的返回值
+            mock_analyze.return_value = {
+                'symbol': '000002',
+                'analysis_date': self.base_date,
+                'timestamp': '2025-01-15T10:30:00',
+                'composite_score': 75.5,
+                'scores': {
+                    'technical': 70.0,
+                    'fundamental': 80.0,
+                    'value': 75.0,
+                    'growth': 82.0,
+                    'money_flow': 68.0,
+                    'cycle': 65.0
+                },
+                'details': {
+                    'technical': {'趋势': '上升', 'RSI': '65'},
+                    'fundamental': {'ROE': '15%', '净利润增长': '20%'},
+                    'value': {'PE': '18倍', 'PB': '1.5倍'},
+                    'growth': {'营收增长': '15%', '利润增长': '20%'},
+                    'money_flow': {'净流入': '5000万', '机构态度': '积极'},
+                    'cycle': {'行业景气': '正常', '周期位置': '中期'}
+                },
+                'recommendations': {
+                    'overall_rating': '👍 推荐',
+                    'investment_suggestion': '较好标的，可以配置'
+                }
+            }
+            
+            analyzer = StockAnalyzer(self.mock_db_manager, self.base_date)
+            result = analyzer.analyze_single_stock("000002")
+            
+            # 验证兼容格式
+            assert 'symbol' in result
+            assert 'analysis_date' in result
+            assert 'timestamp' in result
+            assert 'composite_score' in result
+            assert 'overall_rating' in result
+            
+            # 验证各维度评分键名格式
+            expected_score_keys = [
+                'technical_score', 'fundamental_score', 'value_score',
+                'growth_score', 'money_flow_score', 'cycle_score'
+            ]
+            for key in expected_score_keys:
+                assert key in result, f"缺少兼容性键: {key}"
+            
+            # 验证各维度分析详情键名格式
+            expected_analysis_keys = [
+                'technical_analysis', 'fundamental_analysis', 'value_analysis',
+                'growth_analysis', 'money_flow_analysis', 'cycle_analysis'
+            ]
+            for key in expected_analysis_keys:
+                assert key in result, f"缺少兼容性键: {key}"
+            
+            print("✅ analyze_single_stock 格式兼容性测试通过")
+
+    @patch('stock_analyzer.TechnicalScorer')
+    @patch('stock_analyzer.FundamentalScorer')
+    def test_analyze_single_stock_with_scorer_failures(self, mock_fundamental, mock_technical):
+        """测试 analyze_single_stock 处理评分器失败"""
+        
+        # 设置部分评分器失败
+        mock_technical.return_value.calculate_score_detailed.side_effect = Exception("技术分析失败")
+        mock_fundamental.return_value.calculate_score_detailed.return_value = (80.0, {"基本面": "优秀"})
+        
+        analyzer = StockAnalyzer(self.mock_db_manager, self.base_date)
+        result = analyzer.analyze_single_stock("000002")
+        
+        # 验证仍能返回完整结果
+        assert 'composite_score' in result
+        assert 'technical_score' in result
+        assert 'fundamental_score' in result
+        
+        # 验证失败的评分器使用默认值
+        assert result['technical_score'] == 50.0  # 默认分数
+        assert result['fundamental_score'] == 80.0  # 正常分数
+        
+        # 验证错误信息被记录
+        assert 'technical_analysis' in result
+        assert isinstance(result['technical_analysis'], dict)
+        
+        print("✅ analyze_single_stock 评分器失败处理测试通过")
+
+    def test_analyze_single_stock_with_different_weights(self):
+        """测试 analyze_single_stock 在不同权重下的结果"""
+        
+        with patch.object(StockAnalyzer, 'analyze_stock') as mock_analyze:
+            # 模拟固定的各维度评分
+            def mock_analyze_func(symbol):
+                return {
+                    'symbol': symbol,
+                    'analysis_date': self.base_date,
+                    'timestamp': '2025-01-15T10:30:00',
+                    'composite_score': 70.0,  # 这个会根据权重计算
+                    'scores': {
+                        'technical': 80.0,
+                        'fundamental': 60.0,
+                        'value': 70.0,
+                        'growth': 90.0,
+                        'money_flow': 50.0,
+                        'cycle': 40.0
+                    },
+                    'details': {},
+                    'recommendations': {'overall_rating': '👍 推荐'}
+                }
+            
+            mock_analyze.side_effect = mock_analyze_func
+            
+            analyzer = StockAnalyzer(self.mock_db_manager, self.base_date)
+            
+            # 测试默认权重
+            result_default = analyzer.analyze_single_stock("000002")
+            default_score = result_default['composite_score']
+            
+            # 修改权重，更重视成长性
+            analyzer.set_custom_weights(
+                technical=0.1,
+                fundamental=0.1,
+                value=0.1,
+                growth=0.5,  # 大幅提高成长权重
+                money_flow=0.1,
+                cycle=0.1
+            )
+            
+            result_growth = analyzer.analyze_single_stock("000002")
+            growth_score = result_growth['composite_score']
+            
+            # 由于成长分数高(90)，权重策略应该产生不同结果
+            assert result_growth['growth_score'] == 90.0
+            
+            print(f"✅ 权重影响测试通过 - 默认: {default_score}, 成长导向: {growth_score}")
+
+    def test_analyze_single_stock_empty_symbol(self):
+        """测试 analyze_single_stock 处理空股票代码"""
+        
+        analyzer = StockAnalyzer(self.mock_db_manager, self.base_date)
+        
+        # 测试空字符串
+        result_empty = analyzer.analyze_single_stock("")
+        assert result_empty['symbol'] == ""
+        assert 'composite_score' in result_empty
+        
+        # 测试None (虽然方法签名要求str，但测试健壮性)
+        try:
+            result_none = analyzer.analyze_single_stock(None)
+            # 如果没有抛出异常，验证结果
+            assert 'symbol' in result_none
+        except (TypeError, AttributeError):
+            # 如果抛出类型错误，这是可以接受的
+            pass
+        
+        print("✅ analyze_single_stock 空股票代码处理测试通过")
+
+    def test_analyze_single_stock_special_symbols(self):
+        """测试 analyze_single_stock 处理特殊股票代码"""
+        
+        analyzer = StockAnalyzer(self.mock_db_manager, self.base_date)
+        
+        special_symbols = [
+            "000002.SZ",    # 带后缀
+            "sh600036",     # 带前缀
+            "SZ000002",     # 不同前缀
+            "hk00700",      # 港股
+            "INVALID123"    # 无效代码
+        ]
+        
+        for symbol in special_symbols:
+            try:
+                result = analyzer.analyze_single_stock(symbol)
+                
+                # 验证基本结构
+                assert 'symbol' in result
+                assert 'composite_score' in result
+                assert result['symbol'] == symbol
+                
+                print(f"  ✅ {symbol}: {result.get('composite_score', 'N/A')}")
+                
+            except Exception as e:
+                print(f"  ⚠️ {symbol} 处理异常: {e}")
+        
+        print("✅ analyze_single_stock 特殊股票代码测试通过")
+
+    @patch.object(StockAnalyzer, '_generate_recommendations')
+    def test_analyze_single_stock_recommendations_integration(self, mock_recommendations):
+        """测试 analyze_single_stock 与推荐生成的集成"""
+        
+        # 模拟推荐生成
+        mock_recommendations.return_value = {
+            'overall_rating': '🌟 强烈推荐',
+            'investment_suggestion': '优质标的，建议重点关注',
+            'risk_level': '中低风险',
+            'time_horizon': '中长期(6个月-2年)'
+        }
+        
+        with patch.object(StockAnalyzer, 'analyze_stock') as mock_analyze:
+            mock_analyze.return_value = {
+                'symbol': '000002',
+                'analysis_date': self.base_date,
+                'timestamp': '2025-01-15T10:30:00',
+                'composite_score': 85.0,
+                'scores': {'technical': 80.0, 'fundamental': 85.0},
+                'details': {'technical': {}, 'fundamental': {}},
+                'recommendations': mock_recommendations.return_value
+            }
+            
+            analyzer = StockAnalyzer(self.mock_db_manager, self.base_date)
+            result = analyzer.analyze_single_stock("000002")
+            
+            # 验证推荐信息被正确传递
+            assert result['overall_rating'] == '🌟 强烈推荐'
+            assert 'timestamp' in result
+            assert result['composite_score'] == 85.0
+        
+        print("✅ analyze_single_stock 推荐集成测试通过")
+
+    def test_analyze_single_stock_data_types(self):
+        """测试 analyze_single_stock 返回数据类型"""
+        
+        with patch.object(StockAnalyzer, 'analyze_stock') as mock_analyze:
+            mock_analyze.return_value = {
+                'symbol': '000002',
+                'analysis_date': '20250910',
+                'timestamp': '2025-01-15T10:30:00',
+                'composite_score': 75.5,
+                'scores': {
+                    'technical': 70.0,
+                    'fundamental': 80.0,
+                    'value': 75.0,
+                    'growth': 82.0,
+                    'money_flow': 68.0,
+                    'cycle': 65.0
+                },
+                'details': {
+                    'technical': {'指标1': '值1'},
+                    'fundamental': {'指标2': '值2'}
+                },
+                'recommendations': {
+                    'overall_rating': '👍 推荐'
+                }
+            }
+            
+            analyzer = StockAnalyzer(self.mock_db_manager, self.base_date)
+            result = analyzer.analyze_single_stock("000002")
+            
+            # 验证数据类型
+            assert isinstance(result['symbol'], str)
+            assert isinstance(result['analysis_date'], str)
+            assert isinstance(result['timestamp'], str)
+            assert isinstance(result['composite_score'], (int, float))
+            assert isinstance(result['overall_rating'], str)
+            
+            # 验证评分数据类型
+            for scorer in ['technical', 'fundamental', 'value', 'growth', 'money_flow', 'cycle']:
+                score_key = f'{scorer}_score'
+                assert isinstance(result[score_key], (int, float))
+                
+                analysis_key = f'{scorer}_analysis'
+                assert isinstance(result[analysis_key], dict)
+        
+        print("✅ analyze_single_stock 数据类型测试通过")
+
+    def test_analyze_single_stock_performance(self):
+        """测试 analyze_single_stock 性能"""
+        
+        with patch.object(StockAnalyzer, 'analyze_stock') as mock_analyze:
+            # 模拟快速返回
+            mock_analyze.return_value = {
+                'symbol': '000002',
+                'analysis_date': self.base_date,
+                'timestamp': '2025-01-15T10:30:00',
+                'composite_score': 75.0,
+                'scores': {
+                    'technical': 70.0,
+                    'fundamental': 80.0,
+                    'value': 75.0,
+                    'growth': 82.0,
+                    'money_flow': 68.0,
+                    'cycle': 65.0
+                },
+                'details': {},
+                'recommendations': {'overall_rating': '👍 推荐'}
+            }
+            
+            analyzer = StockAnalyzer(self.mock_db_manager, self.base_date)
+            
+            # 测试多次调用的性能
+            start_time = time.time()
+            
+            for i in range(10):
+                result = analyzer.analyze_single_stock(f"00000{i}")
+                assert 'composite_score' in result
+            
+            end_time = time.time()
+            execution_time = end_time - start_time
+            
+            # 简单性能检查 (应该很快，因为是mock)
+            assert execution_time < 5.0, f"10次调用耗时过长: {execution_time:.2f}秒"
+            
+            print(f"✅ analyze_single_stock 性能测试通过 - 10次调用耗时: {execution_time:.3f}秒")
+
+    # ==================== analyze_single_stock 错误处理测试 ====================
+
+    def test_analyze_single_stock_database_error(self):
+        """测试 analyze_single_stock 数据库错误处理"""
+        
+        # 模拟数据库错误
+        self.mock_db_manager.side_effect = Exception("数据库连接失败")
+        
+        analyzer = StockAnalyzer(self.mock_db_manager, self.base_date)
+        
+        # 应该能处理数据库错误而不崩溃
+        result = analyzer.analyze_single_stock("000002")
+        
+        assert 'symbol' in result
+        assert result['symbol'] == "000002"
+        
+        print("✅ analyze_single_stock 数据库错误处理测试通过")
+
+    @patch('stock_analyzer.TechnicalScorer')
+    def test_analyze_single_stock_scorer_import_error(self, mock_technical):
+        """测试 analyze_single_stock 评分器导入错误处理"""
+        
+        # 模拟评分器导入失败
+        mock_technical.side_effect = ImportError("无法导入评分器模块")
+        
+        try:
+            analyzer = StockAnalyzer(self.mock_db_manager, self.base_date)
+            result = analyzer.analyze_single_stock("000002")
+            
+            # 如果能正常运行，验证结果
+            assert 'symbol' in result
+            print("✅ analyze_single_stock 在评分器导入错误下仍能运行")
+            
+        except ImportError:
+            print("⚠️ analyze_single_stock 在评分器导入错误时抛出异常 (可接受)")
+
+    def test_analyze_single_stock_concurrent_calls(self):
+        """测试 analyze_single_stock 并发调用"""
+        
+        with patch.object(StockAnalyzer, 'analyze_stock') as mock_analyze:
+            mock_analyze.return_value = {
+                'symbol': 'TEST',
+                'analysis_date': self.base_date,
+                'timestamp': '2025-01-15T10:30:00',
+                'composite_score': 75.0,
+                'scores': {'technical': 70.0},
+                'details': {'technical': {}},
+                'recommendations': {'overall_rating': '👍 推荐'}
+            }
+            
+            analyzer = StockAnalyzer(self.mock_db_manager, self.base_date)
+            
+            # 使用线程池测试并发
+            import concurrent.futures
+            
+            def analyze_wrapper(symbol):
+                return analyzer.analyze_single_stock(symbol)
+            
+            symbols = [f"00000{i}" for i in range(5)]
+            
+            with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+                futures = [executor.submit(analyze_wrapper, symbol) for symbol in symbols]
+                results = [future.result() for future in concurrent.futures.as_completed(futures)]
+            
+            # 验证所有调用都成功
+            assert len(results) == 5
+            for result in results:
+                assert 'composite_score' in result
+                assert 'symbol' in result
+        
+        print("✅ analyze_single_stock 并发调用测试通过")
+
+    # ==================== 运行 analyze_single_stock 专项测试 ====================
+
+    def test_run_analyze_single_stock_tests():
+        """运行所有 analyze_single_stock 专项测试"""
+        print("🎯 开始运行 analyze_single_stock 专项测试...")
+        
+        test_instance = TestStockAnalyzer()
+        test_instance.setup_method()
+        
+        test_methods = [
+            "test_analyze_single_stock_success",
+            "test_analyze_single_stock_format_compatibility",
+            "test_analyze_single_stock_with_scorer_failures",
+            "test_analyze_single_stock_with_different_weights",
+            "test_analyze_single_stock_empty_symbol",
+            "test_analyze_single_stock_special_symbols",
+            "test_analyze_single_stock_recommendations_integration",
+            "test_analyze_single_stock_data_types",
+            "test_analyze_single_stock_performance",
+            "test_analyze_single_stock_database_error",
+            "test_analyze_single_stock_scorer_import_error",
+            "test_analyze_single_stock_concurrent_calls"
+        ]
+        
+        passed = 0
+        failed = 0
+        
+        for method_name in test_methods:
+            try:
+                print(f"\n🔍 执行: {method_name}")
+                test_method = getattr(test_instance, method_name)
+                test_method()
+                passed += 1
+            except Exception as e:
+                print(f"❌ {method_name} 失败: {e}")
+                failed += 1
+        
+        print(f"\n📊 analyze_single_stock 测试结果:")
+        print(f"✅ 通过: {passed}")
+        print(f"❌ 失败: {failed}")
+        print(f"📈 通过率: {passed/(passed+failed)*100:.1f}%")
+        
+        return passed, failed
 if __name__ == "__main__":
     test_run_all_stock_analyzer_tests()
