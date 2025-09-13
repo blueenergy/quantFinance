@@ -13,7 +13,7 @@
 
 import pandas as pd
 import numpy as np
-from . import BaseScorer
+from .base_scorer import BaseScorer
 from datetime import datetime, timedelta
 
 class ValueScorer(BaseScorer):
@@ -270,7 +270,6 @@ class ValueScorer(BaseScorer):
     def _calculate_peg_score(self, valuation_data, financial_data):
         """计算PEG评分"""
         details = {}
-        print(valuation_data, financial_data)
         try:
             pe_ratio = valuation_data.get('pe_ratio', None)
             # 尝试多个增长率字段
