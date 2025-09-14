@@ -1,7 +1,8 @@
-from typing import List, Optional
+from typing import List, Optional, Any
 from datetime import date, datetime
 from bson import ObjectId
 from fastapi import APIRouter, Query, HTTPException, Depends
+from pydantic import BaseModel
 from db import get_db_collections
 from utils import serialize_doc
 from auth import get_current_active_user
@@ -9,19 +10,88 @@ router = APIRouter()
 
 collections = get_db_collections()
 collection = collections["volume_price"] # type: ignore
+class RecordResponseModel(BaseModel):
+    symbol: Optional[str]
+    trade_date: Optional[Any]
+    composite_score: Optional[float] = None
+    cycle_score: Optional[float] = None
+    growth_score: Optional[float] = None
+    fundamental_score: Optional[float] = None
+    value_score: Optional[float] = None
+    technical_score: Optional[float] = None
+    money_flow_score: Optional[float] = None
+    score_date: Optional[str] = None
+    # Add other fields as needed
 
-@router.get("/records/", response_model=List[dict])
+@router.get("/records/")
 def get_records(symbol: Optional[str] = Query(None), limit: int = 10, sort: Optional[str] = None):
     query = {}
     if symbol:
         query["symbol"] = symbol
-    cursor = collection.find(query)
+    # 构建聚合管道，先将 trade_date 转为 %Y%m%d 字符串e_date 转为 %Y%m%d 字符串
+    pipeline = [
+        {"$match": query},
+        {"$addFields": {
+            "trade_date_str": {
+                "$cond": [
+                    {"$eq": [{"$type": "$trade_date"}, "date"]},
+                    {"$dateToString": {"format": "%Y%m%d", "date": "$trade_date"}},
+                    "$trade_date"
+                ]
+            }
+        }}
+    ]
     if sort:
         # 支持 '-trade_date' 降序
         field = sort.lstrip('-')
         direction = -1 if sort.startswith('-') else 1
-        cursor = cursor.sort(field, direction)
-    docs = cursor.limit(limit)
+        pipeline.append({"$sort": {field: direction}})
+    pipeline.append({"$limit": limit})
+    # 左连接 stock_scores，按 symbol+trade_date_str 对 score_date
+    pipeline.append({
+        "$lookup": {
+            "from": "stock_scores",
+            "let": {"symbol": "$symbol", "trade_date_str": "$trade_date_str"},
+            "pipeline": [
+                {"$match": {"$expr": {"$and": [
+                    {"$eq": ["$symbol", "$$symbol"]},
+                    {"$eq": ["$score_date", "$$trade_date_str"]}
+                ]}}}
+            ],
+            "as": "score_docs"
+        }
+    })
+    pipeline.append({"$addFields": {
+        "score_doc": {"$arrayElemAt": ["$score_docs", 0]}
+    }})
+    # 合并评分字段到主文档
+    pipeline.append({"$addFields": {
+        "composite_score": {"$ifNull": ["$score_doc.composite_score", None]},
+        "cycle_score": {"$ifNull": ["$score_doc.cycle_score", None]},
+        "growth_score": {"$ifNull": ["$score_doc.growth_score", None]},
+        "fundamental_score": {"$ifNull": ["$score_doc.fundamental_score", None]},
+        "value_score": {"$ifNull": ["$score_doc.value_score", None]},
+        "technical_score": {"$ifNull": ["$score_doc.technical_score", None]},
+        "money_flow_score": {"$ifNull": ["$score_doc.money_flow_score", None]},
+        "score_date": {"$ifNull": ["$score_doc.score_date", None]}
+    }})
+    # pipeline.append({"$project": {"score_docs": 0, "score_doc": 0, "trade_date_str": 0}})
+    docs = list(collection.aggregate(pipeline))
+
+    pipeline.append({"$project": {
+        "symbol": 1,
+        "trade_date": 1,
+        "trade_date_str": 1,  # debug: see join key
+        "score_docs": 1,      # debug: see joined docs
+        "score_doc": 1,       # debug: see first joined doc
+        "composite_score": 1,
+        "cycle_score": 1,
+        "fundamental_score": 1,
+        "growth_score": 1,
+        "technical_score": 1,
+        "money_flow_score": 1,
+        "score_date": 1
+    }})
     return [serialize_doc(doc) for doc in docs]
 
 @router.get("/record/{record_id}")

@@ -2,9 +2,19 @@
 from datetime import datetime, date
 
 
+from bson import ObjectId
+
 def serialize_doc(doc):
-    doc["_id"] = str(doc["_id"])
-    return doc
+    def convert(obj):
+        if isinstance(obj, ObjectId):
+            return str(obj)
+        elif isinstance(obj, dict):
+            return {k: convert(v) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [convert(i) for i in obj]
+        else:
+            return obj
+    return convert(doc)
 
 def get_ts_code(symbol):
     if symbol.startswith('6'):
