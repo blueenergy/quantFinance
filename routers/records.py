@@ -23,7 +23,7 @@ class RecordResponseModel(BaseModel):
     score_date: Optional[str] = None
     # Add other fields as needed
 
-@router.get("/records/")
+@router.get("/records/", response_model=List[RecordResponseModel])
 def get_records(symbol: Optional[str] = Query(None), limit: int = 10, sort: Optional[str] = None):
     query = {}
     if symbol:
@@ -81,9 +81,6 @@ def get_records(symbol: Optional[str] = Query(None), limit: int = 10, sort: Opti
     pipeline.append({"$project": {
         "symbol": 1,
         "trade_date": 1,
-        "trade_date_str": 1,  # debug: see join key
-        "score_docs": 1,      # debug: see joined docs
-        "score_doc": 1,       # debug: see first joined doc
         "composite_score": 1,
         "cycle_score": 1,
         "fundamental_score": 1,
