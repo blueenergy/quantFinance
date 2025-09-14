@@ -4,8 +4,9 @@ from db import get_db_collections
 from typing import Optional,List
 from pydantic import BaseModel
 from datetime import datetime, timedelta
-from scores.stock_scoring_system import StockScoringSystem
+from fastapi import APIRouter
 
+router = APIRouter(tags=["股票排名"])
 
 
 # 添加tools目录到Python路径
@@ -17,71 +18,117 @@ from scores.stock_scoring_system import StockScoringSystem
 #     print(f"Warning: Cannot import StockScoringSystem: {e}")
 #     StockScoringSystem = None
 
-router = APIRouter(tags=["股票排名"])
 
-def get_scoring_system(date: Optional[str] = None):
-    """依赖注入：获取评分系统实例"""
-    if StockScoringSystem is None:
-        raise HTTPException(status_code=500, detail="评分系统未正确安装")
-    
-    # ✅ 修复：动态计算日期而不是硬编码
-    if date is None:
-        yesterday = datetime.now() - timedelta(days=1)
-        date = yesterday.strftime('%Y%m%d')
-    
-    return StockScoringSystem(base_date=date)
+from fastapi import Request
+
+def get_db_collections_from_request(request: Request):
+    # 假设 get_db_collections() 返回 {'stock_scores': ..., 'stock_info': ...}
+    return get_db_collections()
+
+
 
 @router.get("/stock-rankings")
 async def get_stock_rankings(
+    request: Request,
     limit: int = Query(100, ge=1, le=1000),
     min_score: Optional[float] = Query(None, description="最低分数过滤"),
     exclude_st: bool = Query(True, description="是否排除ST股票"),
-    date: Optional[str] = Query(None, description="指定日期 YYYYMMDD,默认为昨天")
+    date: Optional[str] = Query(None, description="指定日期 YYYYMMDD,默认为最新日期")
 ):
     """
-    获取股票评分排行榜
+    获取股票评分排行榜 - 每只股票只显示最新一天的评分
     
     Args:
         limit: 返回数量限制,默认100
         min_score: 最低分数过滤，可选
         exclude_st: 是否排除ST股票,默认True
-        date: 指定评分日期，格式 YYYYMMDD,默认为昨天
+        date: 指定评分日期，格式 YYYYMMDD,默认为最新日期
     """
     try:
-        scoring_system = get_scoring_system(date)
+        db = get_db_collections_from_request(request)
+        stock_scores = db['stock_scores']
+        stock_info = db['stock_info']
         
-        if exclude_st:
-            top_stocks = scoring_system.get_top_stocks(limit=limit, score_date=date)
-            
-            # 应用最低分数过滤
-            if min_score is not None:
-                top_stocks = [stock for stock in top_stocks if stock.get('total_score', 0) >= min_score]
-                top_stocks = top_stocks[:limit]
+        # ✅ 核心修改：确保每只股票只返回最新一天的评分
+        if date:
+            # 如果指定了日期，直接按该日期查询
+            query = {"score_date": date}
         else:
-            # 不排除ST股票的逻辑
-            query = {}
+            # 如果没有指定日期，使用聚合查询获取每只股票的最新评分
+            pipeline = [
+                # 按股票代码和评分日期分组，取最新日期
+                {
+                    "$group": {
+                        "_id": "$symbol",
+                        "latest_date": {"$max": "$score_date"},
+                        "docs": {"$push": "$$ROOT"}
+                    }
+                },
+                # 展开文档并只保留最新日期的记录
+                {"$unwind": "$docs"},
+                {
+                    "$match": {
+                        "$expr": {"$eq": ["$docs.score_date", "$latest_date"]}
+                    }
+                },
+                # 替换根文档
+                {"$replaceRoot": {"newRoot": "$docs"}},
+                # 按总分降序排序
+                {"$sort": {"composite_score": -1}},
+                # 限制返回数量
+                {"$limit": limit * 2}  # 多取一些，后面可能要过滤ST股票
+            ]
+            
+            all_stocks = list(stock_scores.aggregate(pipeline))
+            
+            # 如果聚合查询失败，fallback到原逻辑
+            if not all_stocks:
+                query = {}
+                if date:
+                    query["score_date"] = date
+                all_stocks = list(stock_scores.find(query).sort("composite_score", -1).limit(limit * 2))
+        if exclude_st and not date:
+            # 使用聚合查询结果
+            top_stocks = all_stocks
+        elif exclude_st:
+            # 指定日期时，直接查找该日期的评分并过滤ST
+            query = {"score_date": date}
+            all_stocks = list(stock_scores.find(query).sort("composite_score", -1).limit(limit * 2))
+            top_stocks = all_stocks
+        else:
+            # 不排除ST股票
             if date:
-                query["score_date"] = date
-            elif scoring_system.base_date:
-                query["score_date"] = scoring_system.base_date
-            
-            all_stocks = list(scoring_system.stock_scores.find(query).sort("total_score", -1).limit(limit * 2))
-            
-            # 添加股票名称和行业信息
-            for stock in all_stocks:
-                stock_info = scoring_system.stock_info.find_one({"symbol": stock['symbol']})
-                if stock_info:
-                    stock['name'] = stock_info.get('name', '')
-                    stock['industry'] = stock_info.get('industry', '')
-                else:
-                    stock['name'] = ''
-                    stock['industry'] = ''
-            
-            # 应用最低分数过滤
-            if min_score is not None:
-                all_stocks = [stock for stock in all_stocks if stock.get('total_score', 0) >= min_score]
-            
-            top_stocks = all_stocks[:limit]
+                query = {"score_date": date}
+                all_stocks = list(stock_scores.find(query).sort("composite_score", -1).limit(limit * 2))
+            # all_stocks 已经在上面定义了
+            top_stocks = all_stocks
+        # 添加股票名称和行业信息
+        for stock in top_stocks:
+            info = stock_info.find_one({"symbol": stock['symbol']})
+            stock['name'] = info.get('name', '') if info else ''
+            stock['industry'] = info.get('industry', '') if info else ''
+
+        # Python再次按composite_score降序排序，确保顺序正确
+        top_stocks.sort(key=lambda x: x.get('composite_score', 0), reverse=True)
+
+        # Debug输出，方便排查排序问题
+        print("[DEBUG] 排名预览：")
+        for s in top_stocks[:10]:
+            print(f"symbol={s.get('symbol')}, score_date={s.get('score_date')}, composite_score={s.get('composite_score')}")
+
+        # 排除ST股票（如果启用）
+        if exclude_st and not date:
+            # 过滤ST股票
+            top_stocks = [stock for stock in top_stocks 
+                         if not (stock.get('name', '').startswith('ST') or 
+                                stock.get('name', '').startswith('*ST'))]
+
+        # 应用最低分数过滤
+        if min_score is not None:
+            top_stocks = [stock for stock in top_stocks if stock.get('composite_score', 0) >= min_score]
+
+        # 最终限制数量
+        top_stocks = top_stocks[:limit]
         
         # 格式化返回数据
         formatted_stocks = []
@@ -95,12 +142,14 @@ async def get_stock_rankings(
                 "symbol": stock.get("symbol", ""),
                 "name": stock.get("name", ""),
                 "industry": stock.get("industry", ""),
-                "total_score": round(stock.get("total_score", 0), 2),
+                "composite_score": round(stock.get("composite_score", 0), 2),
                 "cycle_score": round(stock.get("cycle_score", 0), 2),
+                "growth_score": round(stock.get("growth_score", 0), 2),
                 "fundamental_score": round(stock.get("fundamental_score", 0), 2),
+                "value_score": round(stock.get("value_score", 0), 2),
                 "technical_score": round(stock.get("technical_score", 0), 2),
                 "money_flow_score": round(stock.get("money_flow_score", 0), 2),
-                "score_date": stock.get("score_date", scoring_system.base_date)
+                "score_date": stock.get("score_date", date if date else "")
             }
             formatted_stocks.append(formatted_stock)
         
@@ -108,7 +157,7 @@ async def get_stock_rankings(
             "success": True,
             "data": formatted_stocks,
             "total": len(formatted_stocks),
-            "date": scoring_system.base_date,
+            "date": date if date else "",
             "message": f"成功获取Top {len(formatted_stocks)}股票评分{'(已排除ST股票)' if exclude_st else ''}"
         }
         
@@ -118,96 +167,37 @@ async def get_stock_rankings(
         print(error_detail)
         raise HTTPException(status_code=500, detail=f"获取股票排行失败: {str(e)}")
 
-# ✅ 修改现有的刷新端点路径
-@router.post("/stock-rankings/refresh")  # 原来是 "/refresh"
-async def refresh_stock_scores(
-    symbols: Optional[list] = None,
-    date: Optional[str] = Query(None, description="指定日期 YYYYMMDD,默认为昨天")
-):
-    """
-    重新计算股票评分
-    
-    Args:
-        symbols: 指定股票代码列表，为空则计算所有股票
-        date: 指定评分日期，默认为昨天
-    """
-    try:
-        scoring_system = get_scoring_system(date)
-        
-        if symbols:
-            # 只计算指定股票
-            results = []
-            for symbol in symbols:
-                score_data = scoring_system.calculate_stock_score(symbol, base_date=date)
-                if score_data:
-                    # 更新数据库
-                    scoring_system.stock_scores.replace_one(
-                        {"symbol": symbol, "score_date": score_data.get("score_date")},
-                        score_data,
-                        upsert=True
-                    )
-                    results.append(score_data)
-            message = f"成功重新评分 {len(results)} 只指定股票"
-        else:
-            # 计算所有股票
-            results = scoring_system.score_all_stocks(base_date=date)
-            message = f"成功重新评分 {len(results)} 只股票"
-        
-        return {
-            "success": True,
-            "data": results,
-            "total": len(results),
-            "date": scoring_system.base_date,
-            "message": message
-        }
-    except Exception as e:
-        import traceback
-        print(f"重新评分失败: {str(e)}\n{traceback.format_exc()}")
-        raise HTTPException(status_code=500, detail=f"重新评分失败: {str(e)}")
-
 @router.get("/score/{symbol}")
 async def get_stock_score(
+    request: Request,
     symbol: str,
     date: Optional[str] = Query(None, description="指定日期 YYYYMMDD,默认为昨天")
 ):
     """
-    获取单个股票的详细评分
+    获取单个股票的详细评分（直接查数据库）
     """
     try:
-        scoring_system = get_scoring_system(date)
-        
+        db = get_db_collections_from_request(request)
+        stock_scores = db['stock_scores']
+        stock_info = db['stock_info']
         # 构建查询条件
         query = {"symbol": symbol}
-        if scoring_system.base_date:
-            query["score_date"] = scoring_system.base_date
-        
-        # 先从数据库查询已有评分
-        existing_score = scoring_system.stock_scores.find_one(query)
-        
-        if existing_score:
-            existing_score["_id"] = str(existing_score["_id"])
-            return {
-                "success": True,
-                "data": existing_score,
-                "message": "获取历史评分成功"
-            }
-        
-        # 如果没有历史评分，实时计算
-        score_data = scoring_system.calculate_stock_score(symbol, base_date=date)
-        if score_data:
-            # 保存到数据库
-            scoring_system.stock_scores.replace_one(
-                {"symbol": symbol, "score_date": score_data.get("score_date")},
-                score_data,
-                upsert=True
-            )
-            return {
-                "success": True,
-                "data": score_data,
-                "message": "实时计算评分成功"
-            }
-        else:
-            raise HTTPException(status_code=404, detail="股票未找到或数据不足")
+        if date:
+            query["score_date"] = date
+        # 查找评分
+        score = stock_scores.find_one(query, sort=[("score_date", -1)])
+        if not score:
+            raise HTTPException(status_code=404, detail="未找到该股票评分记录")
+        # 查找股票信息
+        info = stock_info.find_one({"symbol": symbol})
+        score["_id"] = str(score["_id"])
+        score["name"] = info.get("name", "") if info else ""
+        score["industry"] = info.get("industry", "") if info else ""
+        return {
+            "success": True,
+            "data": score,
+            "message": "获取历史评分成功"
+        }
     except HTTPException:
         raise
     except Exception as e:
@@ -217,22 +207,28 @@ async def get_stock_score(
 
 @router.get("/score-history/{symbol}")
 async def get_stock_score_history(
+    request: Request,
     symbol: str,
     days: int = Query(30, ge=1, le=365),
     date: Optional[str] = Query(None, description="截止日期 YYYYMMDD,默认为昨天")
 ):
-    """获取股票评分历史记录"""
+    """获取股票评分历史记录（直接查数据库）"""
     try:
-        scoring_system = get_scoring_system(date)
-        
-        # 使用评分系统的方法获取历史记录
-        score_history = scoring_system.get_stock_score_history(symbol, days=days)
-        
-        # 转换ObjectId
-        for score in score_history:
+        db = get_db_collections_from_request(request)
+        stock_scores = db['stock_scores']
+        # 构建查询条件
+        query = {"symbol": symbol}
+        if date:
+            query["score_date"] = {"$lte": date}
+        # 查询最近days天的评分，按score_date降序
+        cursor = stock_scores.find(query).sort("score_date", -1).limit(days)
+        score_history = []
+        for score in cursor:
             if '_id' in score:
                 score["_id"] = str(score["_id"])
-        
+            score_history.append(score)
+        # 按日期升序返回
+        score_history = sorted(score_history, key=lambda x: x.get("score_date", ""))
         return {
             "success": True,
             "data": score_history,
@@ -284,17 +280,17 @@ async def get_score_categories():
 
 @router.get("/statistics")
 async def get_scoring_statistics(
+    request: Request,
     date: Optional[str] = Query(None, description="指定日期 YYYYMMDD, 默认为昨天")
 ):
-    """获取评分统计信息"""
+    """获取评分统计信息（直接查数据库）"""
     try:
-        scoring_system = get_scoring_system(date)
-        
+        db = get_db_collections_from_request(request)
+        stock_scores = db['stock_scores']
         # 构建查询条件
         match_query = {}
-        if scoring_system.base_date:
-            match_query["score_date"] = scoring_system.base_date
-        
+        if date:
+            match_query["score_date"] = date
         # 统计各分数段的股票数量
         pipeline = [
             {"$match": match_query},
@@ -303,36 +299,33 @@ async def get_scoring_statistics(
                     "_id": {
                         "$switch": {
                             "branches": [
-                                {"case": {"$gte": ["$total_score", 80]}, "then": "优秀(80-100)"},
-                                {"case": {"$gte": ["$total_score", 70]}, "then": "良好(70-79)"},
-                                {"case": {"$gte": ["$total_score", 60]}, "then": "一般(60-69)"},
-                                {"case": {"$gte": ["$total_score", 50]}, "then": "较差(50-59)"}
+                                {"case": {"$gte": ["$composite_score", 80]}, "then": "优秀(80-100)"},
+                                {"case": {"$gte": ["$composite_score", 70]}, "then": "良好(70-79)"},
+                                {"case": {"$gte": ["$composite_score", 60]}, "then": "一般(60-69)"},
+                                {"case": {"$gte": ["$composite_score", 50]}, "then": "较差(50-59)"}
                             ],
                             "default": "很差(0-49)"
                         }
                     },
                     "count": {"$sum": 1},
-                    "avg_score": {"$avg": "$total_score"}
+                    "avg_score": {"$avg": "$composite_score"}
                 }
             },
             {"$sort": {"avg_score": -1}}
         ]
-        
-        score_distribution = list(scoring_system.stock_scores.aggregate(pipeline))
-        
+        score_distribution = list(stock_scores.aggregate(pipeline))
         # 总体统计
-        total_stocks = scoring_system.stock_scores.count_documents(match_query)
-        avg_pipeline = [{"$match": match_query}, {"$group": {"_id": None, "avg": {"$avg": "$total_score"}}}]
-        avg_result = list(scoring_system.stock_scores.aggregate(avg_pipeline))
+        total_stocks = stock_scores.count_documents(match_query)
+        avg_pipeline = [{"$match": match_query}, {"$group": {"_id": None, "avg": {"$avg": "$composite_score"}}}]
+        avg_result = list(stock_scores.aggregate(avg_pipeline))
         avg_score = avg_result[0]["avg"] if avg_result else 0
-        
         return {
             "success": True,
             "data": {
                 "total_stocks": total_stocks,
                 "average_score": round(avg_score, 2),
                 "score_distribution": score_distribution,
-                "query_date": scoring_system.base_date,
+                "query_date": date if date else "",
                 "last_update": datetime.now().isoformat()
             },
             "message": "获取评分统计成功"
@@ -360,77 +353,76 @@ async def get_current_date():
 class SelectedStocksRequest(BaseModel):
     symbols: List[str]
 
-# ✅ 修复 selected 端点
+# ✅ 修复 selected 端点 - 确保每只股票只显示最新评分
+
 @router.post("/stock-rankings/selected")
 async def get_selected_stock_rankings(
-    request: SelectedStocksRequest,  # ✅ 使用 Pydantic 模型接收请求体
-    date: Optional[str] = Query(None, description="指定日期 YYYYMMDD,默认为昨天")
+    request: Request,
+    body: SelectedStocksRequest,
+    date: Optional[str] = Query(None, description="指定日期 YYYYMMDD,默认为每只股票的最新日期")
 ):
     """
-    获取指定股票的评分
-    
-    Args:
-        request: 包含股票代码列表的请求体
-        date: 指定评分日期，默认为昨天
+    获取指定股票的评分 - 每只股票只显示最新一天的评分（直接查数据库）
     """
     try:
-        symbols = request.symbols  # ✅ 从请求体中获取 symbols
-        print(f"✅ 接收到股票代码: {symbols}") 
-        
+        symbols = body.symbols
         if not symbols:
             raise HTTPException(status_code=400, detail="股票代码列表不能为空")
-        
-        scoring_system = get_scoring_system(date)
-        
-        # 构建查询条件
-        query = {"symbol": {"$in": symbols}}
-        if scoring_system.base_date:
-            query["score_date"] = scoring_system.base_date
-        
-        # 查询指定股票的评分
-        selected_stocks = list(scoring_system.stock_scores.find(query))
-        
+        db = get_db_collections_from_request(request)
+        stock_scores = db['stock_scores']
+        stock_info = db['stock_info']
+        if date:
+            query = {"symbol": {"$in": symbols}, "score_date": date}
+            selected_stocks = list(stock_scores.find(query))
+        else:
+            pipeline = [
+                {"$match": {"symbol": {"$in": symbols}}},
+                {"$group": {
+                    "_id": "$symbol",
+                    "latest_date": {"$max": "$score_date"},
+                    "docs": {"$push": "$$ROOT"}
+                }},
+                {"$unwind": "$docs"},
+                {"$match": {"$expr": {"$eq": ["$docs.score_date", "$latest_date"]}}},
+                {"$replaceRoot": {"newRoot": "$docs"}},
+                {"$sort": {"composite_score": -1}}
+            ]
+            selected_stocks = list(stock_scores.aggregate(pipeline))
+            if not selected_stocks:
+                base_query = {"symbol": {"$in": symbols}}
+                selected_stocks = list(stock_scores.find(base_query))
         # 添加股票名称和行业信息
         for stock in selected_stocks:
-            stock_info = scoring_system.stock_info.find_one({"symbol": stock['symbol']})
-            if stock_info:
-                stock['name'] = stock_info.get('name', '')
-                stock['industry'] = stock_info.get('industry', '')
-            else:
-                stock['name'] = ''
-                stock['industry'] = ''
-        
-        # 按总分降序排序
-        selected_stocks.sort(key=lambda x: x.get('total_score', 0), reverse=True)
-        
+            info = stock_info.find_one({"symbol": stock['symbol']})
+            stock['name'] = info.get('name', '') if info else ''
+            stock['industry'] = info.get('industry', '') if info else ''
+        # 如果没有指定日期，按总分降序排序
+        if not date:
+            selected_stocks.sort(key=lambda x: x.get('composite_score', 0), reverse=True)
         # 格式化返回数据
         formatted_stocks = []
         for stock in selected_stocks:
-            # 处理 ObjectId
             if '_id' in stock:
                 stock['_id'] = str(stock['_id'])
-            
             formatted_stock = {
                 "symbol": stock.get("symbol", ""),
                 "name": stock.get("name", ""),
                 "industry": stock.get("industry", ""),
-                "total_score": round(stock.get("total_score", 0), 2),
+                "composite_score": round(stock.get("composite_score", 0), 2),
                 "cycle_score": round(stock.get("cycle_score", 0), 2),
                 "fundamental_score": round(stock.get("fundamental_score", 0), 2),
                 "technical_score": round(stock.get("technical_score", 0), 2),
                 "money_flow_score": round(stock.get("money_flow_score", 0), 2),
-                "score_date": stock.get("score_date", scoring_system.base_date)
+                "score_date": stock.get("score_date", date if date else "")
             }
             formatted_stocks.append(formatted_stock)
-        
         return {
             "success": True,
             "data": formatted_stocks,
             "total": len(formatted_stocks),
-            "date": scoring_system.base_date,
-            "message": f"成功获取 {len(formatted_stocks)} 只指定股票评分"
+            "date": date if date else "",
+            "message": f"成功获取 {len(formatted_stocks)} 只指定股票评分 (每只股票显示最新评分)"
         }
-        
     except HTTPException:
         raise
     except Exception as e:
