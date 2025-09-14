@@ -33,7 +33,8 @@ async def get_stock_rankings(
     limit: int = Query(100, ge=1, le=1000),
     min_score: Optional[float] = Query(None, description="最低分数过滤"),
     exclude_st: bool = Query(True, description="是否排除ST股票"),
-    date: Optional[str] = Query(None, description="指定日期 YYYYMMDD,默认为最新日期")
+    date: Optional[str] = Query(None, description="指定日期 YYYYMMDD,默认为最新日期"),
+    strategy: str = Query('balanced', description="指定排行榜策略，balanced/aggressive/conservative")
 ):
     """
     获取股票评分排行榜 - 每只股票只显示最新一天的评分
@@ -109,12 +110,22 @@ async def get_stock_rankings(
             stock['industry'] = info.get('industry', '') if info else ''
 
         # Python再次按composite_score降序排序，确保顺序正确
-        top_stocks.sort(key=lambda x: x.get('composite_score', 0), reverse=True)
+        def extract_score(stock):
+            cs = stock.get('composite_score', 0)
+            if isinstance(cs, dict):
+                return cs.get(strategy, 0)
+            return cs
+        top_stocks.sort(key=extract_score, reverse=True)
 
         # Debug输出，方便排查排序问题
         print("[DEBUG] 排名预览：")
         for s in top_stocks[:10]:
-            print(f"symbol={s.get('symbol')}, score_date={s.get('score_date')}, composite_score={s.get('composite_score')}")
+            cs = s.get('composite_score', 0)
+            if isinstance(cs, dict):
+                score_val = cs.get(strategy, 0)
+            else:
+                score_val = cs
+            print(f"symbol={s.get('symbol')}, score_date={s.get('score_date')}, composite_score={score_val}")
 
         # 排除ST股票（如果启用）
         if exclude_st and not date:
@@ -136,13 +147,17 @@ async def get_stock_rankings(
             # 处理 ObjectId
             if '_id' in stock:
                 stock['_id'] = str(stock['_id'])
-            
+            cs = stock.get("composite_score", 0)
+            # 保证 composite_score 始终为 dict
+            if not isinstance(cs, dict):
+                cs = {'balanced': cs}
+            cs_val = cs.get(strategy, 0)
             formatted_stock = {
                 "rank": i,
                 "symbol": stock.get("symbol", ""),
                 "name": stock.get("name", ""),
                 "industry": stock.get("industry", ""),
-                "composite_score": round(stock.get("composite_score", 0), 2),
+                "composite_score": cs,
                 "cycle_score": round(stock.get("cycle_score", 0), 2),
                 "growth_score": round(stock.get("growth_score", 0), 2),
                 "fundamental_score": round(stock.get("fundamental_score", 0), 2),
@@ -432,3 +447,7 @@ async def get_selected_stock_rankings(
         error_detail = f"获取指定股票评分失败: {str(e)}\n{traceback.format_exc()}"
         print(error_detail)
         raise HTTPException(status_code=500, detail=f"获取指定股票评分失败: {str(e)}")
+
+# # 假设 ranking_strategy 变量为当前排序策略
+# df['score_for_sort'] = df['composite_score'].apply(lambda x: x.get(ranking_strategy, 0) if isinstance(x, dict) else x)
+# df = df.sort_values('score_for_sort', ascending=False).reset_index(drop=True)
