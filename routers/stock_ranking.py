@@ -410,7 +410,9 @@ async def get_selected_stock_rankings(
                 "industry": stock.get("industry", ""),
                 "composite_score": round(stock.get("composite_score", 0), 2),
                 "cycle_score": round(stock.get("cycle_score", 0), 2),
+                "value_score": round(stock.get("value_score", 0), 2),
                 "fundamental_score": round(stock.get("fundamental_score", 0), 2),
+                "growth_score": round(stock.get("growth_score", 0), 2),
                 "technical_score": round(stock.get("technical_score", 0), 2),
                 "money_flow_score": round(stock.get("money_flow_score", 0), 2),
                 "score_date": stock.get("score_date", date if date else "")
