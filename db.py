@@ -1,5 +1,6 @@
 import os
 from pymongo import MongoClient
+from pymongo.collection import Collection
 from typing import Dict
 from dotenv import load_dotenv
 load_dotenv()
@@ -12,7 +13,7 @@ DB_NAME = "finance"
 client = MongoClient(mongo_url)
 db = client[DB_NAME]
 
-def get_db_collections() -> Dict[str, object]:
+def get_db_collections() -> Dict[str, Collection]:
     """
     Return a dict of commonly used collections.
     Usage:
@@ -22,6 +23,7 @@ def get_db_collections() -> Dict[str, object]:
     return {
         "users": db["users"],
         "stock_info": db["stock_info"],
+        "stock_scores": db["stock_scores"],
         "volume_price": db["volume_price"],
         "analysis_history": db["analysis_history"],
         "login_logs": db["login_logs"],
