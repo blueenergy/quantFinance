@@ -13,6 +13,11 @@ collection = collections["volume_price"] # type: ignore
 class RecordResponseModel(BaseModel):
     symbol: Optional[str]
     trade_date: Optional[Any]
+    open: Optional[float] = None
+    close: Optional[float] = None
+    high: Optional[float] = None
+    low: Optional[float] = None
+    volume: Optional[float] = None
     composite_score: Optional[float] = None
     cycle_score: Optional[float] = None
     growth_score: Optional[float] = None
@@ -75,12 +80,29 @@ def get_records(symbol: Optional[str] = Query(None), limit: int = 10, sort: Opti
         "money_flow_score": {"$ifNull": ["$score_doc.money_flow_score", None]},
         "score_date": {"$ifNull": ["$score_doc.score_date", None]}
     }})
+    # composite_score 兼容 dict，始终返回 float（如 balanced）
+    pipeline.append({
+        "$addFields": {
+            "composite_score": {
+                "$cond": [
+                    {"$eq": [ {"$type": "$composite_score"}, "object"]},
+                    "$composite_score.balanced",
+                    "$composite_score"
+                ]
+            }
+        }
+    })
     # pipeline.append({"$project": {"score_docs": 0, "score_doc": 0, "trade_date_str": 0}})
     docs = list(collection.aggregate(pipeline))
 
     pipeline.append({"$project": {
         "symbol": 1,
         "trade_date": 1,
+        "open": 1,
+        "close": 1,
+        "high": 1,
+        "low": 1,
+        "volume": 1,
         "composite_score": 1,
         "cycle_score": 1,
         "fundamental_score": 1,
