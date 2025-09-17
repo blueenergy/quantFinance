@@ -411,9 +411,14 @@ async def get_selected_stock_rankings(
             info = stock_info.find_one({"symbol": stock['symbol']})
             stock['name'] = info.get('name', '') if info else ''
             stock['industry'] = info.get('industry', '') if info else ''
-        # 如果没有指定日期，按总分降序排序
+        # 如果没有指定日期，按总分降序排序（兼容 composite_score 为 dict 或数值）
         if not date:
-            selected_stocks.sort(key=lambda x: x.get('composite_score', 0), reverse=True)
+            def extract_score(x):
+                cs = x.get('composite_score', 0)
+                if isinstance(cs, dict):
+                    return cs.get('balanced', 0)
+                return cs
+            selected_stocks.sort(key=extract_score, reverse=True)
         # 格式化返回数据
         formatted_stocks = []
         for stock in selected_stocks:
@@ -423,7 +428,7 @@ async def get_selected_stock_rankings(
                 "symbol": stock.get("symbol", ""),
                 "name": stock.get("name", ""),
                 "industry": stock.get("industry", ""),
-                "composite_score": round(stock.get("composite_score", 0), 2),
+                "composite_score": stock.get("composite_score", 0),
                 "cycle_score": round(stock.get("cycle_score", 0), 2),
                 "value_score": round(stock.get("value_score", 0), 2),
                 "fundamental_score": round(stock.get("fundamental_score", 0), 2),
