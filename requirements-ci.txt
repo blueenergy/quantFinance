@@ -1,0 +1,6 @@
+pytest
+requests
+httpx
+pandas
+numpy
+pymongo
