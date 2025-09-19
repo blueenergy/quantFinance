@@ -4,3 +4,7 @@ httpx
 pandas
 numpy
 pymongo
+dotenv
+fastapi
+tushare
+efinance
