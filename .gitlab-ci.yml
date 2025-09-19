@@ -5,7 +5,9 @@ variables:
   PIP_CACHE_DIR: "$CI_PROJECT_DIR/.cache/pip"
 
 cache:
-  key: "${CI_COMMIT_REF_SLUG}"
+  key:
+    files:
+      - requirements-ci.txt
   paths:
     - .cache/pip
     - dashboard/node_modules/
@@ -38,7 +40,7 @@ backend-unit-tests:
     - python -m venv .venv
     - source .venv/bin/activate
     - pip install --upgrade pip
-    - pip install -r requirements-ci.txt
+    - pip install --cache-dir "$PIP_CACHE_DIR" -r requirements-ci.txt
   script:
     - source .venv/bin/activate && pytest -q -m unit --junitxml=pytest-unit-report.xml || true
   artifacts:
@@ -57,7 +59,7 @@ backend-integration-tests:
     - python -m venv .venv
     - source .venv/bin/activate
     - pip install --upgrade pip
-    - pip install -r requirements-ci.txt
+    - pip install --cache-dir "$PIP_CACHE_DIR" -r requirements-ci.txt
   script:
     - source .venv/bin/activate && pytest -q -m integration --junitxml=pytest-integration-report.xml || true
   artifacts:
