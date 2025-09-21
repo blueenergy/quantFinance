@@ -7,7 +7,7 @@ from market_analysis_cache import market_analysis_cache
 from llm_service import llm_manager
 from datetime import date,datetime
 from external_data import external_market_data
-from utils import serialize_doc
+from utils.stock_utils import serialize_doc
 router = APIRouter()
 
 @router.post("/analyze-market")

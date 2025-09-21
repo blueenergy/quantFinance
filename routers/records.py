@@ -4,7 +4,7 @@ from bson import ObjectId
 from fastapi import APIRouter, Query, HTTPException, Depends
 from pydantic import BaseModel
 from db import get_db_collections
-from utils import serialize_doc
+from utils.stock_utils import serialize_doc
 from auth import get_current_active_user
 router = APIRouter()
 

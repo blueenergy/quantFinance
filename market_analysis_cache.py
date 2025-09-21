@@ -16,15 +16,96 @@ class MarketAnalysisCache:
     """市场分析缓存管理器"""
     
     def __init__(self):
-        # MongoDB连接
+        # Attempt to connect to MongoDB. If unavailable (e.g. during unit tests),
+        # fall back to a lightweight in-memory collection to avoid import-time failures.
         mongodb_url = os.getenv('MONGO_URL', 'mongodb://localhost:27017')
-        client = MongoClient(mongodb_url)
         db_name = os.getenv('MONGO_DB', 'finance')
-        self.db = client[db_name]
-        self.collection = self.db['market_analysis_cache']
-        
-        # 创建索引
-        self.collection.create_index([("analysis_date", 1)], unique=True)
+
+        class _InMemoryCollection:
+            def __init__(self):
+                self._docs = []
+
+            def create_index(self, *args, **kwargs):
+                # no-op for in-memory
+                return None
+
+            def find_one(self, query):
+                for d in self._docs:
+                    match = True
+                    for k, v in query.items():
+                        if k not in d or d.get(k) != v:
+                            match = False
+                            break
+                    if match:
+                        return d.copy()
+                return None
+
+            def replace_one(self, filter_q, doc, upsert=False):
+                # simplistic upsert behavior
+                existing = self.find_one(filter_q)
+                if existing:
+                    # replace fields
+                    for i, d in enumerate(self._docs):
+                        if all(item in d.items() for item in filter_q.items()):
+                            self._docs[i] = doc.copy()
+                            return
+                if upsert:
+                    self._docs.append(doc.copy())
+
+            def find(self, query=None):
+                results = []
+                if not query:
+                    results = [d.copy() for d in self._docs]
+                else:
+                    for d in self._docs:
+                        match = True
+                        for k, v in query.items():
+                            if k not in d or d.get(k) != v:
+                                match = False
+                                break
+                        if match:
+                            results.append(d.copy())
+                class Cursor(list):
+                    def sort(self, *args, **kwargs):
+                        return self
+
+                    def skip(self, n):
+                        return Cursor(list(self)[n:])
+
+                    def limit(self, n):
+                        return Cursor(list(self)[:n])
+
+                return Cursor(results)
+
+            def delete_many(self, query):
+                before = len(self._docs)
+                self._docs = [d for d in self._docs if not all(item in d.items() for item in query.items())]
+                class Result:
+                    def __init__(self, deleted_count):
+                        self.deleted_count = deleted_count
+                return Result(before - len(self._docs))
+
+        # Decide whether to use an in-memory fallback. Prefer explicit opt-in
+        # so production does not silently use test behavior. Tests will set
+        # USE_IN_MEMORY_DB=1 in their environment (see tests/conftest.py).
+        use_in_memory = os.getenv('USE_IN_MEMORY_DB', '').lower() in ('1', 'true', 'yes')
+        # Pytest sets PYTEST_CURRENT_TEST in the environment for running tests;
+        # allow that as an implicit opt-in for local test runs.
+        if not use_in_memory and os.getenv('PYTEST_CURRENT_TEST'):
+            use_in_memory = True
+
+        if use_in_memory:
+            # Use in-memory implementation without attempting network connection
+            self.db = None
+            self.collection = _InMemoryCollection()
+        else:
+            # In non-test environments, attempt to connect to a real MongoDB
+            # and surface connection errors so deployment issues are visible.
+            client = MongoClient(mongodb_url, serverSelectionTimeoutMS=2000)
+            self.db = client[db_name]
+            self.collection = self.db['market_analysis_cache']
+            # attempt a quick operation to validate connection
+            self.collection.create_index([("analysis_date", 1)], unique=True)
     
     def is_trading_day(self, check_date: date = None) -> bool:
         """
