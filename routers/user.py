@@ -5,7 +5,7 @@ from models import UserCreate, UserLogin, UserResponse, Token, WatchlistRequest,
 from auth import create_user, authenticate_user, create_access_token, get_current_active_user, log_login_attempt,ACCESS_TOKEN_EXPIRE_MINUTES
 from db import get_db_collections
 from datetime import timedelta, datetime
-from utils import get_ts_code
+from utils.stock_utils import get_ts_code
 
 router = APIRouter()
 

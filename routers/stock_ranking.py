@@ -1,11 +1,15 @@
 # routers/stock_scoring.py
 from fastapi import APIRouter, HTTPException, Depends, Query, Request
 from db import get_db_collections
+from utils.score_utils import safe_round, safe_float, extract_strategy_score
 from typing import Optional, List, Any, cast
 from pydantic import BaseModel
 from datetime import datetime, timedelta
 
 router = APIRouter(tags=["股票排名"])
+
+
+# using helpers from stock-scoring-system/utils/score_utils.py
 
 
 def get_db_collections_from_request(request: Request):
@@ -64,30 +68,27 @@ async def get_stock_rankings(
         else:
             top_stocks = all_stocks
 
-        def extract_score(stock):
-            cs = stock.get('composite_score', 0)
-            if isinstance(cs, dict):
-                return cs.get(strategy, 0)
-            return cs
-
-        top_stocks.sort(key=extract_score, reverse=True)
+        # use centralized helper to extract strategy-specific score
+        top_stocks.sort(key=lambda s: extract_strategy_score(s.get('composite_score', 0), strategy), reverse=True)
 
         formatted = []
         for stock in top_stocks[:limit]:
             cs = stock.get('composite_score', 0)
+            # ensure composite_score is a dict for consistent responses
             if not isinstance(cs, dict):
                 cs = {'balanced': cs}
+
             formatted.append({
                 'symbol': stock.get('symbol', ''),
                 'name': stock.get('name', ''),
                 'industry': stock.get('industry', ''),
                 'composite_score': cs,
-                'cycle_score': round(stock.get('cycle_score', 0), 2),
-                'value_score': round(stock.get('value_score', 0), 2),
-                'fundamental_score': round(stock.get('fundamental_score', 0), 2),
-                'growth_score': round(stock.get('growth_score', 0), 2),
-                'technical_score': round(stock.get('technical_score', 0), 2),
-                'money_flow_score': round(stock.get('money_flow_score', 0), 2),
+                'cycle_score': safe_round(stock.get('cycle_score', 0), 2),
+                'value_score': safe_round(stock.get('value_score', 0), 2),
+                'fundamental_score': safe_round(stock.get('fundamental_score', 0), 2),
+                'growth_score': safe_round(stock.get('growth_score', 0), 2),
+                'technical_score': safe_round(stock.get('technical_score', 0), 2),
+                'money_flow_score': safe_round(stock.get('money_flow_score', 0), 2),
                 'score_date': stock.get('score_date', '')
             })
 
@@ -313,12 +314,12 @@ async def get_selected_stock_rankings(
                             cs = {'balanced': cs}
                         per_date_scores[d] = cs
                         per_date_fields[d] = {
-                            'cycle_score': round(doc.get('cycle_score', 0), 2),
-                            'growth_score': round(doc.get('growth_score', 0), 2),
-                            'fundamental_score': round(doc.get('fundamental_score', 0), 2),
-                            'value_score': round(doc.get('value_score', 0), 2),
-                            'technical_score': round(doc.get('technical_score', 0), 2),
-                            'money_flow_score': round(doc.get('money_flow_score', 0), 2)
+                            'cycle_score': safe_round(doc.get('cycle_score', 0), 2),
+                            'growth_score': safe_round(doc.get('growth_score', 0), 2),
+                            'fundamental_score': safe_round(doc.get('fundamental_score', 0), 2),
+                            'value_score': safe_round(doc.get('value_score', 0), 2),
+                            'technical_score': safe_round(doc.get('technical_score', 0), 2),
+                            'money_flow_score': safe_round(doc.get('money_flow_score', 0), 2)
                         }
                 info = info_cache.get(sym) or stock_info.find_one({"symbol": sym})
                 formatted_stocks.append({
@@ -366,12 +367,8 @@ async def get_selected_stock_rankings(
             stock['industry'] = info.get('industry', '') if info else ''
         # 如果没有指定日期，按总分降序排序（兼容 composite_score 为 dict 或数值）
         if not date:
-            def extract_score(x):
-                cs = x.get('composite_score', 0)
-                if isinstance(cs, dict):
-                    return cs.get('balanced', 0)
-                return cs
-            selected_stocks.sort(key=extract_score, reverse=True)
+            # default to 'balanced' strategy when sorting selected stocks
+            selected_stocks.sort(key=lambda x: extract_strategy_score(x.get('composite_score', 0), 'balanced'), reverse=True)
         # 格式化返回数据
         formatted_stocks = []
         for stock in selected_stocks:
@@ -385,12 +382,12 @@ async def get_selected_stock_rankings(
                 'name': stock.get('name', ''),
                 'industry': stock.get('industry', ''),
                 'composite_score': cs,
-                'cycle_score': round(stock.get('cycle_score', 0), 2),
-                'value_score': round(stock.get('value_score', 0), 2),
-                'fundamental_score': round(stock.get('fundamental_score', 0), 2),
-                'growth_score': round(stock.get('growth_score', 0), 2),
-                'technical_score': round(stock.get('technical_score', 0), 2),
-                'money_flow_score': round(stock.get('money_flow_score', 0), 2),
+                'cycle_score': safe_round(stock.get('cycle_score', 0), 2),
+                'value_score': safe_round(stock.get('value_score', 0), 2),
+                'fundamental_score': safe_round(stock.get('fundamental_score', 0), 2),
+                'growth_score': safe_round(stock.get('growth_score', 0), 2),
+                'technical_score': safe_round(stock.get('technical_score', 0), 2),
+                'money_flow_score': safe_round(stock.get('money_flow_score', 0), 2),
                 'score_date': stock.get('score_date', date if date else '')
             }
             formatted_stocks.append(formatted_stock)

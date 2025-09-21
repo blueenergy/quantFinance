@@ -42,7 +42,16 @@ backend-unit-tests:
     - pip install --upgrade pip
     - pip install --cache-dir "$PIP_CACHE_DIR" -r requirements-ci.txt
   script:
-    - source .venv/bin/activate && pytest -q -m unit --junitxml=pytest-unit-report.xml || true
+    - source .venv/bin/activate
+    - |
+      # load repository .env if present (do NOT commit secrets)
+      if [ -f "$CI_PROJECT_DIR/.env" ]; then set -a && source "$CI_PROJECT_DIR/.env" && set +a; fi
+
+      # default test path mirrors local usage: tests/unit
+      TEST_PATH=${CI_TEST_PATH:-tests/unit}
+      echo "Running unit tests in $TEST_PATH"
+      # ensure tests import modules from the quantFinance package directory
+      PYTHONPATH="$CI_PROJECT_DIR" pytest -q "$TEST_PATH" -m unit --junitxml=pytest-unit-report.xml
   artifacts:
     when: always
     expire_in: 1 week
@@ -61,7 +70,16 @@ backend-integration-tests:
     - pip install --upgrade pip
     - pip install --cache-dir "$PIP_CACHE_DIR" -r requirements-ci.txt
   script:
-    - source .venv/bin/activate && pytest -q -m integration --junitxml=pytest-integration-report.xml || true
+    - source .venv/bin/activate
+    - |
+      # load repository .env if present (do NOT commit secrets)
+      if [ -f "$CI_PROJECT_DIR/.env" ]; then set -a && source "$CI_PROJECT_DIR/.env" && set +a; fi
+
+      # default test path mirrors local usage: tests/integration
+      TEST_PATH=${CI_TEST_PATH:-tests/integration}
+      echo "Running integration tests in $TEST_PATH"
+      # ensure tests import modules from the quantFinance package directory
+      PYTHONPATH="$CI_PROJECT_DIR" pytest -q "$TEST_PATH" -m integration --junitxml=pytest-integration-report.xml || true
   artifacts:
     when: always
     expire_in: 1 week

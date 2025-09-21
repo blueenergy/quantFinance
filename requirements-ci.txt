@@ -8,3 +8,7 @@ dotenv
 fastapi
 tushare
 efinance
+passlib[bcrypt]
+email-validator
+pydantic[email]
+PyJWT

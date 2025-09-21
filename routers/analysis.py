@@ -6,7 +6,7 @@ from auth import get_current_active_user
 from db import get_db_collections
 from llm_service import llm_manager
 from datetime import datetime
-from utils import serialize_doc,format_trade_date
+from utils.stock_utils import serialize_doc,format_trade_date
 
 router = APIRouter()
 
