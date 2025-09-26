@@ -1,6 +1,6 @@
 from typing import Optional, Dict, Any
 from fastapi import APIRouter, Depends, HTTPException
-from models import MarketAnalysisRequest
+from models.all_models import MarketAnalysisRequest
 from auth import get_current_active_user
 from db import get_db_collections
 from market_analysis_cache import market_analysis_cache

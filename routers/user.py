@@ -1,7 +1,7 @@
 import os
 import tushare as ts
 from fastapi import APIRouter, Depends, Request, Query, HTTPException
-from models import UserCreate, UserLogin, UserResponse, Token, WatchlistRequest, WatchlistUpdateRequest
+from models.all_models import UserCreate, UserLogin, UserResponse, Token, WatchlistRequest, WatchlistUpdateRequest
 from auth import create_user, authenticate_user, create_access_token, get_current_active_user, log_login_attempt,ACCESS_TOKEN_EXPIRE_MINUTES
 from db import get_db_collections
 from datetime import timedelta, datetime

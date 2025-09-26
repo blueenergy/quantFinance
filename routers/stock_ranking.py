@@ -405,7 +405,3 @@ async def get_selected_stock_rankings(
         error_detail = f"获取指定股票评分失败: {str(e)}\n{traceback.format_exc()}"
         print(error_detail)
         raise HTTPException(status_code=500, detail=f"获取指定股票评分失败: {str(e)}")
-
-# # 假设 ranking_strategy 变量为当前排序策略
-# df['score_for_sort'] = df['composite_score'].apply(lambda x: x.get(ranking_strategy, 0) if isinstance(x, dict) else x)
-# df = df.sort_values('score_for_sort', ascending=False).reset_index(drop=True)
