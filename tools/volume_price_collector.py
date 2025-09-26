@@ -7,7 +7,7 @@ from datetime import datetime, date, timedelta
 import time
 from tqdm import tqdm
 import tushare as ts
-from utils import get_ts_code
+from utils.stock_utils import get_ts_code
 from dotenv import load_dotenv
 load_dotenv()
 
