@@ -6,6 +6,8 @@ from routers.admin import router as admin_router
 from routers.analysis import router as analysis_router
 from routers.records import router as records_router
 from routers.stock_ranking import router as stock_ranking_router
+from routers import index_data 
+
 
 app = FastAPI()
 
@@ -17,3 +19,4 @@ app.include_router(admin_router, prefix="/api/admin", tags=["管理员"])
 app.include_router(analysis_router, prefix="/api", tags=["AI分析"])
 app.include_router(records_router, prefix="/api", tags=["记录查询"])
 app.include_router(stock_ranking_router, prefix="/api", tags=["股票排名"])
+app.include_router(index_data.router, prefix="/api/index", tags=["指数数据"])

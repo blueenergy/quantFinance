@@ -1,7 +1,7 @@
 import os
 from typing import Optional, Dict, Any
 from fastapi import APIRouter, Depends, Query, HTTPException
-from models import StockAnalysisRequest, AnalysisHistoryRequest
+from models.all_models import StockAnalysisRequest, AnalysisHistoryRequest
 from auth import get_current_active_user
 from db import get_db_collections
 from llm_service import llm_manager
