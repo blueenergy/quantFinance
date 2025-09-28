@@ -1,24 +1,45 @@
 # app/routers/index_data.py
 from fastapi import APIRouter, HTTPException
 #from services.index_services import index_service
-from models.index_models import HS300ConstituentsResponse
+from models.index_models import HS300ConstituentsResponse, IndexConstituentsResponse
 from services.index_services import IndexService
 router = APIRouter()
 
+# 沪深300
 @router.get("/hs300/constituents", response_model=HS300ConstituentsResponse)
 async def get_hs300_constituents(force_refresh: bool = False):
-    """HTTP接口 - 处理API请求"""
     try:
-        # 1. 参数验证
-        # 2. 调用服务层
         service = IndexService()
-        constituents = await service.get_hs300_constituents()      
-        # 3. 构造响应
-        return HS300ConstituentsResponse(
-            success=True,
-            data=constituents,
-            total_count=len(constituents)
-        )
+        data = await service.get_index_constituents("hs300", force_refresh=force_refresh)
+        return IndexConstituentsResponse(success=True, data=data, total_count=len(data))
     except Exception as e:
-        # 4. 错误处理
+        raise HTTPException(status_code=500, detail=str(e))
+
+# 科创50
+@router.get("/star50/constituents", response_model=IndexConstituentsResponse)
+async def get_star50_constituents(force_refresh: bool = False):
+    try:
+        service = IndexService()
+        data = await service.get_index_constituents("star50", force_refresh=force_refresh)
+        return IndexConstituentsResponse(success=True, data=data, total_count=len(data))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# 中证A500
+@router.get("/a500/constituents", response_model=IndexConstituentsResponse)
+async def get_a500_constituents(force_refresh: bool = False):
+    try:
+        service = IndexService()
+        data = await service.get_index_constituents("a500", force_refresh=force_refresh)
+        return IndexConstituentsResponse(success=True, data=data, total_count=len(data))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+# 中证500
+@router.get("/csi500/constituents", response_model=IndexConstituentsResponse)
+async def get_csi500_constituents(force_refresh: bool = False):
+    try:
+        service = IndexService()
+        data = await service.get_index_constituents("csi500", force_refresh=force_refresh)
+        return IndexConstituentsResponse(success=True, data=data, total_count=len(data))
+    except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
