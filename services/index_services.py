@@ -1,6 +1,13 @@
 # app/services/index_service.py
-from typing import List
-from models.index_models import HS300Constituent
+from typing import List, Optional
+from models.index_models import IndexConstituent, HS300Constituent
+from services.tushare_cached import (
+    get_index_weight,
+    get_latest_trade_date,
+    get_stock_basic_map,
+    get_daily_basic_map,
+    TushareNotConfigured
+)
 class IndexService:
     """指数数据服务 - 处理业务逻辑"""
     
@@ -9,160 +16,142 @@ class IndexService:
         # self.pro = ts.pro_api()  # tushare API
         pass
     
-    async def get_hs300_constituents(self, force_refresh: bool = False) -> List[HS300Constituent]:
-        """获取沪深300成分股 - 优先使用缓存
+    async def get_index_constituents(self, index_code: str, force_refresh: bool = False) -> List[IndexConstituent]:
+        """获取任意指数成分股（优先缓存）
 
-        Args:
-            force_refresh: 强制刷新数据，不使用缓存
-            
-        Returns:
-            List[HS300Constituent]: 沪深300成分股列表
+        index_code 示例：
+          399300.SZ  -> 沪深300
+          000688.SH  -> 科创50 (示例，在 tushare 中真实代码可能为 000688.SH)
+          000905.SH  -> 中证500
+          000922.SH  -> 中证红利等（这
+        此处先映射我们需求：
+          a500  -> 000922.SH (示例)  (如果后续确认真实代码替换)
+          star50 -> 000688.SH (示例)
+          hs300 -> 399300.SZ
         """
-        # 步骤1: 如果不强制刷新，先尝试从缓存获取
         if not force_refresh:
-            cached_data = await self._get_cached_constituents()
-            if cached_data and len(cached_data) > 0:
-                print(f"从缓存获取到 {len(cached_data)} 只沪深300成分股")
-                return cached_data
-        # 步骤2: 缓存未命中或强制刷新，尝试从API获取
+            cached = await self._get_cached_constituents(index_code=index_code)
+            if cached:
+                print(f"从缓存获取到 {len(cached)} 只 {index_code} 成分股")
+                return cached
+
         try:
-            api_data = await self.get_hs300_constituents_from_api()
-            if api_data and len(api_data) > 0:
-                print(f"成功从API获取到 {len(api_data)} 只沪深300成分股")
-                success = self._cache_constituents(api_data)
-                if success:
-                    print("成分股数据已成功缓存到数据库")
+            api_data = await self.get_index_constituents_from_api(index_code=index_code)
+            if api_data:
+                print(f"成功从API获取到 {len(api_data)} 只 {index_code} 成分股")
+                self._cache_constituents(api_data, index_code=index_code)
                 return api_data
         except Exception as e:
-            print(f"从API获取数据失败，使用本地数据作为备选: {str(e)}")
-    
-        # 如果API获取失败或返回空数据，使用本地静态数据
-        print("使用本地静态数据...")
-        hs300_data = [
-            {"symbol": "000001", "name": "平安银行", "industry": "银行", "market_cap": 280000000000, "weight": 0.85},
-            {"symbol": "000002", "name": "万科A", "industry": "房地产开发", "market_cap": 250000000000, "weight": 0.78},
-            {"symbol": "600519", "name": "贵州茅台", "industry": "食品饮料", "market_cap": 2200000000000, "weight": 6.89},
-            # 你可以添加更多静态数据在这里
-        ]  
-        return [HS300Constituent(**item) for item in hs300_data]
+            print(f"获取 {index_code} 成分股 API 失败: {e}")
+
+        # fallback 静态数据（根据 index_code 提供简单模拟）
+        # ✅ 本地兜底数据（当 API / Token 缺失时使用）
+        #   补充了小写别名，避免别名查不到而返回空列表的问题（之前 star50 -> 无数据）
+        fallback_map = {
+            # HS300
+            "399300.SZ": [
+                {"symbol": "000001", "name": "平安银行", "industry": "银行", "market_cap": 280000000000, "weight": 0.85},
+                {"symbol": "000002", "name": "万科A", "industry": "房地产开发", "market_cap": 250000000000, "weight": 0.78},
+                {"symbol": "600519", "name": "贵州茅台", "industry": "食品饮料", "market_cap": 2200000000000, "weight": 6.89},
+            ],
+            "hs300": [
+                {"symbol": "000001", "name": "平安银行", "industry": "银行", "market_cap": 280000000000, "weight": 0.85},
+                {"symbol": "000002", "name": "万科A", "industry": "房地产开发", "market_cap": 250000000000, "weight": 0.78},
+                {"symbol": "600519", "name": "贵州茅台", "industry": "食品饮料", "market_cap": 2200000000000, "weight": 6.89},
+            ],
+            # STAR50 / 科创50
+            "STAR50": [
+                {"symbol": "688001", "name": "华兴源创", "industry": "半导体", "market_cap": 45000000000, "weight": 1.10},
+                {"symbol": "688012", "name": "中微公司", "industry": "半导体设备", "market_cap": 120000000000, "weight": 2.20}
+            ],
+            "star50": [
+                {"symbol": "688001", "name": "华兴源创", "industry": "半导体", "market_cap": 45000000000, "weight": 1.10},
+                {"symbol": "688012", "name": "中微公司", "industry": "半导体设备", "market_cap": 120000000000, "weight": 2.20}
+            ],
+            # A500
+            "A500": [
+                {"symbol": "600519", "name": "贵州茅台", "industry": "白酒", "market_cap": 2500000000000, "weight": 2.50},
+                {"symbol": "000333", "name": "美的集团", "industry": "家电", "market_cap": 450000000000, "weight": 1.20 }
+            ],
+            "a500": [
+                {"symbol": "600519", "name": "贵州茅台", "industry": "白酒", "market_cap": 2500000000000, "weight": 2.50},
+                {"symbol": "000333", "name": "美的集团", "industry": "家电", "market_cap": 450000000000, "weight": 1.20 }
+            ],
+            "csi500": [
+                {"symbol": "600519", "name": "贵州茅台", "industry": "白酒", "market_cap": 2500000000000, "weight": 2.50},
+                {"symbol": "000333", "name": "美的集团", "industry": "家电", "market_cap": 450000000000, "weight": 1.20 }
+            ]
+        }
+        simple_code = self._alias_simple_code(index_code)
+        upper_code = index_code.upper()
+        data = (fallback_map.get(index_code)
+                or fallback_map.get(simple_code)
+                or fallback_map.get(upper_code)
+                or fallback_map.get(simple_code.upper())
+                or [])
+        return [IndexConstituent(**item) for item in data]
+
+    # 兼容旧方法名称
+    async def get_hs300_constituents(self, force_refresh: bool = False) -> List[HS300Constituent]:
+        data = await self.get_index_constituents("399300.SZ", force_refresh=force_refresh)
+        return [HS300Constituent(**c.dict()) for c in data]
         
-    async def get_hs300_constituents_from_api(self):
-        """从 tushare API 获取沪深300成分股数据"""
+    async def get_index_constituents_from_api(self, index_code: str) -> List[IndexConstituent]:
+        """通用：从 tushare API 获取指定指数成分股 (当前保留原 HS300 逻辑，逐步泛化)
+
+        index_code: tushare 指数代码，例如 399300.SZ
+        如果传入别名（hs300/star50/a500）会转换。
+        """
         try:
-            import tushare as ts
-            import pandas as pd
-            import os
             import asyncio
             from datetime import datetime
-            
-            # 检查 tushare token 是否可用
-            ts_token = os.getenv("TUSHARE_TOKEN")
-            print(ts_token)
-            if not ts_token:
-                print("警告: 未找到 TUSHARE_TOKEN 环境变量")
-                return []
-                
-            # 初始化 tushare
-            ts.set_token(ts_token)
-            pro = ts.pro_api()
-            
-            print("正在从 tushare 获取沪深300成分股数据...")
-            
-            # 获取当前日期作为交易日期（格式：YYYYMMDD）
-            today = datetime.now().strftime('%Y%m%d')
-            
-            # 获取沪深300成分股
-            df_constituents = pro.index_weight(index_code='399300.SZ', trade_date=today)
-            
-            # 如果当天数据不可用，尝试获取最近的数据
-            if df_constituents.empty:
-                # 获取交易日历
-                df_cal = pro.trade_cal(exchange='SSE', start_date='20200101', end_date=today)
-                # 过滤出最近的交易日
-                df_cal = df_cal[df_cal['is_open'] == 1].sort_values('cal_date', ascending=False)
-                if not df_cal.empty:
-                    latest_trade_date = df_cal.iloc[0]['cal_date']
-                    latest_trade_date = '20250630'  # 临时硬编码，替换为最新的交易日
-                    print(f"当前日期无数据，使用最近交易日: {latest_trade_date}")
-                    df_constituents = pro.index_weight(index_code='399300.SZ', trade_date=latest_trade_date)
-            
-            # 如果仍然没有数据，返回空列表
-            if df_constituents.empty:
-                print("无法获取沪深300成分股数据")
-                return []
-                
-            print(f"获取到 {len(df_constituents)} 条成分股权重记录")
-            
-            # 准备结果列表
-            constituents = []
-            
-            # 对于每个成分股，获取额外信息（行业、市值等）
-            for idx, row in df_constituents.iterrows():
-                # 股票代码转换（去掉后缀.SH或.SZ）
-                symbol = row['con_code']
-                
-                # 从 tushare 获取股票基本信息
-                try:
-                    stock_info = pro.stock_basic(ts_code=symbol)
-                    
-                    # 延迟以避免 API 调用过快
-                    # await asyncio.sleep(0.1)
-                    
-                    if not stock_info.empty:
-                        name = stock_info.iloc[0]['name']
-                        industry = stock_info.iloc[0].get('industry', '')
-                    else:
-                        name = f"股票{symbol}"
-                        industry = ""
-                        
-                    # 获取最新的日行情以获取市值
-                    daily_info = pro.daily_basic(ts_code=symbol, trade_date=today)
-                    
-                    # 延迟以避免 API 调用过快
-                    # await asyncio.sleep(0.1)
-                    
-                    if not daily_info.empty:
-                        market_cap = daily_info.iloc[0].get('total_mv', 0) * 10000  # 单位转换为元
-                    else:
-                        market_cap = 0
-                    
-                    # 构建成分股对象
-                    constituent = HS300Constituent(
+            try:
+                # Determine real code
+                real_code = self._resolve_index_real_code(index_code)
+                # Attempt to get latest trade date
+                trade_date = get_latest_trade_date()
+                if not trade_date:
+                    from datetime import datetime as _dt
+                    trade_date = _dt.now().strftime('%Y%m%d')
+                df_constituents = get_index_weight(real_code, trade_date)
+                if df_constituents is None or df_constituents.empty:
+                    return []
+                # Prepare batch maps
+                basic_map = get_stock_basic_map()
+                daily_map = get_daily_basic_map(trade_date)
+                constituents: List[IndexConstituent] = []
+                for idx, row in df_constituents.iterrows():
+                    symbol = row['con_code']  # ts_code with suffix
+                    base = basic_map.get(symbol, {})
+                    name = base.get('name', f'股票{symbol}')
+                    industry = base.get('industry', '')
+                    daily = daily_map.get(symbol, {})
+                    total_mv = daily.get('total_mv', 0) * 10000  # to yuan
+                    constituent = IndexConstituent(
                         symbol=symbol,
                         name=name,
                         industry=industry,
-                        market_cap=float(market_cap),
-                        weight=float(row['weight']),
+                        market_cap=float(total_mv),
+                        weight=float(row.get('weight', 0)),
                         update_time=datetime.now().strftime('%Y%m%d %H:%M:%S')
                     )
-                    
                     constituents.append(constituent)
-                    
-                    # 每处理5个成分股打印一次进度
-                    if (idx + 1) % 5 == 0:
-                        print(f"已处理 {idx + 1}/{len(df_constituents)} 只成分股")
-                    
-                except Exception as e:
-                    print(f"处理股票 {symbol} 时出错: {str(e)}")
-                    continue
-            
-            print(f"成功获取 {len(constituents)} 只沪深300成分股信息")
-            return constituents
-            
+                    if (idx + 1) % 100 == 0:
+                        await asyncio.sleep(0)  # yield control
+                return constituents
+            except TushareNotConfigured:
+                print("Tushare token not configured; skipping live fetch.")
+                return []
         except Exception as e:
-            print(f"获取沪深300成分股数据失败: {str(e)}")
-            # 返回空列表作为 fallback
+            print(f"获取指数({index_code}) 成分股数据失败: {str(e)}")
             return []
-        
-    def _cache_constituents(self, constituents):
-        """缓存沪深300成分股数据到数据库
     
-        Args:
-            constituents (List[HS300Constituent]): 沪深300成分股列表
-    
-        Returns:
-            bool: 缓存操作是否成功
-        """
+    # 旧名称向后兼容
+    async def get_hs300_constituents_from_api(self):  # type: ignore
+        return await self.get_index_constituents_from_api("399300.SZ")
+
+    def _cache_constituents(self, constituents: List[IndexConstituent], index_code: str):
+        """缓存任意指数成分股数据到数据库"""
         try:
             # 检查是否有数据库连接
             if not hasattr(self, 'db') or self.db is None:
@@ -203,13 +192,13 @@ class IndexService:
             from datetime import datetime
             today = datetime.now().strftime('%Y%m%d')
             
-            # 首先删除旧数据（保证数据一致性）
+            # 删除当日该指数旧数据
             try:
                 self.index_constituents_collection.delete_many({
-                    "index_code": "399300.SZ",
+                    "index_code": index_code,
                     "update_date": today
                 })
-                print(f"已清理今日({today})缓存的沪深300成分股数据")
+                print(f"已清理今日({today})缓存的 {index_code} 成分股数据")
             except Exception as e:
                 print(f"清理旧数据失败: {str(e)}")
             
@@ -229,7 +218,7 @@ class IndexService:
                     
                 # 添加额外的索引字段
                 document = {
-                    "index_code": "399300.SZ",
+                    "index_code": index_code,
                     "update_date": today,
                     "symbol": data.get("symbol", ""),
                     "name": data.get("name", ""),
@@ -243,21 +232,17 @@ class IndexService:
             # 批量插入数据
             if documents:
                 result = self.index_constituents_collection.insert_many(documents)
-                print(f"成功缓存 {len(result.inserted_ids)} 只沪深300成分股")
+                print(f"成功缓存 {len(result.inserted_ids)} 只 {index_code} 成分股")
                 return True
             
             return False
         
         except Exception as e:
-            print(f"缓存沪深300成分股数据失败: {str(e)}")
+            print(f"缓存指数({index_code}) 成分股数据失败: {str(e)}")
             return False
 
-    async def _get_cached_constituents(self):
-        """从缓存获取沪深300成分股数据
-        
-        Returns:
-            List[HS300Constituent]: 缓存的沪深300成分股列表，如果没有则返回空列表
-        """
+    async def _get_cached_constituents(self, index_code: str):
+        """从缓存获取任意指数成分股数据"""
         try:
             # 检查是否有数据库连接
             if not hasattr(self, 'db') or self.db is None:
@@ -285,7 +270,7 @@ class IndexService:
             
             pipeline = [
                 {"$match": {
-                    "index_code": "399300.SZ",
+                    "index_code": index_code,
                     "update_date": {"$in": [today, yesterday]}
                 }},
                 {"$sort": {"update_time": -1}},
@@ -299,13 +284,13 @@ class IndexService:
             cached_records = list(self.index_constituents_collection.aggregate(pipeline))
             
             if not cached_records:
-                print("缓存中没有找到近期的沪深300成分股数据")
+                print(f"缓存中没有找到近期的 {index_code} 成分股数据")
                 return []
             
             # 将缓存记录转换为HS300Constituent对象
-            constituents = []
+            constituents: List[IndexConstituent] = []
             for record in cached_records:
-                constituent = HS300Constituent(
+                constituent = IndexConstituent(
                     symbol=record.get("symbol", "").rstrip('.SZ').rstrip('.SH'),
                     name=record.get("name", ""),
                     industry=record.get("industry", ""),
@@ -315,9 +300,30 @@ class IndexService:
                 )
                 constituents.append(constituent)
             
-            print(f"从缓存中获取到 {len(constituents)} 条记录，缓存日期: {cached_records[0].get('update_date')}")
+            print(f"从缓存中获取到 {len(constituents)} 条 {index_code} 记录，缓存日期: {cached_records[0].get('update_date')}")
             return constituents
             
         except Exception as e:
             print(f"从缓存获取数据失败: {str(e)}")
-            return [HS300Constituent(**item) for item in hs300_data]
+            return []
+
+    # 工具：别名 -> tushare 真实代码
+    def _resolve_index_real_code(self, code: str) -> str:
+        alias = code.lower()
+        mapping = {
+            'hs300': '000300.SH',
+            '399300.sz': '399300.SZ',
+            'star50': '000688.SH',  # 需核实真实代码
+            'a500': '000510.SH',    # 占位示例，真实A500指数代码需确认
+            'csi500':'000905.SH',
+            'a1000': '000852.SH',
+        }
+        return mapping.get(alias, code)
+
+    def _alias_simple_code(self, code: str) -> str:
+        code_lower = code.lower()
+        if code_lower in ('000300.sh','399300.sz', 'hs300'): return 'hs300'
+        if code_lower in ('000688.sh', 'star50'): return 'star50'
+        if code_lower in ('000510.sh', 'a500'): return 'a500'
+        if code_lower in ('000905.sh', 'csi500'): return 'csi500'
+        return code

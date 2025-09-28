@@ -2,8 +2,8 @@
 from pydantic import BaseModel
 from typing import List, Optional
 
-class HS300Constituent(BaseModel):
-    """沪深300成分股模型 - 定义数据结构"""
+class IndexConstituent(BaseModel):
+    """通用指数成分股模型"""
     symbol: str
     name: str
     industry: Optional[str] = None
@@ -11,9 +11,14 @@ class HS300Constituent(BaseModel):
     weight: Optional[float] = None
     update_time: Optional[str] = None
 
-class HS300ConstituentsResponse(BaseModel):
-    """API响应模型 - 定义返回格式"""
+# 向后兼容旧名称（HS300Constituent，用于已存在的导入）
+HS300Constituent = IndexConstituent
+
+class IndexConstituentsResponse(BaseModel):
     success: bool
-    data: List[HS300Constituent]
+    data: List[IndexConstituent]
     total_count: int
     message: Optional[str] = None
+
+# 旧响应名称保持以防已被引用
+HS300ConstituentsResponse = IndexConstituentsResponse
