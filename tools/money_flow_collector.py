@@ -4,7 +4,7 @@ sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 import tushare as ts
 from pymongo import MongoClient, UpdateOne
 from datetime import date
-from utils import get_ts_code
+from utils.stock_utils import get_ts_code
 from dotenv import load_dotenv
 load_dotenv()
 
