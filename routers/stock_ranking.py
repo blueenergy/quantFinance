@@ -5,6 +5,7 @@ from utils.score_utils import safe_round, safe_float, extract_strategy_score
 from typing import Optional, List, Any, cast
 from pydantic import BaseModel
 from datetime import datetime, timedelta
+from bson import ObjectId
 
 router = APIRouter(tags=["股票排名"])
 
@@ -104,6 +105,120 @@ async def get_stock_rankings(
         import traceback
         print(f"获取股票评分失败: {str(e)}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"获取股票评分失败: {str(e)}")
+
+@router.get("/stock-score-detail")
+async def get_single_score_detail(
+    request: Request,
+    symbol: str = Query(..., description="股票代码"),
+    category: str = Query(..., description="评分类别: composite|cycle|value|fundamental|growth|technical|money_flow"),
+    score_date: Optional[str] = Query(None, description="评分日期 YYYYMMDD, 为空则取最新"),
+    strategy: str = Query('balanced', description="策略: balanced|aggressive|conservative 等，与文档中 strategy_scores 对应")
+):
+    """返回指定股票某一评分类别的详情字段。
+
+    category 到字段映射:
+    composite -> 综合得分拆解（含各子项及策略权重）
+    cycle -> cycle_details
+    value -> value_details
+    fundamental -> fundamental_details
+    growth -> growth_details
+    technical -> technical_details
+    money_flow -> money_flow_details
+    """
+    try:
+        cat_map = {
+            'cycle': 'cycle_details',
+            'value': 'value_details',
+            'fundamental': 'fundamental_details',
+            'growth': 'growth_details',
+            'technical': 'technical_details',
+            'money_flow': 'money_flow_details'
+        }
+        supported_categories = set(list(cat_map.keys()) + ['composite'])
+        if category not in supported_categories:
+            raise HTTPException(status_code=400, detail=f"不支持的评分类别: {category}")
+        db = get_db_collections_from_request(request)
+        stock_scores = db['stock_scores']
+        query = {"symbol": symbol}
+        if score_date:
+            query["score_date"] = score_date
+            doc = stock_scores.find_one(query)
+        else:
+            doc = stock_scores.find_one(query, sort=[('score_date', -1)])
+        if not doc:
+            raise HTTPException(status_code=404, detail="未找到对应评分记录")
+        # 处理综合得分拆解
+        if category == 'composite':
+            composite_score = doc.get('composite_score') or {}
+            # 确保 composite_score 统一为 dict
+            if not isinstance(composite_score, dict):
+                composite_score = {'balanced': composite_score}
+            strategy_scores = doc.get('strategy_scores') or {}
+            strat_obj = strategy_scores.get(strategy) or strategy_scores.get('balanced') or {}
+            weight_map = strat_obj.get('weight') or strat_obj.get('weights') or {}
+            # 如果 weight_map 为空，尝试 fallback 通用默认权重（以 balanced 为例）
+            if not weight_map:
+                weight_map = {'cycle': 0.25, 'growth': 0.25, 'fundamental': 0.35, 'value': 0.35, 'technical': 0.25, 'money_flow': 0.15}
+            # 构造子项得分（直接使用文档中各独立字段）
+            sub_scores = {
+                'cycle': doc.get('cycle_score'),
+                'growth': doc.get('growth_score'),
+                'fundamental': doc.get('fundamental_score'),
+                'value': doc.get('value_score'),
+                'technical': doc.get('technical_score'),
+                'money_flow': doc.get('money_flow_score')
+            }
+            # 组装列表展示友好字段
+            details_payload = {}
+            name_map = {
+                'cycle': '周期评分',
+                'growth': '成长评分',
+                'fundamental': '基本面评分',
+                'value': '价值评分',
+                'technical': '技术面评分',
+                'money_flow': '资金流评分'
+            }
+            for key, score_val in sub_scores.items():
+                if score_val is None:
+                    continue
+                w = weight_map.get(key)
+                w_display = f"{round(w*100, 2)}%" if isinstance(w, (int, float)) else '-' 
+                details_payload[f"{name_map.get(key, key)} (权重: {w_display})"] = round(score_val, 2) if isinstance(score_val, (int, float)) else score_val
+            details_payload['当前策略'] = strategy
+            details_payload['综合得分(当前策略)'] = composite_score.get(strategy)
+            return {
+                'success': True,
+                'data': {
+                    'symbol': symbol,
+                    'score_date': doc.get('score_date'),
+                    'category': category,
+                    'details': details_payload
+                },
+                'message': '获取综合得分拆解成功'
+            }
+        # 其它分类处理
+        detail_field = cat_map[category]
+        details = doc.get('details') or {}
+        # 兼容旧结构: 直接平铺字段
+        if not details and any(k.endswith('_details') for k in doc.keys()):
+            details = {k: v for k, v in doc.items() if k.endswith('_details')}
+        category_details = details.get(detail_field, doc.get(detail_field, {})) or {}
+        return {
+            'success': True,
+            'data': {
+                'symbol': symbol,
+                'score_date': doc.get('score_date'),
+                'category': category,
+                'details': category_details
+            },
+            'message': '获取评分详情成功'
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback
+        print(f"获取评分详情失败: {str(e)}\n{traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=f"获取评分详情失败: {str(e)}")
 
 @router.get("/score-history/{symbol}")
 async def get_stock_score_history(
