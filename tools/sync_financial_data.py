@@ -61,6 +61,8 @@ class FinancialDataSyncer:
         self.balance_collection = self.db['financial_balance']    # 资产负债表  
         self.cashflow_collection = self.db['financial_cashflow']  # 现金流量表
         self.financial_indicator_collection = self.db['financial_indicator']  # 财务指标
+        # 新增：daily_basic (估值/日线基础) 集合
+        self.daily_basic_collection = self.db['financial_daily_basic']
         
         # 创建索引
         self._create_indexes()
@@ -84,6 +86,11 @@ class FinancialDataSyncer:
                     collection.create_index(index_keys)
                 except Exception as e:
                     print(f"⚠️ 创建索引失败: {e}")
+        # 为 daily_basic 创建单独索引
+        try:
+            self.daily_basic_collection.create_index([('ts_code', 1), ('trade_date', -1)])
+        except Exception as e:
+            print(f"⚠️ 创建 daily_basic 索引失败: {e}")
     
     def get_stock_list(self, recent_days: Optional[int] = None) -> List[str]:
         """获取股票列表"""
@@ -117,7 +124,7 @@ class FinancialDataSyncer:
         """同步财务数据"""
         # 默认同步所有数据类型
         if data_types is None:
-            data_types = ['income', 'balance', 'cashflow', 'financial_indicator']
+            data_types = ['income', 'balance', 'cashflow', 'financial_indicator', 'daily_basic']
         
         stats = {
             'total': len(ts_codes),
@@ -154,19 +161,26 @@ class FinancialDataSyncer:
                     balance_data = self._fetch_balance_data(ts_code, period, start_date, end_date)
                     
                 if 'cashflow' in data_types:
+                    print(ts_code, period, start_date, end_date)
                     cashflow_data = self._fetch_cashflow_data(ts_code, period, start_date, end_date)
                     
                 if 'financial_indicator' in data_types:
                     financial_indicator_data = self._fetch_financial_indicator_data(ts_code, period, start_date, end_date)
+
+                if 'daily_basic' in data_types:
+                    daily_basic_data = self._fetch_daily_basic_data(ts_code, start_date, end_date)
+                else:
+                    daily_basic_data = None
 
                 print(f"\n📊 {ts_code} 财务数据同步成功:")
                 print("income_data:", len(income_data) if income_data is not None else "Skipped")
                 print("balance_data:", len(balance_data) if balance_data is not None else "Skipped")
                 print("cashflow_data:", len(cashflow_data) if cashflow_data is not None else "Skipped")
                 print("financial_indicator_data:", len(financial_indicator_data) if financial_indicator_data is not None else "Skipped")
+                print("daily_basic:", len(daily_basic_data) if daily_basic_data is not None else "Skipped")
                 
                 # 存储到数据库
-                self._save_financial_data(ts_code, income_data, balance_data, cashflow_data, financial_indicator_data)
+                self._save_financial_data(ts_code, income_data, balance_data, cashflow_data, financial_indicator_data, daily_basic_data)
 
                 stats['success'] += 1
                 
@@ -189,6 +203,7 @@ class FinancialDataSyncer:
         return self.pro.income(
             ts_code=ts_code,
             start_date=start_date,
+            report_type=2,
             end_date=end_date
         )
     
@@ -205,6 +220,7 @@ class FinancialDataSyncer:
         return self.pro.cashflow(
             ts_code=ts_code,
             start_date=start_date,
+            report_type=2,
             end_date=end_date
         )
     
@@ -215,9 +231,27 @@ class FinancialDataSyncer:
             start_date=start_date,
             end_date=end_date
         )
+    
+    def _fetch_daily_basic_data(self, ts_code: str, start_date: Optional[str] = None, end_date: Optional[str] = None) -> pd.DataFrame:
+        """获取 daily_basic（估值/日线基础数据）"""
+        try:
+            if start_date or end_date:
+                df = self.pro.daily_basic(ts_code=ts_code)
+                if df is None or df.empty:
+                    return pd.DataFrame()
+                if start_date:
+                    df = df[df['trade_date'] >= start_date]
+                if end_date:
+                    df = df[df['trade_date'] <= end_date]
+                return df.sort_values('trade_date', ascending=False)
+            else:
+                return self.pro.daily_basic(ts_code=ts_code, limit=30)
+        except Exception as e:
+            print(f"⚠️ 获取 daily_basic 失败 {ts_code}: {e}")
+            return pd.DataFrame()
     def _save_financial_data(self, ts_code: str, income_df: Optional[pd.DataFrame], 
                            balance_df: Optional[pd.DataFrame], cashflow_df: Optional[pd.DataFrame], 
-                           financial_indicator_df: Optional[pd.DataFrame]):
+                           financial_indicator_df: Optional[pd.DataFrame], daily_basic_df: Optional[pd.DataFrame]):
         """保存财务数据到数据库"""
         current_time = datetime.now()
         
@@ -250,6 +284,16 @@ class FinancialDataSyncer:
             self._upsert_dataframe(self.financial_indicator_collection, financial_indicator_df, current_time)
         elif financial_indicator_df is not None and financial_indicator_df.empty:
             print(f"      ⚠️ {ts_code} 财务指标数据为空")
+        # 保存 daily_basic 表
+        if daily_basic_df is not None and not daily_basic_df.empty:
+            # daily_basic 使用 trade_date 作为唯一键，调整 upsert 操作
+            # 将 DataFrame 的 'trade_date' 字段重命名为 'end_date' 来复用 upsert 接口
+            df = daily_basic_df.copy()
+            if 'trade_date' in df.columns:
+                df = df.rename(columns={'trade_date': 'end_date'})
+            self._upsert_dataframe(self.daily_basic_collection, df, current_time)
+        elif daily_basic_df is not None and daily_basic_df.empty:
+            print(f"      ⚠️ {ts_code} daily_basic 数据为空")
         
     
     def _upsert_dataframe(self, collection, df: pd.DataFrame, sync_time: datetime):
@@ -389,7 +433,7 @@ def main():
         if args.data_types:
             data_types = [dtype.strip() for dtype in args.data_types.split(',')]
             # 验证数据类型
-            valid_types = ['income', 'balance', 'cashflow', 'financial_indicator']
+            valid_types = ['income', 'balance', 'cashflow', 'financial_indicator','daily_basic']
             invalid_types = [dtype for dtype in data_types if dtype not in valid_types]
             if invalid_types:
                 print(f"❌ 无效的数据类型: {', '.join(invalid_types)}")
