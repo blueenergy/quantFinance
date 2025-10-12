@@ -19,6 +19,24 @@ stock_info_collection = db["stock_info"]
 money_flow_collection = db["money_flow"]
 state_collection = db["collect_state"]
 
+# --- Index bootstrap (idempotent) -------------------------------------------------
+# We want a compound index on (symbol, trade_date) to speed up upserts & queries.
+# This helper runs once on import; if index exists MongoDB will no-op.
+from pymongo import ASCENDING
+
+def _ensure_money_flow_indexes():
+    try:
+        money_flow_collection.create_index(
+            [("symbol", ASCENDING), ("trade_date", ASCENDING)],
+            name="symbol_trade_date_idx",
+            unique=False,
+            background=True,
+        )
+    except Exception as exc:
+        print(f"Warning: failed to ensure index (symbol, trade_date): {exc}")
+
+_ensure_money_flow_indexes()
+
 
 # df = pro.moneyflow(ts_code= '000002.SZ', start_date='20250101', end_date='20250103')
 # records = df.to_dict(orient='records')
