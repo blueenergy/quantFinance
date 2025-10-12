@@ -36,6 +36,8 @@ state_collection = db["collect_state"]
 
 import argparse
 from datetime import datetime, timedelta
+import time
+from pymongo.errors import BulkWriteError, PyMongoError
 
 
 def build_ts_code_map():
@@ -56,6 +58,128 @@ def build_ts_code_map():
     return mapping
 
 
+def bulk_write_in_batches(collection, operations, batch_size=1000, max_retries=3, backoff_factor=1.5):
+    """Perform unordered bulk writes in batches with retry/backoff.
+
+    Returns tuple (total_upserted, total_modified).
+    """
+    total_upserted = 0
+    total_modified = 0
+
+    for i in range(0, len(operations), batch_size):
+        batch = operations[i:i + batch_size]
+        attempt = 0
+        while True:
+            try:
+                res = collection.bulk_write(batch, ordered=False)
+                # compute upserted count in a version-compatible way
+                upserted = 0
+                if hasattr(res, 'upserted_ids') and res.upserted_ids:
+                    upserted = len(res.upserted_ids)
+                else:
+                    upserted = getattr(res, 'upserted_count', 0) or 0
+
+                modified = getattr(res, 'modified_count', 0) or 0
+                total_upserted += upserted
+                total_modified += modified
+                break
+            except BulkWriteError as bwe:
+                attempt += 1
+                print(f"BulkWriteError on batch {i} attempt {attempt}: {getattr(bwe, 'details', bwe)}")
+                if attempt > max_retries:
+                    print("Max retries exceeded for batch starting at", i)
+                    # Re-raise to let caller decide
+                    raise
+                sleep_time = backoff_factor ** attempt
+                time.sleep(sleep_time)
+            except PyMongoError as e:
+                attempt += 1
+                print(f"PyMongoError on batch {i} attempt {attempt}: {e}")
+                if attempt > max_retries:
+                    raise
+                time.sleep(backoff_factor ** attempt)
+
+    return total_upserted, total_modified
+
+
+def resolve_date_range(arg_start: str, arg_end: str, state_collection, pro_client, lookback_days: int = 14):
+    """Resolve (start, end) date strings (YYYYMMDD) based on user args, existing state and trade calendar.
+
+    Logic:
+      1. End date precedence: arg_end > detected latest trading day > today.
+      2. Start date precedence: arg_start > (state last_date + 1) > (end - 1 day).
+    This mirrors previous inline logic and is isolated for testing.
+    """
+    # Determine end
+    end = arg_end
+    if not end:
+        try:
+            today = datetime.today().date()
+            cal = pro_client.trade_cal(start_date=(today - timedelta(days=lookback_days)).strftime('%Y%m%d'),
+                                        end_date=today.strftime('%Y%m%d'))
+            opens = cal[cal['is_open'] == 1]['cal_date'].tolist()
+            if opens:
+                latest = opens[0]
+                end = latest.replace('-', '') if isinstance(latest, str) else latest.strftime('%Y%m%d')
+                print(f"Auto-selected end date (latest trading day): {end}")
+            else:
+                end = today.strftime('%Y%m%d')
+                print(f"No trading days found; default end=today {end}")
+        except Exception as exc:
+            end = datetime.today().strftime('%Y%m%d')
+            print(f"Failed to compute end from calendar, fallback to today {end}: {exc}")
+
+    # Determine start
+    start = arg_start
+    if not start:
+        try:
+            doc = state_collection.find_one({'_id': 'money_flow_last_date'})
+        except Exception:
+            doc = None
+        if doc and 'last_date' in doc:
+            try:
+                last = datetime.strptime(doc['last_date'], '%Y%m%d').date()
+                start = (last + timedelta(days=1)).strftime('%Y%m%d')
+                print(f"Resuming from last successful date: {start}")
+            except Exception:
+                start = None
+        if not start:
+            try:
+                end_obj = datetime.strptime(end, '%Y%m%d').date()
+                start = (end_obj - timedelta(days=1)).strftime('%Y%m%d')
+                print(f"Defaulting start to {start} (end - 1 day)")
+            except Exception:
+                start = end
+                print(f"Fallback: set start=end={start}")
+
+    # Guard: if start > end, swap or clamp
+    try:
+        if datetime.strptime(start, '%Y%m%d') > datetime.strptime(end, '%Y%m%d'):
+            print(f"Warning: start {start} > end {end}, adjusting start=end")
+            start = end
+    except Exception:
+        pass
+    return start, end
+
+
+def get_trade_days(start_date: str, end_date: str, pro_client):
+    """Return list of trading days (YYYYMMDD). Falls back to sequential days if calendar fetch fails."""
+    try:
+        cal = pro_client.trade_cal(start_date=start_date, end_date=end_date)
+        trade_days = cal[cal['is_open'] == 1]['cal_date'].tolist()
+        return [d.replace('-', '') if isinstance(d, str) else d.strftime('%Y%m%d') for d in trade_days]
+    except Exception as exc:
+        print(f"Failed to fetch trade calendar, fallback iteration: {exc}")
+        s = datetime.strptime(start_date, "%Y%m%d").date()
+        e = datetime.strptime(end_date, "%Y%m%d").date()
+        out = []
+        day = s
+        while day <= e:
+            out.append(day.strftime('%Y%m%d'))
+            day += timedelta(days=1)
+        return out
+
+
 def collect_range_by_date(start_date: str, end_date: str):
     """Collect moneyflow data for each date in [start_date, end_date].
 
@@ -66,21 +190,7 @@ def collect_range_by_date(start_date: str, end_date: str):
     """
     ts_map = build_ts_code_map()
 
-    # prefer using tushare trading calendar to skip non-trading days
-    try:
-        cal = pro.trade_cal(start_date=start_date, end_date=end_date)
-        # trade_cal returns a DataFrame with 'cal_date' and 'is_open' flags
-        trade_days = cal[cal['is_open'] == 1]['cal_date'].tolist()
-        trade_days = [d.replace('-', '') if isinstance(d, str) else d.strftime('%Y%m%d') for d in trade_days]
-    except Exception as exc:
-        print(f"Failed to fetch trade calendar, falling back to daily iteration: {exc}")
-        s = datetime.strptime(start_date, "%Y%m%d").date()
-        e = datetime.strptime(end_date, "%Y%m%d").date()
-        trade_days = []
-        day = s
-        while day <= e:
-            trade_days.append(day.strftime('%Y%m%d'))
-            day += timedelta(days=1)
+    trade_days = get_trade_days(start_date, end_date, pro)
 
     for trade_date in trade_days:
         try:
@@ -121,17 +231,10 @@ def collect_range_by_date(start_date: str, end_date: str):
 
         if operations:
             try:
-                result = money_flow_collection.bulk_write(operations, ordered=False)
-                upserted_count = 0
-                if hasattr(result, 'upserted_ids') and result.upserted_ids:
-                    upserted_count = len(result.upserted_ids)
-                elif hasattr(result, 'upserted_count'):
-                    upserted_count = result.upserted_count or 0
-
-                modified_count = getattr(result, 'modified_count', 0)
+                upserted_count, modified_count = bulk_write_in_batches(money_flow_collection, operations)
                 print(f"Date {trade_date}: upserted {upserted_count} / modified {modified_count}")
 
-                #update last successful date in state collection
+                # update last successful date in state collection
                 try:
                     state_collection.update_one({'_id': 'money_flow_last_date'}, {'$set': {'last_date': trade_date}}, upsert=True)
                 except Exception as exc:
@@ -142,76 +245,14 @@ def collect_range_by_date(start_date: str, end_date: str):
 
 def main():
     parser = argparse.ArgumentParser(description='Money flow collector')
-    parser.add_argument('--mode', choices=['date', 'symbol'], default='date', help='collection mode')
     parser.add_argument('--start', help='start date YYYYMMDD')
     parser.add_argument('--end', help='end date YYYYMMDD')
     args = parser.parse_args()
 
-    if args.mode == 'date':
-        # Default end: if omitted, pick latest trading date <= today
-        end = args.end
-        if not end:
-            try:
-                today = datetime.today().date()
-                # ask tushare for recent trade days (last 14 days should be enough)
-                cal = pro.trade_cal(start_date=(today - timedelta(days=14)).strftime('%Y%m%d'), end_date=today.strftime('%Y%m%d'))
-                opens = cal[cal['is_open'] == 1]['cal_date'].tolist()
-                print(opens)
-                if opens:
-                    latest = opens[0]
-                    end = latest.replace('-', '') if isinstance(latest, str) else latest.strftime('%Y%m%d')
-                    print(f"Auto-selected end date (latest trading day): {end}")
-                else:
-                    end = today.strftime('%Y%m%d')
-                    print(f"No trading days found in calendar; defaulting end to today: {end}")
-            except Exception as exc:
-                end = datetime.today().strftime('%Y%m%d')
-                print(f"Failed to fetch trade calendar to determine end date, defaulting to today: {end} (error: {exc})")
 
-        # If start is omitted, try to resume from last successful date + 1 day
-        start = args.start
-        if not start:
-            doc = state_collection.find_one({'_id': 'money_flow_last_date'})
-            if doc and 'last_date' in doc:
-                # advance one day
-                last = datetime.strptime(doc['last_date'], '%Y%m%d').date()
-                start_date_obj = last + timedelta(days=1)
-                start = start_date_obj.strftime('%Y%m%d')
-                print(f"Resuming from last successful date: {start}")
-            else:
-                # default to 7 days before end if no state present
-                end_obj = datetime.strptime(end, '%Y%m%d').date()
-                start_date_obj = end_obj - timedelta(days=1)
-                start = start_date_obj.strftime('%Y%m%d')
-                print(f"No last-successful-date found, defaulting start to {start}")
-        print(f"Collecting data from {start} to {end}")
-        collect_range_by_date(start, end)
-    else:
-        # symbol mode: preserve backward compatible behavior - single symbol range from hardcoded dates
-        for doc in stock_info_collection.find():
-            ts_code = get_ts_code(doc['symbol'])
-            df = pro.moneyflow(ts_code=ts_code, start_date='20250906', end_date='20250913')
-            records = df.to_dict(orient='records')
-
-            # 给每条记录加 symbol 字段
-            for record in records:
-                record["symbol"] = doc["symbol"]
-
-            if records:
-                # ✅ 使用 bulk_write 批量 upsert
-                operations = []
-                for record in records:
-                    operations.append(
-                        UpdateOne(
-                            {"symbol": record["symbol"], "trade_date": record["trade_date"]},
-                            {"$set": record},
-                            upsert=True
-                        )
-                    )
-
-                if operations:
-                    result = money_flow_collection.bulk_write(operations)
-                    print(f"股票 {doc['symbol']}: 插入 {result.upserted_count} 条，更新 {result.modified_count} 条")
+    start, end = resolve_date_range(args.start, args.end, state_collection, pro)
+    print(f"Collecting data from {start} to {end}")
+    collect_range_by_date(start, end)
 
 
 if __name__ == '__main__':
