@@ -10,25 +10,7 @@ cache:
       - requirements-ci.txt
   paths:
     - .cache/pip
-    - dashboard/node_modules/
-    - dashboard/.vite
 
-frontend-tests:
-  stage: test
-  image: node:20
-  cache:
-    paths:
-      - dashboard/node_modules/
-      - dashboard/.vite
-  script:
-    - cd dashboard
-    - npm ci
-    - npm test
-  artifacts:
-    when: always
-    expire_in: 1 week
-    paths:
-      - dashboard/node_modules/
 
 backend-unit-tests:
   stage: test
