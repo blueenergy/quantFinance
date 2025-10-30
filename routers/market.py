@@ -1,5 +1,6 @@
+# 新增：获取market spectrum的API接口
 from typing import Optional, Dict, Any
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter,Query, Depends, HTTPException
 from models.all_models import MarketAnalysisRequest
 from auth import get_current_active_user
 from db import get_db_collections
@@ -185,3 +186,25 @@ def fetch_market_data() -> Optional[Dict[str, Any]]:
         print(f"[市场数据] 获取失败: {e}")
         return None
     
+@router.get('/market-spectrum', summary="获取市场阴阳谱数据", tags=["Market"])
+def get_market_spectrum(
+    start_date: str = Query(..., description="开始日期,格式YYYYMMDD"),
+    end_date: str = Query(..., description="结束日期,格式YYYYMMDD")
+):  
+    collections = get_db_collections()
+    collection = collections['market_spectrum']
+    query = {
+        'trade_date': {'$gte': start_date, '$lte': end_date}
+    }
+    projection = {
+        '_id': 0,
+        'trade_date': 1,
+        'yang_spectrum': 1,
+        'yin_spectrum': 1,
+        'total_stocks': 1,
+        'above_ma5_count': 1,
+        'below_ma5_count': 1
+    }
+    cursor = collection.find(query, projection).sort('trade_date', 1)
+    data = list(cursor)
+    return {"data": data}
