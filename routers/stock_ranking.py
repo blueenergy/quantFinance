@@ -35,31 +35,69 @@ async def get_stock_rankings(
         stock_scores = db['stock_scores']
         stock_info = db['stock_info']
 
+        # Efficient aggregation: $sort -> $group (first doc) -> project -> sort
         if date:
-            query = {"score_date": date}
-            all_stocks = list(stock_scores.find(query).sort("composite_score", -1).limit(limit * 2))
-        else:
+            match_stage = {"$match": {"score_date": date}}
+            if min_score is not None:
+                match_stage["$match"].update({"composite_score": {"$gte": min_score}})
             pipeline = [
-                {"$group": {"_id": {"symbol": "$symbol", "date": "$score_date"}, "docs": {"$push": "$$ROOT"}}},
-                {"$sort": {"_id.date": -1}},
+                match_stage,
+                {"$project": {
+                    "symbol": 1,
+                    "composite_score": 1,
+                    "cycle_score": 1,
+                    "value_score": 1,
+                    "fundamental_score": 1,
+                    "growth_score": 1,
+                    "technical_score": 1,
+                    "money_flow_score": 1,
+                    "score_date": 1
+                }},
+                {"$sort": {"composite_score": -1}},
+                {"$limit": limit * 2}
             ]
-            # attempt to get latest per symbol via aggregation
-            try:
-                pipeline = [
-                    {"$group": {"_id": "$symbol", "latest_date": {"$max": "$score_date"}, "docs": {"$push": "$$ROOT"}}},
-                    {"$unwind": "$docs"},
-                    {"$match": {"$expr": {"$eq": ["$docs.score_date", "$latest_date"]}}},
-                    {"$replaceRoot": {"newRoot": "$docs"}},
-                    {"$sort": {"composite_score": -1}},
-                    {"$limit": limit * 2}
-                ]
-                all_stocks = list(stock_scores.aggregate(pipeline))
-            except Exception:
-                all_stocks = list(stock_scores.find({}).sort("composite_score", -1).limit(limit * 2))
+        else:
+            # sort by score_date desc, then group by symbol taking first
+            pipeline = [
+                {"$sort": {"score_date": -1}},
+                {"$group": {"_id": "$symbol", "first": {"$first": "$$ROOT"}}},
+                {"$replaceRoot": {"newRoot": "$first"}},
+                {"$project": {
+                    "symbol": 1,
+                    "composite_score": 1,
+                    "cycle_score": 1,
+                    "value_score": 1,
+                    "fundamental_score": 1,
+                    "growth_score": 1,
+                    "technical_score": 1,
+                    "money_flow_score": 1,
+                    "score_date": 1
+                }},
+            ]
+            if min_score is not None:
+                pipeline.append({"$match": {"composite_score": {"$gte": min_score}}})
+            pipeline.extend([
+                {"$sort": {"composite_score": -1}},
+                {"$limit": limit * 2}
+            ])
 
-        # attach basic info
+        try:
+            all_stocks = list(stock_scores.aggregate(pipeline))
+        except Exception:
+            # Fallback: simple find with sorting if aggregation fails
+            base_query = {"score_date": date} if date else {}
+            if min_score is not None:
+                base_query["composite_score"] = {"$gte": min_score}
+            all_stocks = list(stock_scores.find(base_query).sort("composite_score", -1).limit(limit * 2))
+
+        # Batch attach basic info to avoid N+1 queries
+        symbols = [s.get('symbol') for s in all_stocks if s.get('symbol')]
+        info_map = {}
+        if symbols:
+            for info in stock_info.find({"symbol": {"$in": symbols}}, projection={"symbol": 1, "name": 1, "industry": 1}):
+                info_map[info.get('symbol')] = info
         for stock in all_stocks:
-            info = stock_info.find_one({"symbol": stock.get('symbol')})
+            info = info_map.get(stock.get('symbol'))
             stock['name'] = info.get('name', '') if info else ''
             stock['industry'] = info.get('industry', '') if info else ''
 
