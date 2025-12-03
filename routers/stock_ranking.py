@@ -94,7 +94,8 @@ async def get_stock_rankings(
         symbols = [s.get('symbol') for s in all_stocks if s.get('symbol')]
         info_map = {}
         if symbols:
-            for info in stock_info.find({"symbol": {"$in": symbols}}, projection={"symbol": 1, "name": 1, "industry": 1}):
+            # Use positional projection arg for broader compatibility with test fakes
+            for info in stock_info.find({"symbol": {"$in": symbols}}, {"symbol": 1, "name": 1, "industry": 1}):
                 info_map[info.get('symbol')] = info
         for stock in all_stocks:
             info = info_map.get(stock.get('symbol'))
