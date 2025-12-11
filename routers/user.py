@@ -1,7 +1,6 @@
-import os
-import tushare as ts
+from typing import List
 from fastapi import APIRouter, Depends, Request, Query, HTTPException
-from models.all_models import UserCreate, UserLogin, UserResponse, Token, WatchlistRequest, WatchlistUpdateRequest
+from models.all_models import UserCreate, UserLogin, UserResponse, Token, WatchlistRequest, WatchlistUpdateRequest, WatchlistStrategySetRequest, WatchlistStrategyResponse, SecuritiesAccountCreate, SecuritiesAccountUpdate, SecuritiesAccountResponse
 from auth import create_user, authenticate_user, create_access_token, get_current_active_user, log_login_attempt,ACCESS_TOKEN_EXPIRE_MINUTES
 from db import get_db_collections
 from datetime import timedelta, datetime
@@ -134,6 +133,44 @@ def update_watchlist(request: WatchlistUpdateRequest, current_user: dict = Depen
     )
     return {"success": True}
 
+# --- Watchlist strategies per symbol ---
+@router.get("/watchlist/strategies")
+def get_watchlist_strategies(current_user: dict = Depends(get_current_active_user)):
+    collections = get_db_collections()
+    strat_col = collections["watchlist_strategies"]
+    user_id = get_user_id(current_user)
+    docs = strat_col.find({"user_id": user_id})
+    data = []
+    for d in docs:
+        data.append({
+            "symbol": d["symbol"],
+            "strategy_key": d.get("strategy_key"),
+            "params": d.get("params", {}),
+            "updated_at": d.get("updated_at"),
+            "enabled": d.get("enabled", True),
+        })
+    return {"success": True, "data": data}
+
+@router.post("/watchlist/strategy")
+def set_watchlist_strategy(req: WatchlistStrategySetRequest, current_user: dict = Depends(get_current_active_user)):
+    collections = get_db_collections()
+    watchlist_col = collections["user_watchlists"]
+    strat_col = collections["watchlist_strategies"]
+    user_id = get_user_id(current_user)
+    # Ensure symbol is in user watchlist
+    doc = watchlist_col.find_one({"user_id": user_id})
+    symbols = doc["symbols"] if doc and "symbols" in doc else []
+    if req.symbol not in symbols:
+        raise HTTPException(status_code=400, detail="Symbol not in user watchlist")
+    import time
+    enabled = getattr(req, "enabled", True)
+    strat_col.update_one(
+        {"user_id": user_id, "symbol": req.symbol},
+        {"$set": {"strategy_key": req.strategy, "params": req.params, "updated_at": time.time(), "enabled": enabled}},
+        upsert=True
+    )
+    return {"success": True}
+
 @router.get("/watchlist-stocks")
 def get_user_watchlist_stocks(current_user: dict = Depends(get_current_active_user)):
     """获取当前用户自选股的详细信息"""
@@ -153,20 +190,18 @@ def get_user_watchlist_stocks(current_user: dict = Depends(get_current_active_us
         symbols = watchlist_doc["symbols"]
         result = []
 
-        ts.set_token(os.getenv("TUSHARE_TOKEN"))
-        pro = ts.pro_api()
-
-
-
-        # quotes = ef.stock.get_realtime_quotes()
-        # filtered = quotes[quotes['股票代码'].isin(symbols)]
+        volume_price_col = collections["volume_price"]
         for symbol in symbols:
-            ts_code = get_ts_code(symbol)
-            df = pro.daily(ts_code=ts_code, limit=1)
-            name = collections["stock_info"].find_one({"symbol": symbol})['name']
+            stock_info = collections["stock_info"].find_one({"symbol": symbol})
+            name = stock_info["name"] if stock_info and "name" in stock_info else symbol
 
-            if not df.empty:
-                latest_record = df.iloc[0]
+            # Find latest record for symbol in volume_price
+            latest_record = volume_price_col.find_one(
+                {"symbol": symbol},
+                sort=[("trade_date", -1)]
+            )
+
+            if latest_record:
                 stock_data = {
                     "symbol": symbol,
                     "name": name,
@@ -179,31 +214,30 @@ def get_user_watchlist_stocks(current_user: dict = Depends(get_current_active_us
                     "open": latest_record.get("open"),
                     "change": latest_record.get("change"),
                     "change_percent": latest_record.get("pct_chg"),
+                    "turnover_rate": latest_record.get("turnover_rate"),
+                    "pe": latest_record.get("pe"),
+                    "market_cap": latest_record.get("market_cap"),
+                    "circ_market_cap": latest_record.get("circ_market_cap")
+                }
+                result.append(stock_data)
+            else:
+                result.append({
+                    "symbol": symbol,
+                    "name": name,
+                    "close": None,
+                    "trade_date": None,
+                    "volume": None,
+                    "turnover": None,
+                    "high": None,
+                    "low": None,
+                    "open": None,
+                    "change": None,
+                    "change_percent": None,
                     "turnover_rate": None,
                     "pe": None,
                     "market_cap": None,
                     "circ_market_cap": None
-                }
-
-                result.append(stock_data)
-            else:
-                 result.append({
-                "symbol": symbol,
-                "name": symbol,
-                "close": None,
-                "trade_date": None,
-                "volume": None,
-                "turnover": None,
-                "high": None,
-                "low": None,
-                "open": None,
-                "change": None,
-                "change_percent": None,
-                "turnover_rate": None,
-                "pe": None,
-                "market_cap": None,
-                "circ_market_cap": None
-                 })
+                })
         
         return {
             "success": True,
@@ -214,3 +248,54 @@ def get_user_watchlist_stocks(current_user: dict = Depends(get_current_active_us
             "success": False,
             "message": f"获取用户自选股信息失败: {str(e)}"
         }
+
+# 证券账户管理
+from models.all_models import SecuritiesAccountCreate, SecuritiesAccountUpdate, SecuritiesAccountResponse
+
+@router.post("/securities_account", response_model=SecuritiesAccountResponse)
+def create_securities_account(request: SecuritiesAccountCreate, current_user: dict = Depends(get_current_active_user)):
+    collections = get_db_collections()
+    col = collections["securities_accounts"]
+    user_id = get_user_id(current_user)
+    import datetime
+    doc = {
+        "user_id": user_id,
+        "broker": request.broker,
+        "account_id": request.account_id,
+        "password": request.password,
+        "created_at": datetime.datetime.utcnow(),
+        "updated_at": datetime.datetime.utcnow(),
+    }
+    result = col.insert_one(doc)
+    doc["id"] = str(result.inserted_id)
+    return SecuritiesAccountResponse(**doc)
+
+@router.get("/securities_account", response_model=List[SecuritiesAccountResponse])
+def list_securities_accounts(current_user: dict = Depends(get_current_active_user)):
+    collections = get_db_collections()
+    col = collections["securities_accounts"]
+    user_id = get_user_id(current_user)
+    docs = list(col.find({"user_id": user_id}))
+    for d in docs:
+        d["id"] = str(d["_id"])
+    return [SecuritiesAccountResponse(**d) for d in docs]
+
+@router.put("/securities_account/{account_id}", response_model=SecuritiesAccountResponse)
+def update_securities_account(account_id: str, request: SecuritiesAccountUpdate, current_user: dict = Depends(get_current_active_user)):
+    collections = get_db_collections()
+    col = collections["securities_accounts"]
+    user_id = get_user_id(current_user)
+    update_doc = {k: v for k, v in request.dict().items() if v is not None}
+    update_doc["updated_at"] = datetime.datetime.utcnow()
+    col.update_one({"user_id": user_id, "account_id": account_id}, {"$set": update_doc})
+    doc = col.find_one({"user_id": user_id, "account_id": account_id})
+    doc["id"] = str(doc["_id"])
+    return SecuritiesAccountResponse(**doc)
+
+@router.delete("/securities_account/{account_id}")
+def delete_securities_account(account_id: str, current_user: dict = Depends(get_current_active_user)):
+    collections = get_db_collections()
+    col = collections["securities_accounts"]
+    user_id = get_user_id(current_user)
+    col.delete_one({"user_id": user_id, "account_id": account_id})
+    return {"success": True}
