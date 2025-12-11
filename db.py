@@ -30,6 +30,8 @@ def get_db_collections() -> Dict[str, Collection]:
         "admin_logs": db["admin_logs"],
         "market_analysis_cache": db["market_analysis_cache"],
         "user_watchlists": db["user_watchlists"],
+        "watchlist_strategies": db["watchlist_strategies"],
+        "securities_accounts": db["securities_accounts"],
         "money_flow": db["money_flow"],  # 资金流数据
         "market_spectrum": db["market_spectrum"],  # 阴阳谱数据
         # Add more collections as needed

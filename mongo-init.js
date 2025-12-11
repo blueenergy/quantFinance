@@ -18,6 +18,8 @@ db.createUser({
 
 // 创建集合和索引
 db.createCollection('users');
+db.createCollection('securities_accounts');
+db.createCollection('watchlist_strategies');
 db.createCollection('watchlists');
 db.createCollection('stock_data');
 db.createCollection('analysis_history');
@@ -26,6 +28,8 @@ db.createCollection('admin_logs');
 
 // 为用户集合创建索引
 db.users.createIndex({ "username": 1 }, { unique: true });
+db.securities_accounts.createIndex({ "user_id": 1, "broker": 1, "account_id": 1 }, { unique: true });
+db.watchlist_strategies.createIndex({ "user_id": 1, "symbol": 1 }, { unique: true });
 db.users.createIndex({ "email": 1 }, { unique: true });
 db.users.createIndex({ "is_admin": 1 });
 db.users.createIndex({ "is_active": 1 });

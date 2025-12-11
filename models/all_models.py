@@ -79,6 +79,16 @@ class WatchlistRequest(BaseModel):
 class WatchlistUpdateRequest(BaseModel):
     symbols: List[str]
 
+class WatchlistStrategySetRequest(BaseModel):
+    symbol: str
+    strategy: str
+    params: dict
+
+class WatchlistStrategyResponse(BaseModel):
+    symbol: str
+    strategy: str
+    params: dict
+
 class AnalysisHistoryRequest(BaseModel):
     symbol: str
     prompt: Optional[str] = None
@@ -86,3 +96,21 @@ class AnalysisHistoryRequest(BaseModel):
     provider: Optional[str] = None
     model: Optional[str] = None
     timestamp: Optional[str] = None
+
+# --- Securities accounts ---
+class SecuritiesAccountBase(BaseModel):
+    broker: str
+    account_id: str
+
+class SecuritiesAccountCreate(SecuritiesAccountBase):
+    password: str
+
+class SecuritiesAccountUpdate(BaseModel):
+    broker: Optional[str] = None
+    account_id: Optional[str] = None
+    password: Optional[str] = None
+
+class SecuritiesAccountResponse(SecuritiesAccountBase):
+    id: str
+    created_at: datetime
+    updated_at: Optional[datetime] = None
