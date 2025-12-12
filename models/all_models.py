@@ -83,6 +83,7 @@ class WatchlistStrategySetRequest(BaseModel):
     symbol: str
     strategy: str
     params: dict
+    enabled: Optional[bool] = True
 
 class WatchlistStrategyResponse(BaseModel):
     symbol: str
