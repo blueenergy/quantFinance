@@ -34,6 +34,8 @@ def get_db_collections() -> Dict[str, Collection]:
         "securities_accounts": db["securities_accounts"],
         "money_flow": db["money_flow"],  # 资金流数据
         "market_spectrum": db["market_spectrum"],  # 阴阳谱数据
+        "strategy_template": db["strategy_template"],  # 策略参数模板
+        "strategy_metadata": db["strategy_metadata"],  # 策略元数据（key和name）
         # Add more collections as needed
     }
 
