@@ -9,6 +9,7 @@ from routers.stock_ranking import router as stock_ranking_router
 from routers import index_data 
 from routers.securities_account import router as sec_account_router
 from routers.strategy import router as strategy_router
+from routers.trade_execution import router as trade_execution_router
 
 
 app = FastAPI()
@@ -24,3 +25,4 @@ app.include_router(stock_ranking_router, prefix="/api", tags=["股票排名"])
 app.include_router(index_data.router, prefix="/api/index", tags=["指数数据"])
 app.include_router(sec_account_router, prefix="/api/user", tags=["账户"])
 app.include_router(strategy_router,prefix="/api", tags=["策略"])
+app.include_router(trade_execution_router, prefix="/api", tags=["交易执行"])
