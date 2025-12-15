@@ -13,6 +13,7 @@ collection = collections["volume_price"] # type: ignore
 class RecordResponseModel(BaseModel):
     symbol: Optional[str]
     trade_date: Optional[Any]
+    name: Optional[str] = None
     open: Optional[float] = None
     close: Optional[float] = None
     high: Optional[float] = None
@@ -26,14 +27,13 @@ class RecordResponseModel(BaseModel):
     technical_score: Optional[float] = None
     money_flow_score: Optional[float] = None
     score_date: Optional[str] = None
-    # Add other fields as needed
 
 @router.get("/records/", response_model=List[RecordResponseModel])
 def get_records(symbol: Optional[str] = Query(None), limit: int = 10, sort: Optional[str] = None):
     query = {}
     if symbol:
         query["symbol"] = symbol
-    # 构建聚合管道，先将 trade_date 转为 %Y%m%d 字符串e_date 转为 %Y%m%d 字符串
+    # 构建聚合管道，先将 trade_date 转为 %Y%m%d 字符串
     pipeline = [
         {"$match": query},
         {"$addFields": {
@@ -92,9 +92,24 @@ def get_records(symbol: Optional[str] = Query(None), limit: int = 10, sort: Opti
             }
         }
     })
-    # pipeline.append({"$project": {"score_docs": 0, "score_doc": 0, "trade_date_str": 0}})
-    docs = list(collection.aggregate(pipeline))
-
+    
+    # 添加 stock_info 左连接来获取股票名称
+    pipeline.append({
+        "$lookup": {
+            "from": "stock_info",
+            "localField": "symbol",
+            "foreignField": "symbol",
+            "as": "stock_info_docs"
+        }
+    })
+    pipeline.append({"$addFields": {
+        "stock_info": {"$arrayElemAt": ["$stock_info_docs", 0]}
+    }})
+    pipeline.append({"$addFields": {
+        "name": {"$ifNull": ["$stock_info.name", ""]}
+    }})
+    
+    # 最后的 $project 保留所需字段
     pipeline.append({"$project": {
         "symbol": 1,
         "trade_date": 1,
@@ -103,6 +118,7 @@ def get_records(symbol: Optional[str] = Query(None), limit: int = 10, sort: Opti
         "high": 1,
         "low": 1,
         "volume": 1,
+        "name": 1,
         "composite_score": 1,
         "cycle_score": 1,
         "fundamental_score": 1,
@@ -111,6 +127,8 @@ def get_records(symbol: Optional[str] = Query(None), limit: int = 10, sort: Opti
         "money_flow_score": 1,
         "score_date": 1
     }})
+    
+    docs = list(collection.aggregate(pipeline))
     return [serialize_doc(doc) for doc in docs]
 
 @router.get("/record/{record_id}")
