@@ -38,6 +38,7 @@ def get_db_collections() -> Dict[str, Collection]:
         "strategy_metadata": db["strategy_metadata"],  # 策略元数据（key和name）
         "trade_executions": db["trade_executions"],  # 交易执行记录
         "trade_signals": db["trade_signals"],  # 交易信号
+        "minute_bars": db["minute_bars"],  # 分钟K线数据
         # Add more collections as needed
     }
 
