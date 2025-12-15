@@ -249,3 +249,202 @@ def get_trade_strategies():
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"查询失败: {str(e)}")
+
+@router.get("/trade-activities/stats", summary="获取所有交易活动统计")
+def get_trade_activities_stats():
+    """统计所有交易活动（包括信号和执行记录）"""
+    try:
+        collections = get_db_collections()
+        executions_coll = collections["trade_executions"]
+        signals_coll = collections["trade_signals"]
+        
+        # 获取执行记录（排除回测）
+        executions = list(executions_coll.find({"worker_mode": {"$ne": "backtest"}}))
+        
+        # 获取交易信号（live 模式）
+        signals = list(signals_coll.find({
+            "$or": [
+                {"worker_mode": "live"},
+                {"mode": "live"}
+            ]
+        }))
+        
+        # 统计执行记录
+        exec_buy = sum(1 for t in executions if (t.get("side") or t.get("action", "")).upper() == "BUY")
+        exec_sell = sum(1 for t in executions if (t.get("side") or t.get("action", "")).upper() == "SELL")
+        
+        # 统计信号
+        signal_buy = sum(1 for s in signals if s.get("action", "").lower() == "buy")
+        signal_sell = sum(1 for s in signals if s.get("action", "").lower() == "sell")
+        
+        # 收集所有股票
+        symbols = set()
+        for t in executions:
+            if t.get("symbol"):
+                symbols.add(t.get("symbol"))
+        for s in signals:
+            if s.get("symbol"):
+                symbols.add(s.get("symbol"))
+        
+        return {
+            "success": True,
+            "stats": {
+                "total_trades": len(executions) + len(signals),
+                "executed_trades": len(executions),
+                "pending_signals": len(signals),
+                "buy_trades": exec_buy + signal_buy,
+                "sell_trades": exec_sell + signal_sell,
+                "total_symbols": len(symbols),
+                "symbols": list(symbols)
+            }
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"统计失败: {str(e)}")
+
+@router.get("/trade-activities/", summary="获取所有交易活动（包含信号和执行记录）")
+def get_all_trade_activities(
+    limit: int = Query(100, description="返回记录数量限制"),
+    skip: int = Query(0, description="跳过的记录数量"),
+    start_date: Optional[str] = Query(None, description="开始日期 (YYYY-MM-DD)"),
+    end_date: Optional[str] = Query(None, description="结束日期 (YYYY-MM-DD)"),
+    days: Optional[int] = Query(None, description="最近N天"),
+    status_filter: Optional[str] = Query(None, description="状态筛选: executed, pending, all")
+):
+    """融合 trade_signals 和 trade_executions，提供完整的交易活动视图"""
+    try:
+        collections = get_db_collections()
+        executions_coll = collections["trade_executions"]
+        signals_coll = collections["trade_signals"]
+        stock_info_coll = collections["stock_info"]
+        
+        # 构建日期查询条件
+        date_query = {}
+        if days:
+            from datetime import datetime, timedelta
+            end = datetime.now().replace(hour=23, minute=59, second=59)
+            start = (end - timedelta(days=days - 1)).replace(hour=0, minute=0, second=0)
+            date_query = {
+                "$or": [
+                    {
+                        "date": {
+                            "$gte": start.strftime("%Y-%m-%d"),
+                            "$lte": end.strftime("%Y-%m-%d")
+                        }
+                    },
+                    {
+                        "timestamp": {
+                            "$gte": start.timestamp(),
+                            "$lte": end.timestamp()
+                        }
+                    }
+                ]
+            }
+        elif start_date or end_date:
+            from datetime import datetime
+            or_conditions = []
+            date_filter = {}
+            timestamp_filter = {}
+            
+            if start_date:
+                date_filter["$gte"] = start_date
+                start_dt = datetime.strptime(start_date, "%Y-%m-%d")
+                timestamp_filter["$gte"] = start_dt.timestamp()
+            if end_date:
+                date_filter["$lte"] = end_date
+                end_dt = datetime.strptime(end_date, "%Y-%m-%d").replace(hour=23, minute=59, second=59)
+                timestamp_filter["$lte"] = end_dt.timestamp()
+            
+            if date_filter:
+                or_conditions.append({"date": date_filter})
+            if timestamp_filter:
+                or_conditions.append({"timestamp": timestamp_filter})
+            if or_conditions:
+                date_query = {"$or": or_conditions}
+        
+        merged_activities = []
+        
+        # 1. 获取已执行的交易记录（如果不是仅显示 pending）
+        if status_filter != "pending":
+            exec_query = {"worker_mode": {"$ne": "backtest"}}  # 排除回测数据
+            if date_query:
+                exec_query.update(date_query)
+            
+            executions = list(executions_coll.find(exec_query).sort("timestamp", -1))
+            
+            for exec_doc in executions:
+                merged_activities.append({
+                    "_id": str(exec_doc.get("_id")),
+                    "symbol": exec_doc.get("symbol"),
+                    "direction": (exec_doc.get("side") or exec_doc.get("action", "")).upper(),
+                    "status": "FILLED",
+                    "status_category": "executed",
+                    "price": exec_doc.get("filled_price", exec_doc.get("price", 0)),
+                    "target_price": exec_doc.get("target_price"),
+                    "filled_price": exec_doc.get("filled_price"),
+                    "quantity": exec_doc.get("quantity", exec_doc.get("size", 0)),
+                    "strategy": exec_doc.get("strategy_name", exec_doc.get("strategy", "")),
+                    "timestamp": exec_doc.get("timestamp", 0),
+                    "order_id": exec_doc.get("order_id", ""),
+                    "source": "trade_execution",
+                    "date": exec_doc.get("date", "")
+                })
+        
+        # 2. 获取待执行的交易信号（如果不是仅显示 executed）
+        if status_filter != "executed":
+            signal_query = {
+                "$or": [
+                    {"worker_mode": "live"},
+                    {"mode": "live"}
+                ],
+                "status": {"$in": ["pending", "retry_pending", "submitted"]}
+            }
+            if date_query:
+                signal_query.update(date_query)
+            
+            signals = list(signals_coll.find(signal_query).sort("timestamp", -1))
+            
+            for signal_doc in signals:
+                status_map = {
+                    "pending": "PENDING",
+                    "retry_pending": "RETRY",
+                    "submitted": "SUBMITTED"
+                }
+                merged_activities.append({
+                    "_id": str(signal_doc.get("_id")),
+                    "symbol": signal_doc.get("symbol"),
+                    "direction": (signal_doc.get("action", "")).upper(),
+                    "status": status_map.get(signal_doc.get("status", "pending"), "PENDING"),
+                    "status_category": "pending",
+                    "price": signal_doc.get("price", 0),
+                    "target_price": signal_doc.get("price"),
+                    "filled_price": None,
+                    "quantity": signal_doc.get("size", 0),
+                    "strategy": signal_doc.get("strategy", ""),
+                    "timestamp": signal_doc.get("timestamp", 0),
+                    "order_id": signal_doc.get("order_id", ""),
+                    "source": "trade_signal",
+                    "error_message": signal_doc.get("error_message"),
+                    "retry_count": signal_doc.get("retry_count", 0),
+                    "date": signal_doc.get("date", "")
+                })
+        
+        # 3. 按时间倒序排序
+        merged_activities.sort(key=lambda x: x.get("timestamp", 0), reverse=True)
+        
+        # 4. 分页
+        total = len(merged_activities)
+        merged_activities = merged_activities[skip:skip + limit]
+        
+        # 5. 添加股票名称
+        merged_activities = enrich_trades_with_stock_names(merged_activities, stock_info_coll)
+        
+        return {
+            "success": True,
+            "data": merged_activities,
+            "count": len(merged_activities),
+            "total": total
+        }
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"查询失败: {str(e)}")
