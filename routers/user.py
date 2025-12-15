@@ -249,6 +249,211 @@ def get_user_watchlist_stocks(current_user: dict = Depends(get_current_active_us
             "message": f"获取用户自选股信息失败: {str(e)}"
         }
 
+
+def add_exchange_suffix(symbol: str) -> str:
+    """Add exchange suffix for stock symbol.
+    
+    Rules:
+    - 6xxxxx (Shanghai) -> .SH
+    - 0xxxxx, 3xxxxx (Shenzhen) -> .SZ
+    - Already has suffix -> return as-is
+    
+    Args:
+        symbol: Stock symbol (e.g., "600990" or "600990.SH")
+        
+    Returns:
+        str: Symbol with exchange suffix (e.g., "600990.SH")
+    """
+    if '.' in symbol:
+        return symbol  # Already has suffix
+    
+    if symbol.startswith('6'):
+        return f"{symbol}.SH"
+    elif symbol.startswith(('0', '3')):
+        return f"{symbol}.SZ"
+    else:
+        return f"{symbol}.SZ"  # Default to Shenzhen
+
+
+def remove_exchange_suffix(symbol: str) -> str:
+    """Remove exchange suffix from stock symbol.
+    
+    Args:
+        symbol: Symbol with suffix (e.g., "600990.SH")
+        
+    Returns:
+        str: Symbol without suffix (e.g., "600990")
+    """
+    return symbol.replace(".SH", "").replace(".SZ", "")
+
+
+@router.get("/watchlist-stocks/realtime")
+def get_user_watchlist_realtime(current_user: dict = Depends(get_current_active_user)):
+    """获取当前用户自选股的实时数据基于分钟K线）
+    
+    Returns:
+        {
+            "success": True,
+            "data": [
+                {
+                    "symbol": "600990",
+                    "name": "四创电子",
+                    "price": 29.61,        # 最新价格（最新分钟K线的收盘价）
+                    "open": 27.61,         # 今日开盘价
+                    "high": 31.0,          # 今日最高价
+                    "low": 27.45,          # 今日最低价
+                    "volume": 278479.0,    # 今日累计成交量
+                    "change": 0.50,        # 涨跌额
+                    "change_pct": 1.72,    # 涨跌幅%
+                    "update_time": "2025-12-16 14:30:00"  # 最后更新时间
+                },
+                ...
+            ]
+        }
+    """
+    try:
+        user_id = current_user["id"]
+        
+        # 1. 获取用户自选股列表
+        collections = get_db_collections()
+        user_watchlists_collection = collections["user_watchlists"]
+        watchlist_doc = user_watchlists_collection.find_one({"user_id": user_id})
+        
+        if not watchlist_doc or not watchlist_doc.get("symbols"):
+            return {
+                "success": True,
+                "data": []
+            }
+        
+        symbols = watchlist_doc["symbols"]  # e.g., ["600990", "300722"]
+        
+        # 2. 获取昨日收盘价（用于计算涨跌幅）
+        yesterday_close_map = {}  # symbol -> close_price
+        volume_price_col = collections["volume_price"]
+        
+        for symbol in symbols:
+            latest_record = volume_price_col.find_one(
+                {"symbol": symbol},
+                sort=[("trade_date", -1)]
+            )
+            if latest_record:
+                yesterday_close_map[symbol] = latest_record.get("close")
+        
+        # 3. 准备查询条件（minute_bars 中 symbol 没有交易所后缀）
+        # symbols 已经是不带后缀的格式，如 ["600990", "300722"]
+        
+        # 4. 聚合今日分钟K线数据
+        minute_bars_col = collections["minute_bars"]
+        today = datetime.now().strftime("%Y%m%d")  # e.g., "20251216"
+        
+        # minute_bars 的 trade_date 格式是 YYYYMMDDHHmm，需要按日期前缀匹配
+        pipeline = [
+            {
+                "$match": {
+                    "symbol": {"$in": symbols},  # 不需要后缀
+                    "trade_date": {"$regex": f"^{today}"}  # 匹配今天的所有分钟数据
+                }
+            },
+            {"$sort": {"trade_date": 1}},  # 按时间排序
+            {
+                "$group": {
+                    "_id": "$symbol",
+                    "open": {"$first": "$open"},      # 第一根K线的开盘价
+                    "close": {"$last": "$close"},     # 最新K线的收盘价
+                    "high": {"$max": "$high"},        # 最高价
+                    "low": {"$min": "$low"},          # 最低价
+                    "volume": {"$sum": "$volume"},    # 累计成交量
+                    "latest_time": {"$last": "$trade_date"}  # 最后更新时间
+                }
+            }
+        ]
+        
+        realtime_data = list(minute_bars_col.aggregate(pipeline))
+        
+        # 5. 构建结果并计算涨跌幅
+        result = []
+        realtime_map = {item["_id"]: item for item in realtime_data}  # symbol -> data
+        
+        stock_info_col = collections["stock_info"]
+        
+        for symbol in symbols:
+            # 获取股票名称
+            stock_info = stock_info_col.find_one({"symbol": symbol})
+            name = stock_info["name"] if stock_info and "name" in stock_info else symbol
+            
+            if symbol in realtime_map:
+                # 有今日实时数据
+                item = realtime_map[symbol]
+                current_price = item["close"]
+                yesterday_close = yesterday_close_map.get(symbol, item["open"])  # 如果没有昨日数据，用今日开盘价
+                
+                # 计算涨跌额和涨跌幅
+                change = current_price - yesterday_close if yesterday_close else 0
+                change_pct = (change / yesterday_close * 100) if yesterday_close else 0
+                
+                # 格式化更新时间（YYYYMMDDHHmm -> YYYY-MM-DD HH:MM:SS）
+                latest_time_str = item["latest_time"]
+                if latest_time_str and len(latest_time_str) >= 12:
+                    formatted_time = f"{latest_time_str[0:4]}-{latest_time_str[4:6]}-{latest_time_str[6:8]} {latest_time_str[8:10]}:{latest_time_str[10:12]}:00"
+                else:
+                    formatted_time = str(latest_time_str)
+                
+                result.append({
+                    "symbol": symbol,
+                    "name": name,
+                    "price": round(current_price, 2),
+                    "open": round(item["open"], 2),
+                    "high": round(item["high"], 2),
+                    "low": round(item["low"], 2),
+                    "volume": round(item["volume"], 2),
+                    "change": round(change, 2),
+                    "change_pct": round(change_pct, 2),
+                    "update_time": formatted_time
+                })
+            else:
+                # 无今日实时数据，返回昨日数据或空值
+                yesterday_close = yesterday_close_map.get(symbol)
+                
+                if yesterday_close:
+                    result.append({
+                        "symbol": symbol,
+                        "name": name,
+                        "price": round(yesterday_close, 2),
+                        "open": None,
+                        "high": None,
+                        "low": None,
+                        "volume": None,
+                        "change": 0.0,
+                        "change_pct": 0.0,
+                        "update_time": None
+                    })
+                else:
+                    result.append({
+                        "symbol": symbol,
+                        "name": name,
+                        "price": None,
+                        "open": None,
+                        "high": None,
+                        "low": None,
+                        "volume": None,
+                        "change": None,
+                        "change_pct": None,
+                        "update_time": None
+                    })
+        
+        return {
+            "success": True,
+            "data": result
+        }
+        
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return {
+            "success": False,
+            "message": f"获取实时自选股数据失败: {str(e)}"
+        }
+
 # 证券账户管理
 from models.all_models import SecuritiesAccountCreate, SecuritiesAccountUpdate, SecuritiesAccountResponse
 
