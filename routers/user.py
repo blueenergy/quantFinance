@@ -164,9 +164,11 @@ def set_watchlist_strategy(req: WatchlistStrategySetRequest, current_user: dict 
         raise HTTPException(status_code=400, detail="Symbol not in user watchlist")
     import time
     enabled = getattr(req, "enabled", True)
+    # CRITICAL: Query must include strategy_key to ensure precise match
+    # This prevents updating wrong strategy when user has multiple strategies for same symbol
     strat_col.update_one(
-        {"user_id": user_id, "symbol": req.symbol},
-        {"$set": {"strategy_key": req.strategy, "params": req.params, "updated_at": time.time(), "enabled": enabled}},
+        {"user_id": user_id, "symbol": req.symbol, "strategy_key": req.strategy},
+        {"$set": {"params": req.params, "updated_at": time.time(), "enabled": enabled}},
         upsert=True
     )
     return {"success": True}
