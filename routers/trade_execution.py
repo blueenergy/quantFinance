@@ -1,8 +1,9 @@
-from fastapi import APIRouter, Query, HTTPException
+from fastapi import APIRouter, Query, HTTPException, Depends
 from typing import List, Optional, Dict, Any
 from datetime import datetime
 from db import get_db_collections
 from utils.stock_utils import serialize_doc
+from auth import get_current_active_user
 
 router = APIRouter()
 
@@ -31,22 +32,24 @@ def enrich_trades_with_stock_names(trades: List[Dict], stock_info_collection) ->
     
     return trades
 
-@router.get("/trade-executions/", summary="获取所有交易执行记录")
+@router.get("/trade-executions/", summary="获取当前用户的交易执行记录")
 def get_all_trade_executions(
     limit: int = Query(100, description="返回记录数量限制"),
     skip: int = Query(0, description="跳过的记录数量"),
     start_date: Optional[str] = Query(None, description="开始日期 (YYYY-MM-DD)"),
     end_date: Optional[str] = Query(None, description="结束日期 (YYYY-MM-DD)"),
-    days: Optional[int] = Query(None, description="最近N天")
+    days: Optional[int] = Query(None, description="最近N天"),
+    current_user: dict = Depends(get_current_active_user),
 ):
-    """获取所有交易执行记录，按时间倒序排列，支持日期范围筛选"""
+    """获取当前登录用户的交易执行记录，按时间倒序排列，支持日期范围筛选"""
     try:
         collections = get_db_collections()
         collection = collections["trade_executions"]
         stock_info_collection = collections["stock_info"]
         
-        # 构建查询条件
-        query = {}
+        # 构建查询条件（按用户 + 日期）
+        user_id = current_user["id"]
+        query: Dict[str, Any] = {"user_id": user_id}
         
         # 处理日期筛选
         if days:
@@ -75,7 +78,7 @@ def get_all_trade_executions(
             or_conditions = []
             
             # date 字段条件
-            date_query = {}
+            date_query: Dict[str, Any] = {}
             if start_date:
                 date_query["$gte"] = start_date
             if end_date:
@@ -84,7 +87,7 @@ def get_all_trade_executions(
                 or_conditions.append({"date": date_query})
             
             # timestamp 字段条件
-            timestamp_query = {}
+            timestamp_query: Dict[str, Any] = {}
             if start_date:
                 start_dt = datetime.strptime(start_date, "%Y-%m-%d").replace(hour=0, minute=0, second=0)
                 timestamp_query["$gte"] = start_dt.timestamp()
@@ -112,20 +115,24 @@ def get_all_trade_executions(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"查询失败: {str(e)}")
 
-@router.get("/trade-executions/symbol/{symbol}", summary="获取特定股票的交易执行记录")
+@router.get("/trade-executions/symbol/{symbol}", summary="获取当前用户特定股票的交易执行记录")
 def get_trade_executions_by_symbol(
     symbol: str,
     limit: int = Query(100, description="返回记录数量限制"),
-    skip: int = Query(0, description="跳过的记录数量")
+    skip: int = Query(0, description="跳过的记录数量"),
+    current_user: dict = Depends(get_current_active_user),
 ):
-    """获取特定股票的交易执行记录，按时间倒序排列"""
+    """获取当前用户特定股票的交易执行记录，按时间倒序排列"""
     try:
         collections = get_db_collections()
         collection = collections["trade_executions"]
         stock_info_collection = collections["stock_info"]
         
+        user_id = current_user["id"]
+        query = {"symbol": symbol, "user_id": user_id}
+        
         # 查询并排序
-        cursor = collection.find({"symbol": symbol}).sort("timestamp", -1).skip(skip).limit(limit)
+        cursor = collection.find(query).sort("timestamp", -1).skip(skip).limit(limit)
         trades = [serialize_doc(doc) for doc in cursor]
         
         # 添加股票名称
@@ -140,20 +147,24 @@ def get_trade_executions_by_symbol(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"查询失败: {str(e)}")
 
-@router.get("/trade-executions/date/{date}", summary="获取特定日期的交易执行记录")
+@router.get("/trade-executions/date/{date}", summary="获取当前用户特定日期的交易执行记录")
 def get_trade_executions_by_date(
     date: str,
     limit: int = Query(100, description="返回记录数量限制"),
-    skip: int = Query(0, description="跳过的记录数量")
+    skip: int = Query(0, description="跳过的记录数量"),
+    current_user: dict = Depends(get_current_active_user),
 ):
-    """获取特定日期的交易执行记录，按时间倒序排列"""
+    """获取当前用户特定日期的交易执行记录，按时间倒序排列"""
     try:
         collections = get_db_collections()
         collection = collections["trade_executions"]
         stock_info_collection = collections["stock_info"]
         
+        user_id = current_user["id"]
+        query = {"date": date, "user_id": user_id}
+        
         # 查询并排序
-        cursor = collection.find({"date": date}).sort("timestamp", -1).skip(skip).limit(limit)
+        cursor = collection.find(query).sort("timestamp", -1).skip(skip).limit(limit)
         trades = [serialize_doc(doc) for doc in cursor]
         
         # 添加股票名称
@@ -168,15 +179,15 @@ def get_trade_executions_by_date(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"查询失败: {str(e)}")
 
-@router.get("/trade-executions/stats", summary="获取交易统计数据")
-def get_trade_execution_stats():
-    """获取交易统计数据"""
+@router.get("/trade-executions/stats", summary="获取当前用户的交易统计数据")
+def get_trade_execution_stats(current_user: dict = Depends(get_current_active_user)):
+    """获取当前登录用户的交易统计数据"""
     try:
         collections = get_db_collections()
         collection = collections["trade_executions"]
         
-        # 获取所有交易记录
-        trades = list(collection.find())
+        user_id = current_user["id"]
+        trades = list(collection.find({"user_id": user_id}))
         
         if not trades:
             return {
@@ -192,11 +203,11 @@ def get_trade_execution_stats():
         
         # 统计数据
         total_trades = len(trades)
-        buy_trades = sum(1 for t in trades if t.get("side", "").upper() == "BUY")
-        sell_trades = sum(1 for t in trades if t.get("side", "").upper() == "SELL")
+        buy_trades = sum(1 for t in trades if t.get("side", t.get("action", "")).upper() == "BUY")
+        sell_trades = sum(1 for t in trades if t.get("side", t.get("action", "")).upper() == "SELL")
         
         # 按股票分组统计
-        symbols = {}
+        symbols: Dict[str, Any] = {}
         for trade in trades:
             symbol = trade.get("symbol", "UNKNOWN")
             if symbol not in symbols:
@@ -207,14 +218,14 @@ def get_trade_execution_stats():
                     "strategies": set()
                 }
             
-            side = trade.get("side", "").upper()
+            side = (trade.get("side") or trade.get("action", "")).upper()
             if side == "BUY":
                 symbols[symbol]["buy_count"] += 1
             elif side == "SELL":
                 symbols[symbol]["sell_count"] += 1
                 
-            symbols[symbol]["total_quantity"] += trade.get("quantity", 0)
-            symbols[symbol]["strategies"].add(trade.get("strategy_name", "UNKNOWN"))
+            symbols[symbol]["total_quantity"] += trade.get("quantity", trade.get("size", 0))
+            symbols[symbol]["strategies"].add(trade.get("strategy_name", trade.get("strategy", "UNKNOWN")))
         
         # 转换策略集合为列表
         for symbol_data in symbols.values():
@@ -233,40 +244,48 @@ def get_trade_execution_stats():
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"统计失败: {str(e)}")
 
-@router.get("/trade-executions/strategies", summary="获取所有策略名称")
-def get_trade_strategies():
-    """获取所有出现过的策略名称"""
+@router.get("/trade-executions/strategies", summary="获取当前用户出现过的策略名称")
+def get_trade_strategies(current_user: dict = Depends(get_current_active_user)):
+    """获取当前用户出现过的策略名称"""
     try:
         collections = get_db_collections()
         collection = collections["trade_executions"]
+        user_id = current_user["id"]
         
-        # 获取所有不同的策略名称
-        strategies = list(collection.distinct("strategy_name"))
+        # 获取所有不同的策略名称（兼容 strategy_name / strategy 字段）
+        strategies_name = list(collection.distinct("strategy_name", {"user_id": user_id}))
+        strategies_key = list(collection.distinct("strategy", {"user_id": user_id}))
+        strategies = set([s for s in strategies_name if s] + [s for s in strategies_key if s])
         
         return {
             "success": True,
-            "strategies": [s for s in strategies if s]  # 过滤掉空值
+            "strategies": list(strategies)
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"查询失败: {str(e)}")
 
-@router.get("/trade-activities/stats", summary="获取所有交易活动统计")
-def get_trade_activities_stats():
-    """统计所有交易活动（包括信号和执行记录）"""
+@router.get("/trade-activities/stats", summary="获取当前用户的所有交易活动统计")
+def get_trade_activities_stats(current_user: dict = Depends(get_current_active_user)):
+    """统计当前用户的所有交易活动（包括信号和执行记录）"""
     try:
         collections = get_db_collections()
         executions_coll = collections["trade_executions"]
         signals_coll = collections["trade_signals"]
+        user_id = current_user["id"]
         
-        # 获取执行记录（排除回测）
-        executions = list(executions_coll.find({"worker_mode": {"$ne": "backtest"}}))
+        # 获取执行记录（排除回测，按用户）
+        executions = list(executions_coll.find({
+            "worker_mode": {"$ne": "backtest"},
+            "user_id": user_id
+        }))
         
-        # 获取交易信号（live 模式）
+        # 获取交易信号（live 模式，按用户）
         signals = list(signals_coll.find({
             "$or": [
                 {"worker_mode": "live"},
                 {"mode": "live"}
-            ]
+            ],
+            "user_id": user_id
         }))
         
         # 统计执行记录
@@ -301,21 +320,23 @@ def get_trade_activities_stats():
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"统计失败: {str(e)}")
 
-@router.get("/trade-activities/", summary="获取所有交易活动（包含信号和执行记录）")
+@router.get("/trade-activities/", summary="获取当前用户的所有交易活动（包含信号和执行记录）")
 def get_all_trade_activities(
     limit: int = Query(100, description="返回记录数量限制"),
     skip: int = Query(0, description="跳过的记录数量"),
     start_date: Optional[str] = Query(None, description="开始日期 (YYYY-MM-DD)"),
     end_date: Optional[str] = Query(None, description="结束日期 (YYYY-MM-DD)"),
     days: Optional[int] = Query(None, description="最近N天"),
-    status_filter: Optional[str] = Query(None, description="状态筛选: executed, pending, all")
+    status_filter: Optional[str] = Query(None, description="状态筛选: executed, pending, all"),
+    current_user: dict = Depends(get_current_active_user),
 ):
-    """融合 trade_signals 和 trade_executions，提供完整的交易活动视图"""
+    """融合 trade_signals 和 trade_executions，提供当前用户的完整交易活动视图"""
     try:
         collections = get_db_collections()
         executions_coll = collections["trade_executions"]
         signals_coll = collections["trade_signals"]
         stock_info_coll = collections["stock_info"]
+        user_id = current_user["id"]
         
         # 构建日期查询条件
         date_query = {}
@@ -365,7 +386,7 @@ def get_all_trade_activities(
         
         # 1. 获取已执行的交易记录（如果不是仅显示 pending）
         if status_filter != "pending":
-            exec_query = {"worker_mode": {"$ne": "backtest"}}  # 排除回测数据
+            exec_query = {"worker_mode": {"$ne": "backtest"}, "user_id": user_id}  # 排除回测数据，按用户过滤
             if date_query:
                 exec_query.update(date_query)
             
@@ -396,7 +417,8 @@ def get_all_trade_activities(
                     {"worker_mode": "live"},
                     {"mode": "live"}
                 ],
-                "status": {"$in": ["pending", "retry_pending", "submitted"]}
+                "status": {"$in": ["pending", "retry_pending", "submitted"]},
+                "user_id": user_id,
             }
             if date_query:
                 signal_query.update(date_query)
