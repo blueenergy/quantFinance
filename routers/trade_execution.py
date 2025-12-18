@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Query, HTTPException, Depends
 from typing import List, Optional, Dict, Any
-from datetime import datetime
+from datetime import datetime, timedelta
 from db import get_db_collections
 from utils.stock_utils import serialize_doc
 from auth import get_current_active_user
@@ -40,10 +40,15 @@ def _compute_realized_pnl_for_group(trades: List[Dict[str, Any]]) -> Dict[str, A
       - BUY: 更新持仓和平均成本
       - SELL: 以当前平均成本计算本次卖出的已实现盈亏
 
-    注意: 这里只计算已实现盈亏，不考虑未平仓浮动盈亏。
+    返回字典包含:
+      - net_quantity: 最终净持仓数量
+      - realized_pnl: 已实现盈亏
+      - avg_cost: 当前持仓的平均成本价(如果 net_quantity 为 0 则为 0)
+
+    注意: 这里只计算已实现盈亏和平均成本，不直接计算未平仓浮动盈亏。
     """
     if not trades:
-        return {"net_quantity": 0, "realized_pnl": 0.0}
+        return {"net_quantity": 0, "realized_pnl": 0.0, "avg_cost": 0.0}
 
     # 按时间顺序排序
     sorted_trades = sorted(trades, key=lambda t: t.get("timestamp", 0))
@@ -69,13 +74,14 @@ def _compute_realized_pnl_for_group(trades: List[Dict[str, Any]]) -> Dict[str, A
             or t.get("target_price")
             or 0.0
         )
+        commission = t.get("commission", 0.0) or 0.0
 
         if not qty or not price:
             continue
 
         if side_raw == "BUY":
-            # 买入: 更新平均成本和持仓
-            total_cost = avg_cost * position_qty + price * qty
+            # 买入: 更新平均成本和持仓, 手续费计入成本
+            total_cost = avg_cost * position_qty + price * qty + commission
             position_qty += qty
             if position_qty > 0:
                 avg_cost = total_cost / position_qty
@@ -85,14 +91,19 @@ def _compute_realized_pnl_for_group(trades: List[Dict[str, Any]]) -> Dict[str, A
                 sell_qty = 0
             else:
                 sell_qty = min(qty, position_qty)
-                realized_pnl += (price - avg_cost) * sell_qty
+                # 卖出: 以当前平均成本计算已实现盈亏, 并扣除本次卖出的手续费
+                realized_pnl += (price - avg_cost) * sell_qty - commission
                 position_qty -= sell_qty
 
             if position_qty <= 0:
                 position_qty = 0
                 avg_cost = 0.0
 
-    return {"net_quantity": position_qty, "realized_pnl": round(realized_pnl, 2)}
+    return {
+        "net_quantity": position_qty,
+        "realized_pnl": round(realized_pnl, 2),
+        "avg_cost": round(avg_cost, 4) if position_qty > 0 else 0.0,
+    }
 
 
 def _group_executions_by_order(executions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -349,11 +360,19 @@ def get_trade_pnl_summary(
         minute_bars_coll = collections["minute_bars"]
         user_id = current_user["id"]
 
+        # FastAPI 在实际请求中会注入已解析的值，但直接调用函数时参数可能仍然是 Query 对象
+        # 为了兼容单元测试和直接调用，这里将非预期类型归一化为 None
+        if not isinstance(days, (int, type(None))):
+            days = None
+        if not isinstance(start_date, (str, type(None))):
+            start_date = None
+        if not isinstance(end_date, (str, type(None))):
+            end_date = None
+
         # 基于 get_all_trade_executions 的日期筛选逻辑构建查询
         query: Dict[str, Any] = {"user_id": user_id}
 
         if days:
-            from datetime import datetime, timedelta
             end = datetime.now().replace(hour=23, minute=59, second=59)
             start = (end - timedelta(days=days - 1)).replace(hour=0, minute=0, second=0)
             query["$or"] = [
@@ -371,8 +390,6 @@ def get_trade_pnl_summary(
                 },
             ]
         elif start_date or end_date:
-            from datetime import datetime
-
             or_conditions = []
 
             date_query: Dict[str, Any] = {}
@@ -455,15 +472,14 @@ def get_trade_pnl_summary(
             pnl_info = _compute_realized_pnl_for_group(info["trades"])
             net_qty = pnl_info["net_quantity"]
             realized_pnl = pnl_info["realized_pnl"]
+            avg_cost = pnl_info.get("avg_cost", 0.0)
 
             current_price = latest_prices.get(symbol)
             unrealized_pnl = 0.0
 
-            # 暂时只有在有 current_price 且 net_qty != 0 时才计算浮盈
+            # 只有在有 current_price 且 net_qty != 0 时才计算浮盈
             if current_price is not None and net_qty:
-                # TODO: 后续可扩展 _compute_realized_pnl_for_group 返回 avg_cost，用于精确计算浮盈
-                # 目前先留接口字段，unrealized_pnl 默认保持 0，避免误导
-                unrealized_pnl = 0.0
+                unrealized_pnl = (current_price - avg_cost) * net_qty
 
             total_unrealized_pnl += unrealized_pnl
 
