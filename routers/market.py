@@ -208,3 +208,49 @@ def get_market_spectrum(
     cursor = collection.find(query, projection).sort('trade_date', 1)
     data = list(cursor)
     return {"data": data}
+
+
+@router.get('/market-spectrum-minute', summary="获取分钟级市场阴阳谱数据", tags=["Market"])
+def get_market_spectrum_minute(
+    start_time: str = Query(..., description="开始时间,格式YYYYMMDDHHMM"),
+    end_time: str = Query(..., description="结束时间,格式YYYYMMDDHHMM"),
+    ma_period: int = Query(5, description="均线周期,默认5"),
+    spectrum_type: str = Query("daily_realtime", alias="type", description="曲线类型: minute 或 daily_realtime")
+):
+    """获取分钟级市场阴阳谱数据.
+
+    数据来源: market_spectrum_minute 集合, 字段包括:
+      - trade_date: YYYYMMDDHHMM
+      - yang_spectrum / yin_spectrum
+      - total_stocks
+      - above_ma_count / below_ma_count
+      - ma_period, granularity 字段区分来源
+    """
+    collections = get_db_collections()
+    collection = collections.get('market_spectrum_minute')  # type: ignore
+
+    if collection is None:
+        raise HTTPException(status_code=500, detail="market_spectrum_minute collection not configured")
+
+    # Map type -> granularity field stored in DB
+    granularity = 'daily_realtime' if spectrum_type == 'daily_realtime' else 'minute'
+
+    query = {
+        'trade_date': {'$gte': start_time, '$lte': end_time},
+        'ma_period': ma_period,
+        'granularity': granularity
+    }
+    projection = {
+        '_id': 0,
+        'trade_date': 1,
+        'yang_spectrum': 1,
+        'yin_spectrum': 1,
+        'total_stocks': 1,
+        'above_ma_count': 1,
+        'below_ma_count': 1,
+        'ma_period': 1,
+        'granularity': 1,
+    }
+    cursor = collection.find(query, projection).sort('trade_date', 1)
+    data = list(cursor)
+    return {"data": data}
