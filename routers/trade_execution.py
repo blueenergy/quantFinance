@@ -32,6 +32,67 @@ def enrich_trades_with_stock_names(trades: List[Dict], stock_info_collection) ->
     
     return trades
 
+
+def _compute_realized_pnl_for_group(trades: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """基于一组同一股票+策略的执行记录，按时间顺序计算持仓与已实现盈亏.
+
+    使用简单的加权平均成本法:
+      - BUY: 更新持仓和平均成本
+      - SELL: 以当前平均成本计算本次卖出的已实现盈亏
+
+    注意: 这里只计算已实现盈亏，不考虑未平仓浮动盈亏。
+    """
+    if not trades:
+        return {"net_quantity": 0, "realized_pnl": 0.0}
+
+    # 按时间顺序排序
+    sorted_trades = sorted(trades, key=lambda t: t.get("timestamp", 0))
+
+    position_qty = 0
+    avg_cost = 0.0
+    realized_pnl = 0.0
+
+    for t in sorted_trades:
+        side_raw = (t.get("side") or t.get("action", "")).upper()
+        if side_raw not in ("BUY", "SELL"):
+            continue
+
+        qty = (
+            t.get("quantity")
+            or t.get("size")
+            or t.get("filled_size")
+            or 0
+        )
+        price = (
+            t.get("filled_price")
+            or t.get("price")
+            or t.get("target_price")
+            or 0.0
+        )
+
+        if not qty or not price:
+            continue
+
+        if side_raw == "BUY":
+            # 买入: 更新平均成本和持仓
+            total_cost = avg_cost * position_qty + price * qty
+            position_qty += qty
+            if position_qty > 0:
+                avg_cost = total_cost / position_qty
+        else:  # SELL
+            sell_qty = min(qty, position_qty) if position_qty > 0 else qty
+            if position_qty <= 0:
+                # 没有持仓时卖出，简单视为从0成本卖出
+                realized_pnl += price * sell_qty
+            else:
+                realized_pnl += (price - avg_cost) * sell_qty
+            position_qty -= sell_qty
+            if position_qty <= 0:
+                position_qty = 0
+                avg_cost = 0.0
+
+    return {"net_quantity": position_qty, "realized_pnl": round(realized_pnl, 2)}
+
 @router.get("/trade-executions/", summary="获取当前用户的交易执行记录")
 def get_all_trade_executions(
     limit: int = Query(100, description="返回记录数量限制"),
@@ -244,6 +305,122 @@ def get_trade_execution_stats(current_user: dict = Depends(get_current_active_us
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"统计失败: {str(e)}")
 
+
+@router.get("/trade-executions/pnl-summary", summary="获取当前用户按股票和策略分组的盈亏统计")
+def get_trade_pnl_summary(
+    days: Optional[int] = Query(None, description="最近N天"),
+    start_date: Optional[str] = Query(None, description="开始日期 (YYYY-MM-DD)"),
+    end_date: Optional[str] = Query(None, description="结束日期 (YYYY-MM-DD)"),
+    current_user: dict = Depends(get_current_active_user),
+):
+    """按股票和策略分组汇总当前用户的已实现盈亏和净持仓.
+
+    主要用于前端展示：
+      - 每个股票 + 策略的交易笔数、净持仓数量、已实现盈亏
+      - 支持按日期范围或最近N天筛选，便于回溯查看
+    """
+    try:
+        collections = get_db_collections()
+        executions_coll = collections["trade_executions"]
+        stock_info_coll = collections["stock_info"]
+        user_id = current_user["id"]
+
+        # 基于 get_all_trade_executions 的日期筛选逻辑构建查询
+        query: Dict[str, Any] = {"user_id": user_id}
+
+        if days:
+            from datetime import datetime, timedelta
+            end = datetime.now().replace(hour=23, minute=59, second=59)
+            start = (end - timedelta(days=days - 1)).replace(hour=0, minute=0, second=0)
+            query["$or"] = [
+                {
+                    "date": {
+                        "$gte": start.strftime("%Y-%m-%d"),
+                        "$lte": end.strftime("%Y-%m-%d"),
+                    }
+                },
+                {
+                    "timestamp": {
+                        "$gte": start.timestamp(),
+                        "$lte": end.timestamp(),
+                    }
+                },
+            ]
+        elif start_date or end_date:
+            from datetime import datetime
+
+            or_conditions = []
+
+            date_query: Dict[str, Any] = {}
+            if start_date:
+                date_query["$gte"] = start_date
+            if end_date:
+                date_query["$lte"] = end_date
+            if date_query:
+                or_conditions.append({"date": date_query})
+
+            timestamp_query: Dict[str, Any] = {}
+            if start_date:
+                start_dt = datetime.strptime(start_date, "%Y-%m-%d").replace(hour=0, minute=0, second=0)
+                timestamp_query["$gte"] = start_dt.timestamp()
+            if end_date:
+                end_dt = datetime.strptime(end_date, "%Y-%m-%d").replace(hour=23, minute=59, second=59)
+                timestamp_query["$lte"] = end_dt.timestamp()
+            if timestamp_query:
+                or_conditions.append({"timestamp": timestamp_query})
+
+            if or_conditions:
+                query["$or"] = or_conditions
+
+        # 查询当前用户的所有执行记录
+        trades = list(executions_coll.find(query))
+        if not trades:
+            return {"success": True, "data": [], "total_realized_pnl": 0.0}
+
+        # 分组: (symbol, strategy) -> trades
+        groups: Dict[tuple, Dict[str, Any]] = {}
+        for t in trades:
+            symbol = t.get("symbol", "")
+            strategy = t.get("strategy_name", t.get("strategy", "")) or "UNKNOWN"
+            key = (symbol, strategy)
+            if key not in groups:
+                groups[key] = {"trades": [], "trade_count": 0}
+            groups[key]["trades"].append(t)
+            groups[key]["trade_count"] += 1
+
+        # 计算每个分组的净持仓和已实现盈亏
+        summary_rows = []
+        for (symbol, strategy), info in groups.items():
+            pnl_info = _compute_realized_pnl_for_group(info["trades"])
+            summary_rows.append(
+                {
+                    "symbol": symbol,
+                    "strategy": strategy,
+                    "total_trades": info["trade_count"],
+                    "net_quantity": pnl_info["net_quantity"],
+                    "realized_pnl": pnl_info["realized_pnl"],
+                }
+            )
+
+        # 批量补全股票名称
+        symbols = list({row["symbol"] for row in summary_rows if row.get("symbol")})
+        stock_docs = list(
+            stock_info_coll.find({"symbol": {"$in": symbols}}, {"symbol": 1, "name": 1})
+        )
+        symbol_to_name = {doc["symbol"]: doc.get("name", "") for doc in stock_docs}
+        for row in summary_rows:
+            row["stock_name"] = symbol_to_name.get(row["symbol"], "")
+
+        total_realized_pnl = round(sum(r["realized_pnl"] for r in summary_rows), 2)
+
+        return {
+            "success": True,
+            "data": summary_rows,
+            "total_realized_pnl": total_realized_pnl,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"统计失败: {str(e)}")
+
 @router.get("/trade-executions/strategies", summary="获取当前用户出现过的策略名称")
 def get_trade_strategies(current_user: dict = Depends(get_current_active_user)):
     """获取当前用户出现过的策略名称"""
@@ -417,7 +594,6 @@ def get_all_trade_activities(
                     {"worker_mode": "live"},
                     {"mode": "live"}
                 ],
-                "status": {"$in": ["pending", "retry_pending", "submitted"]},
                 "user_id": user_id,
             }
             if date_query:
@@ -426,17 +602,33 @@ def get_all_trade_activities(
             signals = list(signals_coll.find(signal_query).sort("timestamp", -1))
             
             for signal_doc in signals:
+                raw_status = str(signal_doc.get("status", "pending")).lower()
                 status_map = {
                     "pending": "PENDING",
                     "retry_pending": "RETRY",
-                    "submitted": "SUBMITTED"
+                    "submitted": "SUBMITTED",
+                    "executed": "FILLED",
+                    "filled": "FILLED",
+                    "partial_filled": "PARTIAL_FILLED",
+                    "failed": "FAILED",
+                    "rejected": "FAILED",
                 }
+                # 粗分为待执行 vs 已执行/失败，便于前端理解
+                if raw_status in ("pending", "retry_pending", "submitted"):
+                    status_category = "pending"
+                elif raw_status in ("executed", "filled", "partial_filled"):
+                    status_category = "executed"
+                elif raw_status in ("failed", "rejected"):
+                    status_category = "failed"
+                else:
+                    status_category = "other"
+                
                 merged_activities.append({
                     "_id": str(signal_doc.get("_id")),
                     "symbol": signal_doc.get("symbol"),
                     "direction": (signal_doc.get("action", "")).upper(),
-                    "status": status_map.get(signal_doc.get("status", "pending"), "PENDING"),
-                    "status_category": "pending",
+                    "status": status_map.get(raw_status, raw_status.upper()),
+                    "status_category": status_category,
                     "price": signal_doc.get("price", 0),
                     "target_price": signal_doc.get("price"),
                     "filled_price": None,
