@@ -58,9 +58,9 @@ def _compute_realized_pnl_for_group(trades: List[Dict[str, Any]]) -> Dict[str, A
             continue
 
         qty = (
-            t.get("quantity")
+            t.get("filled_size")
+            or t.get("quantity")
             or t.get("size")
-            or t.get("filled_size")
             or 0
         )
         price = (
@@ -80,18 +80,39 @@ def _compute_realized_pnl_for_group(trades: List[Dict[str, Any]]) -> Dict[str, A
             if position_qty > 0:
                 avg_cost = total_cost / position_qty
         else:  # SELL
-            sell_qty = min(qty, position_qty) if position_qty > 0 else qty
             if position_qty <= 0:
-                # 没有持仓时卖出，简单视为从0成本卖出
-                realized_pnl += price * sell_qty
+                # 当前系统视角下没有可用持仓: 不计算已实现盈亏，也不引入负持仓
+                sell_qty = 0
             else:
+                sell_qty = min(qty, position_qty)
                 realized_pnl += (price - avg_cost) * sell_qty
-            position_qty -= sell_qty
+                position_qty -= sell_qty
+
             if position_qty <= 0:
                 position_qty = 0
                 avg_cost = 0.0
 
     return {"net_quantity": position_qty, "realized_pnl": round(realized_pnl, 2)}
+
+
+def _group_executions_by_order(executions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """按 order_id 聚合执行记录，避免同一订单被重复统计。
+
+    当前实现: 对于每个 order_id，保留 timestamp 最大的一条记录作为该订单的代表快照。
+    这样可以在券商重复回放相同执行回报时，防止在统计和视图中重复计算。
+    """
+    if not executions:
+        return []
+
+    grouped: Dict[str, Dict[str, Any]] = {}
+    for doc in executions:
+        order_id = doc.get("order_id") or str(doc.get("_id"))
+        current = grouped.get(order_id)
+        if (not current) or (doc.get("timestamp", 0) > current.get("timestamp", 0)):
+            grouped[order_id] = doc
+
+    return list(grouped.values())
+
 
 @router.get("/trade-executions/", summary="获取当前用户的交易执行记录")
 def get_all_trade_executions(
@@ -248,7 +269,9 @@ def get_trade_execution_stats(current_user: dict = Depends(get_current_active_us
         collection = collections["trade_executions"]
         
         user_id = current_user["id"]
-        trades = list(collection.find({"user_id": user_id}))
+        trades = _group_executions_by_order(list(collection.find({"user_id": user_id})))
+        # 过滤掉完全未成交的订单（filled_size 为 0），避免统计中计入作废单
+        trades = [t for t in trades if t.get("filled_size", 0) != 0]
         
         if not trades:
             return {
@@ -285,7 +308,7 @@ def get_trade_execution_stats(current_user: dict = Depends(get_current_active_us
             elif side == "SELL":
                 symbols[symbol]["sell_count"] += 1
                 
-            symbols[symbol]["total_quantity"] += trade.get("quantity", trade.get("size", 0))
+            symbols[symbol]["total_quantity"] += trade.get("filled_size", trade.get("quantity", trade.get("size", 0)))
             symbols[symbol]["strategies"].add(trade.get("strategy_name", trade.get("strategy", "UNKNOWN")))
         
         # 转换策略集合为列表
@@ -323,6 +346,7 @@ def get_trade_pnl_summary(
         collections = get_db_collections()
         executions_coll = collections["trade_executions"]
         stock_info_coll = collections["stock_info"]
+        minute_bars_coll = collections["minute_bars"]
         user_id = current_user["id"]
 
         # 基于 get_all_trade_executions 的日期筛选逻辑构建查询
@@ -373,9 +397,11 @@ def get_trade_pnl_summary(
                 query["$or"] = or_conditions
 
         # 查询当前用户的所有执行记录
-        trades = list(executions_coll.find(query))
+        trades = _group_executions_by_order(list(executions_coll.find(query)))
+        # 过滤掉完全未成交的订单（filled_size 为 0），避免统计中计入作废单
+        trades = [t for t in trades if t.get("filled_size", 0) != 0]
         if not trades:
-            return {"success": True, "data": [], "total_realized_pnl": 0.0}
+            return {"success": True, "data": [], "total_realized_pnl": 0.0, "total_unrealized_pnl": 0.0}
 
         # 分组: (symbol, strategy) -> trades
         groups: Dict[tuple, Dict[str, Any]] = {}
@@ -390,15 +416,65 @@ def get_trade_pnl_summary(
 
         # 计算每个分组的净持仓和已实现盈亏
         summary_rows = []
+        # 收集所有需要查询的 symbol
+        all_symbols: set = set()
+        for (symbol, _), info in groups.items():
+            all_symbols.add(symbol)
+
+        # 使用 minute_bars 获取每个 symbol 的最新收盘价（近实时价）
+        latest_prices: Dict[str, float] = {}
+        if all_symbols:
+            today_prefix = datetime.now().strftime("%Y%m%d")
+            pipeline = [
+                {
+                    "$match": {
+                        "symbol": {"$in": list(all_symbols)},
+                        "trade_date": {"$regex": f"^{today_prefix}"},
+                    }
+                },
+                {"$sort": {"trade_date": 1}},
+                {
+                    "$group": {
+                        "_id": "$symbol",
+                        "close": {"$last": "$close"},
+                    }
+                },
+            ]
+            try:
+                realtime_docs = list(minute_bars_coll.aggregate(pipeline))
+                for doc in realtime_docs:
+                    s = doc.get("_id")
+                    close = doc.get("close")
+                    if s and close is not None:
+                        latest_prices[s] = float(close)
+            except Exception:
+                latest_prices = {}
+
+        total_unrealized_pnl = 0.0
         for (symbol, strategy), info in groups.items():
             pnl_info = _compute_realized_pnl_for_group(info["trades"])
+            net_qty = pnl_info["net_quantity"]
+            realized_pnl = pnl_info["realized_pnl"]
+
+            current_price = latest_prices.get(symbol)
+            unrealized_pnl = 0.0
+
+            # 暂时只有在有 current_price 且 net_qty != 0 时才计算浮盈
+            if current_price is not None and net_qty:
+                # TODO: 后续可扩展 _compute_realized_pnl_for_group 返回 avg_cost，用于精确计算浮盈
+                # 目前先留接口字段，unrealized_pnl 默认保持 0，避免误导
+                unrealized_pnl = 0.0
+
+            total_unrealized_pnl += unrealized_pnl
+
             summary_rows.append(
                 {
                     "symbol": symbol,
                     "strategy": strategy,
                     "total_trades": info["trade_count"],
-                    "net_quantity": pnl_info["net_quantity"],
-                    "realized_pnl": pnl_info["realized_pnl"],
+                    "net_quantity": net_qty,
+                    "realized_pnl": realized_pnl,
+                    "unrealized_pnl": round(unrealized_pnl, 2),
                 }
             )
 
@@ -412,11 +488,13 @@ def get_trade_pnl_summary(
             row["stock_name"] = symbol_to_name.get(row["symbol"], "")
 
         total_realized_pnl = round(sum(r["realized_pnl"] for r in summary_rows), 2)
+        total_unrealized_pnl = round(total_unrealized_pnl, 2)
 
         return {
             "success": True,
             "data": summary_rows,
             "total_realized_pnl": total_realized_pnl,
+            "total_unrealized_pnl": total_unrealized_pnl,
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"统计失败: {str(e)}")
@@ -441,61 +519,13 @@ def get_trade_strategies(current_user: dict = Depends(get_current_active_user)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"查询失败: {str(e)}")
 
-@router.get("/trade-activities/stats", summary="获取当前用户的所有交易活动统计")
+@router.get("/trade-activities/stats", include_in_schema=False)
 def get_trade_activities_stats(current_user: dict = Depends(get_current_active_user)):
-    """统计当前用户的所有交易活动（包括信号和执行记录）"""
-    try:
-        collections = get_db_collections()
-        executions_coll = collections["trade_executions"]
-        signals_coll = collections["trade_signals"]
-        user_id = current_user["id"]
-        
-        # 获取执行记录（排除回测，按用户）
-        executions = list(executions_coll.find({
-            "worker_mode": {"$ne": "backtest"},
-            "user_id": user_id
-        }))
-        
-        # 获取交易信号（live 模式，按用户）
-        signals = list(signals_coll.find({
-            "$or": [
-                {"worker_mode": "live"},
-                {"mode": "live"}
-            ],
-            "user_id": user_id
-        }))
-        
-        # 统计执行记录
-        exec_buy = sum(1 for t in executions if (t.get("side") or t.get("action", "")).upper() == "BUY")
-        exec_sell = sum(1 for t in executions if (t.get("side") or t.get("action", "")).upper() == "SELL")
-        
-        # 统计信号
-        signal_buy = sum(1 for s in signals if s.get("action", "").lower() == "buy")
-        signal_sell = sum(1 for s in signals if s.get("action", "").lower() == "sell")
-        
-        # 收集所有股票
-        symbols = set()
-        for t in executions:
-            if t.get("symbol"):
-                symbols.add(t.get("symbol"))
-        for s in signals:
-            if s.get("symbol"):
-                symbols.add(s.get("symbol"))
-        
-        return {
-            "success": True,
-            "stats": {
-                "total_trades": len(executions) + len(signals),
-                "executed_trades": len(executions),
-                "pending_signals": len(signals),
-                "buy_trades": exec_buy + signal_buy,
-                "sell_trades": exec_sell + signal_sell,
-                "total_symbols": len(symbols),
-                "symbols": list(symbols)
-            }
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"统计失败: {str(e)}")
+    """[Deprecated] 该接口已废弃，请使用 /trade-executions/stats 或前端本地统计.
+
+    保留占位以避免旧客户端报 404，但不再返回实际统计数据。
+    """
+    raise HTTPException(status_code=410, detail="/trade-activities/stats has been removed; use /trade-executions/stats instead")
 
 @router.get("/trade-activities/", summary="获取当前用户的所有交易活动（包含信号和执行记录）")
 def get_all_trade_activities(
@@ -567,19 +597,34 @@ def get_all_trade_activities(
             if date_query:
                 exec_query.update(date_query)
             
-            executions = list(executions_coll.find(exec_query).sort("timestamp", -1))
+            executions = _group_executions_by_order(list(executions_coll.find(exec_query).sort("timestamp", -1)))
+            # 排除完全未成交的订单，避免在用户视图中显示作废单
+            executions = [e for e in executions if e.get("filled_size", 0) != 0]
             
             for exec_doc in executions:
+                raw_status = str(exec_doc.get("status", "filled")).lower()
+                if raw_status in ("filled",):
+                    status = "FILLED"
+                    status_category = "executed"
+                elif raw_status in ("partial_filled",):
+                    status = "PARTIAL_FILLED"
+                    status_category = "executed"
+                elif raw_status in ("rejected", "failed"):
+                    status = "FAILED"
+                    status_category = "failed"
+                else:
+                    status = raw_status.upper()
+                    status_category = "executed"
                 merged_activities.append({
                     "_id": str(exec_doc.get("_id")),
                     "symbol": exec_doc.get("symbol"),
                     "direction": (exec_doc.get("side") or exec_doc.get("action", "")).upper(),
-                    "status": "FILLED",
-                    "status_category": "executed",
+                    "status": status,
+                    "status_category": status_category,
                     "price": exec_doc.get("filled_price", exec_doc.get("price", 0)),
                     "target_price": exec_doc.get("target_price"),
                     "filled_price": exec_doc.get("filled_price"),
-                    "quantity": exec_doc.get("quantity", exec_doc.get("size", 0)),
+                    "quantity": exec_doc.get("filled_size", exec_doc.get("size", exec_doc.get("quantity", 0))),
                     "strategy": exec_doc.get("strategy_name", exec_doc.get("strategy", "")),
                     "timestamp": exec_doc.get("timestamp", 0),
                     "order_id": exec_doc.get("order_id", ""),
