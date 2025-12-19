@@ -1,0 +1,12 @@
+# Ignore all SSL certificate files
+*.pem
+*.key
+*.crt
+*.csr
+*.pfx
+*.p12
+
+# Keep the generation script and documentation
+!generate-ssl-cert.sh
+!README.md
+!.gitignore
