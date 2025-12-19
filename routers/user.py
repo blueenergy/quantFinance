@@ -1,7 +1,7 @@
 from typing import List
 from fastapi import APIRouter, Depends, Request, Query, HTTPException
-from models.all_models import UserCreate, UserLogin, UserResponse, Token, WatchlistRequest, WatchlistUpdateRequest, WatchlistStrategySetRequest, WatchlistStrategyResponse, SecuritiesAccountCreate, SecuritiesAccountUpdate, SecuritiesAccountResponse
-from auth import create_user, authenticate_user, create_access_token, get_current_active_user, log_login_attempt,ACCESS_TOKEN_EXPIRE_MINUTES
+from models.all_models import UserCreate, UserLogin, ChangePasswordRequest, UserResponse, Token, WatchlistRequest, WatchlistUpdateRequest, WatchlistStrategySetRequest, WatchlistStrategyResponse, SecuritiesAccountCreate, SecuritiesAccountUpdate, SecuritiesAccountResponse
+from auth import create_user, authenticate_user, create_access_token, get_current_active_user, log_login_attempt,ACCESS_TOKEN_EXPIRE_MINUTES, verify_password, get_password_hash
 from db import get_db_collections
 from datetime import timedelta, datetime
 from utils.stock_utils import get_ts_code
@@ -81,6 +81,34 @@ def get_profile(current_user: dict = Depends(get_current_active_user)):
         created_at=current_user.get("created_at"),
         last_login=current_user.get("last_login")
     )
+
+@router.post("/change-password")
+def change_password(request: ChangePasswordRequest, current_user: dict = Depends(get_current_active_user)):
+    """Change password for current authenticated user"""
+    collections = get_db_collections()
+    users_col = collections["users"]
+
+    username = current_user.get("username")
+    if not username:
+        raise HTTPException(status_code=400, detail="Invalid current user context")
+
+    user_doc = users_col.find_one({"username": username})
+    if not user_doc:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    if not verify_password(request.old_password, user_doc.get("hashed_password", "")):
+        raise HTTPException(status_code=400, detail="Incorrect current password")
+
+    if len(request.new_password) < 8:
+        raise HTTPException(status_code=400, detail="New password must be at least 8 characters long")
+
+    if request.new_password == request.old_password:
+        raise HTTPException(status_code=400, detail="New password must be different from current password")
+
+    new_hash = get_password_hash(request.new_password)
+    users_col.update_one({"_id": user_doc["_id"]}, {"$set": {"hashed_password": new_hash}})
+
+    return {"success": True, "message": "Password updated successfully"}
 
 # 自选股相关
 def get_user_id(current_user: dict):
