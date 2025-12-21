@@ -9,7 +9,6 @@ router = APIRouter(prefix="/strategy", tags=["strategy"])
 # Fallback strategy map (used when database is not available)
 STRATEGY_MAP_FALLBACK = {
 	"grid": "网格策略",
-	"intraday_grid": "日内网格策略",
 	"buyhold": "买入持有",
 	"boll": "布林带策略",
 	"meanrev": "均值回归",
@@ -26,7 +25,6 @@ STRATEGY_MAP_FALLBACK = {
 	"asymmetric_dragon": "非对称潜龙低吸",
 	"asymmetric_yang": "非对称单阳不破",
 	"exit_monitor": "只监控卖出",
-	"hf_exit_monitor": "高频卖出监控",
 }
 
 @router.get("/strategies")
@@ -51,6 +49,13 @@ def list_strategies() -> Dict[str, Any]:
 			out.append({
 				"key": s.get("key"),
 				"name": s.get("name", s.get("key")),
+				"summary": s.get("summary", ""),
+				"principle": s.get("principle", ""),
+				"suitable_for": s.get("suitable_for", ""),
+				"risk_warning": s.get("risk_warning", ""),
+				"params_hint": s.get("params_hint", ""),
+				"allow_live": s.get("allow_live", True),
+				"allow_backtest": s.get("allow_backtest", True),
 			})
 		return {"ok": True, "strategies": out}
 	except Exception as e:
@@ -100,6 +105,8 @@ def list_strategy_templates(strategy: str = None) -> Dict[str, Any]:
 			"preset": tpl.get("preset"),
 			"description": tpl.get("description", ""),
 			"params": tpl.get("params", {}),
+			"params_with_desc": tpl.get("params_with_desc", {}),  # Include parameter descriptions
+			"is_default": tpl.get("is_default", False),
 		})
 	
 	return {"ok": True, "templates": grouped}

@@ -521,7 +521,7 @@ def update_securities_account(account_id: str, request: SecuritiesAccountUpdate,
     col = collections["securities_accounts"]
     user_id = get_user_id(current_user)
     update_doc = {k: v for k, v in request.dict().items() if v is not None}
-    update_doc["updated_at"] = datetime.datetime.utcnow()
+    update_doc["updated_at"] = datetime.utcnow()
     col.update_one({"user_id": user_id, "account_id": account_id}, {"$set": update_doc})
     doc = col.find_one({"user_id": user_id, "account_id": account_id})
     doc["id"] = str(doc["_id"])
