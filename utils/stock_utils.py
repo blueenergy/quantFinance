@@ -1,8 +1,7 @@
 
 from datetime import datetime, date
-
-
 from bson import ObjectId
+from .symbol_utils import normalize_symbol
 
 def serialize_doc(doc):
     def convert(obj):
@@ -17,15 +16,18 @@ def serialize_doc(doc):
     return convert(doc)
 
 def get_ts_code(symbol):
-    if symbol.startswith('6'):
-        tu_symbol = symbol + '.SH'
-    elif symbol.startswith('0') or symbol.startswith('3'):
-        tu_symbol = symbol + '.SZ'
-    elif symbol.startswith('9') or symbol.startswith('8') or symbol.startswith('4'):
-        tu_symbol = symbol + '.BJ'
-    else:
-        raise Exception("Not supported symbols")
-    return tu_symbol
+    """
+    Convert symbol to tushare/standard format with exchange suffix.
+    
+    Deprecated: Use normalize_symbol() from symbol_utils instead.
+    This function is kept for backward compatibility.
+    
+    Examples:
+        "000858" -> "000858.SZ"
+        "600519" -> "600519.SH"
+        "430047" -> "430047.BJ"
+    """
+    return normalize_symbol(symbol)
 
 def format_trade_date(dt):
     if isinstance(dt, str):
