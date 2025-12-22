@@ -110,6 +110,36 @@ def change_password(request: ChangePasswordRequest, current_user: dict = Depends
 
     return {"success": True, "message": "Password updated successfully"}
 
+
+@router.post("/token/refresh", response_model=Token)
+def refresh_token(current_user: dict = Depends(get_current_active_user)):
+    """为已登录用户生成新的 Token（用于 quantTrader 配置）
+    
+    注意：这不会撤销旧 Token，旧 Token 仍然有效直到过期
+    """
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token(
+        data={"sub": current_user["username"]}, 
+        expires_delta=access_token_expires
+    )
+    
+    user_response = UserResponse(
+        id=current_user["id"],
+        username=current_user["username"],
+        email=current_user["email"],
+        full_name=current_user.get("full_name"),
+        is_active=current_user.get("is_active", True),
+        is_admin=current_user.get("is_admin", False),
+        created_at=current_user["created_at"],
+        last_login=current_user.get("last_login")
+    )
+    
+    return Token(
+        access_token=access_token,
+        token_type="bearer",
+        user=user_response
+    )
+
 # 自选股相关
 def get_user_id(current_user: dict):
     # 统一获取用户唯一标识（主键 _id），并转换为字符串
