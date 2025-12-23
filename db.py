@@ -40,6 +40,12 @@ def get_db_collections() -> Dict[str, Collection]:
         "trade_executions": db["trade_executions"],  # 交易执行记录
         "trade_signals": db["trade_signals"],  # 交易信号
         "minute_bars": db["minute_bars"],  # 分钟K线数据
+        # Worker monitoring
+        "worker_status": db["worker_status"],  # Worker 状态和心跳
+        "worker_activity": db["worker_activity"],  # Worker 活动日志
+        # Notification system
+        "notifications": db["notifications"],  # 通知记录
+        "notification_settings": db["notification_settings"],  # 通知设置
         # Add more collections as needed
     }
 
