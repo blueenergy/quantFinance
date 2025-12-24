@@ -9,6 +9,173 @@ import time
 
 router = APIRouter()
 
+
+@router.get("/minute-bars/", summary="获取股票分钟K线数据")
+def get_minute_bars(
+    symbol: str = Query(..., description="股票代码"),
+    start_date: Optional[str] = Query(None, description="开始日期 (YYYYMMDD或YYYYMMDDHHMM)"),
+    end_date: Optional[str] = Query(None, description="结束日期 (YYYYMMDD或YYYYMMDDHHMM)"),
+    limit: int = Query(500, description="返回记录数量限制", ge=1, le=2000),
+    current_user: dict = Depends(get_current_active_user),
+):
+    """获取股票分钟K线数据，用于绘制分钟图
+    
+    Args:
+        symbol: 股票代码（如 600391 或 600391.SH）
+        start_date: 开始日期，支持 YYYYMMDD 或 YYYYMMDDHHMM 格式
+        end_date: 结束日期，支持 YYYYMMDD 或 YYYYMMDDHHMM 格式
+        limit: 返回记录数量
+    
+    Returns:
+        {
+            "success": True,
+            "data": [
+                {
+                    "trade_date": "202412201030",
+                    "open": 26.35,
+                    "high": 26.50,
+                    "low": 26.30,
+                    "close": 26.45,
+                    "volume": 12500
+                },
+                ...
+            ],
+            "count": 240
+        }
+    """
+    try:
+        collections = get_db_collections()
+        minute_bars_coll = collections["minute_bars"]
+        
+        # 规范化symbol（处理带后缀和不带后缀的情况）
+        symbol_normalized = normalize_symbol(symbol)
+        symbol_stripped = strip_exchange_suffix(symbol)
+        
+        # 构建查询条件
+        query: Dict[str, Any] = {
+            "$or": [
+                {"symbol": symbol_normalized},
+                {"symbol": symbol_stripped}
+            ]
+        }
+        
+        # 添加日期范围筛选
+        if start_date or end_date:
+            date_query: Dict[str, Any] = {}
+            if start_date:
+                # 支持 YYYYMMDD 或 YYYYMMDDHHMM 格式
+                if len(start_date) == 8:  # YYYYMMDD
+                    date_query["$gte"] = start_date + "0000"  # 转为当天00:00
+                else:
+                    date_query["$gte"] = start_date
+            
+            if end_date:
+                if len(end_date) == 8:  # YYYYMMDD
+                    date_query["$lte"] = end_date + "2359"  # 转为当天23:59
+                else:
+                    date_query["$lte"] = end_date
+            
+            if date_query:
+                query["trade_date"] = date_query
+        
+        # 查询并排序（时间升序，方便前端绘制）
+        cursor = minute_bars_coll.find(query).sort("trade_date", 1).limit(limit)
+        bars = [serialize_doc(doc) for doc in cursor]
+        
+        return {
+            "success": True,
+            "data": bars,
+            "count": len(bars)
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"查询分钟K线失败: {str(e)}")
+
+
+@router.get("/trade-signals/", summary="获取交易信号记录")
+def get_trade_signals(
+    symbol: Optional[str] = Query(None, description="股票代码"),
+    strategy: Optional[str] = Query(None, description="策略名称"),
+    start_date: Optional[str] = Query(None, description="开始日期 (YYYY-MM-DD)"),
+    end_date: Optional[str] = Query(None, description="结束日期 (YYYY-MM-DD)"),
+    limit: int = Query(200, description="返回记录数量限制", ge=1, le=500),
+    current_user: dict = Depends(get_current_active_user),
+):
+    """获取交易信号记录，用于在K线图上标记买卖点
+    
+    Args:
+        symbol: 股票代码（可选，不传则返回所有）
+        strategy: 策略名称（可选）
+        start_date: 开始日期
+        end_date: 结束日期
+        limit: 返回记录数量
+    
+    Returns:
+        {
+            "success": True,
+            "data": [
+                {
+                    "symbol": "600391",
+                    "strategy": "GridTradingStrategy",
+                    "action": "buy",
+                    "price": 26.35,
+                    "timestamp": 1703039400.0,
+                    "order_id": "strategy_xxx",
+                    "status": "pending"
+                },
+                ...
+            ],
+            "count": 15
+        }
+    """
+    try:
+        collections = get_db_collections()
+        signals_coll = collections["trade_signals"]
+        
+        user_id = current_user["id"]
+        
+        # 构建查询条件
+        query: Dict[str, Any] = {"user_id": user_id}
+        
+        # 添加股票代码筛选
+        if symbol:
+            symbol_normalized = normalize_symbol(symbol)
+            symbol_stripped = strip_exchange_suffix(symbol)
+            query["$or"] = [
+                {"symbol": symbol_normalized},
+                {"symbol": symbol_stripped}
+            ]
+        
+        # 添加策略筛选
+        if strategy:
+            query["strategy"] = strategy
+        
+        # 添加日期范围筛选
+        if start_date or end_date:
+            timestamp_query: Dict[str, Any] = {}
+            if start_date:
+                start_dt = datetime.strptime(start_date, "%Y-%m-%d").replace(hour=0, minute=0, second=0)
+                timestamp_query["$gte"] = start_dt.timestamp()
+            if end_date:
+                end_dt = datetime.strptime(end_date, "%Y-%m-%d").replace(hour=23, minute=59, second=59)
+                timestamp_query["$lte"] = end_dt.timestamp()
+            
+            if timestamp_query:
+                query["timestamp"] = timestamp_query
+        
+        # 查询并排序（时间升序）
+        cursor = signals_coll.find(query).sort("timestamp", 1).limit(limit)
+        signals = [serialize_doc(doc) for doc in cursor]
+        
+        return {
+            "success": True,
+            "data": signals,
+            "count": len(signals)
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"查询交易信号失败: {str(e)}")
+
 def enrich_trades_with_stock_names(trades: List[Dict], stock_info_collection) -> List[Dict]:
     """为交易记录添加股票名称，支持新旧symbol格式兼容"""
     if not trades:
