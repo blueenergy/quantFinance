@@ -3,6 +3,8 @@ from fastapi import APIRouter, Depends, Query, HTTPException
 from auth import get_current_admin_user, log_admin_action, create_admin_user
 from db import get_db_collections
 from datetime import timedelta, datetime
+from utils.stock_utils import serialize_doc
+import time
 
 
 
@@ -268,6 +270,102 @@ def get_admin_statistics(admin_user: dict = Depends(get_current_admin_user)):
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"获取统计信息失败: {str(e)}")
+
+@router.get("/data-collection/status", summary="获取数据采集状态")
+def get_data_collection_status(admin_user: dict = Depends(get_current_admin_user)):
+    """管理员查看数据采集状态
+    
+    返回：
+    - 正在采集的股票列表
+    - 每只股票的最新数据时间
+    - 采集统计信息
+    """
+    try:
+        collections = get_db_collections()
+        minute_bars_coll = collections["minute_bars"]
+        
+        # 记录管理员操作
+        log_admin_action(
+            admin_user=admin_user,
+            action="VIEW_DATA_COLLECTION_STATUS",
+            details="View data collection status"
+        )
+        
+        # 统计每只股票的分钟K线数据
+        pipeline = [
+            {
+                "$group": {
+                    "_id": "$symbol",
+                    "total_bars": {"$sum": 1},
+                    "latest_date": {"$max": "$trade_date"},
+                    "earliest_date": {"$min": "$trade_date"}
+                }
+            },
+            {"$sort": {"latest_date": -1}}
+        ]
+        
+        stocks_data = list(minute_bars_coll.aggregate(pipeline))
+        
+        # 处理数据
+        stocks_list = []
+        today = datetime.now().strftime("%Y%m%d")
+        active_today = 0
+        
+        for stock in stocks_data:
+            symbol = stock["_id"]
+            total_bars = stock["total_bars"]
+            latest_date = stock.get("latest_date", "")
+            earliest_date = stock.get("earliest_date", "")
+            
+            # 判断是否今天有数据
+            is_active_today = latest_date.startswith(today) if latest_date else False
+            if is_active_today:
+                active_today += 1
+            
+            # 计算最后更新时间距离现在多久
+            if latest_date and len(latest_date) >= 12:
+                try:
+                    latest_dt = datetime.strptime(latest_date[:12], "%Y%m%d%H%M")
+                    minutes_ago = int((datetime.now() - latest_dt).total_seconds() / 60)
+                except:
+                    minutes_ago = None
+            else:
+                minutes_ago = None
+            
+            stocks_list.append({
+                "symbol": symbol,
+                "total_bars": total_bars,
+                "latest_date": latest_date,
+                "earliest_date": earliest_date,
+                "is_active_today": is_active_today,
+                "minutes_since_update": minutes_ago
+            })
+        
+        # 总体统计
+        total_stocks = len(stocks_list)
+        total_bars = sum(s["total_bars"] for s in stocks_list)
+        
+        # 今天的数据量
+        today_bars = minute_bars_coll.count_documents({
+            "trade_date": {"$regex": f"^{today}"}
+        })
+        
+        return {
+            "success": True,
+            "data": {
+                "summary": {
+                    "total_stocks": total_stocks,
+                    "active_today": active_today,
+                    "total_bars": total_bars,
+                    "today_bars": today_bars,
+                    "last_update": datetime.now().isoformat()
+                },
+                "stocks": stocks_list
+            }
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"获取数据采集状态失败: {str(e)}")
 
 @router.put("/users/{user_id}/status")
 def update_user_status(
