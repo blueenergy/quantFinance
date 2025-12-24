@@ -12,6 +12,7 @@ from routers.strategy import router as strategy_router
 from routers.trade_execution import router as trade_execution_router
 from routers.worker_monitor import router as worker_monitor_router
 from routers.notification import router as notification_router
+from routers.trader import router as trader_router
 
 
 app = FastAPI()
@@ -30,3 +31,4 @@ app.include_router(strategy_router,prefix="/api", tags=["策略"])
 app.include_router(trade_execution_router, prefix="/api", tags=["交易执行"])
 app.include_router(worker_monitor_router, prefix="/api", tags=["Worker监控"])
 app.include_router(notification_router, prefix="/api", tags=["通知提醒"])
+app.include_router(trader_router, prefix="/api", tags=["交易客户端"])
