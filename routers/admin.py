@@ -1,10 +1,18 @@
 from bson import ObjectId
-from fastapi import APIRouter, Depends, Query, HTTPException
+from fastapi import APIRouter, Depends, Query, HTTPException, Body
+from typing import List
 from auth import get_current_admin_user, log_admin_action, create_admin_user
 from db import get_db_collections
 from datetime import timedelta, datetime
 from utils.stock_utils import serialize_doc
 import time
+from models.all_models import (
+    WorkerNodeRegisterRequest,
+    WorkerNodeHeartbeat,
+    WorkerGroupConfig,
+    WorkerGroupsReport,
+)
+from task_router import TaskRouter
 
 
 
@@ -184,6 +192,188 @@ def get_login_logs(
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"获取登录日志失败: {str(e)}")
+
+
+@router.post("/worker-nodes/register")
+def register_worker_node(payload: WorkerNodeRegisterRequest):
+    """Worker 节点注册/更新接口（供 Node Agent 调用）"""
+    try:
+        collections = get_db_collections()
+        worker_nodes = collections["worker_nodes"]
+        now = datetime.utcnow()
+
+        existing = worker_nodes.find_one({"node_id": payload.node_id})
+        doc = {
+            "node_id": payload.node_id,
+            "host": payload.host,
+            "labels": payload.labels or {},
+            "capacity": payload.capacity or {},
+            "last_heartbeat": now,
+            "status": "online",
+            "updated_at": now,
+        }
+        if existing:
+            worker_nodes.update_one({"_id": existing["_id"]}, {"$set": doc})
+        else:
+            doc["created_at"] = now
+            worker_nodes.insert_one(doc)
+
+        return {"success": True, "data": {"node_id": payload.node_id}}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Worker 节点注册失败: {str(e)}")
+
+
+@router.post("/worker-nodes/heartbeat")
+def worker_node_heartbeat(payload: WorkerNodeHeartbeat):
+    """Worker 节点心跳上报接口"""
+    try:
+        collections = get_db_collections()
+        worker_nodes = collections["worker_nodes"]
+        now = datetime.utcnow()
+
+        update = {
+            "last_heartbeat": datetime.fromtimestamp(payload.timestamp),
+            "status": "online",
+            "processes": payload.processes or [],
+            "updated_at": now,
+        }
+        result = worker_nodes.update_one(
+            {"node_id": payload.node_id}, {"$set": update}, upsert=True
+        )
+
+        return {"success": True, "data": {"matched": result.matched_count}}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Worker 节点心跳失败: {str(e)}")
+
+
+@router.get("/worker-groups/assignments")
+def get_worker_group_assignments(node_id: str = Query(..., description="节点ID")):
+    """Node Agent 拉取分配给自己的 Worker 组配置"""
+    try:
+        collections = get_db_collections()
+        worker_groups = collections["worker_groups"]
+
+        docs = list(worker_groups.find({"node_id": node_id}))
+        groups = []
+        for d in docs:
+            # 返回所有分配给该节点的组，不管状态是否同步
+            groups.append({
+                "group_id": d.get("group_id"),
+                "node_id": d.get("node_id"),
+                "symbols": d.get("symbols", []),
+                "user_id": d.get("user_id"),
+                "mode": d.get("mode", "live"),
+                "desired_state": d.get("desired_state", "running"),
+                "current_state": d.get("current_state"),
+                "config": d.get("config", {}),
+            })
+
+        return {"success": True, "data": {"groups": groups}}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"获取 Worker 组分配失败: {str(e)}")
+
+
+@router.post("/worker-groups/report")
+def report_worker_groups(payload: WorkerGroupsReport):
+    """Node Agent 上报 Worker 组当前状态"""
+    try:
+        collections = get_db_collections()
+        worker_groups = collections["worker_groups"]
+        now = datetime.utcnow()
+
+        updated = 0
+        for g in payload.groups:
+            update = {
+                "node_id": payload.node_id,
+                "symbols": g.symbols,
+                "user_id": g.user_id,
+                "mode": g.mode,
+                "desired_state": g.desired_state,
+                "current_state": g.current_state,
+                "config": g.config or {},
+                "updated_at": now,
+            }
+            result = worker_groups.update_one(
+                {"group_id": g.group_id}, {"$set": update}, upsert=True
+            )
+            updated += result.matched_count or 1
+
+        return {"success": True, "data": {"updated": updated}}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"上报 Worker 组状态失败: {str(e)}")
+
+
+@router.get("/worker-nodes/status")
+def get_worker_nodes_status(admin_user: dict = Depends(get_current_admin_user)):
+    """管理员查看所有 Worker 节点状态"""
+    try:
+        collections = get_db_collections()
+        worker_nodes = collections["worker_nodes"]
+        
+        nodes = list(worker_nodes.find({}))
+        now = datetime.utcnow()
+        
+        online_count = 0
+        total_processes = 0
+        
+        for node in nodes:
+            node["_id"] = str(node["_id"])
+            last_hb = node.get("last_heartbeat")
+            
+            # 判断在线状态：5分钟内有心跳视为在线
+            if last_hb and (now - last_hb).total_seconds() < 300:
+                node["status"] = "online"
+                online_count += 1
+            else:
+                node["status"] = "offline"
+            
+            # 统计进程数
+            processes = node.get("processes", [])
+            node["process_count"] = len(processes)
+            total_processes += len(processes)
+        
+        summary = {
+            "total_nodes": len(nodes),
+            "online_nodes": online_count,
+            "total_processes": total_processes,
+        }
+        
+        return {"success": True, "data": {"nodes": nodes, "summary": summary}}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"获取节点状态失败: {str(e)}")
+
+
+@router.get("/worker-groups/status")
+def get_worker_groups_status(admin_user: dict = Depends(get_current_admin_user)):
+    """管理员查看所有 Worker 组状态"""
+    try:
+        collections = get_db_collections()
+        worker_groups = collections["worker_groups"]
+        
+        groups = list(worker_groups.find({}))
+        
+        running_count = 0
+        stopped_count = 0
+        
+        for group in groups:
+            group["_id"] = str(group["_id"])
+            current_state = group.get("current_state")
+            
+            if current_state == "running":
+                running_count += 1
+            elif current_state == "stopped":
+                stopped_count += 1
+        
+        summary = {
+            "total_groups": len(groups),
+            "running_groups": running_count,
+            "stopped_groups": stopped_count,
+        }
+        
+        return {"success": True, "data": {"groups": groups, "summary": summary}}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"获取 Worker 组状态失败: {str(e)}")
+
 
 @router.get("/statistics")
 def get_admin_statistics(admin_user: dict = Depends(get_current_admin_user)):
@@ -531,3 +721,111 @@ def get_analysis_logs(
         }
     except Exception as e:
         return {"success": False, "message": f"获取分析日志失败: {str(e)}"}
+
+
+# ==================== 任务管理 API ====================
+
+@router.post("/tasks/create")
+def create_task(
+    symbols: List[str] = Body(...),
+    user_id: str = Body(...),
+    task_type: str = Body("realtime"),  # realtime / analysis / backtest
+    mode: str = Body("live"),
+    config: dict = Body(None),
+    admin_user: dict = Depends(get_current_admin_user)
+):
+    """管理员创建任务，自动分配到合适的 Worker
+    
+    任务类型：
+    - realtime: 实时交易（只能在私有 Worker 上运行）
+    - analysis: 分析任务（优先公有 Worker）
+    - backtest: 回测任务（优先公有 Worker）
+    """
+    try:
+        # 记录管理员操作
+        log_admin_action(
+            admin_user=admin_user,
+            action="CREATE_TASK",
+            details=f"Task type: {task_type}, Symbols: {symbols}, User: {user_id}"
+        )
+        
+        # 使用 TaskRouter 创建任务
+        group = TaskRouter.create_worker_group(
+            symbols=symbols,
+            user_id=user_id,
+            task_type=task_type,
+            mode=mode,
+            config=config
+        )
+        
+        return {
+            "success": True,
+            "data": {
+                "group": group,
+                "message": f"任务已分配到节点: {group['node_id']}"
+            }
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"创建任务失败: {str(e)}")
+
+
+@router.get("/tasks/available-nodes")
+def get_available_nodes_for_task(
+    task_type: str = Query("realtime"),
+    admin_user: dict = Depends(get_current_admin_user)
+):
+    """查询可用于指定任务类型的节点列表"""
+    try:
+        nodes = TaskRouter.get_available_nodes(task_type)
+        
+        return {
+            "success": True,
+            "data": {
+                "nodes": nodes,
+                "count": len(nodes),
+                "task_type": task_type
+            }
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"查询节点失败: {str(e)}")
+
+
+@router.post("/tasks/assign")
+def assign_task_to_specific_node(
+    node_id: str = Body(...),
+    symbols: List[str] = Body(...),
+    user_id: str = Body(...),
+    task_type: str = Body("realtime"),
+    mode: str = Body("live"),
+    config: dict = Body(None),
+    admin_user: dict = Depends(get_current_admin_user)
+):
+    """管理员手动指定节点分配任务"""
+    try:
+        log_admin_action(
+            admin_user=admin_user,
+            action="ASSIGN_TASK",
+            details=f"Node: {node_id}, Task: {task_type}, Symbols: {symbols}"
+        )
+        
+        group = TaskRouter.assign_task_to_node(
+            node_id=node_id,
+            symbols=symbols,
+            user_id=user_id,
+            task_type=task_type,
+            mode=mode,
+            config=config
+        )
+        
+        return {
+            "success": True,
+            "data": {
+                "group": group,
+                "message": f"任务已分配到节点: {node_id}"
+            }
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"分配任务失败: {str(e)}")
