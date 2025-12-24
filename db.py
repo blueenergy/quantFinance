@@ -46,6 +46,10 @@ def get_db_collections() -> Dict[str, Collection]:
         # Notification system
         "notifications": db["notifications"],  # 通知记录
         "notification_settings": db["notification_settings"],  # 通知设置
+        # Position and account management (from quantTrader)
+        "trader_positions": db["trader_positions"],  # 实时持仓快照
+        "trader_accounts": db["trader_accounts"],  # 账户资金信息
+        "position_snapshots": db["position_snapshots"],  # 历史持仓快照（每日）
         # Add more collections as needed
     }
 
