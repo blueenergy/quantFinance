@@ -43,6 +43,9 @@ def get_db_collections() -> Dict[str, Collection]:
         # Worker monitoring
         "worker_status": db["worker_status"],  # Worker 状态和心跳
         "worker_activity": db["worker_activity"],  # Worker 活动日志
+        # Distributed execution control plane
+        "worker_nodes": db["worker_nodes"],  # 执行节点（机器）注册和状态
+        "worker_groups": db["worker_groups"],  # Worker 组（任务单元）配置和状态
         # Notification system
         "notifications": db["notifications"],  # 通知记录
         "notification_settings": db["notification_settings"],  # 通知设置

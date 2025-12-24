@@ -1,5 +1,5 @@
 from pydantic import BaseModel, EmailStr
-from typing import Optional, List,Any
+from typing import Optional, List, Any, Dict
 from datetime import datetime, timedelta
 
 class UserBase(BaseModel):
@@ -119,3 +119,34 @@ class SecuritiesAccountResponse(SecuritiesAccountBase):
     id: str
     created_at: datetime
     updated_at: Optional[datetime] = None
+
+
+class WorkerNodeRegisterRequest(BaseModel):
+    node_id: str
+    host: str
+    node_type: str = "private"  # private(私有) / public(公有)
+    labels: Optional[Dict[str, Any]] = None
+    capacity: Optional[Dict[str, Any]] = None
+
+
+class WorkerNodeHeartbeat(BaseModel):
+    node_id: str
+    timestamp: float
+    processes: Optional[List[Dict[str, Any]]] = None
+
+
+class WorkerGroupConfig(BaseModel):
+    group_id: str
+    node_id: str
+    symbols: List[str]
+    user_id: str
+    mode: str = "live"  # live / backtest / replay
+    task_type: str = "realtime"  # realtime(实时交易) / analysis(分析) / backtest(回测)
+    desired_state: str = "running"  # running / stopped
+    current_state: Optional[str] = None
+    config: Optional[Dict[str, Any]] = None
+
+
+class WorkerGroupsReport(BaseModel):
+    node_id: str
+    groups: List[WorkerGroupConfig]

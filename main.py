@@ -1,4 +1,5 @@
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from routers.user import router as user_router
 from routers.stock import router as stock_router
 from routers.market import router as market_router
@@ -13,9 +14,19 @@ from routers.trade_execution import router as trade_execution_router
 from routers.worker_monitor import router as worker_monitor_router
 from routers.notification import router as notification_router
 from routers.trader import router as trader_router
+from routers.worker_data import router as worker_data_router
 
 
 app = FastAPI()
+
+# CORS 配置
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # 生产环境应该指定具体域名
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # 注册各功能模块路由
 app.include_router(user_router, prefix="/api/user", tags=["用户"])
@@ -32,3 +43,4 @@ app.include_router(trade_execution_router, prefix="/api", tags=["交易执行"])
 app.include_router(worker_monitor_router, prefix="/api", tags=["Worker监控"])
 app.include_router(notification_router, prefix="/api", tags=["通知提醒"])
 app.include_router(trader_router, prefix="/api", tags=["交易客户端"])
+app.include_router(worker_data_router, prefix="/api/worker-data", tags=["Worker数据访问"])
