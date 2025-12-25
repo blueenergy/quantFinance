@@ -1,43 +1,108 @@
 """Analysis Details API for detailed strategy analysis information."""
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Depends
 from typing import List, Dict, Any
 from datetime import datetime, date
 import json
+
 from db import get_db_collections
+from auth import get_current_active_user
 
 router = APIRouter(prefix="/analysis", tags=["analysis"])
+
+@router.get("/strategy/analysis-detail")
+async def get_general_analysis_detail(
+    current_user: dict = Depends(get_current_active_user),
+    page: int = 1,
+    limit: int = 20,
+    strategy: str = None,
+    symbol: str = None,
+    start_date: str = None,
+    end_date: str = None,
+    collections=Depends(get_db_collections)
+):
+    """
+    Get general analysis information with optional filters.
+    Used by frontend StrategyExecutionAnalysis component.
+    """
+    try:
+        worker_activities = collections["worker_activity"]
+        
+        # Build query
+        query = {"activity_type": "analysis", "user_id": str(current_user["id"]) }
+        
+        # Add optional filters
+        if strategy:
+            query["strategy"] = strategy
+        if symbol:
+            query["symbol"] = symbol
+
+        if start_date or end_date:
+            date_query = {}
+            if start_date:
+                start_dt = datetime.combine(date.fromisoformat(start_date), datetime.min.time())
+                date_query["$gte"] = start_dt.timestamp()
+            if end_date:
+                end_dt = datetime.combine(date.fromisoformat(end_date), datetime.max.time())
+                date_query["$lte"] = end_dt.timestamp()
+            if date_query:
+                query["timestamp"] = date_query
+        
+        # Query analysis records
+        analysis_records = list(worker_activities.find(
+            query,
+            {"_id": 0}  # Exclude _id field
+        ).sort("timestamp", -1).limit(limit))
+        
+        # Filter records that have detailed reasoning
+        detailed_records = []
+        for record in analysis_records:
+            if "result" in record and "detailed_reasoning" in record["result"]:
+                detailed_records.append(record)
+        
+        return {
+            "total_records": len(detailed_records),
+            "analysis_details": detailed_records
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error fetching analysis details: {str(e)}")
+
 
 @router.get("/strategy/{strategy_name}/analysis-detail")
 async def get_strategy_analysis_detail(
     strategy_name: str,
+    current_user: dict = Depends(get_current_active_user),
     limit: int = 50,
     start_date: str = None,
-    end_date: str = None
+    end_date: str = None,
+    collections=Depends(get_db_collections)
 ):
     """
     Get detailed analysis information for a specific strategy.
     Returns detailed reasoning and decision process for deep analysis events.
     """
     try:
-        collections = get_db_collections()
-        col: Collection = collections["worker_activities"]
+        worker_activities = collections["worker_activity"]
+        
         # Build query
-        query = {"strategy": strategy_name, "activity_type": "analysis"}
+        query = {"strategy": strategy_name, "activity_type": "analysis", "user_id": str(current_user["id"]) }
         
         if start_date or end_date:
             date_query = {}
             if start_date:
                 start_dt = datetime.combine(date.fromisoformat(start_date), datetime.min.time())
-                date_query["$gte"] = start_dt
+                date_query["$gte"] = start_dt.timestamp()
             if end_date:
                 end_dt = datetime.combine(date.fromisoformat(end_date), datetime.max.time())
-                date_query["$lte"] = end_dt
+                date_query["$lte"] = end_dt.timestamp()
             if date_query:
                 query["timestamp"] = date_query
         
         # Query analysis records
-        docs = col.find({"user_id": str(current_user["id"])})
-        analysis_records = await docs.to_list(length=limit)
+        analysis_records = list(worker_activities.find(
+            query,
+            {"_id": 0}  # Exclude _id field
+        ).sort("timestamp", -1).limit(limit))
         
         # Filter records that have detailed reasoning
         detailed_records = []
@@ -58,36 +123,38 @@ async def get_strategy_analysis_detail(
 @router.get("/symbol/{symbol}/analysis-detail")
 async def get_symbol_analysis_detail(
     symbol: str,
+    current_user: dict = Depends(get_current_active_user),
     limit: int = 50,
     start_date: str = None,
-    end_date: str = None
+    end_date: str = None,
+    collections=Depends(get_db_collections)
 ):
     """
     Get detailed analysis information for a specific symbol.
     Returns detailed reasoning and decision process for deep analysis events.
     """
     try:
-        db = await get_mongo_db()
+        worker_activities = collections["worker_activity"]
         
         # Build query
-        query = {"symbol": symbol, "activity_type": "analysis"}
+        query = {"symbol": symbol, "activity_type": "analysis", "user_id": str(current_user["id"]) }
         
         if start_date or end_date:
             date_query = {}
             if start_date:
                 start_dt = datetime.combine(date.fromisoformat(start_date), datetime.min.time())
-                date_query["$gte"] = start_dt
+                date_query["$gte"] = start_dt.timestamp()
             if end_date:
                 end_dt = datetime.combine(date.fromisoformat(end_date), datetime.max.time())
-                date_query["$lte"] = end_dt
+                date_query["$lte"] = end_dt.timestamp()
             if date_query:
                 query["timestamp"] = date_query
         
         # Query analysis records
-        analysis_records = await db.worker_activities.find(
+        analysis_records = list(worker_activities.find(
             query,
             {"_id": 0}  # Exclude _id field
-        ).sort("timestamp", -1).limit(limit).to_list(length=limit)
+        ).sort("timestamp", -1).limit(limit))
         
         # Filter records that have detailed reasoning
         detailed_records = []
@@ -106,19 +173,23 @@ async def get_symbol_analysis_detail(
 
 
 @router.get("/analysis-summary")
-async def get_analysis_summary():
+async def get_analysis_summary(
+    current_user: dict = Depends(get_current_active_user),
+    collections=Depends(get_db_collections)
+):
     """
     Get summary of all analysis activities with detailed reasoning.
     """
     try:
-        db = await get_mongo_db()
+        worker_activities = collections["worker_activity"]
         
         # Get all analysis records with detailed reasoning
         pipeline = [
             {
                 "$match": {
                     "activity_type": "analysis",
-                    "result.detailed_reasoning": {"$exists": True}
+                    "result.detailed_reasoning": {"$exists": True},
+                    "user_id": str(current_user["id"])
                 }
             },
             {
@@ -144,7 +215,7 @@ async def get_analysis_summary():
             }
         ]
         
-        summary = await db.worker_activities.aggregate(pipeline).to_list(length=None)
+        summary = list(worker_activities.aggregate(pipeline))
         
         return {
             "summary": summary,
