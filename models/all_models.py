@@ -10,6 +10,10 @@ class UserBase(BaseModel):
 
 class UserCreate(UserBase):
     password: str
+    llm_provider: Optional[str] = None
+    llm_api_key: Optional[str] = None
+    llm_base_url: Optional[str] = None
+    llm_model: Optional[str] = None
 
 class UserLogin(BaseModel):
     username: str
@@ -25,6 +29,12 @@ class UserResponse(UserBase):
     is_admin: bool = False
     created_at: datetime
     last_login: Optional[datetime] = None
+    llm_provider: Optional[str] = None
+    llm_api_key: Optional[str] = None  # This will not be returned to client for security
+    llm_base_url: Optional[str] = None
+    llm_model: Optional[str] = None
+    enable_analytics: Optional[bool] = True
+    active_llm_config_id: Optional[str] = None
 
 class Token(BaseModel):
     access_token: str
@@ -161,3 +171,10 @@ class WorkerGroupConfig(BaseModel):
 class WorkerGroupsReport(BaseModel):
     node_id: str
     groups: List[WorkerGroupConfig]
+
+
+class UpdateLLMConfigRequest(BaseModel):
+    llm_provider: Optional[str] = None
+    llm_api_key: Optional[str] = None
+    llm_base_url: Optional[str] = None
+    llm_model: Optional[str] = None

@@ -44,6 +44,10 @@ class UserBase(BaseModel):
 
 class UserCreate(UserBase):
     password: str
+    llm_provider: Optional[str] = None
+    llm_api_key: Optional[str] = None
+    llm_base_url: Optional[str] = None
+    llm_model: Optional[str] = None
 
 class UserResponse(UserBase):
     id: str
@@ -51,6 +55,10 @@ class UserResponse(UserBase):
     is_admin: bool = False
     created_at: datetime
     last_login: Optional[datetime] = None
+    llm_provider: Optional[str] = None
+    llm_api_key: Optional[str] = None  # This will not be returned to client for security
+    llm_base_url: Optional[str] = None
+    llm_model: Optional[str] = None
 
 class UserLogin(BaseModel):
     username: str
@@ -96,6 +104,11 @@ def get_user(username: str):
     if user:
         user["id"] = str(user["_id"])
         del user["_id"]
+        # 确保返回用户的所有字段，包括LLM配置
+        user.setdefault("llm_provider", None)
+        user.setdefault("llm_api_key", None)
+        user.setdefault("llm_base_url", None)
+        user.setdefault("llm_model", None)
         return user
     return None
 
@@ -173,10 +186,17 @@ def create_user(user_data: UserCreate):
         "email": user_data.email,
         "full_name": user_data.full_name,
         "hashed_password": get_password_hash(user_data.password),
-        "is_active": True,
+        "is_active": False,  # 新注册用户默认不激活，需要邮箱验证
         "is_admin": False,  # 默认不是管理员
         "created_at": datetime.utcnow(),
-        "last_login": None
+        "last_login": None,
+        "email_verified": False,  # 邮箱未验证
+        "llm_provider": user_data.llm_provider,
+        "llm_api_key": user_data.llm_api_key,
+        "llm_base_url": user_data.llm_base_url,
+        "llm_model": user_data.llm_model,
+        "llm_configs": [],  # 初始化新的多LLM配置数组
+        "active_llm_config_id": None  # 初始化激活的配置ID
     }
     
     result = users_collection.insert_one(user_doc)

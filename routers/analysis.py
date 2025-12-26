@@ -7,6 +7,7 @@ from db import get_db_collections
 from llm_service import llm_manager
 from datetime import datetime
 from utils.stock_utils import serialize_doc, format_trade_date
+from bson import ObjectId
 
 router = APIRouter()
 
@@ -25,28 +26,82 @@ async def analyze_stock(request: StockAnalysisRequest, current_user: dict = Depe
         stock_data = get_stock_data_for_analysis(request.symbol)
         if not stock_data:
             raise HTTPException(status_code=404, detail="未找到该股票的量价或资金流数据")
-        # 获取LLM服务
+        
+        # 获取用户激活的LLM配置
+        collections = get_db_collections()
+        users_col = collections["users"]
+        
+        user_doc = users_col.find_one({"_id": ObjectId(current_user["id"])})
+        if not user_doc:
+            raise HTTPException(status_code=404, detail="用户不存在")
+        
+        active_config_id = user_doc.get("active_llm_config_id")
+        llm_configs = user_doc.get("llm_configs", [])
+        
+        # 如果没有激活配置但有可用配置，自动激活第一个
+        if not active_config_id and llm_configs:
+            active_config_id = str(llm_configs[0].get("_id"))
+            # 更新用户文档以激活该配置
+            users_col.update_one(
+                {"_id": ObjectId(current_user["id"])},
+                {"$set": {"active_llm_config_id": active_config_id}}
+            )
+        
+        if not active_config_id:
+            raise HTTPException(status_code=400, detail="请先在用户配置中配置一个LLM配置")
+        
+        # 查找激活的配置
+        active_config = None
+        for config in llm_configs:
+            if str(config.get("_id")) == active_config_id:
+                active_config = config
+                break
+        
+        if not active_config:
+            raise HTTPException(status_code=404, detail="激活的LLM配置不存在")
+        
+        # 获取配置参数
+        user_llm_provider = active_config.get("provider")
+        user_llm_api_key = active_config.get("api_key")
+        user_llm_base_url = active_config.get("base_url")
+        user_llm_model = active_config.get("model")
+        
+        # 使用用户配置，不使用任何默认值
+        # 如果请求中有指定，优先使用请求参数（用于特殊场景）
+        provider = request.provider or user_llm_provider
+        model = request.model or user_llm_model
+        
+        # 验证必需参数
+        if not provider or not model or not user_llm_api_key:
+            raise HTTPException(
+                status_code=400, 
+                detail="LLM配置不完整，请在用户设置中配置完整的LLM信息(provider、model、api_key)"
+            )
+        
+        # 获取LLM服务，优先使用用户特定的API密钥和基础URL
         llm_service = llm_manager.get_service(
-            provider=request.provider or os.getenv('DEFAULT_LLM_PROVIDER', 'Custom'),
-            model=request.model or os.getenv('DEFAULT_MODEL', 'qwen-plus')
+            provider=provider,
+            model=model,
+            api_key=user_llm_api_key,
+            base_url=user_llm_base_url
         )
         analysis_result = await llm_service.analyze_stock(symbol, stock_data)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"AI分析失败: {str(e)}")
 
     # # 保存分析历史
-    # collections = get_db_collections()
-    # analysis_col = collections["analysis_history"]
-    # history_doc = {
-    #     "user_id": current_user["id"],
-    #     "symbol": symbol,
-    #     "start_date": start_date,
-    #     "end_date": end_date,
-    #     "prompt": prompt,
-    #     "result": analysis_result,
-    #     "timestamp": datetime.now()
-    # }
-    # analysis_col.insert_one(history_doc)
+    # # collections = get_db_collections()
+    # # analysis_col = collections["analysis_history"]
+    # # history_doc = {
+    # #     "user_id": current_user["id"],
+    # #     "symbol": symbol,
+    # #     "start_date": start_date,
+    # #     "end_date": end_date,
+    # #     "prompt": prompt,
+    # #     "result": analysis_result,
+    # #     "timestamp": datetime.now()
+    # # }
+    # # analysis_col.insert_one(history_doc)
 
     analysis_result["user_id"] = current_user["id"]
     analysis_result["username"] = current_user["username"]
