@@ -15,7 +15,7 @@ def _encrypt_password(raw: str) -> str:
     # Placeholder: replace with KMS/Fernet integration later
     return raw
 
-@router.get("/accounts", response_model=list[SecuritiesAccountResponse])
+@router.get("/securities_accounts", response_model=list[SecuritiesAccountResponse])
 def list_accounts(current_user: dict = Depends(get_current_active_user)):
     collections = get_db_collections()
     col: Collection = collections["securities_accounts"]
@@ -33,7 +33,7 @@ def list_accounts(current_user: dict = Depends(get_current_active_user)):
         )
     return out
 
-@router.post("/accounts", response_model=SecuritiesAccountResponse)
+@router.post("/securities_accounts", response_model=SecuritiesAccountResponse)
 def create_account(payload: SecuritiesAccountCreate, current_user: dict = Depends(get_current_active_user)):
     collections = get_db_collections()
     col: Collection = collections["securities_accounts"]
@@ -62,7 +62,7 @@ def create_account(payload: SecuritiesAccountCreate, current_user: dict = Depend
         updated_at=None,
     )
 
-@router.put("/accounts/{account_id}")
+@router.put("/securities_accounts/{account_id}")
 def update_account(account_id: str, payload: SecuritiesAccountUpdate, current_user: dict = Depends(get_current_active_user)):
     collections = get_db_collections()
     col: Collection = collections["securities_accounts"]
@@ -76,14 +76,12 @@ def update_account(account_id: str, payload: SecuritiesAccountUpdate, current_us
     if not update:
         return {"success": True}
     update["updated_at"] = datetime.utcnow()
-    res = col.update_one({"user_id": str(current_user["id"]), "_id": {"$eq": col.database.client.get_default_database().command("convertToCapped", "dummy") if False else None}}, {"$set": update})
-    # Simplify: find and update by account_id scoped to user
     res = col.update_one({"user_id": str(current_user["id"]), "account_id": account_id}, {"$set": update})
     if res.matched_count == 0:
         raise HTTPException(status_code=404, detail="Account not found")
     return {"success": True}
 
-@router.delete("/accounts/{account_id}")
+@router.delete("/securities_accounts/{account_id}")
 def delete_account(account_id: str, current_user: dict = Depends(get_current_active_user)):
     collections = get_db_collections()
     col: Collection = collections["securities_accounts"]

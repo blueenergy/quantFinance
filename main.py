@@ -1,13 +1,15 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from routers.user import router as user_router
+from routers.auth import router as auth_router
+from routers.user_watchlist import router as user_watchlist_router
+from routers.user_config import router as user_config_router
 from routers.stock import router as stock_router
 from routers.market import router as market_router
 from routers.admin import router as admin_router
 from routers.analysis import router as analysis_router
 from routers.records import router as records_router
 from routers.stock_ranking import router as stock_ranking_router
-from routers import index_data 
+from routers import index_data
 from routers.securities_account import router as sec_account_router
 from routers.strategy import router as strategy_router
 from routers.trade_execution import router as trade_execution_router
@@ -31,7 +33,10 @@ app.add_middleware(
 )
 
 # 注册各功能模块路由
-app.include_router(user_router, prefix="/api/user", tags=["用户"])
+# app.include_router(user_router, prefix="/api/user", tags=["用户"])  # 已迁移到 auth_router 和 user_watchlist
+app.include_router(auth_router, prefix="/api/auth", tags=["认证"])
+app.include_router(user_watchlist_router, prefix="/api/user", tags=["自选股"])
+app.include_router(user_config_router, prefix="/api/user", tags=["用户配置"])
 app.include_router(stock_router, prefix="/api/stock", tags=["股票"])
 app.include_router(market_router, prefix="/api", tags=["市场分析"])
 app.include_router(admin_router, prefix="/api/admin", tags=["管理员"])
