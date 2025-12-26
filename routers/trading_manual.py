@@ -81,11 +81,7 @@ def manual_retry_failed_signal(
 
 @router.post("/trade-signals/manual-create", summary="手动创建交易信号")
 def manual_create_signal(
-    symbol: str = Query(..., description="股票代码"),
-    action: str = Query(..., regex="^(buy|sell)$", description="操作类型: buy 或 sell"),
-    size: int = Query(..., gt=0, description="交易数量"),
-    price: Optional[float] = Query(None, description="交易价格 (None为市价)"),
-    strategy: str = Query("manual", description="策略名称"),
+    request: Dict[str, Any],
     current_user: dict = Depends(get_current_active_user)
 ):
     """手动创建一个交易信号，模拟手动下单"""
@@ -94,6 +90,22 @@ def manual_create_signal(
         signals_coll = collections["trade_signals"]
         
         user_id = current_user["id"]
+        
+        # 从请求体获取参数
+        symbol = request.get("symbol")
+        action = request.get("action")
+        size = request.get("size")
+        price = request.get("price")
+        strategy = request.get("strategy", "manual")
+        
+        if not symbol:
+            raise HTTPException(status_code=400, detail="股票代码不能为空")
+        
+        if not action:
+            raise HTTPException(status_code=400, detail="操作类型不能为空")
+        
+        if not size:
+            raise HTTPException(status_code=400, detail="交易数量不能为空")
         
         # 规范化股票代码
         normalized_symbol = normalize_symbol(symbol)
