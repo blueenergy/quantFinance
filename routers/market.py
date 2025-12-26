@@ -9,6 +9,7 @@ from llm_service import llm_manager
 from datetime import date,datetime
 from external_data import external_market_data
 from utils.stock_utils import serialize_doc
+from bson import ObjectId
 router = APIRouter()
 
 @router.post("/analyze-market")
@@ -57,8 +58,52 @@ async def analyze_market(request: MarketAnalysisRequest, current_user: dict = De
     if not market_data:
         raise HTTPException(status_code=404, detail="未找到市场数据")
 
-    # 获取LLM服务
-    llm_service = llm_manager.get_service()
+    # 获取用户激活的LLM配置
+    collections = get_db_collections()
+    users_col = collections["users"]
+    
+    user_doc = users_col.find_one({"_id": ObjectId(current_user["id"])})
+    if not user_doc:
+        raise HTTPException(status_code=404, detail="用户不存在")
+    
+    active_config_id = user_doc.get("active_llm_config_id")
+    llm_configs = user_doc.get("llm_configs", [])
+    
+    # 如果没有激活配置但有可用配置，自动激活第一个
+    if not active_config_id and llm_configs:
+        active_config_id = str(llm_configs[0].get("_id"))
+        # 更新用户文档以激活该配置
+        users_col.update_one(
+            {"_id": ObjectId(current_user["id"])},
+            {"$set": {"active_llm_config_id": active_config_id}}
+        )
+    
+    if not active_config_id:
+        raise HTTPException(status_code=400, detail="请先在用户配置中配置一个LLM配置")
+    
+    # 查找激活的配置
+    active_config = None
+    for config in llm_configs:
+        if str(config.get("_id")) == active_config_id:
+            active_config = config
+            break
+    
+    if not active_config:
+        raise HTTPException(status_code=404, detail="激活的LLM配置不存在")
+    
+    # 获取配置参数
+    user_llm_provider = active_config.get("provider")
+    user_llm_api_key = active_config.get("api_key")
+    user_llm_base_url = active_config.get("base_url")
+    user_llm_model = active_config.get("model")
+    
+    # 获取LLM服务，使用用户特定的配置
+    llm_service = llm_manager.get_service(
+        provider=user_llm_provider,
+        model=user_llm_model,
+        api_key=user_llm_api_key,
+        base_url=user_llm_base_url
+    )
     analysis_result = await llm_service.analyze_market(market_data)
 
     if analysis_result.get("success"):

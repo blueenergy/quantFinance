@@ -1,6 +1,6 @@
 """
-LLM API服务类
-支持OpenAI、DeepSeek等兼容OpenAI接口的外部LLM API服务
+LLM API service class
+Supports OpenAI, DeepSeek, etc. external LLM API services compatible with OpenAI interface
 """
 
 import os
@@ -9,68 +9,78 @@ import httpx
 from typing import Dict, List, Optional, Any
 from dotenv import load_dotenv
 
-# 加载环境变量
+# Load environment variables
 load_dotenv()
 
 
 class LLMService:
-    def __init__(self, provider: str = None, model: str = None):
+    def __init__(self, provider: str = None, model: str = None, api_key: str = None, base_url: str = None):
         """
-        初始化LLM服务
+        Initialize LLM service
         
         Args:
-            provider: LLM服务提供商 (openai, deepseek, custom)
-            model: 使用的模型名称
+            provider: LLM service provider (openai, deepseek, custom) - REQUIRED
+            model: Model name to use - REQUIRED
+            api_key: API key - REQUIRED
+            base_url: API base URL (optional, will use provider defaults if not provided)
         """
-        self.provider = provider or os.getenv('DEFAULT_LLM_PROVIDER', 'openai')
-        self.model = model or os.getenv('DEFAULT_MODEL', 'gpt-3.5-turbo')
+        # 不使用任何默认值，完全依赖用户配置
+        if not provider:
+            raise ValueError("必须指定 LLM provider")
+        if not model:
+            raise ValueError("必须指定 LLM model")
+        if not api_key:
+            raise ValueError("必须指定 API key")
+            
+        self.provider = provider
+        self.model = model
+        self.api_key_override = api_key
+        self.base_url_override = base_url
         
-        # 根据提供商设置API配置
+        # Set up API configuration based on provider
         self._setup_api_config()
         
     def _setup_api_config(self):
-        """根据提供商设置API配置"""
-        if self.provider == 'openai':
-            self.api_key = os.getenv('OPENAI_API_KEY')
-            self.base_url = os.getenv('OPENAI_BASE_URL', 'https://api.openai.com/v1')
-        elif self.provider == 'deepseek':
-            self.api_key = os.getenv('DEEPSEEK_API_KEY')
-            self.base_url = os.getenv('DEEPSEEK_BASE_URL', 'https://api.deepseek.com/v1')
-            if not self.model or self.model == 'gpt-3.5-turbo':
-                self.model = 'deepseek-chat'
-        elif self.provider == 'custom':
-            self.api_key = os.getenv('CUSTOM_LLM_API_KEY')
-            self.base_url = os.getenv('CUSTOM_LLM_BASE_URL')
+        """设置 API 配置 - 不使用环境变量，完全依赖用户配置"""
+        # API key 必须由用户提供
+        self.api_key = self.api_key_override
+        
+        # Base URL: 优先使用用户配置，否则使用 provider 的默认值
+        if self.base_url_override:
+            self.base_url = self.base_url_override
         else:
-            raise ValueError(f"Unsupported provider: {self.provider}")
-            
-        if not self.api_key:
-            raise ValueError(f"API key not found for provider: {self.provider}")
-        if not self.base_url:
-            raise ValueError(f"Base URL not found for provider: {self.provider}")
+            # 仅为不同 provider 提供默认的 API endpoint
+            if self.provider == 'openai':
+                self.base_url = 'https://api.openai.com/v1'
+            elif self.provider == 'deepseek':
+                self.base_url = 'https://api.deepseek.com/v1'
+            elif self.provider == 'custom':
+                raise ValueError("对于 custom provider，必须提供 base_url")
+            else:
+                raise ValueError(f"不支持的 provider: {self.provider}")
     
     async def analyze_stock(self, stock_code: str, stock_data: Dict[str, Any]) -> Dict[str, Any]:
         """
-        分析股票数据
+        Analyze stock data
         
         Args:
-            stock_code: 股票代码
-            stock_data: 股票数据
+            stock_code: Stock code
+            stock_data: Stock data
             
         Returns:
-            分析结果
+            Analysis result
         """
         print(f"[股票分析] 开始分析股票: {stock_code}")
         
-        # 构建分析提示词
+        # Build analysis prompt
         prompt = self._build_stock_analysis_prompt(stock_code, stock_data)
         print(f"[股票分析] 提示词构建完成，长度: {len(prompt)} 字符")
         
         try:
-            # 调用LLM API
+            # Call LLM API
             response = await self._call_llm_api(prompt)
             
-            # 解析返回结果
+            # Parse response
             analysis_result = self._parse_analysis_result(response)
             
             print(f"[股票分析] 分析完成 - 股票: {stock_code}")
@@ -81,7 +91,7 @@ class LLMService:
                 "analysis": analysis_result,
                 "provider": self.provider,
                 "model": self.model,
-                "raw_response": response[:500] + "..." if len(response) > 500 else response  # 保留原始响应的前500字符用于调试
+                "raw_response": response[:500] + "..." if len(response) > 500 else response  # Keep first 500 characters of raw response for debugging
             }
         except Exception as e:
             error_msg = str(e) if str(e) else f"Unknown error: {type(e).__name__}"
@@ -99,26 +109,26 @@ class LLMService:
     
     async def analyze_market(self, market_data: Dict[str, Any]) -> Dict[str, Any]:
         """
-        分析市场数据
+        Analyze market data
         
         Args:
-            market_data: 市场数据（包含主要指数信息）
+            market_data: Market data (including major index information)
             
         Returns:
-            市场分析结果
+            Market analysis result
         """
         print(f"[市场分析] 开始分析市场数据")
         print(f"[市场分析] 包含 {len(market_data)} 个指数数据")
         
-        # 构建市场分析提示词
+        # Build market analysis prompt
         prompt = self._build_market_analysis_prompt(market_data)
         print(f"[市场分析] 提示词构建完成，长度: {len(prompt)} 字符")
         
         try:
-            # 调用LLM API
+            # Call LLM API
             response = await self._call_llm_api(prompt)
             
-            # 解析返回结果
+            # Parse response
             analysis_result = self._parse_market_analysis_result(response)
             
             print(f"[市场分析] 分析完成")
@@ -144,21 +154,21 @@ class LLMService:
             }
     
     def _build_market_analysis_prompt(self, market_data: Dict[str, Any]) -> str:
-        """构建市场分析提示词"""
+        """Build market analysis prompt"""
         
-        # 获取分析日期和市场数据
+        # Get analysis date and market data
         analysis_date = market_data.get("analysis_date", "未知日期")
         
-        # 处理不同的数据格式
+        # Handle different data formats
         if "market_data" in market_data:
-            # 新格式：有 market_data 嵌套字段
+            # New format: market_data nested field
             data = market_data["market_data"]
         else:
-            # 旧格式：直接包含指数数据
+            # Old format: directly contains index data
             data = {k: v for k, v in market_data.items() 
                    if k not in ["analysis_date", "data_source"] and isinstance(v, dict)}
         
-        # 添加当前时间信息
+        # Add current time information
         from datetime import datetime
         current_date = datetime.now().strftime('%Y年%m月%d日')
         
@@ -168,7 +178,7 @@ class LLMService:
             f"以下是{analysis_date}的主要指数数据：\n"
         ]
         
-        # 添加各个指数的数据
+        # Add data for each index
         for symbol, stock_data in data.items():
             latest = stock_data.get('latest_record', {})
             historical = stock_data.get('historical_records', [])
@@ -189,7 +199,7 @@ class LLMService:
             prompt_parts.append(f"{index_name} ({symbol}) - {trade_date}:")
             prompt_parts.append(f"收盘点位: {latest.get('close', 0)}")
             
-            # 计算当日涨跌幅
+            # Calculate daily change
             open_price = latest.get('open', 0)
             close_price = latest.get('close', 0)
             if open_price > 0:
@@ -198,7 +208,7 @@ class LLMService:
             
             prompt_parts.append(f"成交量: {latest.get('volume', 0):,}")
             
-            # 计算较前一交易日涨跌幅
+            # Calculate change compared to previous trading day
             if len(historical) >= 2:
                 prev_close = historical[1].get('close', close_price)
                 if prev_close > 0:
@@ -232,13 +242,13 @@ class LLMService:
         return "\n".join(prompt_parts)
     
     def _parse_market_analysis_result(self, response_text: str) -> Dict[str, Any]:
-        """解析市场分析结果"""
+        """Parse market analysis result"""
         try:
-            # 尝试直接解析JSON
+            # Try to parse JSON directly
             result = json.loads(response_text)
             return result
         except json.JSONDecodeError:
-            # 如果不是有效JSON，尝试提取JSON部分
+            # If not valid JSON, try to extract JSON part
             import re
             json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
             if json_match:
@@ -248,7 +258,7 @@ class LLMService:
                 except json.JSONDecodeError:
                     pass
             
-            # 如果仍然失败，返回解析后的文本结构
+            # If still fails, return parsed text structure
             return {
                 "mood": "市场情绪复杂",
                 "summary": response_text[:200] + "..." if len(response_text) > 200 else response_text,
@@ -259,28 +269,28 @@ class LLMService:
             }
 
     def _build_stock_analysis_prompt(self, stock_code: str, stock_data: Dict[str, Any]) -> str:
-        """构建股票分析提示词"""
+        """Build stock analysis prompt"""
         
-        # 提取关键数据
+        # Extract key data
         latest_data = stock_data.get('latest_record', {})
         historical_data = stock_data.get('historical_records', [])
         
-        # 计算一些基本指标
+        # Calculate some basic indicators
         current_price = latest_data.get('close', 0)
         volume = latest_data.get('volume', 0)
         
-        # 构建历史价格趋势
+        # Build historical price trend
         price_trend = []
         if historical_data:
-            for record in historical_data[:10]:  # 最近10天
+            for record in historical_data[:10]:  # Last 10 days
                 volume_price = record.get('volume_price', {})
                 money_flow = record.get('money_flow', {})
                 price_trend.append({
                     'date': record.get('trade_date', ''),
                     'close': volume_price.get('close', 0),
                     'volume': volume_price.get('volume', 0),
-                # 资金流相关字段（如有则加入）
-                # 小单：5万以下 中单：5万～20万 大单：20万～100万 特大单：成交额>=100万 ，数据基于主动买卖单统计
+                # Money flow related fields (if available)
+                # Small order: <50k Medium order: 50k~200k Large order: 200k~1m Super large order: >=1m, data based on active buy/sell orders
                 'net_mf_amount': money_flow.get('net_mf_amount') if money_flow else None,
                 'buy_sm_amount': money_flow.get('buy_sm_amount') if money_flow else None,
                 'sell_sm_amount': money_flow.get('sell_sm_amount') if money_flow else None,
@@ -331,7 +341,7 @@ class LLMService:
         return prompt
     
     async def _call_llm_api(self, prompt: str) -> str:
-        """调用LLM API"""
+        """Call LLM API"""
         print(f"[LLM API] 开始调用 - Provider: {self.provider}, Model: {self.model}")
         print(f"[LLM API] 请求URL: {self.base_url}/chat/completions")
         print(f"[LLM API] Prompt长度: {len(prompt)} 字符")
@@ -359,7 +369,7 @@ class LLMService:
         
         print(f"[LLM API] 请求参数: model={self.model}, temperature=0.3, max_tokens=2000")
         
-        async with httpx.AsyncClient(timeout=60.0) as client:  # 增加超时到60秒
+        async with httpx.AsyncClient(timeout=60.0) as client:  # Increase timeout to 60 seconds
             print(f"[LLM API] 发送请求...")
             response = await client.post(
                 f"{self.base_url}/chat/completions",
@@ -389,12 +399,12 @@ class LLMService:
             return content
     
     def _parse_analysis_result(self, response_text: str) -> Dict[str, Any]:
-        """解析LLM返回的分析结果"""
+        """Parse LLM returned analysis result"""
         try:
-            # 尝试直接解析JSON
+            # Try to parse JSON directly
             return json.loads(response_text)
         except json.JSONDecodeError:
-            # 如果不是有效JSON，尝试提取JSON部分
+            # If not valid JSON, try to extract JSON part
             import re
             json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
             if json_match:
@@ -403,7 +413,7 @@ class LLMService:
                 except json.JSONDecodeError:
                     pass
             
-            # 如果仍然失败，返回原始文本
+            # If still fails, return raw text
             return {
                 "technical_analysis": response_text,
                 "short_term_forecast": "无法解析",
@@ -417,20 +427,26 @@ class LLMService:
 
 
 class LLMServiceManager:
-    """LLM服务管理器"""
+    """LLM service manager"""
     
     def __init__(self):
         self.services = {}
     
-    def get_service(self, provider: str = None, model: str = None) -> LLMService:
-        """获取或创建LLM服务实例"""
-        key = f"{provider}_{model}"
-        if key not in self.services:
-            self.services[key] = LLMService(provider, model)
-        return self.services[key]
+    def get_service(self, provider: str = None, model: str = None, api_key: str = None, base_url: str = None) -> LLMService:
+        """Get or create LLM service instance"""
+        # Create service instance with user-specific configuration
+        # If API key or base URL is provided, create a temporary service instance
+        if api_key or base_url:
+            return LLMService(provider, model, api_key, base_url)
+        else:
+            # Use cached service instance (based on provider and model)
+            key = f"{provider}_{model}"
+            if key not in self.services:
+                self.services[key] = LLMService(provider, model)
+            return self.services[key]
     
     def list_available_providers(self) -> List[str]:
-        """列出可用的服务提供商"""
+        """List available service providers"""
         providers = []
         if os.getenv('OPENAI_API_KEY'):
             providers.append('openai')
@@ -441,5 +457,5 @@ class LLMServiceManager:
         return providers
 
 
-# 全局服务管理器实例
+# Global service manager instance
 llm_manager = LLMServiceManager()

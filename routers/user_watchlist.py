@@ -1,162 +1,43 @@
+"""
+用户自选股管理相关路由
+处理自选股列表、策略、实时数据等功能
+"""
+
 from typing import List
-from fastapi import APIRouter, Depends, Request, Query, HTTPException
-from models.all_models import UserCreate, UserLogin, ChangePasswordRequest, UserResponse, Token, WatchlistRequest, WatchlistUpdateRequest, WatchlistStrategySetRequest, WatchlistStrategyResponse, SecuritiesAccountCreate, SecuritiesAccountUpdate, SecuritiesAccountResponse
-from auth import create_user, authenticate_user, create_access_token, get_current_active_user, log_login_attempt,ACCESS_TOKEN_EXPIRE_MINUTES, verify_password, get_password_hash
+from fastapi import APIRouter, Depends, HTTPException
+from models.all_models import (
+    WatchlistRequest, WatchlistUpdateRequest, WatchlistStrategySetRequest, 
+    WatchlistStrategyResponse
+)
+from auth import get_current_active_user
 from db import get_db_collections
-from datetime import timedelta, datetime
-from utils.stock_utils import get_ts_code
+from datetime import datetime
 
 router = APIRouter()
 
-# 注册、登录、个人信息
-@router.post("/register", response_model=UserResponse)
-def register(user: UserCreate):
-    return create_user(user)
 
-@router.post("/login", response_model=Token)
-def login(user_data: UserLogin, request: Request):
-    """用户登录"""
-    # 获取客户端信息
-    ip_address = request.client.host if request.client else "unknown"
-    user_agent = request.headers.get("user-agent", "unknown")
-    
-    user = authenticate_user(user_data.username, user_data.password)
-    if not user:
-        # 记录失败的登录尝试
-        log_login_attempt(
-            username=user_data.username,
-            ip_address=ip_address,
-            user_agent=user_agent,
-            success=False,
-            failure_reason="Incorrect username or password"
-        )
-        raise HTTPException(
-            status_code=401,
-            detail="Incorrect username or password",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    
-    # 记录成功的登录
-    log_login_attempt(
-        username=user_data.username,
-        ip_address=ip_address,
-        user_agent=user_agent,
-        success=True
-    )
-    
-    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    access_token = create_access_token(
-        data={"sub": user["username"]}, expires_delta=access_token_expires
-    )
-    
-    # 准备用户响应数据
-    user_response = UserResponse(
-        id=user["id"],
-        username=user["username"],
-        email=user["email"],
-        full_name=user.get("full_name"),
-        is_active=user.get("is_active", True),
-        is_admin=user.get("is_admin", False),
-        created_at=user["created_at"],
-        last_login=user.get("last_login")
-    )
-    print(user_response)
-    return Token(
-        access_token=access_token,
-        token_type="bearer",
-        user=user_response
-    )
-
-
-@router.get("/profile", response_model=UserResponse)
-def get_profile(current_user: dict = Depends(get_current_active_user)):
-    # 补全所有字段，避免缺失
-    return UserResponse(
-        id=current_user.get("id"),
-        username=current_user.get("username"),
-        email=current_user.get("email"),
-        full_name=current_user.get("full_name"),
-        is_active=current_user.get("is_active", True),
-        is_admin=current_user.get("is_admin", False),
-        created_at=current_user.get("created_at"),
-        last_login=current_user.get("last_login")
-    )
-
-@router.post("/change-password")
-def change_password(request: ChangePasswordRequest, current_user: dict = Depends(get_current_active_user)):
-    """Change password for current authenticated user"""
-    collections = get_db_collections()
-    users_col = collections["users"]
-
-    username = current_user.get("username")
-    if not username:
-        raise HTTPException(status_code=400, detail="Invalid current user context")
-
-    user_doc = users_col.find_one({"username": username})
-    if not user_doc:
-        raise HTTPException(status_code=404, detail="User not found")
-
-    if not verify_password(request.old_password, user_doc.get("hashed_password", "")):
-        raise HTTPException(status_code=400, detail="Incorrect current password")
-
-    if len(request.new_password) < 8:
-        raise HTTPException(status_code=400, detail="New password must be at least 8 characters long")
-
-    if request.new_password == request.old_password:
-        raise HTTPException(status_code=400, detail="New password must be different from current password")
-
-    new_hash = get_password_hash(request.new_password)
-    users_col.update_one({"_id": user_doc["_id"]}, {"$set": {"hashed_password": new_hash}})
-
-    return {"success": True, "message": "Password updated successfully"}
-
-
-@router.post("/token/refresh", response_model=Token)
-def refresh_token(current_user: dict = Depends(get_current_active_user)):
-    """为已登录用户生成新的 Token（用于 quantTrader 配置）
-    
-    注意：这不会撤销旧 Token，旧 Token 仍然有效直到过期
-    """
-    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    access_token = create_access_token(
-        data={"sub": current_user["username"]}, 
-        expires_delta=access_token_expires
-    )
-    
-    user_response = UserResponse(
-        id=current_user["id"],
-        username=current_user["username"],
-        email=current_user["email"],
-        full_name=current_user.get("full_name"),
-        is_active=current_user.get("is_active", True),
-        is_admin=current_user.get("is_admin", False),
-        created_at=current_user["created_at"],
-        last_login=current_user.get("last_login")
-    )
-    
-    return Token(
-        access_token=access_token,
-        token_type="bearer",
-        user=user_response
-    )
-
-# 自选股相关
+# 辅助函数
 def get_user_id(current_user: dict):
-    # 统一获取用户唯一标识（主键 _id），并转换为字符串
+    """统一获取用户唯一标识（主键 _id），并转换为字符串"""
     return str(current_user["id"])
+
+
+# ==================== 自选股列表管理 ====================
 
 @router.get("/watchlist")
 def get_user_watchlist(current_user: dict = Depends(get_current_active_user)):
+    """获取用户自选股列表"""
     collections = get_db_collections()
     watchlist_col = collections["user_watchlists"]
-    #print("current_user:", current_user)
     user_id = get_user_id(current_user)
     doc = watchlist_col.find_one({"user_id": user_id})
     symbols = doc["symbols"] if doc and "symbols" in doc else []
     return {"success": True, "data": {"symbols": symbols}}
 
+
 @router.post("/watchlist/add")
 def add_to_watchlist(request: WatchlistRequest, current_user: dict = Depends(get_current_active_user)):
+    """添加股票到自选股"""
     collections = get_db_collections()
     watchlist_col = collections["user_watchlists"]
     user_id = get_user_id(current_user)
@@ -168,8 +49,10 @@ def add_to_watchlist(request: WatchlistRequest, current_user: dict = Depends(get
     )
     return {"success": True}
 
+
 @router.delete("/watchlist/remove/{symbol}")
 def remove_from_watchlist(symbol: str, current_user: dict = Depends(get_current_active_user)):
+    """从自选股中删除股票"""
     collections = get_db_collections()
     watchlist_col = collections["user_watchlists"]
     user_id = get_user_id(current_user)
@@ -179,8 +62,10 @@ def remove_from_watchlist(symbol: str, current_user: dict = Depends(get_current_
     )
     return {"success": True}
 
+
 @router.put("/watchlist")
 def update_watchlist(request: WatchlistUpdateRequest, current_user: dict = Depends(get_current_active_user)):
+    """更新整个自选股列表"""
     collections = get_db_collections()
     watchlist_col = collections["user_watchlists"]
     user_id = get_user_id(current_user)
@@ -191,9 +76,12 @@ def update_watchlist(request: WatchlistUpdateRequest, current_user: dict = Depen
     )
     return {"success": True}
 
-# --- Watchlist strategies per symbol ---
+
+# ==================== 自选股策略管理 ====================
+
 @router.get("/watchlist/strategies")
 def get_watchlist_strategies(current_user: dict = Depends(get_current_active_user)):
+    """获取用户自选股的所有策略"""
     collections = get_db_collections()
     strat_col = collections["watchlist_strategies"]
     user_id = get_user_id(current_user)
@@ -209,21 +97,28 @@ def get_watchlist_strategies(current_user: dict = Depends(get_current_active_use
         })
     return {"success": True, "data": data}
 
+
 @router.post("/watchlist/strategy")
 def set_watchlist_strategy(req: WatchlistStrategySetRequest, current_user: dict = Depends(get_current_active_user)):
+    """设置或更新自选股的策略
+    
+    CRITICAL: Query must include strategy_key to ensure precise match
+    This prevents updating wrong strategy when user has multiple strategies for same symbol
+    """
     collections = get_db_collections()
     watchlist_col = collections["user_watchlists"]
     strat_col = collections["watchlist_strategies"]
     user_id = get_user_id(current_user)
+    
     # Ensure symbol is in user watchlist
     doc = watchlist_col.find_one({"user_id": user_id})
     symbols = doc["symbols"] if doc and "symbols" in doc else []
     if req.symbol not in symbols:
         raise HTTPException(status_code=400, detail="Symbol not in user watchlist")
+    
     import time
     enabled = getattr(req, "enabled", True)
-    # CRITICAL: Query must include strategy_key to ensure precise match
-    # This prevents updating wrong strategy when user has multiple strategies for same symbol
+    
     strat_col.update_one(
         {"user_id": user_id, "symbol": req.symbol, "strategy_key": req.strategy},
         {"$set": {"params": req.params, "updated_at": time.time(), "enabled": enabled}},
@@ -231,9 +126,12 @@ def set_watchlist_strategy(req: WatchlistStrategySetRequest, current_user: dict 
     )
     return {"success": True}
 
+
+# ==================== 自选股详细信息 ====================
+
 @router.get("/watchlist-stocks")
 def get_user_watchlist_stocks(current_user: dict = Depends(get_current_active_user)):
-    """获取当前用户自选股的详细信息"""
+    """获取当前用户自选股的详细信息（日K线数据）"""
     try:
         user_id = current_user["id"]
         
@@ -310,6 +208,8 @@ def get_user_watchlist_stocks(current_user: dict = Depends(get_current_active_us
         }
 
 
+# ==================== 辅助函数 ====================
+
 def add_exchange_suffix(symbol: str) -> str:
     """Add exchange suffix for stock symbol.
     
@@ -347,9 +247,11 @@ def remove_exchange_suffix(symbol: str) -> str:
     return symbol.replace(".SH", "").replace(".SZ", "")
 
 
+# ==================== 实时数据 ====================
+
 @router.get("/watchlist-stocks/realtime")
 def get_user_watchlist_realtime(current_user: dict = Depends(get_current_active_user)):
-    """获取当前用户自选股的实时数据基于分钟K线）
+    """获取当前用户自选股的实时数据（基于分钟K线）
     
     Returns:
         {
@@ -513,54 +415,3 @@ def get_user_watchlist_realtime(current_user: dict = Depends(get_current_active_
             "success": False,
             "message": f"获取实时自选股数据失败: {str(e)}"
         }
-
-# 证券账户管理
-from models.all_models import SecuritiesAccountCreate, SecuritiesAccountUpdate, SecuritiesAccountResponse
-
-@router.post("/securities_account", response_model=SecuritiesAccountResponse)
-def create_securities_account(request: SecuritiesAccountCreate, current_user: dict = Depends(get_current_active_user)):
-    collections = get_db_collections()
-    col = collections["securities_accounts"]
-    user_id = get_user_id(current_user)
-    import datetime
-    doc = {
-        "user_id": user_id,
-        "broker": request.broker,
-        "account_id": request.account_id,
-        "password": request.password,
-        "created_at": datetime.datetime.utcnow(),
-        "updated_at": datetime.datetime.utcnow(),
-    }
-    result = col.insert_one(doc)
-    doc["id"] = str(result.inserted_id)
-    return SecuritiesAccountResponse(**doc)
-
-@router.get("/securities_account", response_model=List[SecuritiesAccountResponse])
-def list_securities_accounts(current_user: dict = Depends(get_current_active_user)):
-    collections = get_db_collections()
-    col = collections["securities_accounts"]
-    user_id = get_user_id(current_user)
-    docs = list(col.find({"user_id": user_id}))
-    for d in docs:
-        d["id"] = str(d["_id"])
-    return [SecuritiesAccountResponse(**d) for d in docs]
-
-@router.put("/securities_account/{account_id}", response_model=SecuritiesAccountResponse)
-def update_securities_account(account_id: str, request: SecuritiesAccountUpdate, current_user: dict = Depends(get_current_active_user)):
-    collections = get_db_collections()
-    col = collections["securities_accounts"]
-    user_id = get_user_id(current_user)
-    update_doc = {k: v for k, v in request.dict().items() if v is not None}
-    update_doc["updated_at"] = datetime.utcnow()
-    col.update_one({"user_id": user_id, "account_id": account_id}, {"$set": update_doc})
-    doc = col.find_one({"user_id": user_id, "account_id": account_id})
-    doc["id"] = str(doc["_id"])
-    return SecuritiesAccountResponse(**doc)
-
-@router.delete("/securities_account/{account_id}")
-def delete_securities_account(account_id: str, current_user: dict = Depends(get_current_active_user)):
-    collections = get_db_collections()
-    col = collections["securities_accounts"]
-    user_id = get_user_id(current_user)
-    col.delete_one({"user_id": user_id, "account_id": account_id})
-    return {"success": True}
