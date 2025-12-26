@@ -402,12 +402,34 @@ def get_positions(
     try:
         collections = get_db_collections()
         positions_coll = collections["trader_positions"]
+        stock_info_coll = collections["stock_info"]
         
         user_id = current_user["id"]
         
         # Fetch positions
         cursor = positions_coll.find({"user_id": user_id})
         positions = [serialize_doc(doc) for doc in cursor]
+        
+        # Enrich positions with stock names
+        # Since symbols now include exchange suffixes, we can do a direct lookup
+        if positions:
+            # Extract unique symbols from positions
+            symbols = list(set(pos.get("symbol") for pos in positions if pos.get("symbol")))
+            
+            # Query stock info for these symbols (symbols now include exchange suffixes)
+            stock_info_docs = list(stock_info_coll.find(
+                {"symbol": {"$in": symbols}},
+                {"symbol": 1, "name": 1}
+            ))
+            
+            # Create symbol to name mapping
+            symbol_to_name = {doc["symbol"]: doc.get("name", "") for doc in stock_info_docs}
+            
+            # Add stock names to positions
+            for pos in positions:
+                symbol = pos.get("symbol")
+                if symbol:
+                    pos["stock_name"] = symbol_to_name.get(symbol, "")
         
         return {
             "success": True,

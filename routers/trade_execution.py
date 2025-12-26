@@ -177,41 +177,27 @@ def get_trade_signals(
         raise HTTPException(status_code=500, detail=f"查询交易信号失败: {str(e)}")
 
 def enrich_trades_with_stock_names(trades: List[Dict], stock_info_collection) -> List[Dict]:
-    """为交易记录添加股票名称，支持新旧symbol格式兼容"""
+    """为交易记录添加股票名称"""
     if not trades:
         return trades
     
-    # 收集所有唯一的股票代码，并规范化
-    symbols_raw = list(set(trade.get("symbol") for trade in trades if trade.get("symbol")))
-    symbols_normalized = [normalize_symbol(s) for s in symbols_raw]
-    symbols_stripped = [strip_exchange_suffix(s) for s in symbols_raw]
+    # 收集所有唯一的股票代码
+    symbols = list(set(trade.get("symbol") for trade in trades if trade.get("symbol")))
     
-    # 同时查询两种格式（带后缀和不带后缀）
-    all_symbols_to_query = list(set(symbols_normalized + symbols_stripped))
-    
-    # 批量查询股票信息
+    # 批量查询股票信息（symbol现在包含交易所后缀）
     stock_info_docs = list(stock_info_collection.find(
-        {"symbol": {"$in": all_symbols_to_query}},
+        {"symbol": {"$in": symbols}},
         {"symbol": 1, "name": 1}
     ))
     
-    # 创建代码到名称的映射（支持两种格式）
+    # 创建代码到名称的映射
     symbol_to_name = {doc["symbol"]: doc.get("name", "") for doc in stock_info_docs}
     
-    # 为每条交易记录添加股票名称（先查带后缀，再查不带后缀）
+    # 为每条交易记录添加股票名称
     for trade in trades:
         symbol = trade.get("symbol")
         if symbol:
-            # 先尝试标准格式
-            normalized = normalize_symbol(symbol)
-            name = symbol_to_name.get(normalized)
-            
-            # 如果没找到，尝试不带后缀的格式
-            if not name:
-                stripped = strip_exchange_suffix(symbol)
-                name = symbol_to_name.get(stripped, "")
-            
-            trade["stock_name"] = name or ""
+            trade["stock_name"] = symbol_to_name.get(symbol, "")
     
     return trades
 
