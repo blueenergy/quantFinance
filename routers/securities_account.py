@@ -55,14 +55,12 @@ def create_account(payload: SecuritiesAccountCreate, current_user: dict = Depend
     if account_type not in ["real", "simulated"]:
         raise HTTPException(status_code=400, detail="账户类型必须是 'real' 或 'simulated'")
     
-    # 真实账户必须提供 broker、account_id 和 password
+    # 真实账户必须提供 broker 和 account_id
     if account_type == "real":
         if not payload.broker:
             raise HTTPException(status_code=400, detail="真实账户必须提供券商")
         if not payload.account_id:
             raise HTTPException(status_code=400, detail="真实账户必须提供账户ID")
-        if not payload.password:
-            raise HTTPException(status_code=400, detail="真实账户必须提供密码")
     
     # 模拟账户自动生成唯一的 account_id 和固定券商
     if account_type == "simulated":
@@ -83,10 +81,6 @@ def create_account(payload: SecuritiesAccountCreate, current_user: dict = Depend
         "created_at": datetime.utcnow(),
         "updated_at": None,
     }
-    
-    # 真实账户保存加密密码
-    if account_type == "real" and payload.password:
-        doc["password_enc"] = _encrypt_password(payload.password)
     
     # 模拟账户初始化资金
     if account_type == "simulated":
@@ -168,8 +162,6 @@ def update_account(id: str, payload: SecuritiesAccountUpdate, current_user: dict
         update["broker"] = payload.broker
     if payload.account_id is not None:
         update["account_id"] = payload.account_id
-    if payload.password is not None:
-        update["password_enc"] = _encrypt_password(payload.password)
     if payload.account_type is not None:
         update["account_type"] = payload.account_type
     
