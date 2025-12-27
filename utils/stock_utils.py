@@ -7,6 +7,8 @@ def serialize_doc(doc):
     def convert(obj):
         if isinstance(obj, ObjectId):
             return str(obj)
+        elif isinstance(obj, (datetime, date)):
+            return obj.isoformat()
         elif isinstance(obj, dict):
             return {k: convert(v) for k, v in obj.items()}
         elif isinstance(obj, list):

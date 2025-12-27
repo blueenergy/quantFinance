@@ -43,18 +43,27 @@ def login(user_data: UserLogin, request: Request):
             headers={"WWW-Authenticate": "Bearer"},
         )
     
-    # 检查用户是否已激活（邮箱已验证）
+    # 检查用户是否已激活（管理员审批通过）
     if not user.get("is_active", False):
+        # 检查审批状态
+        approval_status = user.get("approval_status", "pending")
+        if approval_status == "pending":
+            detail_msg = "账户待审批，请等待管理员审批后再登录"
+        elif approval_status == "rejected":
+            detail_msg = "账户已被管理员拒绝，请联系管理员"
+        else:
+            detail_msg = "账户未激活，请联系管理员"
+        
         log_login_attempt(
             username=user_data.username,
             ip_address=ip_address,
             user_agent=user_agent,
             success=False,
-            failure_reason="Account not activated, email not verified"
+            failure_reason=f"Account not activated: {approval_status}"
         )
         raise HTTPException(
             status_code=401,
-            detail="账户未激活，请先验证邮箱",
+            detail=detail_msg,
             headers={"WWW-Authenticate": "Bearer"},
         )
     
