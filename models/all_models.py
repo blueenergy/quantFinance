@@ -127,19 +127,27 @@ class AnalysisHistoryRequest(BaseModel):
 class SecuritiesAccountBase(BaseModel):
     broker: str
     account_id: str
+    account_type: str = "real"  # real(真实账户) / simulated(模拟账户)
 
-class SecuritiesAccountCreate(SecuritiesAccountBase):
-    password: str
+class SecuritiesAccountCreate(BaseModel):
+    # 模拟账户的 broker 和 account_id 在后端自动生成，真实账户必须提供
+    broker: Optional[str] = None
+    account_id: Optional[str] = None
+    account_type: str = "real"
+    password: Optional[str] = None  # 模拟账户不需要密码
+    initial_cash: Optional[float] = None  # 模拟账户初始资金，默认100万
 
 class SecuritiesAccountUpdate(BaseModel):
     broker: Optional[str] = None
     account_id: Optional[str] = None
     password: Optional[str] = None
+    account_type: Optional[str] = None
 
 class SecuritiesAccountResponse(SecuritiesAccountBase):
     id: str
     created_at: datetime
     updated_at: Optional[datetime] = None
+    initial_cash: Optional[float] = None  # 模拟账户显示初始资金
 
 
 class WorkerNodeRegisterRequest(BaseModel):

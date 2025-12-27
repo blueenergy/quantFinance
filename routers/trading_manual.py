@@ -117,6 +117,18 @@ def manual_create_signal(
         if size <= 0:
             raise HTTPException(status_code=400, detail="交易数量必须大于0")
         
+        # 获取用户的证券账户
+        securities_accounts_coll = collections["securities_accounts"]
+        user_account = securities_accounts_coll.find_one({"user_id": user_id})
+        
+        if not user_account:
+            raise HTTPException(
+                status_code=400, 
+                detail="请先配置证券账户。单账户模式下，每个用户需要先创建一个证券账户。"
+            )
+        
+        securities_account_id = str(user_account["_id"])
+        
         # 生成订单ID
         order_id = f"manual_{int(time.time())}_{str(uuid.uuid4())[:8]}"
         
@@ -129,6 +141,9 @@ def manual_create_signal(
             "price": price,
             "strategy": strategy,
             "user_id": user_id,
+            "securities_account_id": securities_account_id,  # 关联证券账户
+            "broker": user_account.get("broker", ""),
+            "account_id": user_account.get("account_id", ""),
             "status": "pending",  # 新建信号为待执行状态
             "retry_count": 0,
             "timestamp": time.time(),
