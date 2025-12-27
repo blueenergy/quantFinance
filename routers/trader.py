@@ -293,11 +293,18 @@ def sync_account(
                 )
         
         # Build upsert query
-        query = {"user_id": user_id}
-        if securities_account_id:
-            query["securities_account_id"] = securities_account_id
-        elif account_data.get("account_id"):
-            query["account_id"] = account_data.get("account_id")
+        # 关键：必须使用 securities_account_id 作为唯一标识
+        # 避免使用 account_id 匹配，因为真实账户和模拟账户可能有相同ID
+        if not securities_account_id:
+            raise HTTPException(
+                status_code=400,
+                detail="securities_account_id is required to prevent account conflicts"
+            )
+        
+        query = {
+            "user_id": user_id,
+            "securities_account_id": securities_account_id
+        }
         
         # Upsert (update or insert)
         accounts_coll.update_one(
@@ -396,6 +403,7 @@ def store_position_snapshot(
 
 @router.get("/trader/positions", summary="Get current positions")
 def get_positions(
+    securities_account_id: Optional[str] = Query(None, description="Filter by securities account ID"),
     current_user: dict = Depends(get_current_active_user)
 ):
     """Get current positions synced from quantTrader."""
@@ -406,8 +414,13 @@ def get_positions(
         
         user_id = current_user["id"]
         
+        # Build query
+        query = {"user_id": user_id}
+        if securities_account_id:
+            query["securities_account_id"] = securities_account_id
+        
         # Fetch positions
-        cursor = positions_coll.find({"user_id": user_id})
+        cursor = positions_coll.find(query)
         positions = [serialize_doc(doc) for doc in cursor]
         
         # Enrich positions with stock names
@@ -443,6 +456,7 @@ def get_positions(
 
 @router.get("/trader/account", summary="Get account information")
 def get_account(
+    securities_account_id: Optional[str] = Query(None, description="Filter by securities account ID"),
     current_user: dict = Depends(get_current_active_user)
 ):
     """Get account balance and cash information."""
@@ -452,9 +466,14 @@ def get_account(
         
         user_id = current_user["id"]
         
+        # Build query
+        query = {"user_id": user_id}
+        if securities_account_id:
+            query["securities_account_id"] = securities_account_id
+        
         # Fetch latest account info
         account = accounts_coll.find_one(
-            {"user_id": user_id},
+            query,
             sort=[("synced_at", -1)]
         )
         
