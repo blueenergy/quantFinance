@@ -56,15 +56,17 @@ def get_all_users(
         
         # 分页查询
         skip = (page - 1) * page_size
-        users = list(users_collection.find(
+        users_cursor = users_collection.find(
             query,
             {"hashed_password": 0}  # 不返回密码哈希
-        ).sort("created_at", -1).skip(skip).limit(page_size))
+        ).sort("created_at", -1).skip(skip).limit(page_size)
         
-        # 处理用户数据
-        for user in users:
-            user["id"] = str(user["_id"])
-            del user["_id"]
+        # 处理用户数据，使用serialize_doc处理ObjectId和datetime
+        users = []
+        for user in users_cursor:
+            user_data = serialize_doc(user)
+            user_data["id"] = user_data.pop("_id")  # 将_id重命名为id
+            users.append(user_data)
         
         return {
             "success": True,
@@ -110,26 +112,26 @@ def get_user_detail(
         if not user:
             raise HTTPException(status_code=404, detail="用户不存在")
         
-        user["id"] = str(user["_id"])
-        del user["_id"]
+        # 使用serialize_doc处理ObjectId和datetime
+        user_data = serialize_doc(user)
+        user_data["id"] = user_data.pop("_id")
         
         # 获取用户的自选股信息
-        watchlist_doc = user_watchlists_collection.find_one({"user_id": user["id"]})
+        watchlist_doc = user_watchlists_collection.find_one({"user_id": user_data["id"]})
         watchlist_count = len(watchlist_doc.get("symbols", [])) if watchlist_doc else 0
         
         # 获取用户的最近登录记录
-        recent_logins = list(login_logs_collection.find(
-            {"user_id": user["id"]},
+        recent_logins_cursor = login_logs_collection.find(
+            {"user_id": user_data["id"]},
             sort=[("login_time", -1)]
-        ).limit(5))
+        ).limit(5)
         
-        for login in recent_logins:
-            login["_id"] = str(login["_id"])
+        recent_logins = [serialize_doc(log) for log in recent_logins_cursor]
         
         return {
             "success": True,
             "data": {
-                "user": user,
+                "user": user_data,
                 "statistics": {
                     "watchlist_count": watchlist_count,
                     "recent_logins": recent_logins
@@ -171,11 +173,10 @@ def get_login_logs(
         
         # 分页查询
         skip = (page - 1) * page_size
-        logs = list(login_logs_collection.find(query).sort("login_time", -1).skip(skip).limit(page_size))
+        logs_cursor = login_logs_collection.find(query).sort("login_time", -1).skip(skip).limit(page_size)
         
-        # 处理日志数据
-        for log in logs:
-            log["_id"] = str(log["_id"])
+        # 处理日志数据，使用serialize_doc处理ObjectId和datetime
+        logs = [serialize_doc(log) for log in logs_cursor]
         
         return {
             "success": True,
@@ -192,6 +193,177 @@ def get_login_logs(
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"获取登录日志失败: {str(e)}")
+
+
+@router.get("/users/pending")
+def get_pending_users(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+    admin_user: dict = Depends(get_current_admin_user)
+):
+    """管理员获取待审批的用户列表"""
+    try:
+        # 记录管理员操作
+        log_admin_action(
+            admin_user=admin_user,
+            action="VIEW_PENDING_USERS",
+            details=f"Page: {page}"
+        )
+        
+        # 查询待审批的用户
+        query = {"approval_status": "pending"}
+        
+        # 计算总数
+        total = users_collection.count_documents(query)
+        
+        # 分页查询
+        skip = (page - 1) * page_size
+        users_cursor = users_collection.find(
+            query,
+            {"hashed_password": 0}  # 不返回密码哈希
+        ).sort("created_at", -1).skip(skip).limit(page_size)
+        
+        # 处理用户数据，使用serialize_doc处理ObjectId和datetime
+        users = []
+        for user in users_cursor:
+            user_data = serialize_doc(user)
+            user_data["id"] = user_data.pop("_id")  # 将_id重命名为id
+            users.append(user_data)
+        
+        return {
+            "success": True,
+            "data": {
+                "users": users,
+                "pagination": {
+                    "page": page,
+                    "page_size": page_size,
+                    "total": total,
+                    "total_pages": (total + page_size - 1) // page_size
+                }
+            }
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"获取待审批用户列表失败: {str(e)}")
+
+
+@router.post("/users/{user_id}/approve")
+def approve_user(
+    user_id: str,
+    admin_user: dict = Depends(get_current_admin_user)
+):
+    """管理员批准用户注册"""
+    try:
+        # 查找用户
+        user = users_collection.find_one({"_id": ObjectId(user_id)})
+        
+        if not user:
+            raise HTTPException(status_code=404, detail="用户不存在")
+        
+        if user.get("approval_status") == "approved":
+            raise HTTPException(status_code=400, detail="用户已经被批准")
+        
+        # 更新用户状态
+        now = datetime.utcnow()
+        update_result = users_collection.update_one(
+            {"_id": ObjectId(user_id)},
+            {
+                "$set": {
+                    "approval_status": "approved",
+                    "approved_by": admin_user["username"],
+                    "approved_at": now,
+                    "is_active": True  # 激活用户
+                }
+            }
+        )
+        
+        if update_result.modified_count == 0:
+            raise HTTPException(status_code=500, detail="更新用户状态失败")
+        
+        # 记录管理员操作
+        log_admin_action(
+            admin_user=admin_user,
+            action="APPROVE_USER",
+            target_user_id=user_id,
+            details=f"Approved user {user.get('username')} ({user.get('email')})"
+        )
+        
+        return {
+            "success": True,
+            "message": f"已成功批准用户 {user.get('username')}",
+            "data": {
+                "user_id": user_id,
+                "username": user.get("username"),
+                "approved_at": now.isoformat()
+            }
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"批准用户失败: {str(e)}")
+
+
+@router.post("/users/{user_id}/reject")
+def reject_user(
+    user_id: str,
+    reason: str = Body("", embed=True),
+    admin_user: dict = Depends(get_current_admin_user)
+):
+    """管理员拒绝用户注册"""
+    try:
+        # 查找用户
+        user = users_collection.find_one({"_id": ObjectId(user_id)})
+        
+        if not user:
+            raise HTTPException(status_code=404, detail="用户不存在")
+        
+        if user.get("approval_status") == "rejected":
+            raise HTTPException(status_code=400, detail="用户已经被拒绝")
+        
+        # 更新用户状态
+        now = datetime.utcnow()
+        update_data = {
+            "approval_status": "rejected",
+            "approved_by": admin_user["username"],
+            "approved_at": now,
+            "is_active": False  # 保持未激活状态
+        }
+        
+        if reason:
+            update_data["rejection_reason"] = reason
+        
+        update_result = users_collection.update_one(
+            {"_id": ObjectId(user_id)},
+            {"$set": update_data}
+        )
+        
+        if update_result.modified_count == 0:
+            raise HTTPException(status_code=500, detail="更新用户状态失败")
+        
+        # 记录管理员操作
+        log_admin_action(
+            admin_user=admin_user,
+            action="REJECT_USER",
+            target_user_id=user_id,
+            details=f"Rejected user {user.get('username')} ({user.get('email')}). Reason: {reason}"
+        )
+        
+        return {
+            "success": True,
+            "message": f"已拒绝用户 {user.get('username')}",
+            "data": {
+                "user_id": user_id,
+                "username": user.get("username"),
+                "rejected_at": now.isoformat(),
+                "reason": reason
+            }
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"拒绝用户失败: {str(e)}")
 
 
 @router.post("/worker-nodes/register")
@@ -560,7 +732,7 @@ def get_data_collection_status(admin_user: dict = Depends(get_current_admin_user
 @router.put("/users/{user_id}/status")
 def update_user_status(
     user_id: str,
-    is_active: bool,
+    is_active: bool = Body(..., embed=True),
     admin_user: dict = Depends(get_current_admin_user)
     ):
     """管理员更新用户状态（激活/禁用）"""
@@ -576,22 +748,38 @@ def update_user_status(
         if not target_user:
             raise HTTPException(status_code=404, detail="用户不存在")
         
+        # 准备更新数据
+        update_data = {"is_active": is_active}
+        
+        # 如果用户处于待审批状态，且正在激活，则自动批准
+        if is_active and target_user.get("approval_status") == "pending":
+            now = datetime.utcnow()
+            update_data.update({
+                "approval_status": "approved",
+                "approved_by": admin_user["username"],
+                "approved_at": now
+            })
+        
         # 更新用户状态
         result = users_collection.update_one(
             {"_id": ObjectId(user_id)},
-            {"$set": {"is_active": is_active}}
+            {"$set": update_data}
         )
         
         if result.modified_count == 0:
             raise HTTPException(status_code=400, detail="更新失败")
         
         # 记录管理员操作
+        action_detail = f"Set user active status to {is_active}"
+        if is_active and target_user.get("approval_status") == "pending":
+            action_detail += " and approved user"
+        
         log_admin_action(
             admin_user=admin_user,
             action="UPDATE_USER_STATUS",
             target_user_id=user_id,
             target_username=target_user.get("username"),
-            details=f"Set user active status to {is_active}"
+            details=action_detail
         )
         
         return {
