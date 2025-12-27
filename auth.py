@@ -164,17 +164,63 @@ async def get_current_active_user(current_user: dict = Depends(get_current_user)
         raise HTTPException(status_code=400, detail="Inactive user")
     return current_user
 
+def notify_admins_new_user(user_doc: dict):
+    """给所有管理员发送新用户注册通知"""
+    try:
+        # 直接使用db连接
+        notifications_coll = db["notifications"]
+        
+        # 查找所有管理员
+        admins = list(users_collection.find({"is_admin": True, "is_active": True}))
+        
+        if not admins:
+            print("WARNING: 没有找到活跃的管理员用户")
+            return
+        
+        # 为每个管理员创建通知
+        now = datetime.utcnow()
+        for admin in admins:
+            notification = {
+                "user_id": str(admin["_id"]),
+                "type": "user_registration",
+                "title": "新用户注册待审批",
+                "message": f"用户 {user_doc.get('username')} ({user_doc.get('email')}) 已注册，请审批。",
+                "data": {
+                    "user_id": user_doc.get("id"),
+                    "username": user_doc.get("username"),
+                    "email": user_doc.get("email"),
+                    "full_name": user_doc.get("full_name"),
+                    "created_at": user_doc.get("created_at").isoformat() if user_doc.get("created_at") else None
+                },
+                "is_read": False,
+                "created_at": now,
+                "read_at": None
+            }
+            notifications_coll.insert_one(notification)
+            print(f"DEBUG: 已为管理员 {admin.get('username')} 创建通知")
+            
+    except Exception as e:
+        print(f"ERROR: 创建管理员通知失败: {e}")
+        import traceback
+        traceback.print_exc()
+
 def create_user(user_data: UserCreate):
     """创建新用户"""
+    print(f"DEBUG: 尝试创建用户: username={user_data.username}, email={user_data.email}")
+    
     # 检查用户名是否已存在
-    if get_user(user_data.username):
+    existing_user = get_user(user_data.username)
+    if existing_user:
+        print(f"DEBUG: 用户名 {user_data.username} 已存在")
         raise HTTPException(
             status_code=400,
             detail="Username already registered"
         )
     
     # 检查邮箱是否已存在
-    if users_collection.find_one({"email": user_data.email}):
+    existing_email = users_collection.find_one({"email": user_data.email})
+    if existing_email:
+        print(f"DEBUG: 邮箱 {user_data.email} 已存在")
         raise HTTPException(
             status_code=400,
             detail="Email already registered"
@@ -186,11 +232,14 @@ def create_user(user_data: UserCreate):
         "email": user_data.email,
         "full_name": user_data.full_name,
         "hashed_password": get_password_hash(user_data.password),
-        "is_active": False,  # 新注册用户默认不激活，需要邮箱验证
+        "is_active": False,  # 新注册用户默认不激活，需要管理员审批
         "is_admin": False,  # 默认不是管理员
         "created_at": datetime.utcnow(),
         "last_login": None,
         "email_verified": False,  # 邮箱未验证
+        "approval_status": "pending",  # 审批状态：pending(待审批) / approved(已批准) / rejected(已拒绝)
+        "approved_by": None,  # 审批人
+        "approved_at": None,  # 审批时间
         "llm_provider": user_data.llm_provider,
         "llm_api_key": user_data.llm_api_key,
         "llm_base_url": user_data.llm_base_url,
@@ -203,6 +252,29 @@ def create_user(user_data: UserCreate):
     user_doc["id"] = str(result.inserted_id)
     del user_doc["_id"]
     del user_doc["hashed_password"]  # 不返回密码哈希
+    
+    print(f"DEBUG: 用户 {user_data.username} 创建成功，ID: {user_doc['id']}，等待管理员审批")
+    
+    # 注释掉邮件发送，改为管理员审批流程
+    # try:
+    #     from routers.user_config import send_verification_email
+    #     print(f"DEBUG: 开始发送验证邮件到 {user_data.email}")
+    #     email_sent = send_verification_email(user_data.email, user_data.username)
+    #     if email_sent:
+    #         print(f"SUCCESS: 验证邮件已成功发送到 {user_data.email}")
+    #     else:
+    #         print(f"WARNING: 向 {user_data.email} 发送验证邮件失败，请检查SMTP配置")
+    # except Exception as e:
+    #     print(f"ERROR: 发送验证邮件时出错: {e}")
+    #     import traceback
+    #     traceback.print_exc()
+    
+    # 给管理员发送通知
+    try:
+        notify_admins_new_user(user_doc)
+        print(f"DEBUG: 已向管理员发送新用户注册通知")
+    except Exception as e:
+        print(f"WARNING: 发送管理员通知失败: {e}")
     
     return user_doc
 
