@@ -2,7 +2,7 @@ tqdm
 pandas
 numpy
 pymongo
-efinance
+celery
 tushare
 fastapi 
 uvicorn[standard]
