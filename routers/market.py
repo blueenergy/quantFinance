@@ -12,135 +12,61 @@ from utils.stock_utils import serialize_doc
 from bson import ObjectId
 router = APIRouter()
 
+
+def fetch_market_analysis_result() -> Dict[str, Any]:
+    """Fetch cached market analysis for frontend.
+
+    - On trading days: return only today's cached result (or a clear message if none).
+    - On non-trading days: fall back to the latest trading day's cached result.
+    """
+    today = date.today()
+    today_str = today.strftime('%Y-%m-%d')
+
+    # 只从缓存读取结果：交易日只看当日缓存，非交易日才回退到最近交易日
+    if market_analysis_cache.is_trading_day(today):
+        cached = market_analysis_cache.get_cached_analysis(today_str)
+        if cached:
+            result = cached['analysis_result']
+            result['analysis_date'] = cached.get('analysis_date', today_str)
+            result['cache_info'] = {
+                'from_cache': True,
+                'cache_date': cached.get('analysis_date', today_str),
+                'created_at': cached.get('created_at'),
+                'reason': "返回当日缓存的大盘分析结果"
+            }
+            return result
+        else:
+            return {
+                "success": False,
+                "error": "今日尚无大盘分析，请等待系统定时任务生成",
+                "is_trading_day": True
+            }
+    else:
+        latest_analysis = market_analysis_cache.get_latest_trading_day_analysis()
+        if latest_analysis:
+            result = latest_analysis['analysis_result']
+            result['analysis_date'] = latest_analysis['analysis_date']
+            result['cache_info'] = {
+                'from_cache': True,
+                'cache_date': latest_analysis['analysis_date'],
+                'created_at': latest_analysis.get('created_at'),
+                'reason': f"非交易日，返回最近交易日({latest_analysis['analysis_date']})的分析结果"
+            }
+            return result
+        else:
+            return {
+                "success": False,
+                "error": "非交易日，且最近交易日尚无大盘分析结果",
+                "is_trading_day": False
+            }
+
 @router.post("/analyze-market")
 async def analyze_market(request: MarketAnalysisRequest, current_user: dict = Depends(get_current_active_user)):
-    today = date.today()
-    analysis_date = today.strftime('%Y-%m-%d')
+    """Frontend endpoint: only fetch cached market analysis result.
 
-    # 强制刷新直接分析
-    if getattr(request, 'force_refresh', False):
-        pass  # 跳过缓存逻辑
-    else:
-        # 1. 检查是否需要进行市场分析
-        should_analyze, reason = market_analysis_cache.should_analyze_market(today)
-        if not should_analyze:
-            # 非交易日，尝试返回最近交易日的分析结果
-            if "非交易日" in reason:
-                latest_analysis = market_analysis_cache.get_latest_trading_day_analysis()
-                if latest_analysis:
-                    result = latest_analysis['analysis_result']
-                    result['cache_info'] = {
-                        'from_cache': True,
-                        'cache_date': latest_analysis['analysis_date'],
-                        'reason': f"{reason}，返回最近交易日({latest_analysis['analysis_date']})的分析结果"
-                    }
-                    return result
-                else:
-                    return {
-                        "success": False,
-                        "error": f"{reason}，且未找到最近的交易日分析结果",
-                        "is_trading_day": False
-                    }
-            # 交易日但有缓存，直接返回缓存结果
-            elif "缓存" in reason:
-                cached_analysis = market_analysis_cache.get_cached_analysis(analysis_date)
-                if cached_analysis:
-                    result = cached_analysis['analysis_result']
-                    result['cache_info'] = {
-                        'from_cache': True,
-                        'cache_date': analysis_date,
-                        'reason': reason
-                    }
-                    return result
-
-    # 获取市场数据
-    market_data = fetch_market_data()  # 或 get_market_data_for_analysis()
-    if not market_data:
-        raise HTTPException(status_code=404, detail="未找到市场数据")
-
-    # 获取用户激活的LLM配置
-    collections = get_db_collections()
-    users_col = collections["users"]
-    
-    user_doc = users_col.find_one({"_id": ObjectId(current_user["id"])})
-    if not user_doc:
-        raise HTTPException(status_code=404, detail="用户不存在")
-    
-    active_config_id = user_doc.get("active_llm_config_id")
-    llm_configs = user_doc.get("llm_configs", [])
-    
-    # 如果没有激活配置但有可用配置，自动激活第一个
-    if not active_config_id and llm_configs:
-        active_config_id = str(llm_configs[0].get("_id"))
-        # 更新用户文档以激活该配置
-        users_col.update_one(
-            {"_id": ObjectId(current_user["id"])},
-            {"$set": {"active_llm_config_id": active_config_id}}
-        )
-    
-    if not active_config_id:
-        raise HTTPException(status_code=400, detail="请先在用户配置中配置一个LLM配置")
-    
-    # 查找激活的配置
-    active_config = None
-    for config in llm_configs:
-        if str(config.get("_id")) == active_config_id:
-            active_config = config
-            break
-    
-    if not active_config:
-        raise HTTPException(status_code=404, detail="激活的LLM配置不存在")
-    
-    # 获取配置参数
-    user_llm_provider = active_config.get("provider")
-    user_llm_api_key = active_config.get("api_key")
-    user_llm_base_url = active_config.get("base_url")
-    user_llm_model = active_config.get("model")
-    
-    # 获取LLM服务，使用用户特定的配置
-    llm_service = llm_manager.get_service(
-        provider=user_llm_provider,
-        model=user_llm_model,
-        api_key=user_llm_api_key,
-        base_url=user_llm_base_url
-    )
-    analysis_result = await llm_service.analyze_market(market_data)
-
-    if analysis_result.get("success"):
-        # 提取分析内容
-        analysis = analysis_result.get("analysis", {})
-        # 构建结果
-        result = {
-            "success": True,
-            "analysis_date": market_data.get("analysis_date", analysis_date),
-            "mood": analysis.get("mood", "市场情绪复杂"),
-            "summary": analysis.get("summary", "市场分析结果"),
-            "keyPoints": analysis.get("keyPoints", []),
-            "outlook": analysis.get("outlook", "请关注市场动态"),
-            "riskLevel": analysis.get("riskLevel", "medium"),
-            "riskNote": analysis.get("riskNote", "注意投资风险"),
-            "analysis_type": "market_overview",
-            "provider": analysis_result.get("provider"),
-            "model": analysis_result.get("model"),
-            "cache_info": {
-                'from_cache': False,
-                'cache_date': analysis_date,
-                'reason': "新生成的分析结果"
-            }
-        }
-        # 保存分析结果到缓存
-        cache_success = market_analysis_cache.save_analysis(result, analysis_date)
-        if cache_success:
-            print(f"[市场分析] 分析结果已缓存到数据库")
-        else:
-            print(f"[市场分析] 缓存保存失败，但分析正常返回")
-        return result
-    else:
-        return {
-            "success": False,
-            "error": analysis_result.get("error", "分析失败"),
-            "error_type": analysis_result.get("error_type", "Unknown")
-        }
+    实际分析工作由后台 Celery 定时任务完成，这里不再触发 LLM 调用。
+    """
+    return fetch_market_analysis_result()
 
 def fetch_market_data() -> Optional[Dict[str, Any]]:
     """获取用于市场分析的数据 - 优先使用外部数据源"""

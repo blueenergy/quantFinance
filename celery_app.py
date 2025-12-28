@@ -10,6 +10,12 @@ celery_app = Celery(
     backend='redis://localhost:6379/0'
 )
 
+celery_app.conf.update(
+    task_always_eager=True,
+    task_eager_propagates=True,
+)
+
+
 # Celery Beat schedule configuration
 celery_app.conf.beat_schedule = {
     # Check worker timeouts every minute
@@ -21,6 +27,19 @@ celery_app.conf.beat_schedule = {
     'send-daily-reports': {
         'task': 'celery_app.send_daily_reports_task',
         'schedule': crontab(hour=17, minute=0),  # 5 PM daily
+    },
+    # Generate AI market analysis multiple times on trading days
+    'generate-market-analysis-1000': {
+        'task': 'celery_app.generate_market_analysis_task',
+        'schedule': crontab(hour=10, minute=0, day_of_week='1-5'),  # Mon-Fri 10:00
+    },
+    'generate-market-analysis-1130': {
+        'task': 'celery_app.generate_market_analysis_task',
+        'schedule': crontab(hour=11, minute=30, day_of_week='1-5'),  # Mon-Fri 11:30
+    },
+    'generate-market-analysis-1530': {
+        'task': 'celery_app.generate_market_analysis_task',
+        'schedule': crontab(hour=15, minute=30, day_of_week='1-5'),  # Mon-Fri 15:30
     },
 }
 
@@ -262,4 +281,118 @@ def send_daily_reports_task():
         
     except Exception as e:
         log.error(f"Failed to send daily reports: {e}", exc_info=True)
+        return {"success": False, "error": str(e)}
+
+
+@celery_app.task(name='celery_app.generate_market_analysis_task')
+def generate_market_analysis_task():
+    """Generate AI market analysis using admin's LLM config and cache it by trading date."""
+    from db import get_db_collections
+    from market_analysis_cache import market_analysis_cache
+    from llm_service import llm_manager
+    from routers import market as market_router
+    from datetime import datetime
+    import asyncio
+
+    try:
+        # 获取市场数据（包含 analysis_date 和 market_data）
+        market_bundle = market_router.fetch_market_data()
+        if not market_bundle:
+            log.warning("[市场分析定时任务] 无市场数据，跳过本次分析")
+            return {"success": False, "reason": "no_market_data"}
+        
+        analysis_date = market_bundle.get("analysis_date")
+        if not analysis_date:
+            log.warning("[市场分析定时任务] 市场数据未包含分析日期，跳过本次分析")
+            return {"success": False, "reason": "no_analysis_date"}
+        
+        collections = get_db_collections()
+        users_coll = collections["users"]
+        
+        # 使用固定 admin 账号作为全局配置来源
+        admin_user = users_coll.find_one({"username": "admin", "is_admin": True})
+        if not admin_user:
+            log.error("[市场分析定时任务] 未找到 admin 用户 (username='admin', is_admin=True)，无法生成大盘分析")
+            return {"success": False, "reason": "no_admin_user"}
+        
+        llm_configs = admin_user.get("llm_configs", [])
+        active_config_id = admin_user.get("active_llm_config_id")
+        active_config = None
+        
+        # 如果没有激活配置但有可用配置，默认激活第一个
+        if not active_config_id and llm_configs:
+            active_config = llm_configs[0]
+            active_config_id = str(active_config.get("_id"))
+            users_coll.update_one(
+                {"_id": admin_user["_id"]},
+                {"$set": {"active_llm_config_id": active_config_id}}
+            )
+        else:
+            for config in llm_configs:
+                if str(config.get("_id")) == active_config_id:
+                    active_config = config
+                    break
+        
+        if not active_config:
+            log.error("[市场分析定时任务] admin 用户没有激活的 LLM 配置")
+            return {"success": False, "reason": "no_active_llm_config"}
+        
+        provider = active_config.get("provider")
+        api_key = active_config.get("api_key")
+        base_url = active_config.get("base_url")
+        model = active_config.get("model")
+        
+        if not provider or not model or not api_key:
+            log.error("[市场分析定时任务] admin 用户 LLM 配置不完整 (provider/model/api_key 缺失)")
+            return {"success": False, "reason": "invalid_llm_config"}
+        
+        # 获取 LLM 服务并执行异步市场分析
+        llm_service = llm_manager.get_service(
+            provider=provider,
+            model=model,
+            api_key=api_key,
+            base_url=base_url
+        )
+        
+        analysis_result = asyncio.run(llm_service.analyze_market(market_bundle))
+        
+        if not analysis_result.get("success"):
+            log.error(f"[市场分析定时任务] LLM 分析失败: {analysis_result.get('error')}")
+            return {"success": False, "reason": "llm_analysis_failed", "error": analysis_result.get("error")}
+        
+        analysis = analysis_result.get("analysis", {})
+        actual_analysis_date = market_bundle.get("analysis_date")
+        if not actual_analysis_date:
+            log.error("[市场分析定时任务] 分析结果缺少 analysis_date")
+            return {"success": False, "reason": "missing_analysis_date"}
+        
+        result = {
+            "success": True,
+            "analysis_date": actual_analysis_date,
+            "mood": analysis.get("mood", "市场情绪复杂"),
+            "summary": analysis.get("summary", "市场分析结果"),
+            "keyPoints": analysis.get("keyPoints", []),
+            "outlook": analysis.get("outlook", "请关注市场动态"),
+            "riskLevel": analysis.get("riskLevel", "medium"),
+            "riskNote": analysis.get("riskNote", "注意投资风险"),
+            "analysis_type": "market_overview",
+            "provider": analysis_result.get("provider"),
+            "model": analysis_result.get("model"),
+            "cache_info": {
+                'from_cache': False,
+                'cache_date': actual_analysis_date,
+                'created_at': datetime.now(),
+                'reason': "定时任务生成的分析结果"
+            }
+        }
+        
+        cache_success = market_analysis_cache.save_analysis(result, actual_analysis_date)
+        if cache_success:
+            log.info(f"[市场分析定时任务] 分析结果已缓存到数据库，日期: {actual_analysis_date}")
+        else:
+            log.error("[市场分析定时任务] 缓存保存失败，但分析正常返回")
+        
+        return {"success": True, "analysis_date": actual_analysis_date}
+    except Exception as e:
+        log.error(f"[市场分析定时任务] 执行失败: {e}", exc_info=True)
         return {"success": False, "error": str(e)}
