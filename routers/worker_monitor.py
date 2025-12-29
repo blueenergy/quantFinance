@@ -36,9 +36,14 @@ def get_worker_status(current_user: dict = Depends(get_current_active_user)):
         now = time.time()
         cutoff_time = now - 300  # Consider alive if heartbeat within 5 min
         
+        user_id = current_user["id"]
+        
         # Aggregate active workers
         pipeline = [
-            {"$match": {"last_heartbeat": {"$gte": cutoff_time}}},
+            {"$match": {
+                "user_id": user_id,  # Filter by current user
+                "last_heartbeat": {"$gte": cutoff_time}
+            }},
             {"$sort": {"last_heartbeat": -1}},
             {"$group": {
                 "_id": "$worker_id",
@@ -371,7 +376,14 @@ def worker_heartbeat(
         
         user_id = current_user["id"]
         now = time.time()
-        
+
+        # Use user_id from payload if available, otherwise fall back to authenticated user
+        payload_user_id = payload.get("user_id")
+        if payload_user_id:
+            user_id = payload_user_id
+        else:
+            user_id = current_user["id"]  # Fallback to authenticated user if no user_id in payload
+    
         # Update or insert worker status
         status_doc = {
             "user_id": user_id,
