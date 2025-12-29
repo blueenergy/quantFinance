@@ -116,7 +116,7 @@ def fetch_daily_for_day(pro, date_str: str, verbose=False) -> pd.DataFrame:
         for col in ['open','high','low','close','pre_close','change','pct_chg','amount']:
             df[col] = pd.to_numeric(df[col], errors='coerce')
         df['volume'] = pd.to_numeric(df['volume'], errors='coerce').fillna(0).astype(int)
-        df['symbol'] = df['ts_code'].str.split('.').str[0]
+        df['symbol'] = df['ts_code']
         df['update_time'] = datetime.now().strftime('%Y%m%d %H:%M:%S')
         return df
     except Exception as e:
