@@ -53,6 +53,9 @@ def get_db_collections() -> Dict[str, Collection]:
         "trader_positions": db["trader_positions"],  # 实时持仓快照
         "trader_accounts": db["trader_accounts"],  # 账户资金信息
         "position_snapshots": db["position_snapshots"],  # 历史持仓快照（每日）
+        # Backtesting system
+        "backtest_tasks": db["backtest_tasks"],  # 回测任务
+        "backtest_results": db["backtest_results"],  # 回测结果
         # Add more collections as needed
     }
 
