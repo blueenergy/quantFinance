@@ -104,8 +104,7 @@ def list_strategy_templates(strategy: str = None) -> Dict[str, Any]:
 		grouped[strat].append({
 			"preset": tpl.get("preset"),
 			"description": tpl.get("description", ""),
-			"params": tpl.get("params", {}),
-			"params_with_desc": tpl.get("params_with_desc", {}),  # Include parameter descriptions
+			"params_with_desc": tpl.get("params_with_desc", {}),  # Only return params_with_desc
 			"is_default": tpl.get("is_default", False),
 		})
 	
