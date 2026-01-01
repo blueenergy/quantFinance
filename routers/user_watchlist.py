@@ -110,11 +110,17 @@ def set_watchlist_strategy(req: WatchlistStrategySetRequest, current_user: dict 
     strat_col = collections["watchlist_strategies"]
     user_id = get_user_id(current_user)
     
-    # Ensure symbol is in user watchlist
+    # Auto-add symbol to watchlist if not present
     doc = watchlist_col.find_one({"user_id": user_id})
     symbols = doc["symbols"] if doc and "symbols" in doc else []
     if req.symbol not in symbols:
-        raise HTTPException(status_code=400, detail="Symbol not in user watchlist")
+        # Automatically add symbol to watchlist
+        symbols.append(req.symbol)
+        watchlist_col.update_one(
+            {"user_id": user_id},
+            {"$set": {"symbols": symbols}},
+            upsert=True
+        )
     
     import time
     enabled = getattr(req, "enabled", True)
