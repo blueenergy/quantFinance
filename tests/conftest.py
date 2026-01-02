@@ -12,6 +12,7 @@ if str(PACKAGE_DIR) not in sys.path:
 # Ensure test-run code paths use the in-memory DB fallback to avoid requiring
 # a running MongoDB during unit tests. Tests opt into this behavior explicitly.
 os.environ.setdefault('USE_IN_MEMORY_DB', '1')
+os.environ.setdefault('TESTING', 'true')
 
 import pytest
 from fastapi.testclient import TestClient

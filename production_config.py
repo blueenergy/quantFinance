@@ -2,6 +2,7 @@
 
 import os
 import logging
+from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -16,9 +17,10 @@ import time
 def setup_production_middleware(app: FastAPI):
     """配置生产环境中间件"""
     
-    # 1. 信任的主机中间件
-    trusted_hosts = os.getenv("TRUSTED_HOSTS", "localhost,yourdomain.com").split(",")
-    app.add_middleware(TrustedHostMiddleware, allowed_hosts=trusted_hosts)
+    # 1. 信任的主机中间件 (仅在非测试环境启用)
+    if os.getenv("TESTING") != "true":
+        trusted_hosts = os.getenv("TRUSTED_HOSTS", "localhost,yourdomain.com").split(",")
+        app.add_middleware(TrustedHostMiddleware, allowed_hosts=trusted_hosts)
     
     # 2. HTTPS重定向中间件 (仅在生产环境)
     if os.getenv("ENVIRONMENT") == "production":
@@ -59,10 +61,23 @@ def setup_logging():
     """配置生产环境日志"""
     
     log_level = os.getenv("LOG_LEVEL", "INFO").upper()
-    log_file = os.getenv("LOG_FILE", "/app/logs/app.log")
+    log_file = os.getenv("LOG_FILE", "./logs/app.log")
     
-    # 创建日志目录
-    os.makedirs(os.path.dirname(log_file), exist_ok=True)
+    try:
+        # 创建日志目录
+        os.makedirs(os.path.dirname(log_file), exist_ok=True)
+    except OSError:
+        # 如果无法创建目录（如在只读文件系统中），则只使用控制台处理器
+        print(f"无法创建日志目录 {os.path.dirname(log_file)}, 切换到控制台日志")
+        # 配置根日志器 - 只使用控制台处理器
+        logging.basicConfig(
+            level=getattr(logging, log_level),
+            format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+            handlers=[
+                logging.StreamHandler()  # 只使用控制台处理器
+            ]
+        )
+        return
     
     # 配置日志格式
     log_format = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"

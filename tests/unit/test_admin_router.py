@@ -81,7 +81,7 @@ def test_get_all_users_and_pagination(monkeypatch):
     monkeypatch.setattr(admin, 'log_admin_action', lambda *args, **kwargs: None)
 
     resp = client.get('/api/admin/users?page=1&page_size=2')
-    assert resp.status_code == 200
+    assert resp.status_code == 200, f"Expected 200, got {resp.status_code}. Response: {resp.text}"
     j = resp.json()
     assert j['success'] is True
     assert 'users' in j['data']

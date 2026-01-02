@@ -3,6 +3,7 @@ from typing import List, Dict, Any
 from models.all_models import BaseModel
 from db import get_db_collections
 import time
+from auth import get_current_user
 
 router = APIRouter(prefix="/strategy", tags=["strategy"])
 
@@ -11,15 +12,16 @@ STRATEGY_MAP_FALLBACK = {
 	"grid": "网格策略",
 	"buyhold": "买入持有",
 	"boll": "布林带策略",
-	"meanrev": "均值回归",
-	"momentum": "动量反转",
-	"atr": "ATR突破",
-	"sma": "SMA均线交叉",
-	"triplesma": "三均线交叉",
+	"mean_reversion": "均值回归",
+	"momentum_reversal": "动量反转",
+	"atr_breakout": "ATR突破",
+	"volume_mfi_breakout": "量价突破",
+	"sma_cross": "双均线交叉",
+	"triple_sma": "三均线交叉",
 	"turtle": "海龟交易法",
 	"quick": "快速测试",
-	"index_turtle": "指数增强海龟",
-	"index_grid": "指数增强网格",
+	"index_enhanced_turtle": "指数增强海龟",
+	"index_enhanced_grid": "指数增强网格",
 	"hidden_dragon": "潜龙低吸",
 	"single_yang": "单阳不破",
 	"asymmetric_dragon": "非对称潜龙低吸",
@@ -28,7 +30,7 @@ STRATEGY_MAP_FALLBACK = {
 }
 
 @router.get("/strategies")
-def list_strategies() -> Dict[str, Any]:
+def list_strategies(current_user: Dict = Depends(get_current_user)) -> Dict[str, Any]:
 	"""List available strategies from database (with fallback)."""
 	collections = get_db_collections()
 	col = collections.get("strategy_metadata")
@@ -43,12 +45,16 @@ def list_strategies() -> Dict[str, Any]:
 		if not strats:
 			# If no data in database, use fallback
 			return _list_strategies_fallback()
-		
+			
 		out = []
+		user_service_level = current_user.get("service_level", "free") if current_user else "free"
+		
 		for s in strats:
-			out.append({
-				"key": s.get("key"),
-				"name": s.get("name", s.get("key")),
+			key = s.get("key")
+				
+			item = {
+				"key": key,
+				"name": s.get("name", key),
 				"summary": s.get("summary", ""),
 				"principle": s.get("principle", ""),
 				"suitable_for": s.get("suitable_for", ""),
@@ -56,21 +62,45 @@ def list_strategies() -> Dict[str, Any]:
 				"params_hint": s.get("params_hint", ""),
 				"allow_live": s.get("allow_live", True),
 				"allow_backtest": s.get("allow_backtest", True),
-			})
+				"min_service_level": s.get("min_service_level", "free"),
+			}
+			# 标记 VIP 专属策略 based on min_service_level
+			if item["min_service_level"] == "vip":
+				item["vip_only"] = True
+			
+			# 检查用户是否有权限使用该策略
+			user_level_index = ['free', 'basic', 'vip', 'premium'].index(user_service_level)
+			required_level_index = ['free', 'basic', 'vip', 'premium'].index(item["min_service_level"])
+			item["can_use"] = user_level_index >= required_level_index
+			
+			out.append(item)
 		return {"ok": True, "strategies": out}
 	except Exception as e:
 		print(f"Error reading strategy_metadata: {e}")
-		return _list_strategies_fallback()
+		return _list_strategies_fallback(current_user)
 
 
-def _list_strategies_fallback() -> Dict[str, Any]:
+def _list_strategies_fallback(current_user: Dict = None) -> Dict[str, Any]:
 	"""Fallback to hardcoded strategy map."""
 	out = []
+	user_service_level = current_user.get("service_level", "free") if current_user else "free"
+	
 	for key, name in STRATEGY_MAP_FALLBACK.items():
-		out.append({
+		item = {
 			"key": key,
 			"name": name,
-		})
+			"min_service_level": "vip" if key in ["hidden_dragon", "single_yang"] else "free",
+		}
+		# 标记 VIP 专属策略
+		if item["min_service_level"] == "vip":
+			item["vip_only"] = True
+		
+		# 检查用户是否有权限使用该策略
+		user_level_index = ['free', 'basic', 'vip', 'premium'].index(user_service_level)
+		required_level_index = ['free', 'basic', 'vip', 'premium'].index(item["min_service_level"])
+		item["can_use"] = user_level_index >= required_level_index
+		
+		out.append(item)
 	return {"ok": True, "strategies": out}
 
 
