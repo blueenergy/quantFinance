@@ -110,6 +110,13 @@ def set_watchlist_strategy(req: WatchlistStrategySetRequest, current_user: dict 
     strat_col = collections["watchlist_strategies"]
     user_id = get_user_id(current_user)
     
+    # VIP-only live deployment restriction for Hidden Dragon strategy
+    if req.strategy == "hidden_dragon":
+        service_level = current_user.get("service_level", "free")
+        if service_level != "vip":
+            # 用户可见错误信息使用中文
+            raise HTTPException(status_code=403, detail="潜龙低吸策略仅对VIP用户开放")
+    
     # Auto-add symbol to watchlist if not present
     doc = watchlist_col.find_one({"user_id": user_id})
     symbols = doc["symbols"] if doc and "symbols" in doc else []

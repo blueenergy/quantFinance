@@ -56,6 +56,8 @@ def get_db_collections() -> Dict[str, Collection]:
         # Backtesting system
         "backtest_tasks": db["backtest_tasks"],  # 回测任务
         "backtest_results": db["backtest_results"],  # 回测结果
+        # Permission and service upgrade
+        "upgrade_requests": db["upgrade_requests"],  # 服务升级申请
         # Add more collections as needed
     }
 

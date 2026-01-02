@@ -20,18 +20,14 @@ from routers.worker_data import router as worker_data_router
 from routers.analysis_details import router as analysis_details_router
 from routers.trading_manual import router as trading_manual_router
 from routers.backtest import router as backtest_router
+from routers.permissions import router as permissions_router
+from production_config import configure_production_app
 
 
 app = FastAPI()
 
-# CORS 配置
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # 生产环境应该指定具体域名
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# 应用生产环境配置
+configure_production_app(app)
 
 # 注册各功能模块路由
 # app.include_router(user_router, prefix="/api/user", tags=["用户"])  # 已迁移到 auth_router 和 user_watchlist
@@ -55,3 +51,4 @@ app.include_router(worker_data_router, prefix="/api/worker-data", tags=["Worker�
 app.include_router(analysis_details_router, prefix="/api", tags=["分析详情"])
 app.include_router(trading_manual_router, prefix="/api", tags=["手动交易"])
 app.include_router(backtest_router, prefix="/api", tags=["回测"])
+app.include_router(permissions_router, prefix="/api", tags=["权限管理"])

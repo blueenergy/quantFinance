@@ -104,11 +104,12 @@ def get_user(username: str):
     if user:
         user["id"] = str(user["_id"])
         del user["_id"]
-        # 确保返回用户的所有字段，包括LLM配置
+        # 确保返回用户的所有字段，包括LLM配置和服务等级
         user.setdefault("llm_provider", None)
         user.setdefault("llm_api_key", None)
         user.setdefault("llm_base_url", None)
         user.setdefault("llm_model", None)
+        user.setdefault("service_level", "free")
         return user
     return None
 
