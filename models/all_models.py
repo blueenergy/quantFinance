@@ -1,4 +1,4 @@
-from pydantic import BaseModel, EmailStr, root_validator
+from pydantic import BaseModel, EmailStr, model_validator
 from typing import Optional, List, Any, Dict
 from datetime import datetime, timedelta
 
@@ -116,7 +116,7 @@ class AnalysisHistoryRequest(BaseModel):
     timestamp: Optional[str] = None
     stock_name: Optional[str] = None
 
-    @root_validator(pre=True)
+    @model_validator(mode='before')
     def ensure_analysis_result(cls, values: Dict[str, Any]) -> Dict[str, Any]:
         # If caller only provided `analysis`, wrap it into the canonical structure
         if values.get("analysis_result") is None and values.get("analysis") is not None:
