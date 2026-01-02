@@ -128,7 +128,8 @@ def get_user_profile(current_user: dict = Depends(get_current_active_user)):
             "llm_base_url": current_user.get("llm_base_url"),
             "llm_model": current_user.get("llm_model"),
             "enable_analytics": current_user.get("enable_analytics", True),
-            "active_llm_config_id": current_user.get("active_llm_config_id")
+            "active_llm_config_id": current_user.get("active_llm_config_id"),
+            "service_level": current_user.get("service_level", "free"),
         }
     }
 
