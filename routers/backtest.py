@@ -5,7 +5,9 @@ Workers can poll for pending tasks, claim them, and report results.
 """
 
 from fastapi import APIRouter, HTTPException, Depends
-from pydantic import BaseModel, Field
+from datetime import datetime, date
+from enum import Enum
+from pydantic import BaseModel, Field,ConfigDict,field_validator
 from typing import Optional, List, Dict, Any
 from datetime import datetime
 from bson import ObjectId
@@ -28,8 +30,8 @@ class BacktestTaskCreate(BaseModel):
     start_date: str = Field(..., description="Backtest start date (YYYYMMDD)")
     end_date: str = Field(..., description="Backtest end date (YYYYMMDD)")
     initial_cash: float = Field(default=1000000.0, description="Initial cash for backtest")
-    
-    class Config:
+
+    model_config = ConfigDict(
         json_schema_extra = {
             "example": {
                 "symbol": "000858",
@@ -40,30 +42,52 @@ class BacktestTaskCreate(BaseModel):
                 "initial_cash": 1000000.0
             }
         }
+    )
 
+class BacktestStatus(str, Enum):
+    PENDING = "pending"
+    CLAIMED = "claimed"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
 
 class BacktestTaskResponse(BaseModel):
     """Response model for backtest task"""
-    task_id: str
-    user_id: str
-    symbol: str
-    strategy_key: str
-    strategy_params: Dict[str, Any]
-    start_date: str
-    end_date: str
-    initial_cash: float
-    status: str  # pending, claimed, running, completed, failed, cancelled
-    worker_id: Optional[str] = None
-    created_at: datetime
-    started_at: Optional[datetime] = None
-    completed_at: Optional[datetime] = None
-    error_message: Optional[str] = None
-    
-    class Config:
-        json_encoders = {
-            datetime: lambda v: v.isoformat() if v else None
-        }
+    task_id: str = Field(..., description="Unique identifier for the backtest task")
+    user_id: str = Field(..., description="Identifier of the user who initiated the task")
+    symbol: str = Field(..., description="Trading symbol for the backtest (e.g., 'AAPL')")
+    strategy_key: str = Field(..., description="Key identifying the trading strategy used")
+    # 4. Use Field for default_factory for mutable types
+    strategy_params: Dict[str, Any] = Field(default_factory=dict, description="Parameters for the trading strategy")
+    # 2. Use date objects for date fields
+    start_date: date = Field(..., description="Start date of the backtest period (YYYY-MM-DD)")
+    end_date: date = Field(..., description="End date of the backtest period (YYYY-MM-DD)")
+    initial_cash: float = Field(..., gt=0, description="Initial capital for the backtest")
+    # 1. Use Enum for status
+    status: BacktestStatus = Field(..., description="Current status of the backtest task")
+    worker_id: Optional[str] = Field(None, description="Identifier of the worker processing the task, if claimed")
+    # 5. Default created_at to now if always set on creation
+    created_at: datetime = Field(default_factory=datetime.now, description="Timestamp when the task was created")
+    started_at: Optional[datetime] = Field(None, description="Timestamp when the task started processing")
+    completed_at: Optional[datetime] = Field(None, description="Timestamp when the task completed (successfully or failed)")
+    error_message: Optional[str] = Field(None, description="Error message if the task failed")
 
+    @field_validator('start_date', 'end_date', mode='before')
+    @classmethod
+    def parse_yyyymmdd_to_date(cls, v: Any) -> date:
+        """
+        Custom validator to parse YYYYMMDD strings into datetime.date objects.
+        """
+        if isinstance(v, str):
+            try:
+                # Attempt to parse as YYYYMMDD
+                return datetime.strptime(v, '%Y%m%d').date()
+            except ValueError:
+                # If it's not YYYYMMDD, let Pydantic's default date parsing handle it
+                # (e.g., for YYYY-MM-DD or other standard formats)
+                pass
+        return v # Return the value as is for Pydantic to process (e.g., if it's already a date object)
 
 class BacktestResultMetrics(BaseModel):
     """Backtest result metrics"""
