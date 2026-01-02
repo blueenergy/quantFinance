@@ -17,10 +17,22 @@ import time
 def setup_production_middleware(app: FastAPI):
     """配置生产环境中间件"""
     
+    # 0. CORS中间件 (必须最先添加)
+    allowed_origins = os.getenv("ALLOWED_ORIGINS", "*").split(",")
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=allowed_origins if allowed_origins != ["*"] else ["*"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+        expose_headers=["*"]
+    )
+    
     # 1. 信任的主机中间件 (仅在非测试环境启用)
-    if os.getenv("TESTING") != "true":
-        trusted_hosts = os.getenv("TRUSTED_HOSTS", "localhost,yourdomain.com").split(",")
-        app.add_middleware(TrustedHostMiddleware, allowed_hosts=trusted_hosts)
+    if os.getenv("TESTING") != "true" and os.getenv("DISABLE_TRUSTED_HOST") != "true":
+        trusted_hosts = os.getenv("TRUSTED_HOSTS", "*").split(",")
+        if trusted_hosts != ["*"]:
+            app.add_middleware(TrustedHostMiddleware, allowed_hosts=trusted_hosts)
     
     # 2. HTTPS重定向中间件 (仅在生产环境)
     if os.getenv("ENVIRONMENT") == "production":
