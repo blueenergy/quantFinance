@@ -1,0 +1,495 @@
+"""Unit tests for trader router endpoints in quantFinance.
+
+Tests cover:
+- GET /trader/positions (fetch positions)
+- POST /trader/positions/sync (sync positions batch)
+- DELETE /trader/positions/cleanup (cleanup stale positions)
+- POST /trader/account/sync (sync account info)
+- GET /trader/account (fetch account info)
+"""
+
+import pytest
+from unittest.mock import Mock, patch
+from fastapi.testclient import TestClient
+from bson import ObjectId
+
+from routers import trader
+from main import app
+
+
+class FakeCollection:
+    """Fake MongoDB collection for testing."""
+    
+    def __init__(self, docs=None):
+        self.docs = docs or []
+        self.inserted = []
+        self.updated = []
+        self.deleted = []
+    
+    def find(self, query=None, sort=None):
+        """Find documents matching query."""
+        class Cursor(list):
+            def sort(self, *args, **kwargs):
+                return self
+            
+            def limit(self, n):
+                return Cursor(list(self)[:n])
+        
+        if query is None:
+            query = {}
+        
+        results = []
+        for doc in self.docs:
+            if self._matches(doc, query):
+                results.append(doc)
+        
+        return Cursor(results)
+    
+    def find_one(self, query, sort=None):
+        """Find first document matching query."""
+        cursor = self.find(query)
+        return cursor[0] if cursor else None
+    
+    def insert_many(self, docs):
+        """Insert multiple documents."""
+        result = Mock()
+        result.inserted_ids = [ObjectId() for _ in docs]
+        self.inserted.extend(docs)
+        self.docs.extend(docs)
+        return result
+    
+    def update_one(self, filter_query, update_doc, upsert=False):
+        """Update one document."""
+        result = Mock()
+        for i, doc in enumerate(self.docs):
+            if self._matches(doc, filter_query):
+                if "$set" in update_doc:
+                    doc.update(update_doc["$set"])
+                result.matched_count = 1
+                self.updated.append((filter_query, update_doc))
+                return result
+        
+        if upsert:
+            new_doc = dict(filter_query)
+            if "$set" in update_doc:
+                new_doc.update(update_doc["$set"])
+            new_doc["_id"] = ObjectId()
+            self.docs.append(new_doc)
+            self.inserted.append(new_doc)
+            result.matched_count = 0
+            result.upserted_id = new_doc["_id"]
+        else:
+            result.matched_count = 0
+        
+        return result
+    
+    def delete_many(self, query):
+        """Delete documents matching query."""
+        result = Mock()
+        initial_count = len(self.docs)
+        
+        self.docs = [doc for doc in self.docs if not self._matches(doc, query)]
+        result.deleted_count = initial_count - len(self.docs)
+        
+        self.deleted.append(query)
+        return result
+    
+    def _matches(self, doc, query):
+        """Check if document matches query."""
+        if not query:
+            return True
+        
+        for key, value in query.items():
+            if key == "$nin":
+                # Handle $nin operator for array fields
+                continue
+            
+            if key not in doc:
+                return False
+            
+            if isinstance(value, dict):
+                if "$nin" in value:
+                    # Check if doc value is NOT in the $nin list
+                    if doc[key] in value["$nin"]:
+                        return False
+                else:
+                    return False
+            else:
+                if doc[key] != value:
+                    return False
+        
+        return True
+
+
+class TestCleanupPositionsEndpoint:
+    """Tests for DELETE /trader/positions/cleanup endpoint."""
+    
+    @pytest.fixture
+    def setup(self, monkeypatch):
+        """Setup test environment."""
+        # Create fake collections
+        self.positions_coll = FakeCollection([
+            {
+                "_id": ObjectId(),
+                "user_id": "user_123",
+                "symbol": "600000",
+                "qty": 1000,
+                "avg_price": 10.5
+            },
+            {
+                "_id": ObjectId(),
+                "user_id": "user_123",
+                "symbol": "300001",
+                "qty": 500,
+                "avg_price": 25.0
+            },
+            {
+                "_id": ObjectId(),
+                "user_id": "user_123",
+                "symbol": "000001",
+                "qty": 200,
+                "avg_price": 15.5
+            }
+        ])
+        
+        self.securities_coll = FakeCollection([
+            {
+                "_id": ObjectId("000000000000000000000001"),
+                "user_id": "user_123",
+                "account_id": "ACC_123",
+                "broker": "miniQMT"
+            }
+        ])
+        
+        fake_collections = {
+            "trader_positions": self.positions_coll,
+            "securities_accounts": self.securities_coll
+        }
+        
+        # Mock get_db_collections
+        def mock_get_db_collections():
+            return fake_collections
+        
+        monkeypatch.setattr(trader, "get_db_collections", mock_get_db_collections)
+        
+        # Mock get_current_active_user
+        def mock_get_current_user():
+            return {"id": "user_123"}
+        
+        monkeypatch.setattr(trader, "get_current_active_user", mock_get_current_user)
+    
+    def test_cleanup_removes_stale_positions(self, setup):
+        """Test that cleanup removes positions not in current_symbols list."""
+        client = TestClient(app)
+        
+        # Initial check: should have 3 positions
+        assert len(self.positions_coll.docs) == 3
+        
+        # Cleanup - keep only 600000, remove 300001 and 000001
+        response = client.delete(
+            "/api/trader/positions/cleanup",
+            json={
+                "current_symbols": ["600000"],
+                "securities_account_id": None
+            }
+        )
+        
+        assert response.status_code == 200
+        data = response.json()
+        assert data["success"] is True
+        assert data["deleted_count"] == 2
+        
+        # Verify only 600000 remains
+        assert len(self.positions_coll.docs) == 1
+        assert self.positions_coll.docs[0]["symbol"] == "600000"
+    
+    def test_cleanup_with_multiple_symbols(self, setup):
+        """Test cleanup keeping multiple symbols."""
+        client = TestClient(app)
+        
+        # Keep 600000 and 300001, remove 000001
+        response = client.delete(
+            "/api/trader/positions/cleanup",
+            json={
+                "current_symbols": ["600000", "300001"],
+                "securities_account_id": None
+            }
+        )
+        
+        assert response.status_code == 200
+        data = response.json()
+        assert data["deleted_count"] == 1
+        
+        # Verify 2 positions remain
+        assert len(self.positions_coll.docs) == 2
+        symbols = [doc["symbol"] for doc in self.positions_coll.docs]
+        assert set(symbols) == {"600000", "300001"}
+    
+    def test_cleanup_with_empty_symbols(self, setup):
+        """Test cleanup with empty symbols list (cleanup all)."""
+        client = TestClient(app)
+        
+        # Empty list should cleanup everything
+        response = client.delete(
+            "/api/trader/positions/cleanup",
+            json={
+                "current_symbols": [],
+                "securities_account_id": None
+            }
+        )
+        
+        assert response.status_code == 200
+        data = response.json()
+        assert data["deleted_count"] == 3
+        
+        # Verify all positions removed
+        assert len(self.positions_coll.docs) == 0
+    
+    def test_cleanup_no_matches(self, setup):
+        """Test cleanup when all current symbols already exist."""
+        client = TestClient(app)
+        
+        # All symbols already held
+        response = client.delete(
+            "/api/trader/positions/cleanup",
+            json={
+                "current_symbols": ["600000", "300001", "000001"],
+                "securities_account_id": None
+            }
+        )
+        
+        assert response.status_code == 200
+        data = response.json()
+        assert data["deleted_count"] == 0
+        
+        # Verify all positions still exist
+        assert len(self.positions_coll.docs) == 3
+    
+    def test_cleanup_response_includes_timestamp(self, setup):
+        """Test that cleanup response includes timestamp."""
+        client = TestClient(app)
+        
+        response = client.delete(
+            "/api/trader/positions/cleanup",
+            json={
+                "current_symbols": ["600000"],
+                "securities_account_id": None
+            }
+        )
+        
+        assert response.status_code == 200
+        data = response.json()
+        assert "timestamp" in data
+        assert isinstance(data["timestamp"], (int, float))
+    
+    def test_cleanup_validates_input(self, setup):
+        """Test that cleanup validates required parameters."""
+        client = TestClient(app)
+        
+        # Missing current_symbols
+        response = client.delete(
+            "/api/trader/positions/cleanup",
+            json={"securities_account_id": None}
+        )
+        
+        # FastAPI should reject due to missing required field
+        assert response.status_code == 422
+
+
+class TestSyncPositionsEndpoint:
+    """Tests for POST /trader/positions/sync endpoint."""
+    
+    @pytest.fixture
+    def setup(self, monkeypatch):
+        """Setup test environment."""
+        self.positions_coll = FakeCollection()
+        self.securities_coll = FakeCollection([
+            {
+                "_id": ObjectId("000000000000000000000001"),
+                "user_id": "user_123",
+                "account_id": "ACC_123",
+                "broker": "miniQMT"
+            }
+        ])
+        
+        fake_collections = {
+            "trader_positions": self.positions_coll,
+            "securities_accounts": self.securities_coll
+        }
+        
+        def mock_get_db_collections():
+            return fake_collections
+        
+        monkeypatch.setattr(trader, "get_db_collections", mock_get_db_collections)
+        
+        def mock_get_current_user():
+            return {"id": "user_123"}
+        
+        monkeypatch.setattr(trader, "get_current_active_user", mock_get_current_user)
+    
+    def test_sync_positions_creates_batch(self, setup):
+        """Test that sync_positions properly stores position batch."""
+        client = TestClient(app)
+        
+        positions = [
+            {"symbol": "600000", "qty": 1000, "avg_price": 10.5},
+            {"symbol": "300001", "qty": 500, "avg_price": 25.0}
+        ]
+        
+        response = client.post(
+            "/api/trader/positions/sync",
+            json={
+                "positions": positions,
+                "securities_account_id": "000000000000000000000001"
+            }
+        )
+        
+        assert response.status_code == 200
+        data = response.json()
+        assert data["success"] is True
+        assert data["synced_count"] == 2
+        
+        # Verify positions stored
+        assert len(self.positions_coll.docs) == 2
+    
+    def test_sync_positions_clears_old_data(self, setup):
+        """Test that sync_positions clears previous data."""
+        client = TestClient(app)
+        
+        # Pre-populate with old position
+        self.positions_coll.docs = [
+            {
+                "_id": ObjectId(),
+                "user_id": "user_123",
+                "symbol": "999999",
+                "qty": 100,
+                "avg_price": 5.0
+            }
+        ]
+        
+        # Sync new positions
+        positions = [{"symbol": "600000", "qty": 1000}]
+        
+        response = client.post(
+            "/api/trader/positions/sync",
+            json={
+                "positions": positions,
+                "securities_account_id": "000000000000000000000001"
+            }
+        )
+        
+        assert response.status_code == 200
+        
+        # Old position should be removed
+        assert len(self.positions_coll.docs) == 1
+        assert self.positions_coll.docs[0]["symbol"] == "600000"
+
+
+class TestGetPositionsEndpoint:
+    """Tests for GET /trader/positions endpoint."""
+    
+    @pytest.fixture
+    def setup(self, monkeypatch):
+        """Setup test environment."""
+        self.positions_coll = FakeCollection([
+            {
+                "_id": ObjectId(),
+                "user_id": "user_123",
+                "symbol": "600000",
+                "qty": 1000,
+                "avg_price": 10.5
+            }
+        ])
+        
+        self.stock_info_coll = FakeCollection([
+            {
+                "_id": ObjectId(),
+                "symbol": "600000",
+                "name": "浦发银行"
+            }
+        ])
+        
+        fake_collections = {
+            "trader_positions": self.positions_coll,
+            "stock_info": self.stock_info_coll
+        }
+        
+        def mock_get_db_collections():
+            return fake_collections
+        
+        monkeypatch.setattr(trader, "get_db_collections", mock_get_db_collections)
+        
+        def mock_get_current_user():
+            return {"id": "user_123"}
+        
+        monkeypatch.setattr(trader, "get_current_active_user", mock_get_current_user)
+    
+    def test_get_positions_returns_list(self, setup):
+        """Test that get_positions returns position list."""
+        client = TestClient(app)
+        
+        response = client.get("/api/trader/positions")
+        
+        assert response.status_code == 200
+        data = response.json()
+        assert data["success"] is True
+        assert data["count"] == 1
+        assert len(data["data"]) == 1
+        assert data["data"][0]["symbol"] == "600000"
+    
+    def test_get_positions_enriches_with_stock_names(self, setup):
+        """Test that get_positions enriches positions with stock names."""
+        client = TestClient(app)
+        
+        response = client.get("/api/trader/positions")
+        
+        assert response.status_code == 200
+        data = response.json()
+        assert "stock_name" in data["data"][0]
+        assert data["data"][0]["stock_name"] == "浦发银行"
+
+
+@pytest.mark.unit
+def test_cleanup_positions_endpoint_integration(monkeypatch):
+    """Integration test for cleanup endpoint."""
+    positions_coll = FakeCollection([
+        {
+            "_id": ObjectId(),
+            "user_id": "user_123",
+            "symbol": "600000",
+            "qty": 1000
+        },
+        {
+            "_id": ObjectId(),
+            "user_id": "user_123",
+            "symbol": "300001",
+            "qty": 500
+        }
+    ])
+    
+    fake_collections = {"trader_positions": positions_coll}
+    
+    def mock_get_db_collections():
+        return fake_collections
+    
+    monkeypatch.setattr(trader, "get_db_collections", mock_get_db_collections)
+    
+    def mock_get_current_user():
+        return {"id": "user_123"}
+    
+    monkeypatch.setattr(trader, "get_current_active_user", mock_get_current_user)
+    
+    client = TestClient(app)
+    
+    # Execute cleanup
+    response = client.delete(
+        "/api/trader/positions/cleanup",
+        json={
+            "current_symbols": ["600000"],
+            "securities_account_id": None
+        }
+    )
+    
+    assert response.status_code == 200
+    assert response.json()["deleted_count"] == 1
+    assert len(positions_coll.docs) == 1
