@@ -454,6 +454,52 @@ def get_positions(
         raise HTTPException(status_code=500, detail=f"Failed to fetch positions: {str(e)}")
 
 
+@router.delete("/trader/positions/cleanup", summary="Cleanup stale positions")
+def cleanup_positions(
+    current_symbols: List[str] = Body(..., description="List of symbols currently held"),
+    securities_account_id: Optional[str] = Body(None),
+    current_user: dict = Depends(get_current_active_user)
+):
+    """Clean up stale positions not currently held by broker.
+    
+    Removes positions for symbols that are NOT in the current_symbols list.
+    This is called after position sync to ensure the database only contains
+    positions that are actually held in the broker account.
+    
+    Args:
+        current_symbols: List of symbols currently held in the account
+        securities_account_id: Optional filter by securities account
+        current_user: Authenticated user
+    """
+    try:
+        collections = get_db_collections()
+        positions_coll = collections["trader_positions"]
+        
+        user_id = current_user["id"]
+        
+        # Build cleanup query - remove positions NOT in current_symbols
+        cleanup_query = {
+            "user_id": user_id,
+            "symbol": {"$nin": current_symbols}
+        }
+        
+        # Filter by securities_account_id if provided
+        if securities_account_id:
+            cleanup_query["securities_account_id"] = securities_account_id
+        
+        # Delete stale positions
+        result = positions_coll.delete_many(cleanup_query)
+        
+        return {
+            "success": True,
+            "deleted_count": result.deleted_count,
+            "timestamp": time.time()
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to cleanup positions: {str(e)}")
+
+
 @router.get("/trader/account", summary="Get account information")
 def get_account(
     securities_account_id: Optional[str] = Query(None, description="Filter by securities account ID"),
