@@ -15,6 +15,7 @@ from bson import ObjectId
 
 from routers import trader
 from main import app
+from auth import get_current_active_user
 
 
 class FakeCollection:
@@ -112,6 +113,10 @@ class FakeCollection:
                     # Check if doc value is NOT in the $nin list
                     if doc[key] in value["$nin"]:
                         return False
+                elif "$in" in value:
+                    # Check if doc value is IN the $in list
+                    if doc[key] not in value["$in"]:
+                        return False
                 else:
                     return False
             else:
@@ -172,11 +177,13 @@ class TestCleanupPositionsEndpoint:
         
         monkeypatch.setattr(trader, "get_db_collections", mock_get_db_collections)
         
-        # Mock get_current_active_user
-        def mock_get_current_user():
-            return {"id": "user_123"}
+        # Override dependency
+        app.dependency_overrides[get_current_active_user] = lambda: {"id": "user_123"}
         
-        monkeypatch.setattr(trader, "get_current_active_user", mock_get_current_user)
+        yield
+        
+        # Clean up overrides
+        app.dependency_overrides = {}
     
     def test_cleanup_removes_stale_positions(self, setup):
         """Test that cleanup removes positions not in current_symbols list."""
@@ -186,7 +193,8 @@ class TestCleanupPositionsEndpoint:
         assert len(self.positions_coll.docs) == 3
         
         # Cleanup - keep only 600000, remove 300001 and 000001
-        response = client.delete(
+        response = client.request(
+            "DELETE",
             "/api/trader/positions/cleanup",
             json={
                 "current_symbols": ["600000"],
@@ -208,7 +216,8 @@ class TestCleanupPositionsEndpoint:
         client = TestClient(app)
         
         # Keep 600000 and 300001, remove 000001
-        response = client.delete(
+        response = client.request(
+            "DELETE",
             "/api/trader/positions/cleanup",
             json={
                 "current_symbols": ["600000", "300001"],
@@ -230,7 +239,8 @@ class TestCleanupPositionsEndpoint:
         client = TestClient(app)
         
         # Empty list should cleanup everything
-        response = client.delete(
+        response = client.request(
+            "DELETE",
             "/api/trader/positions/cleanup",
             json={
                 "current_symbols": [],
@@ -250,7 +260,8 @@ class TestCleanupPositionsEndpoint:
         client = TestClient(app)
         
         # All symbols already held
-        response = client.delete(
+        response = client.request(
+            "DELETE",
             "/api/trader/positions/cleanup",
             json={
                 "current_symbols": ["600000", "300001", "000001"],
@@ -269,7 +280,8 @@ class TestCleanupPositionsEndpoint:
         """Test that cleanup response includes timestamp."""
         client = TestClient(app)
         
-        response = client.delete(
+        response = client.request(
+            "DELETE",
             "/api/trader/positions/cleanup",
             json={
                 "current_symbols": ["600000"],
@@ -287,7 +299,8 @@ class TestCleanupPositionsEndpoint:
         client = TestClient(app)
         
         # Missing current_symbols
-        response = client.delete(
+        response = client.request(
+            "DELETE",
             "/api/trader/positions/cleanup",
             json={"securities_account_id": None}
         )
@@ -322,10 +335,13 @@ class TestSyncPositionsEndpoint:
         
         monkeypatch.setattr(trader, "get_db_collections", mock_get_db_collections)
         
-        def mock_get_current_user():
-            return {"id": "user_123"}
+        # Override dependency
+        app.dependency_overrides[get_current_active_user] = lambda: {"id": "user_123"}
         
-        monkeypatch.setattr(trader, "get_current_active_user", mock_get_current_user)
+        yield
+        
+        # Clean up overrides
+        app.dependency_overrides = {}
     
     def test_sync_positions_creates_batch(self, setup):
         """Test that sync_positions properly stores position batch."""
@@ -356,11 +372,14 @@ class TestSyncPositionsEndpoint:
         """Test that sync_positions clears previous data."""
         client = TestClient(app)
         
-        # Pre-populate with old position
+        account_id = "000000000000000000000001"
+        
+        # Pre-populate with old position for the SAME account
         self.positions_coll.docs = [
             {
                 "_id": ObjectId(),
                 "user_id": "user_123",
+                "securities_account_id": account_id,
                 "symbol": "999999",
                 "qty": 100,
                 "avg_price": 5.0
@@ -368,13 +387,13 @@ class TestSyncPositionsEndpoint:
         ]
         
         # Sync new positions
-        positions = [{"symbol": "600000", "qty": 1000}]
+        positions = [{"symbol": "600000.SH", "qty": 1000}]
         
         response = client.post(
             "/api/trader/positions/sync",
             json={
                 "positions": positions,
-                "securities_account_id": "000000000000000000000001"
+                "securities_account_id": account_id
             }
         )
         
@@ -382,7 +401,7 @@ class TestSyncPositionsEndpoint:
         
         # Old position should be removed
         assert len(self.positions_coll.docs) == 1
-        assert self.positions_coll.docs[0]["symbol"] == "600000"
+        assert self.positions_coll.docs[0]["symbol"] == "600000.SH"
 
 
 class TestGetPositionsEndpoint:
@@ -395,7 +414,7 @@ class TestGetPositionsEndpoint:
             {
                 "_id": ObjectId(),
                 "user_id": "user_123",
-                "symbol": "600000",
+                "symbol": "600000.SH",
                 "qty": 1000,
                 "avg_price": 10.5
             }
@@ -404,7 +423,7 @@ class TestGetPositionsEndpoint:
         self.stock_info_coll = FakeCollection([
             {
                 "_id": ObjectId(),
-                "symbol": "600000",
+                "symbol": "600000.SH",
                 "name": "浦发银行"
             }
         ])
@@ -419,10 +438,13 @@ class TestGetPositionsEndpoint:
         
         monkeypatch.setattr(trader, "get_db_collections", mock_get_db_collections)
         
-        def mock_get_current_user():
-            return {"id": "user_123"}
+        # Override dependency
+        app.dependency_overrides[get_current_active_user] = lambda: {"id": "user_123"}
         
-        monkeypatch.setattr(trader, "get_current_active_user", mock_get_current_user)
+        yield
+        
+        # Clean up overrides
+        app.dependency_overrides = {}
     
     def test_get_positions_returns_list(self, setup):
         """Test that get_positions returns position list."""
@@ -435,7 +457,7 @@ class TestGetPositionsEndpoint:
         assert data["success"] is True
         assert data["count"] == 1
         assert len(data["data"]) == 1
-        assert data["data"][0]["symbol"] == "600000"
+        assert data["data"][0]["symbol"] == "600000.SH"
     
     def test_get_positions_enriches_with_stock_names(self, setup):
         """Test that get_positions enriches positions with stock names."""
@@ -474,22 +496,25 @@ def test_cleanup_positions_endpoint_integration(monkeypatch):
     
     monkeypatch.setattr(trader, "get_db_collections", mock_get_db_collections)
     
-    def mock_get_current_user():
-        return {"id": "user_123"}
+    # Override dependency
+    app.dependency_overrides[get_current_active_user] = lambda: {"id": "user_123"}
     
-    monkeypatch.setattr(trader, "get_current_active_user", mock_get_current_user)
-    
-    client = TestClient(app)
-    
-    # Execute cleanup
-    response = client.delete(
-        "/api/trader/positions/cleanup",
-        json={
-            "current_symbols": ["600000"],
-            "securities_account_id": None
-        }
-    )
-    
-    assert response.status_code == 200
-    assert response.json()["deleted_count"] == 1
-    assert len(positions_coll.docs) == 1
+    try:
+        client = TestClient(app)
+        
+        # Execute cleanup
+        response = client.request(
+            "DELETE",
+            "/api/trader/positions/cleanup",
+            json={
+                "current_symbols": ["600000"],
+                "securities_account_id": None
+            }
+        )
+        
+        assert response.status_code == 200
+        assert response.json()["deleted_count"] == 1
+        assert len(positions_coll.docs) == 1
+    finally:
+        # Clean up overrides
+        app.dependency_overrides = {}
