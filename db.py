@@ -58,6 +58,9 @@ def get_db_collections() -> Dict[str, Collection]:
         "backtest_results": db["backtest_results"],  # 回测结果
         # Permission and service upgrade
         "upgrade_requests": db["upgrade_requests"],  # 服务升级申请
+        # Strategy selection results
+        "strategy_stock_pool": db["strategy_stock_pool"],  # 策略选股池结果
+        "strategy_trade_history": db["strategy_trade_history"],  # 策略选股池结果"
         # Add more collections as needed
     }
 

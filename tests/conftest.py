@@ -38,8 +38,22 @@ class FakeCollection:
             return len(self.docs)
         return len([d for d in self.docs if all(item in d.items() for item in query.items())])
 
-    def find(self, query=None, sort=None):
-        return Cursor(self.docs)
+    def find(self, query=None, projection=None):
+        if query is None or query == {}:
+            return Cursor(self.docs)
+        # Filter documents matching query
+        filtered = [d for d in self.docs if all(d.get(k) == v for k, v in query.items())]
+        return Cursor(filtered)
+
+    def distinct(self, field, query=None):
+        """Return unique values for a field, optionally filtered by query."""
+        if query is None or query == {}:
+            docs = self.docs
+        else:
+            docs = [d for d in self.docs if all(d.get(k) == v for k, v in query.items())]
+        
+        values = [d.get(field) for d in docs if field in d]
+        return list(set(values))  # Return unique values
 
     def aggregate(self, pipeline):
         # Default: return docs as-is; tests may override with monkeypatch if needed
