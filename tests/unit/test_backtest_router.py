@@ -141,7 +141,10 @@ def test_create_backtest_task(monkeypatch, mock_user):
     collections = {
         "backtest_tasks": FakeBacktestCollection([]),
         "backtest_results": FakeBacktestCollection([]),
-        "users": FakeBacktestCollection([])
+        "users": FakeBacktestCollection([]),
+        "stock_info": FakeBacktestCollection([
+            {"symbol": "000858", "name": "五粮液"}
+        ])
     }
     
     # Patch at the backtest module level (where it's imported)
@@ -153,6 +156,7 @@ def test_create_backtest_task(monkeypatch, mock_user):
     payload = {
         "symbol": "000858",
         "strategy_key": "turtle",
+        "preset": "turtle_conservative",
         "strategy_params": {"period": 20},
         "start_date": "20240101",
         "end_date": "20241231",
@@ -165,12 +169,15 @@ def test_create_backtest_task(monkeypatch, mock_user):
     data = response.json()
     assert data["symbol"] == "000858"
     assert data["strategy_key"] == "turtle"
+    assert data["preset"] == "turtle_conservative"
+    assert data.get("stock_name") == "五粮液"
     assert data["status"] == "pending"
     assert data["user_id"] == "user123"
     assert "task_id" in data
     
     # Verify task was stored
     assert len(collections["backtest_tasks"].docs) == 1
+    assert collections["backtest_tasks"].docs[0].get("preset") == "turtle_conservative"
     
     client.app.dependency_overrides.clear()
 
@@ -182,7 +189,11 @@ def test_list_backtest_tasks(monkeypatch, mock_user):
     collections = {
         "backtest_tasks": FakeBacktestCollection([]),
         "backtest_results": FakeBacktestCollection([]),
-        "users": FakeBacktestCollection([])
+        "users": FakeBacktestCollection([]),
+        "stock_info": FakeBacktestCollection([
+            {"symbol": "000858", "name": "五粮液"},
+            {"symbol": "600036", "name": "招商银行"}
+        ])
     }
     
     # Add some existing tasks
@@ -192,6 +203,7 @@ def test_list_backtest_tasks(monkeypatch, mock_user):
             "user_id": "user123",
             "symbol": "000858",
             "strategy_key": "turtle",
+            "preset": "turtle_conservative",
             "strategy_params": {},
             "start_date": "20240101",
             "end_date": "20241231",
@@ -208,6 +220,7 @@ def test_list_backtest_tasks(monkeypatch, mock_user):
             "user_id": "user123",
             "symbol": "600036",
             "strategy_key": "grid",
+            "preset": None,
             "strategy_params": {},
             "start_date": "20240101",
             "end_date": "20241231",
@@ -232,6 +245,9 @@ def test_list_backtest_tasks(monkeypatch, mock_user):
     assert response.status_code == 200
     data = response.json()
     assert len(data) == 2
+    assert data[0].get("preset") in ("turtle_conservative", None)
+    # stock_name should be enriched from stock_info when available
+    assert any(t.get("stock_name") == "五粮液" for t in data)
     
     # Test filter by status
     response = client.get("/api/backtest/tasks?status=pending")
@@ -250,7 +266,10 @@ def test_get_backtest_task(monkeypatch, mock_user):
     collections = {
         "backtest_tasks": FakeBacktestCollection([]),
         "backtest_results": FakeBacktestCollection([]),
-        "users": FakeBacktestCollection([])
+        "users": FakeBacktestCollection([]),
+        "stock_info": FakeBacktestCollection([
+            {"symbol": "000858", "name": "五粮液"}
+        ])
     }
     
     collections["backtest_tasks"].docs = [
@@ -259,6 +278,7 @@ def test_get_backtest_task(monkeypatch, mock_user):
             "user_id": "user123",
             "symbol": "000858",
             "strategy_key": "turtle",
+            "preset": "turtle_conservative",
             "strategy_params": {"period": 20},
             "start_date": "20240101",
             "end_date": "20241231",
@@ -283,6 +303,8 @@ def test_get_backtest_task(monkeypatch, mock_user):
     data = response.json()
     assert data["task_id"] == "bt_001"
     assert data["symbol"] == "000858"
+    assert data.get("preset") == "turtle_conservative"
+    assert data.get("stock_name") == "五粮液"
     
     # Test non-existent task
     response = client.get("/api/backtest/tasks/bt_999")

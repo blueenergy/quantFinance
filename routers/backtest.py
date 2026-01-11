@@ -26,6 +26,7 @@ class BacktestTaskCreate(BaseModel):
     """Request model for creating a backtest task"""
     symbol: str = Field(..., description="Stock symbol (e.g., 000858)")
     strategy_key: str = Field(..., description="Strategy key from STRATEGY_MAP")
+    preset: Optional[str] = Field(default=None, description="Optional preset name (e.g., turtle_conservative)")
     strategy_params: Dict[str, Any] = Field(default_factory=dict, description="Strategy parameters")
     start_date: str = Field(..., description="Backtest start date (YYYYMMDD)")
     end_date: str = Field(..., description="Backtest end date (YYYYMMDD)")
@@ -57,7 +58,9 @@ class BacktestTaskResponse(BaseModel):
     task_id: str = Field(..., description="Unique identifier for the backtest task")
     user_id: str = Field(..., description="Identifier of the user who initiated the task")
     symbol: str = Field(..., description="Trading symbol for the backtest (e.g., 'AAPL')")
+    stock_name: Optional[str] = Field(default=None, description="Human-readable stock name")
     strategy_key: str = Field(..., description="Key identifying the trading strategy used")
+    preset: Optional[str] = Field(default=None, description="Preset name used when creating the task")
     # 4. Use Field for default_factory for mutable types
     strategy_params: Dict[str, Any] = Field(default_factory=dict, description="Parameters for the trading strategy")
     # 2. Use date objects for date fields
@@ -151,6 +154,7 @@ async def create_backtest_task(
     """
     collections = get_db_collections()
     backtest_tasks_col = collections["backtest_tasks"]
+    stock_info_col = collections.get("stock_info")
     
     # Generate task ID
     task_id = f"bt_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{task.symbol}"
@@ -161,6 +165,7 @@ async def create_backtest_task(
         "user_id": current_user["id"],
         "symbol": task.symbol,
         "strategy_key": task.strategy_key,
+        "preset": task.preset,
         "strategy_params": task.strategy_params,
         "start_date": task.start_date,
         "end_date": task.end_date,
@@ -178,12 +183,24 @@ async def create_backtest_task(
     if not result.inserted_id:
         raise HTTPException(status_code=500, detail="Failed to create backtest task")
     
+    stock_name = None
+    if stock_info_col is not None:
+        try:
+            info = stock_info_col.find_one({"symbol": task_doc["symbol"]})
+            if info and isinstance(info, dict):
+                name = info.get("name")
+                stock_name = name if isinstance(name, str) and name else None
+        except Exception:
+            stock_name = None
+
     # Return response
     return BacktestTaskResponse(
         task_id=task_doc["task_id"],
         user_id=str(task_doc["user_id"]),
         symbol=task_doc["symbol"],
+        stock_name=stock_name,
         strategy_key=task_doc["strategy_key"],
+        preset=task_doc.get("preset"),
         strategy_params=task_doc["strategy_params"],
         start_date=task_doc["start_date"],
         end_date=task_doc["end_date"],
@@ -206,29 +223,44 @@ async def list_backtest_tasks(
     """
     collections = get_db_collections()
     backtest_tasks_col = collections["backtest_tasks"]
-    
+    stock_info_col = collections.get("stock_info")
+
     query = {"user_id": current_user["id"]}
     if status:
         query["status"] = status
-    
+
     tasks = list(backtest_tasks_col.find(query).sort("created_at", -1).limit(limit))
-    
+
+    symbol_to_name: Dict[str, str] = {}
+    if stock_info_col is not None:
+        for t in tasks:
+            sym = t.get("symbol")
+            if not sym or sym in symbol_to_name:
+                continue
+            info = stock_info_col.find_one({"symbol": sym})
+            if info and isinstance(info, dict):
+                name = info.get("name")
+                if isinstance(name, str) and name:
+                    symbol_to_name[sym] = name
+
     return [
         BacktestTaskResponse(
             task_id=task["task_id"],
-            user_id=str(task["user_id"]),
+            user_id=str(task.get("user_id", "")),
             symbol=task["symbol"],
+            stock_name=symbol_to_name.get(task["symbol"]),
             strategy_key=task["strategy_key"],
-            strategy_params=task.get("strategy_params", {}),
+            preset=task.get("preset"),
+            strategy_params=task.get("strategy_params", {}) or {},
             start_date=task["start_date"],
             end_date=task["end_date"],
             initial_cash=task.get("initial_cash", 1000000.0),
             status=task["status"],
             worker_id=task.get("worker_id"),
-            created_at=task["created_at"],
+            created_at=task.get("created_at"),
             started_at=task.get("started_at"),
             completed_at=task.get("completed_at"),
-            error_message=task.get("error_message")
+            error_message=task.get("error_message"),
         )
         for task in tasks
     ]
@@ -242,30 +274,40 @@ async def get_backtest_task(
     """Get backtest task details"""
     collections = get_db_collections()
     backtest_tasks_col = collections["backtest_tasks"]
-    
+    stock_info_col = collections.get("stock_info")
+
     task = backtest_tasks_col.find_one({
         "task_id": task_id,
         "user_id": current_user["id"]
     })
-    
+
     if not task:
         raise HTTPException(status_code=404, detail="Backtest task not found")
-    
+
+    stock_name = None
+    if stock_info_col is not None:
+        info = stock_info_col.find_one({"symbol": task.get("symbol")})
+        if info and isinstance(info, dict):
+            name = info.get("name")
+            stock_name = name if isinstance(name, str) and name else None
+
     return BacktestTaskResponse(
-        task_id=task["task_id"],
-        user_id=str(task["user_id"]),
-        symbol=task["symbol"],
-        strategy_key=task["strategy_key"],
-        strategy_params=task.get("strategy_params", {}),
-        start_date=task["start_date"],
-        end_date=task["end_date"],
+        task_id=task.get("task_id") or task_id,
+        user_id=str(task.get("user_id", "")),
+        symbol=task.get("symbol"),
+        stock_name=stock_name,
+        strategy_key=task.get("strategy_key"),
+        preset=task.get("preset"),
+        strategy_params=task.get("strategy_params", {}) or {},
+        start_date=task.get("start_date"),
+        end_date=task.get("end_date"),
         initial_cash=task.get("initial_cash", 1000000.0),
-        status=task["status"],
+        status=task.get("status"),
         worker_id=task.get("worker_id"),
-        created_at=task["created_at"],
+        created_at=task.get("created_at"),
         started_at=task.get("started_at"),
         completed_at=task.get("completed_at"),
-        error_message=task.get("error_message")
+        error_message=task.get("error_message"),
     )
 
 
@@ -305,6 +347,47 @@ async def delete_backtest_task(
     backtest_results_col.delete_one({"task_id": task_id})
     
     return {"message": "Backtest task deleted"}
+
+
+@router.post("/tasks/{task_id}/reset")
+async def reset_backtest_task(
+    task_id: str,
+    current_user: dict = Depends(get_current_user)
+):
+    """Reset a cancelled/failed task back to pending for re-execution.
+
+    Clears worker info and timing fields, removes stale results, and sets status=pending.
+    """
+    collections = get_db_collections()
+    backtest_tasks_col = collections["backtest_tasks"]
+    backtest_results_col = collections["backtest_results"]
+
+    task = backtest_tasks_col.find_one({
+        "task_id": task_id,
+        "user_id": current_user["id"]
+    })
+
+    if not task:
+        raise HTTPException(status_code=404, detail="Backtest task not found")
+
+    if task.get("status") not in ["cancelled", "failed"]:
+        raise HTTPException(status_code=400, detail=f"Only cancelled/failed tasks can be reset (current: {task.get('status')})")
+
+    backtest_tasks_col.update_one(
+        {"task_id": task_id},
+        {"$set": {
+            "status": "pending",
+            "worker_id": None,
+            "started_at": None,
+            "completed_at": None,
+            "error_message": None,
+        }}
+    )
+
+    # Remove stale results so rerun writes fresh ones
+    backtest_results_col.delete_one({"task_id": task_id})
+
+    return {"message": "Backtest task reset to pending", "task_id": task_id}
 
 
 # ============================================================================
@@ -388,6 +471,7 @@ async def poll_pending_tasks(
             "user_id": str(task["user_id"]),
             "symbol": task["symbol"],
             "strategy_key": task["strategy_key"],
+            "preset": task.get("preset"),
             "strategy_params": task.get("strategy_params", {}),
             "start_date": task["start_date"],
             "end_date": task["end_date"],
