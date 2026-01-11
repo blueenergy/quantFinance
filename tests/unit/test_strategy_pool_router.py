@@ -11,7 +11,7 @@ showing hidden_dragon stocks when single_yang is selected.
 
 import pytest
 from datetime import datetime
-from tests.conftest import FakeCollection
+from tests.conftest import FakeCollection, Cursor
 
 
 @pytest.mark.unit
@@ -285,6 +285,301 @@ def test_get_pool_stocks_empty_result(client, monkeypatch):
     assert data['count'] == 0
     assert len(data['stocks']) == 0
     
+    client.app.dependency_overrides.clear()
+
+
+@pytest.mark.unit
+def test_get_preset_params_supports_prefixed_presets_and_params_with_desc(client, monkeypatch):
+    """Test /api/strategy-pool/params resolves preset name variants and extracts params_with_desc."""
+    from auth import get_current_user
+
+    def mock_auth():
+        return {'id': 'user1', 'username': 'testuser'}
+
+    client.app.dependency_overrides[get_current_user] = mock_auth
+
+    # Strategy template uses prefixed preset name dragon_default
+    templates = FakeCollection([
+        {
+            'strategy': 'hidden_dragon',
+            'preset': 'dragon_default',
+            'params_with_desc': {
+                'lookback': {'value': 20, 'description': 'x'},
+                'threshold': {'value': 0.5, 'description': 'y'},
+            },
+            'is_default': True,
+        }
+    ])
+
+    def mock_get_collections():
+        return {'strategy_template': templates}
+
+    monkeypatch.setattr('routers.strategy_pool.get_db_collections', mock_get_collections)
+
+    # Request unprefixed preset should still find prefixed template
+    res = client.get('/api/strategy-pool/params?strategy=hidden_dragon&preset=default')
+    assert res.status_code == 200
+    body = res.json()
+    assert body['success'] is True
+    assert body['found'] is True
+    assert body['requested_preset'] == 'default'
+    assert body['preset'] == 'dragon_default'
+    assert body['params'] == {'lookback': 20, 'threshold': 0.5}
+
+    client.app.dependency_overrides.clear()
+
+
+@pytest.mark.unit
+def test_get_preset_params_prefers_params_field_when_present(client, monkeypatch):
+    """If both params and params_with_desc exist, endpoint should return params."""
+    from auth import get_current_user
+
+    def mock_auth():
+        return {'id': 'user1', 'username': 'testuser'}
+
+    client.app.dependency_overrides[get_current_user] = mock_auth
+
+    templates = FakeCollection([
+        {
+            'strategy': 'turtle',
+            'preset': 'turtle_standard',
+            'params': {'period': 55},
+            'params_with_desc': {'period': {'value': 20, 'description': 'ignored'}},
+        }
+    ])
+
+    def mock_get_collections():
+        return {'strategy_template': templates}
+
+    monkeypatch.setattr('routers.strategy_pool.get_db_collections', mock_get_collections)
+
+    res = client.get('/api/strategy-pool/params?strategy=turtle&preset=turtle_standard')
+    assert res.status_code == 200
+    body = res.json()
+    assert body['success'] is True
+    assert body['found'] is True
+    assert body['params'] == {'period': 55}
+
+    client.app.dependency_overrides.clear()
+
+
+class _TradeCursor(Cursor):
+    def sort(self, key, direction):
+        reverse = direction == -1
+        return _TradeCursor(sorted(list(self), key=lambda d: d.get(key) or '', reverse=reverse))
+
+
+class _TradeHistoryCollection:
+    """Fake trade history collection supporting find(query).sort("datetime", 1) with date range ops."""
+
+    def __init__(self, docs=None):
+        self.docs = docs or []
+
+    def find(self, query=None, projection=None):
+        query = query or {}
+
+        def match(doc):
+            for k, v in query.items():
+                if isinstance(v, dict) and k == 'date':
+                    gte = v.get('$gte')
+                    lte = v.get('$lte')
+                    dv = doc.get('date')
+                    if gte and (dv is None or dv < gte):
+                        return False
+                    if lte and (dv is None or dv > lte):
+                        return False
+                    continue
+                if doc.get(k) != v:
+                    return False
+            return True
+
+        return _TradeCursor([d for d in self.docs if match(d)])
+
+
+@pytest.mark.unit
+def test_get_strategy_pool_backtest_result_reconstructs_metrics_trades_equity_and_params_used(client, monkeypatch):
+    from auth import get_current_user
+
+    def mock_auth():
+        return {'id': 'user1', 'username': 'testuser'}
+
+    client.app.dependency_overrides[get_current_user] = mock_auth
+
+    docs = [
+        {
+            'date': '20260108',
+            'strategy': 'hidden_dragon',
+            'preset': 'dragon_default',
+            'symbol': '000001.SZ',
+            'datetime': '2026-01-08 10:00:00',
+            'action': 'BUY',
+            'price': 10.0,
+            'quantity': 100,
+            'commission': 1.0,
+            'pnl': 0.0,
+            'cumulative_pnl': 0.0,
+            'hist_return': 0.0,
+            'hist_sharpe_ratio': 0.0,
+            'hist_max_drawdown': 0.0,
+            'hist_win_rate': 0.0,
+            'hist_total_trades': 0,
+        },
+        {
+            'date': '20260109',
+            'strategy': 'hidden_dragon',
+            'preset': 'dragon_default',
+            'symbol': '000001.SZ',
+            'datetime': '2026-01-09 10:00:00',
+            'action': 'SELL',
+            'price': 11.0,
+            'quantity': 100,
+            'commission': 1.0,
+            'pnl': 100.0,
+            'cumulative_pnl': 100.0,
+            'params_used': {'lookback': 20, 'threshold': 0.5},
+            'hist_return': 0.1,
+            'hist_sharpe_ratio': 1.2,
+            'hist_max_drawdown': -0.05,
+            'hist_win_rate': 0.5,
+            'hist_total_trades': 2,
+        },
+    ]
+
+    trade_history = _TradeHistoryCollection(docs)
+
+    def mock_get_collections():
+        return {'strategy_trade_history': trade_history}
+
+    monkeypatch.setattr('routers.strategy_pool.get_db_collections', mock_get_collections)
+
+    res = client.get(
+        '/api/strategy-pool/backtest-result'
+        '?symbol=000001'
+        '&strategy=hidden_dragon'
+        '&preset=dragon_default'
+        '&end_date=20260109'
+        '&days_back=30'
+        '&initial_cash=1000000'
+    )
+    assert res.status_code == 200
+    body = res.json()
+
+    # symbol normalized
+    assert body['symbol'] == '000001.SZ'
+    assert body['strategy_key'] == 'hidden_dragon'
+    assert body['strategy_params'] == {'lookback': 20, 'threshold': 0.5}
+
+    # metrics from last_doc
+    assert body['metrics']['total_return'] == 0.1
+    assert body['metrics']['sharpe_ratio'] == 1.2
+    assert body['metrics']['max_drawdown'] == -0.05
+    assert body['metrics']['win_rate'] == 0.5
+    assert body['metrics']['total_trades'] == 2
+
+    # trades normalized
+    assert len(body['trades']) == 2
+    assert body['trades'][0]['action'] == 'buy'
+    assert body['trades'][1]['action'] == 'sell'
+    assert body['trades'][1]['cumulative_pnl'] == 100.0
+
+    # equity curve uses last trade per day
+    assert body['equity_curve'] == [
+        {'date': '20260108', 'value': 1000000.0},
+        {'date': '20260109', 'value': 1000100.0},
+    ]
+
+    client.app.dependency_overrides.clear()
+
+
+@pytest.mark.unit
+def test_get_strategy_pool_backtest_result_invalid_end_date_returns_400(client, monkeypatch):
+    from auth import get_current_user
+
+    def mock_auth():
+        return {'id': 'user1', 'username': 'testuser'}
+
+    client.app.dependency_overrides[get_current_user] = mock_auth
+
+    # Even if trade collection exists, invalid end_date should be rejected
+    trade_history = _TradeHistoryCollection([])
+
+    def mock_get_collections():
+        return {'strategy_trade_history': trade_history}
+
+    monkeypatch.setattr('routers.strategy_pool.get_db_collections', mock_get_collections)
+
+    res = client.get('/api/strategy-pool/backtest-result?symbol=000001&strategy=hidden_dragon&end_date=2026-01-09')
+    assert res.status_code == 400
+    assert 'end_date' in res.json().get('detail', '')
+
+    client.app.dependency_overrides.clear()
+
+
+@pytest.mark.unit
+def test_get_strategy_pool_backtest_result_no_trade_history_returns_404(client, monkeypatch):
+    from auth import get_current_user
+
+    def mock_auth():
+        return {'id': 'user1', 'username': 'testuser'}
+
+    client.app.dependency_overrides[get_current_user] = mock_auth
+
+    trade_history = _TradeHistoryCollection([])
+
+    def mock_get_collections():
+        return {'strategy_trade_history': trade_history}
+
+    monkeypatch.setattr('routers.strategy_pool.get_db_collections', mock_get_collections)
+
+    res = client.get('/api/strategy-pool/backtest-result?symbol=000001&strategy=hidden_dragon&preset=dragon_default')
+    assert res.status_code == 404
+    assert 'No trade history' in (res.json().get('detail') or '')
+
+    client.app.dependency_overrides.clear()
+
+
+@pytest.mark.unit
+def test_get_strategy_pool_backtest_result_strategy_params_null_when_params_used_missing(client, monkeypatch):
+    from auth import get_current_user
+
+    def mock_auth():
+        return {'id': 'user1', 'username': 'testuser'}
+
+    client.app.dependency_overrides[get_current_user] = mock_auth
+
+    docs = [
+        {
+            'date': '20260109',
+            'strategy': 'hidden_dragon',
+            'preset': 'dragon_default',
+            'symbol': '000001.SZ',
+            'datetime': '2026-01-09 10:00:00',
+            'action': 'BUY',
+            'price': 10.0,
+            'quantity': 100,
+            'commission': 1.0,
+            'pnl': 0.0,
+            'cumulative_pnl': 0.0,
+            'hist_return': 0.0,
+            'hist_sharpe_ratio': 0.0,
+            'hist_max_drawdown': 0.0,
+            'hist_win_rate': 0.0,
+            'hist_total_trades': 0,
+        }
+    ]
+
+    trade_history = _TradeHistoryCollection(docs)
+
+    def mock_get_collections():
+        return {'strategy_trade_history': trade_history}
+
+    monkeypatch.setattr('routers.strategy_pool.get_db_collections', mock_get_collections)
+
+    res = client.get('/api/strategy-pool/backtest-result?symbol=000001&strategy=hidden_dragon&preset=dragon_default')
+    assert res.status_code == 200
+    body = res.json()
+    assert body['strategy_params'] is None
+
     client.app.dependency_overrides.clear()
 
 
