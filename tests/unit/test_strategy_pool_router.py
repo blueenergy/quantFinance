@@ -426,3 +426,73 @@ def test_get_preset_params_from_templates(client, monkeypatch):
     assert data['params']['entry_window'] == 55
 
     client.app.dependency_overrides.clear()
+
+
+@pytest.mark.unit
+def test_get_strategy_pool_backtest_result_includes_params_used(client, monkeypatch):
+    """Test /api/strategy-pool/backtest-result returns strategy_params from stored params_used."""
+    from auth import get_current_user
+
+    def mock_auth():
+        return {'id': 'user1', 'username': 'testuser'}
+
+    client.app.dependency_overrides[get_current_user] = mock_auth
+
+    # Provide ordered docs (Cursor.sort is a no-op in FakeCollection)
+    trade_docs = [
+        {
+            'date': '20260108',
+            'strategy': 'hidden_dragon',
+            'preset': 'dragon_aggressive',
+            'symbol': '000001.SZ',
+            'datetime': '2026-01-08 10:00:00',
+            'action': 'BUY',
+            'price': 10.0,
+            'quantity': 100,
+            'commission': 0.0,
+            'pnl': 0.0,
+            'cumulative_pnl': 0.0,
+            'hist_win_rate': 0.6,
+            'hist_total_trades': 10,
+            'hist_return': 0.12,
+            'hist_sharpe_ratio': 1.1,
+            'hist_max_drawdown': -0.08,
+        },
+        {
+            'date': '20260109',
+            'strategy': 'hidden_dragon',
+            'preset': 'dragon_aggressive',
+            'symbol': '000001.SZ',
+            'datetime': '2026-01-09 10:00:00',
+            'action': 'SELL',
+            'price': 11.0,
+            'quantity': 100,
+            'commission': 0.0,
+            'pnl': 100.0,
+            'cumulative_pnl': 100.0,
+            'hist_win_rate': 0.6,
+            'hist_total_trades': 10,
+            'hist_return': 0.12,
+            'hist_sharpe_ratio': 1.1,
+            'hist_max_drawdown': -0.08,
+            'params_used': {'limit_up_rate': 0.097, 'max_callback_days': 18},
+        },
+    ]
+
+    fake_trade = FakeCollection(trade_docs)
+
+    def mock_get_collections():
+        return {'strategy_trade_history': fake_trade}
+
+    monkeypatch.setattr('routers.strategy_pool.get_db_collections', mock_get_collections)
+
+    res = client.get('/api/strategy-pool/backtest-result?symbol=000001.SZ&strategy=hidden_dragon&preset=dragon_aggressive')
+    assert res.status_code == 200
+    data = res.json()
+    assert data['symbol'] == '000001.SZ'
+    assert data['strategy_key'] == 'hidden_dragon'
+    assert data['strategy_params'] == {'limit_up_rate': 0.097, 'max_callback_days': 18}
+    assert data['metrics']['total_return'] == 0.12
+    assert len(data['trades']) == 2
+
+    client.app.dependency_overrides.clear()

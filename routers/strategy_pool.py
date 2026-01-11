@@ -3,7 +3,7 @@ from typing import List, Dict, Any, Optional
 from db import get_db_collections
 from auth import get_current_user
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 
 router = APIRouter(prefix="/strategy-pool", tags=["strategy-pool"])
 
@@ -105,6 +105,21 @@ def _candidate_preset_names(strategy: str, preset: str) -> List[str]:
             unique.append(c)
             seen.add(c)
     return unique
+
+
+def _normalize_symbol(symbol: str) -> str:
+    s = (symbol or "").strip().upper()
+    if not s:
+        return s
+    if "." in s:
+        return s
+    if s.startswith("6"):
+        return s + ".SH"
+    if s.startswith("0") or s.startswith("3"):
+        return s + ".SZ"
+    if s.startswith("8") or s.startswith("4"):
+        return s + ".BJ"
+    return s
 
 @router.get("/dates")
 def get_available_dates(
@@ -328,5 +343,128 @@ def get_preset_params(
             "params": params,
             "found": True,
         }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/backtest-result")
+def get_strategy_pool_backtest_result(
+    symbol: str = Query(..., description="Stock symbol"),
+    strategy: str = Query(..., description="Strategy key"),
+    preset: Optional[str] = Query(None, description="Preset name"),
+    end_date: Optional[str] = Query(None, description="Optional end date (YYYYMMDD)"),
+    days_back: int = Query(360, ge=30, le=2000, description="Lookback days for the result window"),
+    initial_cash: float = Query(1_000_000.0, gt=0, description="Initial cash used to build equity curve"),
+    current_user: Dict = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """Instant backtest-like result for Strategy Stock Pool.
+
+    This endpoint does NOT create a new backtest task.
+    It reconstructs a result object from existing `strategy_trade_history` records
+    written by the screening worker.
+
+    Returns an object compatible with the frontend BacktestManager result viewer:
+    {task_id, user_id, symbol, strategy_key, strategy_params?, metrics, trades, equity_curve, created_at}
+    """
+    try:
+        collections = get_db_collections()
+        trade_coll = collections.get("strategy_trade_history")
+        if trade_coll is None:
+            raise HTTPException(status_code=404, detail="strategy_trade_history collection not found")
+
+        norm_symbol = _normalize_symbol(symbol)
+        if not norm_symbol:
+            raise HTTPException(status_code=400, detail="symbol is required")
+
+        if end_date and (not isinstance(end_date, str) or len(end_date) != 8 or not end_date.isdigit()):
+            raise HTTPException(status_code=400, detail="end_date must be YYYYMMDD")
+
+        query: Dict[str, Any] = {
+            "symbol": norm_symbol,
+            "strategy": strategy,
+        }
+        if preset:
+            query["preset"] = preset
+
+        # Optional date range filter (fast for Mongo if indexed)
+        if end_date:
+            try:
+                end_dt = datetime.strptime(end_date, "%Y%m%d")
+                start_dt = end_dt.replace()  # copy
+                # Calendar-based window; we only filter on YYYYMMDD string, so compute start_date string.
+                start_dt = end_dt - timedelta(days=days_back)
+                query["date"] = {"$gte": start_dt.strftime("%Y%m%d"), "$lte": end_date}
+            except Exception:
+                # If parsing fails, ignore range and rely on symbol+strategy+preset.
+                pass
+
+        # Pull trades sorted by datetime
+        cursor = trade_coll.find(query, {"_id": 0}).sort("datetime", 1)
+        docs = list(cursor)
+        if not docs:
+            raise HTTPException(status_code=404, detail="No trade history found for given symbol/strategy/preset")
+
+        # Metrics are duplicated on each trade doc by the worker; use the last doc.
+        last_doc = docs[-1]
+        params_used = last_doc.get("params_used")
+        strategy_params = params_used if isinstance(params_used, dict) and params_used else None
+        metrics = {
+            "total_return": float(last_doc.get("hist_return", 0) or 0),
+            "sharpe_ratio": float(last_doc.get("hist_sharpe_ratio", 0) or 0),
+            "max_drawdown": float(last_doc.get("hist_max_drawdown", 0) or 0),
+            "win_rate": float(last_doc.get("hist_win_rate", 0) or 0),
+            "total_trades": int(last_doc.get("hist_total_trades", 0) or 0),
+        }
+
+        trades: List[Dict[str, Any]] = []
+        equity_by_date: Dict[str, float] = {}
+
+        for d in docs:
+            dt_str = d.get("datetime")
+            raw_action = (d.get("action") or "")
+            action = raw_action.lower()
+            if action == "buy" or raw_action == "BUY":
+                norm_action = "buy"
+            elif action == "sell" or raw_action == "SELL":
+                norm_action = "sell"
+            else:
+                norm_action = action
+
+            price = d.get("price")
+            qty = d.get("quantity", 0)
+            pnl = float(d.get("pnl", 0) or 0)
+            cum = float(d.get("cumulative_pnl", 0) or 0)
+
+            trades.append({
+                "datetime": dt_str or "",
+                "action": norm_action,
+                "price": float(price) if price is not None else 0.0,
+                "quantity": int(qty or 0),
+                "commission": float(d.get("commission", 0) or 0),
+                "pnl": pnl,
+                "cumulative_pnl": cum,
+            })
+
+            # Build a step equity curve by trade date (use last trade of each day)
+            date_part = d.get("date")
+            if isinstance(date_part, str) and len(date_part) == 8 and date_part.isdigit():
+                equity_by_date[date_part] = float(initial_cash) + cum
+
+        equity_curve = [{"date": k, "value": equity_by_date[k]} for k in sorted(equity_by_date.keys())]
+
+        task_id = f"pool_{strategy}_{preset or 'default'}_{norm_symbol}_{(end_date or '')}".replace(" ", "")
+        return {
+            "task_id": task_id,
+            "user_id": str(current_user.get("id", "")),
+            "symbol": norm_symbol,
+            "strategy_key": strategy,
+            "strategy_params": strategy_params,
+            "metrics": metrics,
+            "trades": trades,
+            "equity_curve": equity_curve,
+            "created_at": datetime.utcnow().isoformat(),
+        }
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
