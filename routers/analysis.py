@@ -5,6 +5,7 @@ from models.all_models import StockAnalysisRequest, AnalysisHistoryRequest
 from auth import get_current_active_user
 from db import get_db_collections
 from llm_service import llm_manager
+from services.prompt_provider import mongo_prompt_provider
 from datetime import datetime
 from utils.stock_utils import serialize_doc, format_trade_date
 from bson import ObjectId
@@ -79,13 +80,21 @@ async def analyze_stock(request: StockAnalysisRequest, current_user: dict = Depe
             )
         
         # 获取LLM服务，优先使用用户特定的API密钥和基础URL
+        # Wire prompt provider once
+        llm_manager.set_prompt_provider(mongo_prompt_provider)
+
         llm_service = llm_manager.get_service(
             provider=provider,
             model=model,
             api_key=user_llm_api_key,
             base_url=user_llm_base_url
         )
-        analysis_result = await llm_service.analyze_stock(symbol, stock_data)
+        analysis_result = await llm_service.analyze_stock(
+            symbol,
+            stock_data,
+            user_id=current_user.get("id"),
+            prompt_override=prompt,
+        )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"AI分析失败: {str(e)}")
 

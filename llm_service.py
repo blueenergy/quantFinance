@@ -6,15 +6,27 @@ Supports OpenAI, DeepSeek, etc. external LLM API services compatible with OpenAI
 import os
 import json
 import httpx
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Callable, Awaitable, Tuple
 from dotenv import load_dotenv
 
 # Load environment variables
 load_dotenv()
 
 
+class PromptProvider:
+    """Abstraction for user-specific prompts stored in DB or other backend."""
+
+    async def get_prompt(self, user_id: str, prompt_type: str) -> Optional[str]:
+        """Return a prompt string for given user and type, or None if not found."""
+        raise NotImplementedError
+
+    async def delete_prompt(self, user_id: str, prompt_type: str) -> None:
+        """Delete prompt for given user and type (used to reset to defaults)."""
+        raise NotImplementedError
+
+
 class LLMService:
-    def __init__(self, provider: str = None, model: str = None, api_key: str = None, base_url: str = None):
+    def __init__(self, provider: str = None, model: str = None, api_key: str = None, base_url: str = None, prompt_provider: Optional[PromptProvider] = None):
         """
         Initialize LLM service
         
@@ -36,6 +48,7 @@ class LLMService:
         self.model = model
         self.api_key_override = api_key
         self.base_url_override = base_url
+        self.prompt_provider = prompt_provider
         
         # Set up API configuration based on provider
         self._setup_api_config()
@@ -59,21 +72,35 @@ class LLMService:
             else:
                 raise ValueError(f"不支持的 provider: {self.provider}")
     
-    async def analyze_stock(self, stock_code: str, stock_data: Dict[str, Any]) -> Dict[str, Any]:
+    async def analyze_stock(self, stock_code: str, stock_data: Dict[str, Any], user_id: Optional[str] = None, prompt_override: Optional[str] = None) -> Dict[str, Any]:
         """
         Analyze stock data
         
         Args:
             stock_code: Stock code
             stock_data: Stock data
+            user_id: Optional user identifier to load a user-specific prompt
+            prompt_override: Directly provide a custom prompt string (highest priority)
             
         Returns:
             Analysis result
         """
         print(f"[股票分析] 开始分析股票: {stock_code}")
         
-        # Build analysis prompt
-        prompt = self._build_stock_analysis_prompt(stock_code, stock_data)
+        # Build analysis prompt (priority: explicit override > user DB prompt > default)
+        prompt, is_custom_prompt = await self._get_prompt(
+            prompt_type="stock_analysis",
+            user_id=user_id,
+            prompt_override=prompt_override,
+            default_builder=lambda: self._build_stock_analysis_prompt(stock_code, stock_data),
+        )
+        # 当用户提供自定义提示词或请求显式覆盖时，自动附带结构化股票数据，避免提示词遗漏数据上下文
+        if is_custom_prompt:
+            prompt = (
+                f"{prompt}\n\n"
+                f"[股票数据]\n"
+                f"{json.dumps(stock_data, ensure_ascii=False, indent=2)}"
+            )
         print(f"[股票分析] 提示词构建完成，长度: {len(prompt)} 字符")
         
         try:
@@ -339,6 +366,33 @@ class LLMService:
 """
         print(prompt)
         return prompt
+
+    async def _get_prompt(
+        self,
+        prompt_type: str,
+        user_id: Optional[str],
+        prompt_override: Optional[str],
+        default_builder: Callable[[], str],
+    ) -> Tuple[str, bool]:
+        """Resolve prompt with priority: override > prompt provider > default builder.
+
+        Returns:
+            (prompt_text, is_custom)
+            is_custom=True 表示来自显式 override 或用户自定义提示词，便于后续附带原始数据上下文。
+        """
+        if prompt_override:
+            return prompt_override, True
+
+        if self.prompt_provider and user_id:
+            try:
+                content = await self.prompt_provider.get_prompt(user_id, prompt_type)
+                if content:
+                    print(f"[提示词] 使用用户自定义提示词 (user={user_id}, type={prompt_type})")
+                    return content, True
+            except Exception as e:
+                print(f"[提示词] 读取用户提示词失败 (user={user_id}, type={prompt_type}): {e}")
+
+        return default_builder(), False
     
     async def _call_llm_api(self, prompt: str) -> str:
         """Call LLM API"""
@@ -431,18 +485,19 @@ class LLMServiceManager:
     
     def __init__(self):
         self.services = {}
+        self.prompt_provider: Optional[PromptProvider] = None
+    
+    def set_prompt_provider(self, provider: PromptProvider):
+        self.prompt_provider = provider
     
     def get_service(self, provider: str = None, model: str = None, api_key: str = None, base_url: str = None) -> LLMService:
         """Get or create LLM service instance"""
-        # Create service instance with user-specific configuration
-        # If API key or base URL is provided, create a temporary service instance
         if api_key or base_url:
-            return LLMService(provider, model, api_key, base_url)
+            return LLMService(provider, model, api_key, base_url, prompt_provider=self.prompt_provider)
         else:
-            # Use cached service instance (based on provider and model)
             key = f"{provider}_{model}"
             if key not in self.services:
-                self.services[key] = LLMService(provider, model)
+                self.services[key] = LLMService(provider, model, prompt_provider=self.prompt_provider)
             return self.services[key]
     
     def list_available_providers(self) -> List[str]:

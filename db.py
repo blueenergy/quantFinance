@@ -61,6 +61,7 @@ def get_db_collections() -> Dict[str, Collection]:
         # Strategy selection results
         "strategy_stock_pool": db["strategy_stock_pool"],  # 策略选股池结果
         "strategy_trade_history": db["strategy_trade_history"],  # 策略选股池结果"
+        "prompts": db["prompts"],  # 用户自定义提示词
         # Add more collections as needed
     }
 
