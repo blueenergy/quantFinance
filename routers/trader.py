@@ -423,8 +423,7 @@ def get_positions(
         cursor = positions_coll.find(query)
         positions = [serialize_doc(doc) for doc in cursor]
         
-        # Enrich positions with stock names
-        # Since symbols now include exchange suffixes, we can do a direct lookup
+        # Transform field names to match frontend expectations and enrich with stock names
         if positions:
             # Extract unique symbols from positions
             symbols = list(set(pos.get("symbol") for pos in positions if pos.get("symbol")))
@@ -438,11 +437,33 @@ def get_positions(
             # Create symbol to name mapping
             symbol_to_name = {doc["symbol"]: doc.get("name", "") for doc in stock_info_docs}
             
-            # Add stock names to positions
+            # Transform field names to match frontend expectations and add stock names
+            transformed_positions = []
             for pos in positions:
-                symbol = pos.get("symbol")
-                if symbol:
-                    pos["stock_name"] = symbol_to_name.get(symbol, "")
+                transformed_pos = {
+                    "symbol": pos.get("symbol", ""),
+                    "stock_name": symbol_to_name.get(pos.get("symbol"), ""),
+                    "quantity": pos.get("qty", 0),  # Map 'qty' to 'quantity'
+                    "available_qty": pos.get("can_use_volume", 0),  # Map 'can_use_volume' to 'available_qty'
+                    "frozen_qty": pos.get("frozen_volume", 0),  # Map 'frozen_volume' to 'frozen_qty'
+                    "cost_price": pos.get("avg_price", 0.0),  # Map 'avg_price' to 'cost_price'
+                    "current_price": pos.get("last_price", 0.0),  # Map 'last_price' to 'current_price'
+                    "market_value": pos.get("market_value", 0.0),
+                    "on_road_volume": pos.get("on_road_volume", 0),
+                    "timestamp": pos.get("timestamp"),
+                    "updated_at": pos.get("updated_at"),
+                    "account_id": pos.get("account_id"),
+                    "broker": pos.get("broker"),
+                    "securities_account_id": pos.get("securities_account_id"),
+                    "user_id": pos.get("user_id"),
+                    "synced_at": pos.get("synced_at"),
+                    # Calculate profit/loss fields
+                    "unrealized_pnl": pos.get("unrealized_pnl") if pos.get("unrealized_pnl") is not None else (pos.get("market_value", 0) - (pos.get("avg_price", 0) * pos.get("qty", 0))),
+                    "unrealized_pnl_pct": pos.get("unrealized_pnl_pct") if pos.get("unrealized_pnl_pct") is not None else ((pos.get("market_value", 0) - (pos.get("avg_price", 0) * pos.get("qty", 0))) / (pos.get("avg_price", 0) * pos.get("qty", 0)) * 100 if (pos.get("avg_price", 0) * pos.get("qty", 0)) != 0 else 0)
+                }
+                transformed_positions.append(transformed_pos)
+            
+            positions = transformed_positions
         
         return {
             "success": True,
@@ -529,9 +550,27 @@ def get_account(
                 "data": None
             }
         
+        # Transform field names to match frontend expectations
+        transformed_account = {
+            "total_assets": account.get("total_asset", 0),  # Map 'total_asset' to 'total_assets'
+            "available_cash": account.get("available_cash", 0),
+            "market_value": account.get("market_value", 0),
+            "daily_pnl": account.get("pnl", 0),  # Map 'pnl' to 'daily_pnl'
+            "daily_pnl_ratio": account.get("pnl_ratio", 0),  # Map 'pnl_ratio' to 'daily_pnl_ratio'
+            "cash": account.get("cash", 0),
+            "frozen_cash": account.get("frozen_cash", 0),
+            "buying_power": account.get("buying_power", 0),
+            "account_type": account.get("account_type"),
+            "account_id": account.get("account_id"),
+            "broker": account.get("broker"),
+            "user_id": account.get("user_id"),
+            "securities_account_id": account.get("securities_account_id"),
+            "synced_at": account.get("synced_at")
+        }
+        
         return {
             "success": True,
-            "data": serialize_doc(account)
+            "data": transformed_account
         }
         
     except Exception as e:
