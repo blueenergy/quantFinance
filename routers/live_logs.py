@@ -56,71 +56,91 @@ class ConnectionManager:
 manager = ConnectionManager()
 
 
+async def listen_for_logs(websocket: WebSocket, symbol: str):
+    """
+    Listens for new log entries for a specific symbol using a MongoDB change stream
+    and sends them to the client via WebSocket.
+    """
+    collections = get_db_collections()
+    logs_coll = collections.get("strategy_execution_logs")
+    if not logs_coll:
+        logger.warning(f"Collection 'strategy_execution_logs' not found for symbol {symbol}")
+        return
+
+    # Define the pipeline to filter for inserts for the specific symbol
+    pipeline = [
+        {
+            '$match': {
+                'operationType': 'insert',
+                'fullDocument.symbol': symbol
+            }
+        }
+    ]
+
+    try:
+        # Use 'with' to ensure the change stream is properly closed
+        with logs_coll.watch(pipeline) as stream:
+            logger.info(f"Change stream opened for symbol: {symbol}")
+            for change in stream:
+                new_log = change['fullDocument']
+                # The client expects a specific format
+                await websocket.send_json({
+                    "type": "stream",
+                    "data": serialize_doc(new_log)
+                })
+    except asyncio.CancelledError:
+        logger.info(f"Change stream task cancelled for symbol: {symbol}")
+    except Exception as e:
+        logger.error(f"Error in change stream for {symbol}: {e}")
+    finally:
+        logger.info(f"Change stream closed for symbol: {symbol}")
+
+
 @router.websocket("/ws/strategy-logs/{symbol}")
 async def websocket_strategy_logs(websocket: WebSocket, symbol: str):
     """WebSocket endpoint for streaming live strategy execution logs.
     
-    Args:
-        symbol: Stock symbol to stream logs for (e.g., "300347.SZ")
-    
-    Message format sent to clients:
-    {
-        "symbol": "300347.SZ",
-        "strategy": "HiddenDragonLowSuction",
-        "call_count": 120,
-        "data_bars": 1250,
-        "latest_bar": "2026-01-06 14:00:00",
-        "price": 25.50,
-        "timestamp": 1704544800,
-        "mode": "live"
-    }
+    - Sends the last 50 logs as initial history.
+    - Uses a MongoDB change stream to push new logs in real-time.
     """
     await manager.connect(websocket, symbol)
-    
+    listener_task = None
     try:
-        # Send initial message with current state
+        # 1. Send initial history
         collections = get_db_collections()
         logs_coll = collections.get("strategy_execution_logs")
-        
         if logs_coll:
-            latest_log = logs_coll.find_one({"symbol": symbol}, sort=[("timestamp", -1)])
-            if latest_log:
-                latest_log = serialize_doc(latest_log)
-                await websocket.send_json({
-                    "type": "init",
-                    "symbol": symbol,
-                    "data": latest_log
-                })
-        
-        # Keep connection alive and poll for updates
-        while True:
-            # Sleep briefly to avoid busy loop
-            await asyncio.sleep(0.5)
+            # Fetch the last 50 logs, sorted from oldest to newest for correct display order
+            history_cursor = logs_coll.find(
+                {'symbol': symbol},
+                {'_id': 0}
+            ).sort('timestamp', -1).limit(50)
             
-            # Query latest log entry
-            if logs_coll:
-                latest_log = logs_coll.find_one(
-                    {"symbol": symbol},
-                    sort=[("timestamp", -1)]
-                )
-                
-                if latest_log:
-                    latest_log = serialize_doc(latest_log)
-                    # Send update to this connection
-                    try:
-                        await websocket.send_json({
-                            "type": "update",
-                            "symbol": symbol,
-                            "data": latest_log
-                        })
-                    except RuntimeError:
-                        # Connection closed
-                        break
-    
+            history = list(history_cursor)
+            history.reverse() # Reverse to send oldest first
+            
+            await websocket.send_json({
+                "type": "history",
+                "data": [serialize_doc(log) for log in history]
+            })
+            logger.info(f"Sent {len(history)} historical logs to client for {symbol}")
+
+        # 2. Start a background task to listen for new logs
+        listener_task = asyncio.create_task(listen_for_logs(websocket, symbol))
+
+        # 3. Keep the connection alive, the listener_task will handle sending data
+        while True:
+            # This loop can be used to handle incoming messages from the client if needed
+            # Or just to keep the connection open.
+            await asyncio.sleep(60) # Sleep to prevent a busy loop
+
     except WebSocketDisconnect:
-        manager.disconnect(websocket, symbol)
+        logger.info(f"Client for {symbol} disconnected.")
     except Exception as e:
         logger.error(f"WebSocket error for {symbol}: {e}")
+    finally:
+        if listener_task:
+            listener_task.cancel()
         manager.disconnect(websocket, symbol)
 
 
