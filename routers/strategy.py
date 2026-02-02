@@ -152,6 +152,7 @@ def get_config(symbol: str) -> Dict[str, Any]:
 
 @router.post("/configs/{symbol}")
 def update_config(symbol: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+	"""更新策略配置，自动设置 engine="vnpy" """
 	collections = get_db_collections()
 	col = collections["watch_configs"] if "watch_configs" in collections else collections["watchlist_strategies"]
 	update_doc = {
@@ -161,6 +162,7 @@ def update_config(symbol: str, payload: Dict[str, Any]) -> Dict[str, Any]:
 		"params": payload.get("params", {}),
 		"refresh_interval_sec": float(payload.get("refresh_interval_sec", 0.5)),
 		"updated_at": time.time(),
+		"engine": "vnpy",  # 🔥 自动设置 engine 为 vnpy（实盘策略仅支持 vnpy）
 	}
 	col.update_one({"symbol": symbol}, {"$set": update_doc}, upsert=True)
 	return {"ok": True}
@@ -176,10 +178,12 @@ def list_configs() -> List[Dict[str, Any]]:
 
 @router.post("/configs")
 def upsert_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
+	"""批量更新策略配置，自动设置 engine="vnpy" """
 	collections = get_db_collections()
 	col = collections["watch_configs"] if "watch_configs" in collections else collections["watchlist_strategies"]
 	payload = dict(cfg)
 	payload["updated_at"] = time.time()
+	payload["engine"] = "vnpy"  # 🔥 自动设置 engine 为 vnpy（实盘策略仅支持 vnpy）
 	col.update_one({"symbol": payload["symbol"], "user_id": payload.get("user_id", "")}, {"$set": payload}, upsert=True)
 	return {"ok": True, "symbol": payload["symbol"]}
 

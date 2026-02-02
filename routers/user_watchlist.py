@@ -104,6 +104,8 @@ def set_watchlist_strategy(req: WatchlistStrategySetRequest, current_user: dict 
     
     CRITICAL: Query must include strategy_key to ensure precise match
     This prevents updating wrong strategy when user has multiple strategies for same symbol
+    
+    NOTE: 自动设置 engine="vnpy"，因为实盘策略目前只支持 vnpy 引擎
     """
     collections = get_db_collections()
     watchlist_col = collections["user_watchlists"]
@@ -132,9 +134,18 @@ def set_watchlist_strategy(req: WatchlistStrategySetRequest, current_user: dict 
     import time
     enabled = getattr(req, "enabled", True)
     
+    # 构建更新文档，自动添加 engine 字段
+    update_doc = {
+        "strategy_key": req.strategy,
+        "params": req.params,
+        "updated_at": time.time(),
+        "enabled": enabled,
+        "engine": "vnpy",  # 🔥 自动设置 engine 为 vnpy（实盘策略仅支持 vnpy）
+    }
+    
     strat_col.update_one(
         {"user_id": user_id, "symbol": req.symbol, "strategy_key": req.strategy},
-        {"$set": {"params": req.params, "updated_at": time.time(), "enabled": enabled}},
+        {"$set": update_doc},
         upsert=True
     )
     return {"success": True}
