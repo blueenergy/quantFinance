@@ -77,7 +77,8 @@ def login(user_data: UserLogin, request: Request):
     
     access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     access_token = create_access_token(
-        data={"sub": user["username"]}, expires_delta=access_token_expires
+        data={"sub": user["username"], "user_id": user["id"]}, 
+        expires_delta=access_token_expires
     )
     
     # 准备用户响应数据
