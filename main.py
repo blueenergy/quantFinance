@@ -26,7 +26,6 @@ from routers.analysis_details import router as analysis_details_router
 from routers.trading_manual import router as trading_manual_router
 from routers.backtest import router as backtest_router
 from routers.permissions import router as permissions_router
-from routers.live_logs import router as live_logs_router
 from routers.strategy_pool import router as strategy_pool_router
 from routers.strategy_workers import router as strategy_workers_router
 from production_config import configure_production_app
@@ -60,6 +59,5 @@ app.include_router(analysis_details_router, prefix="/api", tags=["分析详情"]
 app.include_router(trading_manual_router, prefix="/api", tags=["手动交易"])
 app.include_router(backtest_router, prefix="/api", tags=["回测"])
 app.include_router(permissions_router, prefix="/api", tags=["权限管理"])
-app.include_router(live_logs_router, prefix="/api", tags=["实时日志"])
 app.include_router(strategy_pool_router, prefix="/api", tags=["策略股池"])
 app.include_router(strategy_workers_router, prefix="/api/strategy", tags=["策略Worker"])
