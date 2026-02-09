@@ -16,6 +16,95 @@ celery_app.conf.update(
 )
 
 
+def fetch_ladder_data_for_analysis(target_date: str = None) -> dict:
+    """
+    获取连板天梯数据用于 LLM 市场分析。
+    
+    Returns:
+        dict: 包含情绪得分、梯队分布、主线板块等信息
+    """
+    from db import get_db_collections
+    from datetime import datetime
+    
+    collections = get_db_collections()
+    ladder_col = collections["limit_up_ladder"]
+    daily_col = collections["daily_limit_up"]
+    
+    if not target_date:
+        target_date = datetime.now().strftime("%Y%m%d")
+    
+    # 获取天梯聚合数据
+    ladder = ladder_col.find_one({"date": target_date})
+    
+    # 如果今天没数据，尝试获取最近的
+    if not ladder:
+        ladder = ladder_col.find_one(
+            {"date": {"$lte": target_date}},
+            sort=[("date", -1)]
+        )
+    
+    if not ladder:
+        return None
+    
+    actual_date = ladder.get("date", target_date)
+    indicators = ladder.get("indicators", {})
+    
+    # 计算梯队分布
+    tier_distribution = {}
+    total_limit_up = 0
+    max_streak = 0
+    
+    for tier_key, tier_data in ladder.get("tiers", {}).items():
+        count = tier_data.get("count", 0)
+        tier_distribution[tier_key] = count
+        total_limit_up += count
+    
+    # 获取最高连板
+    highest_stock = daily_col.find_one(
+        {"date": actual_date},
+        sort=[("streak", -1)]
+    )
+    if highest_stock:
+        max_streak = highest_stock.get("streak", 0)
+    
+    # 获取主线板块 (取涨停数最多的前3个板块)
+    sector_ranking = ladder.get("sector_ranking", [])
+    mainlines = [s.get("sector", "") for s in sector_ranking[:3] if s.get("sector")]
+    
+    # 计算晋级率 (2板以上 / 总涨停)
+    high_tier_count = sum(tier_distribution.get(k, 0) for k in ["2", "3", "4+"])
+    promotion_rate = high_tier_count / total_limit_up if total_limit_up > 0 else 0
+    
+    # 情绪等级
+    sentiment_score = indicators.get("sentiment_score", 50)
+    if sentiment_score >= 80:
+        sentiment_level = "极度乐观"
+    elif sentiment_score >= 60:
+        sentiment_level = "谨慎乐观"
+    elif sentiment_score >= 40:
+        sentiment_level = "中性观望"
+    elif sentiment_score >= 20:
+        sentiment_level = "谨慎悲观"
+    else:
+        sentiment_level = "极度悲观"
+    
+    return {
+        "date": actual_date,
+        "sentiment_score": sentiment_score,
+        "sentiment_level": sentiment_level,
+        "total_limit_up": total_limit_up,
+        "max_streak": max_streak,
+        "high_tier_count": high_tier_count,
+        "promotion_rate": round(promotion_rate, 3),
+        "mainlines": mainlines,
+        "tier_distribution": tier_distribution,
+        "highest_stock": {
+            "name": highest_stock.get("name", "") if highest_stock else "",
+            "streak": max_streak
+        } if highest_stock else None
+    }
+
+
 # Celery Beat schedule configuration
 celery_app.conf.beat_schedule = {
     # Check worker timeouts every minute
@@ -306,6 +395,15 @@ def generate_market_analysis_task():
             log.warning("[市场分析定时任务] 市场数据未包含分析日期，跳过本次分析")
             return {"success": False, "reason": "no_analysis_date"}
         
+        # 新增: 获取连板天梯数据
+        ladder_data = fetch_ladder_data_for_analysis(analysis_date)
+        if ladder_data:
+            market_bundle["ladder_data"] = ladder_data
+            log.info(f"[市场分析定时任务] 获取连板天梯数据: 情绪={ladder_data.get('sentiment_score')}, "
+                     f"涨停={ladder_data.get('total_limit_up')}, 主线={ladder_data.get('mainlines')}")
+        else:
+            log.warning("[市场分析定时任务] 未获取到连板天梯数据，将使用基础市场分析")
+        
         collections = get_db_collections()
         users_coll = collections["users"]
         
@@ -375,6 +473,9 @@ def generate_market_analysis_task():
             "outlook": analysis.get("outlook", "请关注市场动态"),
             "riskLevel": analysis.get("riskLevel", "medium"),
             "riskNote": analysis.get("riskNote", "注意投资风险"),
+            # 新增: 连板天梯相关分析字段
+            "ladderInsight": analysis.get("ladderInsight", ""),
+            "mainlineAnalysis": analysis.get("mainlineAnalysis", ""),
             "analysis_type": "market_overview",
             "provider": analysis_result.get("provider"),
             "model": analysis_result.get("model"),
