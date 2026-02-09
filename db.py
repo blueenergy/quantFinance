@@ -61,6 +61,10 @@ def get_db_collections() -> Dict[str, Collection]:
         # Strategy selection results
         "strategy_stock_pool": db["strategy_stock_pool"],  # 策略选股池结果
         "strategy_trade_history": db["strategy_trade_history"],  # 策略选股池结果"
+        # Limit-up ladder system (连板天梯)
+        "daily_limit_up": db["daily_limit_up"],  # 每日涨停股票
+        "limit_up_ladder": db["limit_up_ladder"],  # 连板天梯聚合数据
+        "sector_flow": db["sector_flow"],  # 板块资金流向
         # Add more collections as needed
     }
 
