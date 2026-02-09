@@ -166,7 +166,10 @@ class LLMService:
         else:
             # Old format: directly contains index data
             data = {k: v for k, v in market_data.items() 
-                   if k not in ["analysis_date", "data_source"] and isinstance(v, dict)}
+                   if k not in ["analysis_date", "data_source", "ladder_data"] and isinstance(v, dict)}
+        
+        # 获取连板天梯数据（如果有）
+        ladder_data = market_data.get("ladder_data")
         
         # Add current time information
         from datetime import datetime
@@ -217,14 +220,53 @@ class LLMService:
             
             prompt_parts.append("")
         
+        # 新增: 连板天梯数据部分
+        if ladder_data:
+            prompt_parts.append("## 连板天梯数据\n")
+            prompt_parts.append(f"- 情绪得分: {ladder_data.get('sentiment_score', 'N/A')} ({ladder_data.get('sentiment_level', '')})")
+            prompt_parts.append(f"- 涨停家数: {ladder_data.get('total_limit_up', 'N/A')}只")
+            prompt_parts.append(f"- 最高连板: {ladder_data.get('max_streak', 'N/A')}板")
+            
+            # 最高连板股票
+            highest = ladder_data.get('highest_stock')
+            if highest and highest.get('name'):
+                prompt_parts.append(f"  (龙头: {highest.get('name')} {highest.get('streak')}连板)")
+            
+            # 梯队分布
+            tier_dist = ladder_data.get('tier_distribution', {})
+            if tier_dist:
+                dist_str = ', '.join([f"{k}板: {v}只" for k, v in sorted(tier_dist.items(), key=lambda x: x[0], reverse=True)])
+                prompt_parts.append(f"- 梯队分布: {dist_str}")
+            
+            # 晋级率
+            promotion_rate = ladder_data.get('promotion_rate', 0)
+            prompt_parts.append(f"- 晋级率: {promotion_rate*100:.1f}% (首板→二板及以上)")
+            
+            # 主线板块
+            mainlines = ladder_data.get('mainlines', [])
+            if mainlines:
+                prompt_parts.append(f"- 主线板块: {', '.join(mainlines)}")
+            
+            prompt_parts.append("")
+        
         prompt_parts.extend([
             f"请基于{analysis_date}的市场数据，从以下几个维度进行分析:",
             "1. 市场整体走势分析",
             "2. 各板块表现对比", 
             "3. 成交量变化分析",
-            "4. 市场情绪判断",
+            "4. 市场情绪判断（结合连板天梯情绪得分）" if ladder_data else "4. 市场情绪判断",
             "5. 短期市场展望（1-3个交易日）",
             "6. 风险提示与投资建议",
+        ])
+        
+        # 如果有天梯数据，增加额外分析维度
+        if ladder_data:
+            prompt_parts.extend([
+                "7. 连板天梯分析（龙头股演绎、板块轮动特征）",
+                "8. 主线板块追踪（今日主线延续性判断）",
+            ])
+        
+        prompt_parts.extend([
             "",
             "请以JSON格式返回分析结果，包含以下字段:",
             "{",
@@ -233,13 +275,23 @@ class LLMService:
             '  "keyPoints": ["关键要点1", "关键要点2", "关键要点3"],',
             '  "outlook": "市场展望(100-150字)",',
             '  "riskLevel": "风险等级(low/medium/high)",',
-            '  "riskNote": "风险提示(50-100字)"',
+            '  "riskNote": "风险提示(50-100字)",',
+        ])
+        
+        if ladder_data:
+            prompt_parts.extend([
+                '  "ladderInsight": "连板天梯分析(50-100字，分析龙头演绎和情绪周期)",',
+                '  "mainlineAnalysis": "主线板块分析(50-100字，分析板块轮动和资金动向)"',
+            ])
+        
+        prompt_parts.extend([
             "}",
             "",
             f"请确保分析客观专业，明确基于{analysis_date}的市场表现。"
         ])
         
         return "\n".join(prompt_parts)
+
     
     def _parse_market_analysis_result(self, response_text: str) -> Dict[str, Any]:
         """Parse market analysis result"""
@@ -423,6 +475,177 @@ class LLMService:
                 "resistance_level": 0,
                 "confidence_score": 50,
                 "key_points": ["分析结果格式异常"]
+            }
+
+    async def analyze_portfolio_opportunities(
+        self, 
+        watchlist: List[Dict[str, Any]], 
+        positions: List[Dict[str, Any]], 
+        ladder_data: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """
+        分析自选股和持仓的投资机会
+        
+        Args:
+            watchlist: 自选股列表，每项包含 symbol, name, industry, change_pct 等
+            positions: 持仓列表，每项包含 symbol, name, industry, cost_price, current_price 等
+            ladder_data: 当日连板天梯数据
+            
+        Returns:
+            包含补涨机会和高抛低吸建议的分析结果
+        """
+        print(f"[组合机会分析] 开始分析 - 自选股: {len(watchlist)}只, 持仓: {len(positions)}只")
+        
+        # Build analysis prompt
+        prompt = self._build_portfolio_analysis_prompt(watchlist, positions, ladder_data)
+        print(f"[组合机会分析] 提示词构建完成，长度: {len(prompt)} 字符")
+        
+        try:
+            # Call LLM API
+            response = await self._call_llm_api(prompt)
+            
+            # Parse response
+            analysis_result = self._parse_portfolio_analysis_result(response)
+            
+            print(f"[组合机会分析] 分析完成")
+            
+            return {
+                "success": True,
+                "analysis": analysis_result,
+                "provider": self.provider,
+                "model": self.model,
+                "raw_response": response[:500] + "..." if len(response) > 500 else response
+            }
+        except Exception as e:
+            error_msg = str(e) if str(e) else f"Unknown error: {type(e).__name__}"
+            print(f"组合机会分析失败, 错误: {error_msg}")
+            return {
+                "success": False,
+                "error": error_msg,
+                "error_type": type(e).__name__,
+                "provider": self.provider,
+                "model": self.model
+            }
+    
+    def _build_portfolio_analysis_prompt(
+        self, 
+        watchlist: List[Dict[str, Any]], 
+        positions: List[Dict[str, Any]], 
+        ladder_data: Dict[str, Any]
+    ) -> str:
+        """构建组合机会分析提示词"""
+        from datetime import datetime
+        current_date = datetime.now().strftime('%Y年%m月%d日')
+        
+        prompt_parts = [
+            f"当前时间：{current_date}\n",
+            "你是一位资深的短线策略分析师，请基于今日连板天梯数据，分析用户的自选股和持仓。\n",
+        ]
+        
+        # 连板天梯数据部分
+        if ladder_data:
+            prompt_parts.append("## 今日连板天梯\n")
+            prompt_parts.append(f"- 情绪得分: {ladder_data.get('sentiment_score', 'N/A')} ({ladder_data.get('sentiment_level', '')})")
+            
+            mainlines = ladder_data.get('mainlines', [])
+            if mainlines:
+                prompt_parts.append(f"- 主线板块: {', '.join(mainlines)}")
+            
+            prompt_parts.append(f"- 最高连板: {ladder_data.get('max_streak', 'N/A')}板")
+            
+            highest = ladder_data.get('highest_stock')
+            if highest and highest.get('name'):
+                prompt_parts.append(f"  (龙头: {highest.get('name')} {highest.get('streak')}连板)")
+            
+            prompt_parts.append(f"- 晋级率: {ladder_data.get('promotion_rate', 0)*100:.1f}%")
+            prompt_parts.append("")
+        
+        # 自选股部分
+        if watchlist:
+            prompt_parts.append("## 用户自选股\n")
+            prompt_parts.append("| 代码 | 名称 | 行业 | 今日涨幅 |")
+            prompt_parts.append("|------|------|------|----------|")
+            for stock in watchlist[:20]:  # 限制最多20只
+                symbol = stock.get('symbol', '')
+                name = stock.get('name', '')
+                industry = stock.get('industry', '未知')
+                change = stock.get('change_pct', 0)
+                prompt_parts.append(f"| {symbol} | {name} | {industry} | {change:+.2f}% |")
+            prompt_parts.append("")
+        
+        # 持仓部分
+        if positions:
+            prompt_parts.append("## 用户持仓\n")
+            prompt_parts.append("| 代码 | 名称 | 行业 | 成本价 | 现价 | 盈亏% |")
+            prompt_parts.append("|------|------|------|--------|------|-------|")
+            for pos in positions[:20]:  # 限制最多20只
+                symbol = pos.get('symbol', '')
+                name = pos.get('stock_name', pos.get('name', ''))
+                industry = pos.get('industry', '未知')
+                cost = pos.get('cost_price', 0)
+                current = pos.get('current_price', 0)
+                pnl_pct = pos.get('unrealized_pnl_pct', 0)
+                prompt_parts.append(f"| {symbol} | {name} | {industry} | {cost:.2f} | {current:.2f} | {pnl_pct:+.2f}% |")
+            prompt_parts.append("")
+        
+        prompt_parts.extend([
+            "请分析：",
+            "1. **补涨机会**: 自选股/持仓中哪些与今日主线板块关联（通过行业语义匹配），是否存在补涨空间",
+            "2. **高抛低吸**: 持仓股票中是否有适合高抛或低吸的机会（基于涨幅、盈亏、技术位置）",
+            "",
+            "请以JSON格式返回分析结果:",
+            "{",
+            '  "catchup_opportunities": [',
+            '    {',
+            '      "symbol": "股票代码",',
+            '      "name": "股票名称",',
+            '      "industry": "所属行业",',
+            '      "related_mainline": "关联的主线板块",',
+            '      "catchup_score": 0-100的补涨评分,',
+            '      "analysis": "分析理由(30-50字)",',
+            '      "risk": "风险提示(20-30字)"',
+            '    }',
+            '  ],',
+            '  "swing_trading": [',
+            '    {',
+            '      "symbol": "股票代码",',
+            '      "name": "股票名称",',
+            '      "action": "高抛/低吸/持有观望",',
+            '      "reason": "建议理由(30-50字)",',
+            '      "target_price": 目标价位(可选),',
+            '      "stop_loss": 止损价位(可选)',
+            '    }',
+            '  ],',
+            '  "summary": "整体分析总结(50-100字)"',
+            "}",
+            "",
+            "注意：",
+            "- 行业与板块的关联需要语义判断，如'通信设备'可能关联'算力'板块",
+            "- 补涨评分越高表示机会越大",
+            "- 如果没有明显机会，相应数组可以为空"
+        ])
+        
+        return "\n".join(prompt_parts)
+    
+    def _parse_portfolio_analysis_result(self, response_text: str) -> Dict[str, Any]:
+        """解析组合机会分析结果"""
+        try:
+            result = json.loads(response_text)
+            return result
+        except json.JSONDecodeError:
+            import re
+            json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
+            if json_match:
+                try:
+                    result = json.loads(json_match.group())
+                    return result
+                except json.JSONDecodeError:
+                    pass
+            
+            return {
+                "catchup_opportunities": [],
+                "swing_trading": [],
+                "summary": "分析结果解析失败，请稍后重试"
             }
 
 
