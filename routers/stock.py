@@ -34,10 +34,11 @@ def search_stocks(q: str):
         # 对于数字查询，查找以该数字开头的股票代码
         query = {"symbol": {"$regex": f"^{q}", "$options": "i"}}
     else:
-        # 对于非数字查询，匹配股票代码或名称
+        # 对于非数字查询，匹配股票代码、名称或拼音
         query = {"$or": [
             {"symbol": {"$regex": q, "$options": "i"}},
-            {"name": {"$regex": q, "$options": "i"}}
+            {"name": {"$regex": q, "$options": "i"}},
+            {"pinyin": {"$regex": q, "$options": "i"}}
         ]}
     
     stocks = list(stock_col.find(query).limit(20))  # 限制返回数量
