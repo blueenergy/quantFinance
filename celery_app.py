@@ -32,6 +32,9 @@ def fetch_ladder_data_for_analysis(target_date: str = None) -> dict:
     
     if not target_date:
         target_date = datetime.now().strftime("%Y%m%d")
+    else:
+        # 统一日期格式为 YYYYMMDD (去除连字符)
+        target_date = target_date.replace("-", "")
     
     # 获取天梯聚合数据
     ladder = ladder_col.find_one({"date": target_date})
