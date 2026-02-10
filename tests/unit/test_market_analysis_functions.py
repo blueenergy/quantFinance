@@ -203,8 +203,18 @@ class TestGenerateMarketAnalysisTask:
         fake_users_coll = MagicMock()
         fake_users_coll.find_one.return_value = None  # No admin user
         
+        # Mock ladder data with return values
+        fake_ladder_coll = MagicMock()
+        fake_ladder_coll.find_one.return_value = {"sentiment_score": 85, "sentiment_mood": "乐观"}
+        fake_daily_coll = MagicMock()
+        fake_daily_coll.find_one.return_value = {"limit_up_count": 50}
+
         def fake_get_collections():
-            return {'users': fake_users_coll}
+            return {
+                'users': fake_users_coll,
+                'limit_up_ladder': fake_ladder_coll,
+                'daily_limit_up': fake_daily_coll
+            }
         
         import db
         monkeypatch.setattr(db, 'get_db_collections', fake_get_collections)
@@ -235,8 +245,18 @@ class TestGenerateMarketAnalysisTask:
             'active_llm_config_id': None
         }
         
+        # Mock ladder data with return values
+        fake_ladder_coll = MagicMock()
+        fake_ladder_coll.find_one.return_value = {"sentiment_score": 85, "sentiment_mood": "乐观"}
+        fake_daily_coll = MagicMock()
+        fake_daily_coll.find_one.return_value = {"limit_up_count": 50}
+
         def fake_get_collections():
-            return {'users': fake_users_coll}
+            return {
+                'users': fake_users_coll,
+                'limit_up_ladder': fake_ladder_coll,
+                'daily_limit_up': fake_daily_coll
+            }
         
         import db
         monkeypatch.setattr(db, 'get_db_collections', fake_get_collections)
@@ -279,8 +299,26 @@ class TestGenerateMarketAnalysisTask:
             'active_llm_config_id': 'config-1'
         }
         
+        # Mock ladder data
+        fake_ladder_coll = MagicMock()
+        fake_ladder_coll.find_one.return_value = {
+            "date": "2025-12-22",
+            "sentiment_score": 85,
+            "sentiment_mood": "乐观"
+        }
+        
+        fake_daily_coll = MagicMock()
+        fake_daily_coll.find_one.return_value = {
+             "date": "2025-12-22",
+             "limit_up_count": 50
+        }
+
         def fake_get_collections():
-            return {'users': fake_users_coll}
+            return {
+                'users': fake_users_coll,
+                'limit_up_ladder': fake_ladder_coll,
+                'daily_limit_up': fake_daily_coll
+            }
         
         import db
         monkeypatch.setattr(db, 'get_db_collections', fake_get_collections)
@@ -354,8 +392,18 @@ class TestGenerateMarketAnalysisTask:
             'active_llm_config_id': 'config-1'
         }
         
+        # Mock ladder data with return values
+        fake_ladder_coll = MagicMock()
+        fake_ladder_coll.find_one.return_value = {"sentiment_score": 85, "sentiment_mood": "乐观"}
+        fake_daily_coll = MagicMock()
+        fake_daily_coll.find_one.return_value = {"limit_up_count": 50}
+
         def fake_get_collections():
-            return {'users': fake_users_coll}
+            return {
+                'users': fake_users_coll,
+                'limit_up_ladder': fake_ladder_coll,
+                'daily_limit_up': fake_daily_coll
+            }
         
         import db
         monkeypatch.setattr(db, 'get_db_collections', fake_get_collections)
