@@ -391,11 +391,25 @@ def get_trade_executions_by_symbol(
         stock_info_collection = collections["stock_info"]
         
         user_id = current_user["id"]
-        query = {"symbol": symbol, "user_id": user_id}
+        
+        # 构建查询条件，支持多种 symbol 格式
+        symbol_normalized = normalize_symbol(symbol)
+        symbol_stripped = strip_exchange_suffix(symbol)
+        
+        query = {
+            "user_id": user_id,
+            "$or": [
+                {"symbol": symbol},
+                {"symbol": symbol_normalized},
+                {"symbol": symbol_stripped}
+            ]
+        }
         
         # 查询并排序
         cursor = collection.find(query).sort("timestamp", -1).skip(skip).limit(limit)
-        trades = [serialize_doc(doc) for doc in cursor]
+        trades = _group_executions_by_order([serialize_doc(doc) for doc in cursor])
+        # 过滤掉未成交的订单（filled_size 为 0 的废单）
+        trades = [t for t in trades if t.get("filled_size", 0) != 0]
         
         # 添加股票名称
         trades = enrich_trades_with_stock_names(trades, stock_info_collection)
