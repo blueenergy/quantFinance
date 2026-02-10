@@ -20,7 +20,51 @@ import logging
 import httpx
 from auth import get_current_user  # 导入认证函数
 
-router = APIRouter()
+# ==================== 生命周期事件 ====================
+
+from contextlib import asynccontextmanager
+
+@asynccontextmanager
+async def lifespan(app: APIRouter):
+    """应用生命周期管理"""
+    # Startup logic
+    if not REMOTE_WORKER_API:
+        logger.warning(
+            "⚠️  REMOTE_WORKER_API not configured!\n"
+            "   Strategy Manager Workers API will not be available.\n"
+            "   Please set REMOTE_WORKER_API in .env file."
+        )
+    else:
+        try:
+            # 使用公开的健康检查端点（不需要认证）
+            base_url = _get_base_api_url()
+            async with httpx.AsyncClient(timeout=10) as client:
+                response = await client.get(f"{base_url.rstrip('/api/workers')}/health")
+                response.raise_for_status()
+            logger.info(f"✓ Strategy Manager Workers API ready: {REMOTE_WORKER_API}")
+        except Exception as e:
+            logger.error(f"✗ Strategy Manager API unavailable: {e}")
+    
+    yield
+    
+    # Shutdown logic
+    logger.info("Strategy Manager router shutting down")
+
+# 重新初始化 Router 以使用 lifespan
+# 注意：APIRouter 的 lifespan 参数在 FastAPI 0.93.0+ 支持
+# 如果是旧版本，可能需要绑定到 app 实例，但这里是 Router，通常由 main.py 的 app.include_router 挂载
+# 而 Router 自身的 lifecycle event 是通过 on_event 实现的。
+# FastAPI 官方文档推荐在主 App 使用 lifespan。对于 APIRouter，目前 native lifespan 支持有限。
+# 既然收到弃用警告，说明环境是新版 FastAPI。
+# 但 APIRouter 本身不支持传入 lifespan 参数（只有 FastAPI app 支持）。
+# 然而，on_event("startup") 在 Router 中仍然有效，只是被标记为 deprecated。
+# 正确的做法是：将这些逻辑移动到主应用的 lifespan 中，或者忽略警告如果确实需要依附于 router。
+# 但为了消除警告，我们可以保留 handler 函数，但在 main.py 中调用它们，或者直接使用 lifespan refactor。
+# 
+# 经查，APIRouter(lifespan=...) 是支持的 (FastAPI >= 0.100.0)。
+# 我们需要重新实例化 router。
+
+router = APIRouter(lifespan=lifespan)
 logger = logging.getLogger("strategy_workers")
 
 # ==================== 配置 ====================
@@ -255,31 +299,4 @@ async def get_status(current_user: dict = Depends(get_current_user)) -> Dict[str
     return {**data, "deployment_mode": "remote"}
 
 
-# ==================== 生命周期事件 ====================
 
-@router.on_event("startup")
-async def startup():
-    """应用启动时验证远程 API 可用性"""
-    if not REMOTE_WORKER_API:
-        logger.warning(
-            "⚠️  REMOTE_WORKER_API not configured!\n"
-            "   Strategy Manager Workers API will not be available.\n"
-            "   Please set REMOTE_WORKER_API in .env file."
-        )
-        return
-    
-    try:
-        # 使用公开的健康检查端点（不需要认证）
-        base_url = _get_base_api_url()
-        async with httpx.AsyncClient(timeout=10) as client:
-            response = await client.get(f"{base_url.rstrip('/api/workers')}/health")
-            response.raise_for_status()
-        logger.info(f"✓ Strategy Manager Workers API ready: {REMOTE_WORKER_API}")
-    except Exception as e:
-        logger.error(f"✗ Strategy Manager API unavailable: {e}")
-
-
-@router.on_event("shutdown")
-async def shutdown():
-    """应用关闭时清理资源"""
-    logger.info("Strategy Manager router shutting down")
