@@ -8,23 +8,51 @@ services:
     ports:
       - "3001:3001"
     environment:
-      - MONGODB_URL=${MONGODB_URL:-mongodb://mongodb:27017/quantfinance}
+      - DB_CONNECTION_URL=mongodb://host.docker.internal:27017/quantfinance # Renamed
+      - REDIS_URL=redis://:${REDIS_PASSWORD:-your-redis-password}@redis:6379/0
       - JWT_SECRET=${JWT_SECRET:-your-jwt-secret-change-in-production}
       - ENVIRONMENT=${ENVIRONMENT:-production}
       - CORS_ORIGINS=${CORS_ORIGINS:-http://localhost,http://localhost:3000,http://localhost:5173}
-    depends_on:
-      - mongodb
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    # depends_on:
+    #   - mongodb
     restart: unless-stopped
     networks:
       - quant-network
     volumes:
       - ./logs:/app/logs
+      - .:/app  # Hot Reload: Mount source code
+    command: uvicorn main:app --host 0.0.0.0 --port 3001 --workers 1 --reload  # Hot Reload: Enabled
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:3001/health"]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 40s
+
+  # Celery 任务队列 (Worker + Beat)
+  celery:
+    build: 
+      context: .
+      dockerfile: Dockerfile.backend
+    container_name: quant-celery
+    command: celery -A celery_app worker -B --loglevel=info
+    environment:
+      - DB_CONNECTION_URL=mongodb://host.docker.internal:27017/quantfinance # Renamed to avoid .env conflict
+      - REDIS_URL=redis://:${REDIS_PASSWORD:-your-redis-password}@redis:6379/0
+      - JWT_SECRET=${JWT_SECRET:-your-jwt-secret-change-in-production}
+      - ENVIRONMENT=${ENVIRONMENT:-production}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      # - mongodb
+      - redis
+    restart: unless-stopped
+    networks:
+      - quant-network
+    volumes:
+      - ./logs:/app/logs
 
   # AI分析服务
   quant-analyzer:
@@ -33,7 +61,7 @@ services:
       dockerfile: Dockerfile
     container_name: quant-analyzer
     environment:
-      - MONGO_URI=mongodb://host.docker.internal:27017/
+      - MONGO_URI=${DOCKER_MONGO_URI:-mongodb://host.docker.internal:27017/}
       - DB_NAME=finance
       - TUSHARE_TOKEN=${TUSHARE_TOKEN}
       - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
@@ -52,8 +80,8 @@ services:
   # 前端Web服务
   web:
     build:
-      context: .
-      dockerfile: Dockerfile.frontend
+      context: ../quantFinance-dashboard
+      dockerfile: Dockerfile.fast
     container_name: quant-web
     ports:
       - "80:80"
@@ -61,6 +89,7 @@ services:
     depends_on:
       - api
     restart: unless-stopped
+    profiles: ["frontend"]  # Optional: Only start with --profile frontend
     networks:
       - quant-network
     volumes:
@@ -72,30 +101,10 @@ services:
       timeout: 10s
       retries: 3
 
-  # MongoDB数据库
-  mongodb:
-    image: mongo:7.0
-    container_name: quant-mongodb
-    ports:
-      - "27017:27017"
-    environment:
-      - MONGO_INITDB_ROOT_USERNAME=${MONGO_USERNAME:-admin}
-      - MONGO_INITDB_ROOT_PASSWORD=${MONGO_PASSWORD:-your-password-change-this}
-      - MONGO_INITDB_DATABASE=quantfinance
-    volumes:
-      - mongodb_data:/data/db
-      - mongodb_config:/data/configdb
-      - ./mongo-init.js:/docker-entrypoint-initdb.d/mongo-init.js:ro
-    restart: unless-stopped
-    networks:
-      - quant-network
-    command: mongod --auth --bind_ip_all
-    healthcheck:
-      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 40s
+  # MongoDB数据库 (已移除，使用外部数据库)
+  # mongodb:
+  #   image: mongo:7.0
+  #   # ...
 
   # Redis缓存 (可选，用于会话管理和缓存)
   redis:
@@ -125,6 +134,7 @@ services:
       - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - prometheus_data:/prometheus
     restart: unless-stopped
+    profiles: ["monitoring"]  # Optional: Only start with --profile monitoring
     networks:
       - quant-network
     command:
@@ -148,6 +158,7 @@ services:
       - ./monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards:ro
       - ./monitoring/grafana/datasources:/etc/grafana/provisioning/datasources:ro
     restart: unless-stopped
+    profiles: ["monitoring"]  # Optional: Only start with --profile monitoring
     networks:
       - quant-network
     depends_on:
@@ -158,10 +169,10 @@ networks:
     driver: bridge
 
 volumes:
-  mongodb_data:
-    driver: local
-  mongodb_config:
-    driver: local
+#   mongodb_data:
+#     driver: local
+#   mongodb_config:
+#     driver: local
   redis_data:
     driver: local
   prometheus_data:
