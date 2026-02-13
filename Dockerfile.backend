@@ -1,7 +1,9 @@
 FROM rockylinux:9
 
 # 设置工作目录
+# 设置工作目录
 WORKDIR /app
+ENV PYTHONPATH=/app
 
 # 安装系统依赖
 RUN dnf install -y gcc gcc-c++ make curl python3 python3-pip --allowerasing && \
