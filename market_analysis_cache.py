@@ -18,7 +18,7 @@ class MarketAnalysisCache:
     def __init__(self):
         # Attempt to connect to MongoDB. If unavailable (e.g. during unit tests),
         # fall back to a lightweight in-memory collection to avoid import-time failures.
-        mongodb_url = os.getenv('MONGO_URL', 'mongodb://localhost:27017')
+        mongodb_url = os.getenv('DB_CONNECTION_URL', os.getenv('MONGO_URL', 'mongodb://localhost:27017'))
         db_name = os.getenv('MONGO_DB', 'finance')
 
         class _InMemoryCollection:

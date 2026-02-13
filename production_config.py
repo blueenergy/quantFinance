@@ -35,9 +35,10 @@ def setup_production_middleware(app: FastAPI):
             app.add_middleware(TrustedHostMiddleware, allowed_hosts=trusted_hosts)
     
     # 2. HTTPS重定向中间件 (仅在生产环境)
-    if os.getenv("ENVIRONMENT") == "production":
-        from fastapi.middleware.httpsredirect import HTTPSRedirectMiddleware
-        app.add_middleware(HTTPSRedirectMiddleware)
+    # 2. HTTPS重定向中间件 (仅在生产环境)
+    #- if os.getenv("ENVIRONMENT") == "production":
+    #-     from fastapi.middleware.httpsredirect import HTTPSRedirectMiddleware
+    #-     app.add_middleware(HTTPSRedirectMiddleware)
     
     # 3. Gzip压缩中间件
     app.add_middleware(GZipMiddleware, minimum_size=1000)

@@ -6,7 +6,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # MongoDB connection settings
-mongo_url = os.getenv("MONGO_URL", "mongodb://localhost:27017")
+mongo_url = os.getenv("DB_CONNECTION_URL", os.getenv("MONGO_URL", "mongodb://localhost:27017"))
 DB_NAME = "finance"
 
 # Singleton client (reuse across app)

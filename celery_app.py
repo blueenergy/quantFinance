@@ -4,10 +4,12 @@ import logging
 
 log = logging.getLogger(__name__)
 
+import os
+
 celery_app = Celery(
     'tasks',
-    broker='redis://localhost:6379/0',
-    backend='redis://localhost:6379/0'
+    broker=os.getenv('REDIS_URL', 'redis://localhost:6379/0'),
+    backend=os.getenv('REDIS_URL', 'redis://localhost:6379/0')
 )
 
 celery_app.conf.update(
@@ -16,99 +18,11 @@ celery_app.conf.update(
 )
 
 
-def fetch_ladder_data_for_analysis(target_date: str = None) -> dict:
-    """
-    获取连板天梯数据用于 LLM 市场分析。
-    
-    Returns:
-        dict: 包含情绪得分、梯队分布、主线板块等信息
-    """
-    from db import get_db_collections
-    from datetime import datetime
-    
-    collections = get_db_collections()
-    ladder_col = collections["limit_up_ladder"]
-    daily_col = collections["daily_limit_up"]
-    
-    if not target_date:
-        target_date = datetime.now().strftime("%Y%m%d")
-    else:
-        # 统一日期格式为 YYYYMMDD (去除连字符)
-        target_date = target_date.replace("-", "")
-    
-    # 获取天梯聚合数据
-    ladder = ladder_col.find_one({"date": target_date})
-    
-    # 如果今天没数据，尝试获取最近的
-    if not ladder:
-        ladder = ladder_col.find_one(
-            {"date": {"$lte": target_date}},
-            sort=[("date", -1)]
-        )
-    
-    if not ladder:
-        return None
-    
-    actual_date = ladder.get("date", target_date)
-    indicators = ladder.get("indicators", {})
-    
-    # 计算梯队分布
-    tier_distribution = {}
-    total_limit_up = 0
-    max_streak = 0
-    
-    for tier_key, tier_data in ladder.get("tiers", {}).items():
-        count = tier_data.get("count", 0)
-        tier_distribution[tier_key] = count
-        total_limit_up += count
-    
-    # 获取最高连板
-    highest_stock = daily_col.find_one(
-        {"date": actual_date},
-        sort=[("streak", -1)]
-    )
-    if highest_stock:
-        max_streak = highest_stock.get("streak", 0)
-    
-    # 获取主线板块 (取涨停数最多的前3个板块)
-    sector_ranking = ladder.get("sector_ranking", [])
-    mainlines = [s.get("sector", "") for s in sector_ranking[:3] if s.get("sector")]
-    
-    # 计算晋级率 (2板以上 / 总涨停)
-    high_tier_count = sum(tier_distribution.get(k, 0) for k in ["2", "3", "4+"])
-    promotion_rate = high_tier_count / total_limit_up if total_limit_up > 0 else 0
-    
-    # 情绪等级
-    sentiment_score = indicators.get("sentiment_score", 50)
-    if sentiment_score >= 80:
-        sentiment_level = "极度乐观"
-    elif sentiment_score >= 60:
-        sentiment_level = "谨慎乐观"
-    elif sentiment_score >= 40:
-        sentiment_level = "中性观望"
-    elif sentiment_score >= 20:
-        sentiment_level = "谨慎悲观"
-    else:
-        sentiment_level = "极度悲观"
-    
-    return {
-        "date": actual_date,
-        "sentiment_score": sentiment_score,
-        "sentiment_level": sentiment_level,
-        "total_limit_up": total_limit_up,
-        "max_streak": max_streak,
-        "high_tier_count": high_tier_count,
-        "promotion_rate": round(promotion_rate, 3),
-        "mainlines": mainlines,
-        "tier_distribution": tier_distribution,
-        "highest_stock": {
-            "name": highest_stock.get("name", "") if highest_stock else "",
-            "streak": max_streak
-        } if highest_stock else None
-    }
 
+# 
+# fetch_ladder_data_for_analysis logic has been moved to quantAnalyzer/services/market_analyzer.py
+# 
 
-# Celery Beat schedule configuration
 celery_app.conf.beat_schedule = {
     # Check worker timeouts every minute
     'check-worker-timeouts': {
@@ -378,125 +292,62 @@ def send_daily_reports_task():
 
 @celery_app.task(name='celery_app.generate_market_analysis_task')
 def generate_market_analysis_task():
-    """Generate AI market analysis using admin's LLM config and cache it by trading date."""
+    """
+    Schedule AI market analysis task.
+    Instead of running it here (which blocks if eager=True), we push a task to MongoDB.
+    quantAnalyzer will pick it up and execute it asynchronously.
+    """
     from db import get_db_collections
-    from market_analysis_cache import market_analysis_cache
-    from llm_service import llm_manager
-    from routers import market as market_router
     from datetime import datetime
-    import asyncio
-
+    
     try:
-        # 获取市场数据（包含 analysis_date 和 market_data）
-        market_bundle = market_router.fetch_market_data()
-        if not market_bundle:
-            log.warning("[市场分析定时任务] 无市场数据，跳过本次分析")
-            return {"success": False, "reason": "no_market_data"}
-        
-        analysis_date = market_bundle.get("analysis_date")
-        if not analysis_date:
-            log.warning("[市场分析定时任务] 市场数据未包含分析日期，跳过本次分析")
-            return {"success": False, "reason": "no_analysis_date"}
-        
-        # 新增: 获取连板天梯数据
-        ladder_data = fetch_ladder_data_for_analysis(analysis_date)
-        if ladder_data:
-            market_bundle["ladder_data"] = ladder_data
-            log.info(f"[市场分析定时任务] 获取连板天梯数据: 情绪={ladder_data.get('sentiment_score')}, "
-                     f"涨停={ladder_data.get('total_limit_up')}, 主线={ladder_data.get('mainlines')}")
-        else:
-            log.warning("[市场分析定时任务] 未获取到连板天梯数据，将使用基础市场分析")
-        
         collections = get_db_collections()
+        tasks_col = collections["analysis_tasks"]
         users_coll = collections["users"]
         
-        # 使用固定 admin 账号作为全局配置来源
+        # 1. Determine Analysis Date (Today)
+        # We use current system date. quantAnalyzer will fetch market data for this date.
+        today_str = datetime.now().strftime('%Y-%m-%d')
+        
+        # 2. Get Admin User for Attribution
         admin_user = users_coll.find_one({"username": "admin", "is_admin": True})
         if not admin_user:
-            log.error("[市场分析定时任务] 未找到 admin 用户 (username='admin', is_admin=True)，无法生成大盘分析")
-            return {"success": False, "reason": "no_admin_user"}
-        
-        llm_configs = admin_user.get("llm_configs", [])
-        active_config_id = admin_user.get("active_llm_config_id")
-        active_config = None
-        
-        # 如果没有激活配置但有可用配置，默认激活第一个
-        if not active_config_id and llm_configs:
-            active_config = llm_configs[0]
-            active_config_id = str(active_config.get("_id"))
-            users_coll.update_one(
-                {"_id": admin_user["_id"]},
-                {"$set": {"active_llm_config_id": active_config_id}}
-            )
+            log.error("[Market Analysis] Admin user not found, assigning to 'system'")
+            user_id = "system"
         else:
-            for config in llm_configs:
-                if str(config.get("_id")) == active_config_id:
-                    active_config = config
-                    break
+            user_id = str(admin_user["_id"])
+            
+        # 3. Check if task already pending/completed for today to avoid duplicates
+        # We allow re-triggering if failed, but avoid queue spamming
+        existing = tasks_col.find_one({
+            "type": "market_analysis",
+            "params.date": today_str,
+            "status": {"$in": ["pending", "processing"]}
+        })
         
-        if not active_config:
-            log.error("[市场分析定时任务] admin 用户没有激活的 LLM 配置")
-            return {"success": False, "reason": "no_active_llm_config"}
-        
-        provider = active_config.get("provider")
-        api_key = active_config.get("api_key")
-        base_url = active_config.get("base_url")
-        model = active_config.get("model")
-        
-        if not provider or not model or not api_key:
-            log.error("[市场分析定时任务] admin 用户 LLM 配置不完整 (provider/model/api_key 缺失)")
-            return {"success": False, "reason": "invalid_llm_config"}
-        
-        # 获取 LLM 服务并执行异步市场分析
-        llm_service = llm_manager.get_service(
-            provider=provider,
-            model=model,
-            api_key=api_key,
-            base_url=base_url
-        )
-        
-        analysis_result = asyncio.run(llm_service.analyze_market(market_bundle))
-        
-        if not analysis_result.get("success"):
-            log.error(f"[市场分析定时任务] LLM 分析失败: {analysis_result.get('error')}")
-            return {"success": False, "reason": "llm_analysis_failed", "error": analysis_result.get("error")}
-        
-        analysis = analysis_result.get("analysis", {})
-        actual_analysis_date = market_bundle.get("analysis_date")
-        if not actual_analysis_date:
-            log.error("[市场分析定时任务] 分析结果缺少 analysis_date")
-            return {"success": False, "reason": "missing_analysis_date"}
-        
-        result = {
-            "success": True,
-            "analysis_date": actual_analysis_date,
-            "mood": analysis.get("mood", "市场情绪复杂"),
-            "summary": analysis.get("summary", "市场分析结果"),
-            "keyPoints": analysis.get("keyPoints", []),
-            "outlook": analysis.get("outlook", "请关注市场动态"),
-            "riskLevel": analysis.get("riskLevel", "medium"),
-            "riskNote": analysis.get("riskNote", "注意投资风险"),
-            # 新增: 连板天梯相关分析字段
-            "ladderInsight": analysis.get("ladderInsight", ""),
-            "mainlineAnalysis": analysis.get("mainlineAnalysis", ""),
-            "analysis_type": "market_overview",
-            "provider": analysis_result.get("provider"),
-            "model": analysis_result.get("model"),
-            "cache_info": {
-                'from_cache': False,
-                'cache_date': actual_analysis_date,
-                'created_at': datetime.now(),
-                'reason': "定时任务生成的分析结果"
-            }
+        if existing:
+            log.info(f"[Market Analysis] Task already pending for {today_str}, skipping schedule.")
+            return {"success": True, "message": "already_queued"}
+            
+        # 4. Push Task
+        task_doc = {
+            "type": "market_analysis",
+            "status": "pending",
+            "priority": 10, # High priority
+            "user_id": user_id,
+            "stock_name": "大盘指数", # For UI display compatible
+            "symbol": "MARKET",       # For UI display compatible
+            "params": {
+                "date": today_str
+            },
+            "created_at": datetime.now(),
+            "source": "scheduler"
         }
         
-        cache_success = market_analysis_cache.save_analysis(result, actual_analysis_date)
-        if cache_success:
-            log.info(f"[市场分析定时任务] 分析结果已缓存到数据库，日期: {actual_analysis_date}")
-        else:
-            log.error("[市场分析定时任务] 缓存保存失败，但分析正常返回")
+        result = tasks_col.insert_one(task_doc)
+        log.info(f"[Market Analysis] Scheduled task {result.inserted_id} for {today_str}")
+        return {"success": True, "task_id": str(result.inserted_id)}
         
-        return {"success": True, "analysis_date": actual_analysis_date}
     except Exception as e:
-        log.error(f"[市场分析定时任务] 执行失败: {e}", exc_info=True)
+        log.error(f"[Market Analysis] Scheduling failed: {e}", exc_info=True)
         return {"success": False, "error": str(e)}
