@@ -8,6 +8,9 @@ from llm_service import llm_manager
 from datetime import datetime
 from utils.stock_utils import serialize_doc, format_trade_date
 from bson import ObjectId
+from models.analysis_task import AnalysisTaskCreate, TaskStatus
+from services.quota_manager import QuotaManager
+from db import db
 
 router = APIRouter()
 
@@ -744,3 +747,78 @@ def get_stock_data_for_analysis(symbol: str) -> Optional[Dict[str, Any]]:
     except Exception as e:
         print(f"获取股票数据失败: {e}")
         return None
+@router.post("/analyze/deep-analysis")
+async def create_deep_analysis_task(
+    request: AnalysisTaskCreate,
+    current_user: dict = Depends(get_current_active_user)
+):
+    """
+    创建深度分析任务 (Producer)。
+    - 检查用户权限和配额 (VIP: 50次/月, 免费: 2次/周)。
+    - 投递任务到异步队列。
+    """
+    collections = get_db_collections()
+    quota_manager = QuotaManager(db)
+    
+    # 1. 确定用户等级
+    # 优先检查 is_vip 字段，其次检查 level 字段，最后默认为 free
+    user_level = "free"
+    # Admin is VIP
+    if current_user.get("is_admin"):
+         user_level = "vip"
+    elif current_user.get("is_vip"):
+         user_level = "vip"
+    else:
+        # Check both 'level' and 'service_level' (auth.py defaults)
+        level = current_user.get("level")
+        service_level = current_user.get("service_level")
+        
+        print(f"[DEBUG] User Analysis Request: user={current_user.get('username')}, level={level}, service_level={service_level}")
+        
+        if level == "vip" or service_level == "vip":
+            user_level = "vip"
+        else:
+            user_level = level or service_level or "free"
+            
+        print(f"[DEBUG] Determined user_level: {user_level}")
+        
+    # 2. 检查配额
+    if not quota_manager.check_quota(current_user["id"], user_level):
+        limit = quota_manager.get_limit(user_level)
+        period_key = quota_manager._get_period_key(user_level)
+        raise HTTPException(
+            status_code=403, 
+            detail=f"配额已用完。{user_level}用户限制暂为 {limit}次/{'月' if user_level=='vip' else '周'}。当前周期: {period_key}"
+        )
+
+    # 3. 创建任务
+    task_doc = {
+        "user_id": current_user["id"],
+        "symbol": request.symbol,
+        "status": TaskStatus.PENDING,
+        "priority": request.priority,
+        "created_at": datetime.now(),
+        "updated_at": datetime.now(),
+        "provider": request.provider,
+        "model": request.model
+    }
+    
+    try:
+        result = collections["analysis_tasks"].insert_one(task_doc)
+        task_id = str(result.inserted_id)
+        
+        # 4. 扣除配额
+        quota_manager.consume_quota(current_user["id"], user_level)
+        
+        remaining = quota_manager.get_remaining(current_user["id"], user_level)
+        
+        return {
+            "success": True,
+            "task_id": task_id,
+            "status": "pending",
+            "message": "深度分析任务已提交",
+            "quota_remaining": remaining,
+            "position_in_queue": collections["analysis_tasks"].count_documents({"status": "pending"})
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"任务创建失败: {str(e)}")
