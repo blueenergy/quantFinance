@@ -92,7 +92,8 @@ async def get_daily_ladder(
             "seal_amount": stock.get("seal_amount", 0),
             "limit_up_time": stock.get("limit_up_time", ""),
             "open_count": stock.get("open_count", 0),
-            "turnover_ratio": stock.get("turnover_ratio", 0)
+            "turnover_ratio": stock.get("turnover_ratio", 0),
+            "analysis": stock.get("analysis", None)  # AI Reasoning Result
         })
     
     # 板块聚合（基于 ladder 中的数据）
@@ -371,4 +372,32 @@ async def get_history(
         "end_date": end_date,
         "count": len(ladders),
         "data": [serialize_doc(l) for l in ladders]
+    }
+
+
+@router.get("/reasoning/{symbol}", summary="获取个股归因详情")
+async def get_reasoning_detail(
+    symbol: str, 
+    date: str = Query(None, description="日期 YYYYMMDD"),
+    current_user: dict = Depends(get_current_active_user)
+):
+    """获取指定股票的 AI 归因详情和新闻上下文"""
+    collections = get_db_collections()
+    
+    if not date:
+        date = datetime.now().strftime("%Y%m%d")
+        
+    analysis_col = collections["analysis_logs"]
+    
+    log = analysis_col.find_one({"symbol": symbol, "date": date})
+    
+    if not log:
+        return {
+            "success": False,
+            "error": f"{symbol} on {date} has no detailed analysis"
+        }
+        
+    return {
+        "success": True,
+        "data": serialize_doc(log)
     }
