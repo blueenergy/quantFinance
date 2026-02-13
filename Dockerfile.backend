@@ -1,4 +1,4 @@
-FROM rockylinux:9.6
+FROM rockylinux:9
 
 # 设置工作目录
 WORKDIR /app

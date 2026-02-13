@@ -30,7 +30,7 @@ pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 security = HTTPBearer()
 
 # MongoDB连接
-mongo_url = os.getenv("MONGO_URL", "mongodb://localhost:27017")
+mongo_url = os.getenv("DB_CONNECTION_URL", os.getenv("MONGO_URL", "mongodb://localhost:27017"))
 client = MongoClient(mongo_url)
 db = client[os.getenv("MONGO_DB", "finance")]
 users_collection = db.users
