@@ -81,3 +81,8 @@ dashboard/node_modules/
 # MongoDB dumps
 *.bson
 *.metadata.json
+
+# Local DBs
+*.db
+celerybeat-schedule
+celerybeat_schedule

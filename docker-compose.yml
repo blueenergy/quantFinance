@@ -26,6 +26,29 @@ services:
       retries: 3
       start_period: 40s
 
+  # AI分析服务
+  quant-analyzer:
+    build:
+      context: ../quantAnalyzer
+      dockerfile: Dockerfile
+    container_name: quant-analyzer
+    environment:
+      - MONGO_URI=mongodb://host.docker.internal:27017/
+      - DB_NAME=finance
+      - TUSHARE_TOKEN=${TUSHARE_TOKEN}
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
+      - DEEPSEEK_BASE_URL=${DEEPSEEK_BASE_URL}
+      - DEFAULT_LLM_PROVIDER=deepseek
+      - DEFAULT_MODEL=deepseek-chat
+      - ANALYSIS_INTERVAL=300
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+    # networks:
+    #   - quant-network
+    volumes:
+      - ../quantAnalyzer/logs:/app/logs
+
   # 前端Web服务
   web:
     build:
