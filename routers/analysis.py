@@ -822,3 +822,35 @@ async def create_deep_analysis_task(
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"任务创建失败: {str(e)}")
+@router.get("/analyze/unread-count", summary="获取未读分析数量")
+async def get_unread_count(current_user: dict = Depends(get_current_active_user)):
+    collections = get_db_collections()
+    count = collections["analysis_history"].count_documents({
+        "user_id": current_user["id"],
+        "is_read": False,
+        "source": "async_task" # Only count async tasks? Or all? Let's count all unread.
+    })
+    return {"count": count}
+
+@router.post("/analyze/mark-read", summary="标记分析为已读")
+async def mark_analysis_read(ids: List[str], current_user: dict = Depends(get_current_active_user)):
+    collections = get_db_collections()
+    if not ids:
+        return {"success": True, "modified_count": 0}
+        
+    # Convert string IDs to ObjectIds
+    obj_ids = []
+    for i in ids:
+        try:
+            obj_ids.append(ObjectId(i))
+        except:
+            pass
+            
+    result = collections["analysis_history"].update_many(
+        {
+            "_id": {"$in": obj_ids},
+            "user_id": current_user["id"]
+        },
+        {"$set": {"is_read": True}}
+    )
+    return {"success": True, "modified_count": result.modified_count}
