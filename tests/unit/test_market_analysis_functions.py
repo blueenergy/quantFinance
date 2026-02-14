@@ -172,262 +172,92 @@ class TestFetchMarketAnalysisResult:
 
 @pytest.mark.unit
 class TestGenerateMarketAnalysisTask:
-    """Test the backend Celery task for generating market analysis."""
+    """Test the backend Celery task for SCHEDULING market analysis (Async)."""
 
-    def test_no_market_data(self, monkeypatch):
-        """If fetch_market_data returns None, task should skip."""
+    def test_schedule_success(self, monkeypatch):
+        """Task should be inserted into MongoDB analysis_tasks collection."""
         from celery_app import generate_market_analysis_task
+        from datetime import datetime
         
-        # Mock fetch_market_data to return None
-        import routers.market as market_router
-        monkeypatch.setattr(market_router, 'fetch_market_data', lambda: None)
+        # Mock DB collections
+        fake_tasks_col = MagicMock()
+        fake_tasks_col.find_one.return_value = None  # No existing task
+        fake_tasks_col.insert_one.return_value.inserted_id = 'new-task-id'
         
-        result = generate_market_analysis_task()
-        
-        assert result['success'] is False
-        assert result['reason'] == 'no_market_data'
-
-    def test_no_admin_user(self, monkeypatch):
-        """If admin user doesn't exist, task should fail."""
-        from celery_app import generate_market_analysis_task
-        
-        # Mock fetch_market_data
-        import routers.market as market_router
-        monkeypatch.setattr(
-            market_router,
-            'fetch_market_data',
-            lambda: {'analysis_date': '2025-12-22', 'market_data': {}}
-        )
-        
-        # Mock get_db_collections at db module level
         fake_users_coll = MagicMock()
-        fake_users_coll.find_one.return_value = None  # No admin user
+        fake_users_coll.find_one.return_value = {"_id": "admin-id"}
         
-        # Mock ladder data with return values
-        fake_ladder_coll = MagicMock()
-        fake_ladder_coll.find_one.return_value = {"sentiment_score": 85, "sentiment_mood": "乐观"}
-        fake_daily_coll = MagicMock()
-        fake_daily_coll.find_one.return_value = {"limit_up_count": 50}
-
         def fake_get_collections():
             return {
-                'users': fake_users_coll,
-                'limit_up_ladder': fake_ladder_coll,
-                'daily_limit_up': fake_daily_coll
+                'analysis_tasks': fake_tasks_col,
+                'users': fake_users_coll
             }
         
         import db
         monkeypatch.setattr(db, 'get_db_collections', fake_get_collections)
-        
-        result = generate_market_analysis_task()
-        
-        assert result['success'] is False
-        assert result['reason'] == 'no_admin_user'
-
-    def test_admin_no_llm_config(self, monkeypatch):
-        """If admin has no LLM config, task should fail."""
-        from celery_app import generate_market_analysis_task
-        
-        import routers.market as market_router
-        monkeypatch.setattr(
-            market_router,
-            'fetch_market_data',
-            lambda: {'analysis_date': '2025-12-22', 'market_data': {}}
-        )
-        
-        # Mock admin user without LLM configs
-        fake_users_coll = MagicMock()
-        fake_users_coll.find_one.return_value = {
-            '_id': 'admin-id',
-            'username': 'admin',
-            'is_admin': True,
-            'llm_configs': [],
-            'active_llm_config_id': None
-        }
-        
-        # Mock ladder data with return values
-        fake_ladder_coll = MagicMock()
-        fake_ladder_coll.find_one.return_value = {"sentiment_score": 85, "sentiment_mood": "乐观"}
-        fake_daily_coll = MagicMock()
-        fake_daily_coll.find_one.return_value = {"limit_up_count": 50}
-
-        def fake_get_collections():
-            return {
-                'users': fake_users_coll,
-                'limit_up_ladder': fake_ladder_coll,
-                'daily_limit_up': fake_daily_coll
-            }
-        
-        import db
-        monkeypatch.setattr(db, 'get_db_collections', fake_get_collections)
-        
-        result = generate_market_analysis_task()
-        
-        assert result['success'] is False
-        assert result['reason'] == 'no_active_llm_config'
-
-    def test_successful_analysis_generation(self, monkeypatch):
-        """Happy path: admin exists, LLM runs, cache saves."""
-        from celery_app import generate_market_analysis_task
-        
-        # Mock fetch_market_data
-        import routers.market as market_router
-        monkeypatch.setattr(
-            market_router,
-            'fetch_market_data',
-            lambda: {
-                'analysis_date': '2025-12-22',
-                'market_data': {'1A0001': {'symbol': '1A0001'}}
-            }
-        )
-        
-        # Mock admin user with valid LLM config
-        fake_users_coll = MagicMock()
-        fake_users_coll.find_one.return_value = {
-            '_id': 'admin-id',
-            'username': 'admin',
-            'is_admin': True,
-            'llm_configs': [
-                {
-                    '_id': 'config-1',
-                    'provider': 'openai',
-                    'model': 'gpt-4',
-                    'api_key': 'test-key',
-                    'base_url': None
-                }
-            ],
-            'active_llm_config_id': 'config-1'
-        }
-        
-        # Mock ladder data
-        fake_ladder_coll = MagicMock()
-        fake_ladder_coll.find_one.return_value = {
-            "date": "2025-12-22",
-            "sentiment_score": 85,
-            "sentiment_mood": "乐观"
-        }
-        
-        fake_daily_coll = MagicMock()
-        fake_daily_coll.find_one.return_value = {
-             "date": "2025-12-22",
-             "limit_up_count": 50
-        }
-
-        def fake_get_collections():
-            return {
-                'users': fake_users_coll,
-                'limit_up_ladder': fake_ladder_coll,
-                'daily_limit_up': fake_daily_coll
-            }
-        
-        import db
-        monkeypatch.setattr(db, 'get_db_collections', fake_get_collections)
-        
-        # Mock llm_manager.get_service
-        fake_llm_service = MagicMock()
-        
-        # Mock the async analyze_market method
-        async def fake_analyze(bundle):
-            return {
-                'success': True,
-                'analysis': {
-                    'mood': '乐观',
-                    'summary': '市场强劲',
-                    'keyPoints': ['上涨'],
-                    'outlook': '继续上涨',
-                    'riskLevel': 'low',
-                    'riskNote': '风险可控'
-                },
-                'provider': 'openai',
-                'model': 'gpt-4'
-            }
-        
-        fake_llm_service.analyze_market = AsyncMock(side_effect=fake_analyze)
-        
-        from llm_service import llm_manager
-        monkeypatch.setattr(
-            llm_manager,
-            'get_service',
-            lambda **kwargs: fake_llm_service
-        )
-        
-        # Mock market_analysis_cache.save_analysis
-        from market_analysis_cache import market_analysis_cache
-        monkeypatch.setattr(
-            market_analysis_cache,
-            'save_analysis',
-            lambda result, date_str: True
-        )
         
         result = generate_market_analysis_task()
         
         assert result['success'] is True
-        assert result['analysis_date'] == '2025-12-22'
+        assert result['task_id'] == 'new-task-id'
+        
+        # Verify insertion
+        fake_tasks_col.insert_one.assert_called_once()
+        inserted_doc = fake_tasks_col.insert_one.call_args[0][0]
+        assert inserted_doc['type'] == 'market_analysis'
+        assert inserted_doc['status'] == 'pending'
+        assert inserted_doc['user_id'] == 'admin-id'
+        assert inserted_doc['symbol'] == 'MARKET'
 
-    def test_llm_analysis_failure(self, monkeypatch):
-        """If LLM analysis fails, task should return failure."""
+    def test_duplicate_prevention(self, monkeypatch):
+        """If a task is already pending/processing for today, do not insert new one."""
         from celery_app import generate_market_analysis_task
         
-        import routers.market as market_router
-        monkeypatch.setattr(
-            market_router,
-            'fetch_market_data',
-            lambda: {'analysis_date': '2025-12-22', 'market_data': {}}
-        )
+        # Mock DB with existing task
+        fake_tasks_col = MagicMock()
+        fake_tasks_col.find_one.return_value = {'_id': 'existing-task'}
         
         fake_users_coll = MagicMock()
-        fake_users_coll.find_one.return_value = {
-            '_id': 'admin-id',
-            'username': 'admin',
-            'is_admin': True,
-            'llm_configs': [
-                {
-                    '_id': 'config-1',
-                    'provider': 'openai',
-                    'model': 'gpt-4',
-                    'api_key': 'test-key',
-                    'base_url': None
-                }
-            ],
-            'active_llm_config_id': 'config-1'
-        }
+        fake_users_coll.find_one.return_value = {"_id": "admin-id"}
         
-        # Mock ladder data with return values
-        fake_ladder_coll = MagicMock()
-        fake_ladder_coll.find_one.return_value = {"sentiment_score": 85, "sentiment_mood": "乐观"}
-        fake_daily_coll = MagicMock()
-        fake_daily_coll.find_one.return_value = {"limit_up_count": 50}
-
         def fake_get_collections():
             return {
-                'users': fake_users_coll,
-                'limit_up_ladder': fake_ladder_coll,
-                'daily_limit_up': fake_daily_coll
+                'analysis_tasks': fake_tasks_col,
+                'users': fake_users_coll
             }
         
         import db
         monkeypatch.setattr(db, 'get_db_collections', fake_get_collections)
         
-        # Mock LLM failure
-        fake_llm_service = MagicMock()
+        result = generate_market_analysis_task()
         
-        async def fake_analyze_fail(bundle):
+        assert result['success'] is True
+        assert result['message'] == 'already_queued'
+        fake_tasks_col.insert_one.assert_not_called()
+
+    def test_admin_fallback(self, monkeypatch):
+        """If admin user not found, task should be assigned to 'system'."""
+        from celery_app import generate_market_analysis_task
+        
+        fake_tasks_col = MagicMock()
+        fake_tasks_col.find_one.return_value = None
+        fake_tasks_col.insert_one.return_value.inserted_id = 'task-id'
+        
+        fake_users_coll = MagicMock()
+        fake_users_coll.find_one.return_value = None  # No admin found
+        
+        def fake_get_collections():
             return {
-                'success': False,
-                'error': 'LLM API timeout'
+                'analysis_tasks': fake_tasks_col,
+                'users': fake_users_coll
             }
         
-        fake_llm_service.analyze_market = AsyncMock(side_effect=fake_analyze_fail)
-        
-        from llm_service import llm_manager
-        monkeypatch.setattr(
-            llm_manager,
-            'get_service',
-            lambda **kwargs: fake_llm_service
-        )
+        import db
+        monkeypatch.setattr(db, 'get_db_collections', fake_get_collections)
         
         result = generate_market_analysis_task()
         
-        assert result['success'] is False
-        assert result['reason'] == 'llm_analysis_failed'
-        assert 'LLM API timeout' in result['error']
+        assert result['success'] is True
+        fake_tasks_col.insert_one.assert_called_once()
+        inserted_doc = fake_tasks_col.insert_one.call_args[0][0]
+        assert inserted_doc['user_id'] == 'system'
