@@ -73,6 +73,8 @@ def get_db_collections() -> Dict[str, Collection]:
         # Phase 10: Async Task Queue Architecture
         "analysis_tasks": db["analysis_tasks"],  # 深度分析任务队列
         "quota_usage": db["quota_usage"],        # 用户配额使用情况
+        "global_analysis": db["global_analysis"], # 全球市场分析结果
+        "market_analysis": db["market_analysis"], # 盘中/盘后大盘分析结果
         # Add more collections as needed
     }
 
