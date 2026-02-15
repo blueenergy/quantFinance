@@ -47,6 +47,11 @@ celery_app.conf.beat_schedule = {
         'task': 'celery_app.generate_market_analysis_task',
         'schedule': crontab(hour=15, minute=30, day_of_week='1-5'),  # Mon-Fri 15:30
     },
+    # Generate Global Market Analysis at 08:30 AM before A-share open
+    'generate-global-analysis-0830': {
+        'task': 'celery_app.generate_global_analysis_task',
+        'schedule': crontab(hour=8, minute=30, day_of_week='1-5'),  # Mon-Fri 08:30
+    },
 }
 
 celery_app.conf.timezone = 'Asia/Shanghai'
@@ -350,4 +355,55 @@ def generate_market_analysis_task():
         
     except Exception as e:
         log.error(f"[Market Analysis] Scheduling failed: {e}", exc_info=True)
+        return {"success": False, "error": str(e)}
+
+@celery_app.task(name='celery_app.generate_global_analysis_task')
+def generate_global_analysis_task():
+    """
+    Schedule Global Market Analysis task (Overnight mapping).
+    Runs at 08:30 AM to catch global news before A-share open.
+    """
+    from db import get_db_collections
+    from datetime import datetime
+    
+    try:
+        collections = get_db_collections()
+        tasks_col = collections["analysis_tasks"]
+        users_coll = collections["users"]
+        
+        today_str = datetime.now().strftime('%Y-%m-%d')
+        admin_user = users_coll.find_one({"username": "admin", "is_admin": True})
+        user_id = str(admin_user["_id"]) if admin_user else "system"
+            
+        # Avoid duplicates for the same day
+        existing = tasks_col.find_one({
+            "type": "global_analysis",
+            "params.date": today_str,
+            "status": {"$in": ["pending", "processing"]}
+        })
+        
+        if existing:
+            log.info(f"[Global Analysis] Task already pending for {today_str}, skipping.")
+            return {"success": True, "message": "already_queued"}
+            
+        task_doc = {
+            "type": "global_analysis",
+            "status": "pending",
+            "priority": 15, # Higher than regular market analysis
+            "user_id": user_id,
+            "stock_name": "全球市场联动",
+            "symbol": "GLOBAL",
+            "params": {
+                "date": today_str
+            },
+            "created_at": datetime.now(),
+            "source": "scheduler"
+        }
+        
+        result = tasks_col.insert_one(task_doc)
+        log.info(f"[Global Analysis] Scheduled task {result.inserted_id} for {today_str}")
+        return {"success": True, "task_id": str(result.inserted_id)}
+        
+    except Exception as e:
+        log.error(f"[Global Analysis] Scheduling failed: {e}", exc_info=True)
         return {"success": False, "error": str(e)}
