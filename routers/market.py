@@ -68,6 +68,35 @@ async def analyze_market(request: MarketAnalysisRequest, current_user: dict = De
     """
     return fetch_market_analysis_result()
 
+@router.get("/global-analysis")
+async def get_global_analysis(current_user: dict = Depends(get_current_active_user)):
+    """获取最新的全球市场联动分析结果"""
+    try:
+        collections = get_db_collections()
+        # Fetch the latest document from global_analysis collection
+        doc = collections["global_analysis"].find_one(
+            sort=[("timestamp", -1)]
+        )
+        
+        if not doc:
+            return {
+                "success": False,
+                "error": "今日尚无全球市场分析数据"
+            }
+            
+        # Serialize MongoDB document
+        result = serialize_doc(doc)
+        return {
+            "success": True,
+            "data": result
+        }
+    except Exception as e:
+        print(f"[全球分析] 获取失败: {e}")
+        return {
+            "success": False,
+            "error": f"系统错误: {str(e)}"
+        }
+
 def fetch_market_data() -> Optional[Dict[str, Any]]:
     """获取用于市场分析的数据 - 优先使用外部数据源"""
     try:
