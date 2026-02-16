@@ -144,6 +144,37 @@ def get_daily_basic_map(trade_date: str) -> Dict[str, Dict[str, Any]]:
     _cache_set(key, mapping)
     return mapping
 
+def is_trading_day(check_date: str) -> Optional[bool]:
+    """Check if a specific date (YYYY-MM-DD or YYYYMMDD) is a trading day.
+    Returns:
+        True: Trading day
+        False: Non-trading day
+        None: API error or data missing (caller should loop back)
+    Cached for 1 hour.
+    """
+    # Normalize date format to YYYYMMDD for Tushare
+    date_str = check_date.replace('-', '')
+    key = f"is_trading_day:{date_str}"
+    
+    cached = _cache_get(key, _DEFAULT_TTL)
+    if cached is not None:
+        return cached
+
+    try:
+        pro = _get_pro()
+        df = pro.trade_cal(exchange='SSE', start_date=date_str, end_date=date_str)
+        if df is None or df.empty:
+            return None
+        
+        # is_open: 1=Open, 0=Close
+        is_open = int(df.iloc[0]['is_open']) == 1
+        _cache_set(key, is_open)
+        return is_open
+    except Exception:
+        # Log error or silence it. 
+        # Returning None allows caller to fallback to other logic.
+        return None
+
 # Convenience util to clear cache (e.g. in tests)
 
 def clear_cache():

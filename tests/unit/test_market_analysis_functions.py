@@ -86,10 +86,17 @@ class TestFetchMarketAnalysisResult:
             lambda date_str: None
         )
         
+        # Mock latest analysis miss too
+        monkeypatch.setattr(
+            market.market_analysis_cache,
+            'get_latest_trading_day_analysis',
+            lambda: None
+        )
+        
         result = market.fetch_market_analysis_result()
         
         assert result['success'] is False
-        assert result['error'] == "今日尚无大盘分析，请等待系统定时任务生成"
+        assert result['error'] == "暂无任何历史大盘分析数据"
         assert result['is_trading_day'] is True
 
     def test_non_trading_day_with_latest_analysis(self, monkeypatch):
@@ -134,7 +141,7 @@ class TestFetchMarketAnalysisResult:
         assert result['success'] is True
         assert result['analysis_date'] == '2025-12-19'
         assert result['cache_info']['from_cache'] is True
-        assert '非交易日' in result['cache_info']['reason']
+        assert '当前无最新分析' in result['cache_info']['reason']
         assert '2025-12-19' in result['cache_info']['reason']
 
     def test_non_trading_day_no_latest_analysis(self, monkeypatch):
@@ -166,7 +173,7 @@ class TestFetchMarketAnalysisResult:
         result = market.fetch_market_analysis_result()
         
         assert result['success'] is False
-        assert result['error'] == "非交易日，且最近交易日尚无大盘分析结果"
+        assert result['error'] == "暂无任何历史大盘分析数据"
         assert result['is_trading_day'] is False
 
 
