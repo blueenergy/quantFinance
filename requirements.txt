@@ -15,6 +15,7 @@ bcrypt<4.0
 python-multipart
 email-validator
 pytest>=7.0
+yfinance
 
 # 生产环境额外依赖
 motor>=3.3.2                    # MongoDB异步驱动
