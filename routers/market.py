@@ -22,26 +22,23 @@ def fetch_market_analysis_result() -> Dict[str, Any]:
     today = date.today()
     today_str = today.strftime('%Y-%m-%d')
 
-    # 只从缓存读取结果：交易日只看当日缓存，非交易日才回退到最近交易日
-    if market_analysis_cache.is_trading_day(today):
-        cached = market_analysis_cache.get_cached_analysis(today_str)
-        if cached:
-            result = cached['analysis_result']
-            result['analysis_date'] = cached.get('analysis_date', today_str)
-            result['cache_info'] = {
-                'from_cache': True,
-                'cache_date': cached.get('analysis_date', today_str),
-                'created_at': cached.get('created_at'),
-                'reason': "返回当日缓存的大盘分析结果"
-            }
-            return result
-        else:
-            return {
-                "success": False,
-                "error": "今日尚无大盘分析，请等待系统定时任务生成",
-                "is_trading_day": True
-            }
+    # Try to get today's analysis first
+    cached = market_analysis_cache.get_cached_analysis(today_str)
+    
+    if cached:
+        result = cached['analysis_result']
+        result['analysis_date'] = cached.get('analysis_date', today_str)
+        result['cache_info'] = {
+            'from_cache': True,
+            'cache_date': cached.get('analysis_date', today_str),
+            'created_at': cached.get('created_at'),
+            'reason': "返回当日缓存的大盘分析结果"
+        }
+        # Add success flag for frontend
+        result['success'] = True
+        return result
     else:
+        # Fallback to latest trading day analysis (even if today is a trading day but data is not ready)
         latest_analysis = market_analysis_cache.get_latest_trading_day_analysis()
         if latest_analysis:
             result = latest_analysis['analysis_result']
@@ -50,14 +47,16 @@ def fetch_market_analysis_result() -> Dict[str, Any]:
                 'from_cache': True,
                 'cache_date': latest_analysis['analysis_date'],
                 'created_at': latest_analysis.get('created_at'),
-                'reason': f"非交易日，返回最近交易日({latest_analysis['analysis_date']})的分析结果"
+                'reason': f"当前无最新分析，返回最近交易日({latest_analysis['analysis_date']})的结果"
             }
+            # Add success flag for frontend
+            result['success'] = True
             return result
         else:
             return {
                 "success": False,
-                "error": "非交易日，且最近交易日尚无大盘分析结果",
-                "is_trading_day": False
+                "error": "暂无任何历史大盘分析数据",
+                "is_trading_day": market_analysis_cache.is_trading_day(today)
             }
 
 @router.post("/analyze-market")
