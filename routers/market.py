@@ -74,8 +74,9 @@ async def get_global_analysis(current_user: dict = Depends(get_current_active_us
     try:
         collections = get_db_collections()
         # Fetch the latest document from global_analysis collection
+        # Sort by _id (desc) to get the most recently inserted document regardless of timestamp field
         doc = collections["global_analysis"].find_one(
-            sort=[("timestamp", -1)]
+            sort=[("_id", -1)]
         )
         
         if not doc:
