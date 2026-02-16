@@ -254,3 +254,67 @@ def get_market_spectrum_minute(
     cursor = collection.find(query, projection).sort('trade_date', 1)
     data = list(cursor)
     return {"data": data}
+
+@router.get("/market-quotes", summary="获取实时市场报价(Lightweight)", tags=["Market"])
+def get_realtime_quotes(symbols: str = Query(..., description="逗号分隔的股票代码，如 ^IXIC,FXI")):
+    """
+    获取指定代码的最新实时报价，用于前端 Watchdog 监控。
+    返回: { symbol: { price: float, change_pct: float, timestamp: str } }
+    """
+    import yfinance as yf
+    
+    symbol_list = [s.strip() for s in symbols.split(',') if s.strip()]
+    if not symbol_list:
+        return {"success": True, "data": {}}
+        
+    try:
+        # 使用 Tickers 对象批量初始化
+        tickers = yf.Tickers(" ".join(symbol_list))
+        result = {}
+        
+        for symbol in symbol_list:
+            try:
+                ticker = tickers.tickers[symbol]
+                # 使用 fast_info 获取最新数据 (如果不该属性，yfinance 版本过旧，回退到 info)
+                if hasattr(ticker, 'fast_info'):
+                    price = ticker.fast_info.last_price
+                    prev = ticker.fast_info.previous_close
+                    
+                    if price is not None and prev is not None:
+                        change_pct = ((price - prev) / prev) * 100
+                        result[symbol] = {
+                            "price": round(price, 2),
+                            "change_pct": round(change_pct, 2),
+                            "timestamp": datetime.now().isoformat()
+                        }
+                        continue
+                
+                # 如果 fast_info 失败或不可用，尝试使用 history
+                hist = ticker.history(period="1d")
+                if not hist.empty:
+                    # 对于 history，我们只能拿到收盘价。很难拿到实时涨跌幅，除非我们有昨收。
+                    # 这里做一个简单的近似，或者如果拿不到就不返回 change_pct
+                    price = hist['Close'].iloc[-1]
+                    # 尝试用 info 拿 previousClose
+                    info = ticker.info
+                    prev = info.get('previousClose') or price 
+                    
+                    change_pct = 0.0
+                    if prev:
+                        change_pct = ((price - prev) / prev) * 100
+                        
+                    result[symbol] = {
+                        "price": round(price, 2),
+                        "change_pct": round(change_pct, 2),
+                        "timestamp": datetime.now().isoformat()
+                    }
+                    
+            except Exception as e:
+                print(f"[MarketWatchdog] Error fetching {symbol}: {e}")
+                continue
+                
+        return {"success": True, "data": result}
+        
+    except Exception as e:
+        print(f"[MarketWatchdog] API Error: {e}")
+        return {"success": False, "error": str(e)}
