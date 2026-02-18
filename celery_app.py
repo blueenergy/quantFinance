@@ -43,9 +43,9 @@ celery_app.conf.beat_schedule = {
         'task': 'celery_app.generate_market_analysis_task',
         'schedule': crontab(hour=11, minute=30, day_of_week='1-5'),  # Mon-Fri 11:30
     },
-    'generate-market-analysis-1530': {
+    'generate-market-analysis-1630': {
         'task': 'celery_app.generate_market_analysis_task',
-        'schedule': crontab(hour=15, minute=30, day_of_week='1-5'),  # Mon-Fri 15:30
+        'schedule': crontab(hour=16, minute=30, day_of_week='1-5'),  # Mon-Fri 16:30
     },
     # Generate Global Market Analysis at 08:30 AM before A-share open
     'generate-global-analysis-0830': {
