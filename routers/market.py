@@ -6,11 +6,68 @@ from auth import get_current_active_user
 from db import get_db_collections
 from market_analysis_cache import market_analysis_cache
 from llm_service import llm_manager
-from datetime import date,datetime
+from datetime import date, datetime
 from external_data import external_market_data
 from utils.stock_utils import serialize_doc
 from bson import ObjectId
+from models.analysis_task import TaskStatus
+
 router = APIRouter()
+
+
+@router.post("/analyze-global")
+async def trigger_global_analysis(current_user: dict = Depends(get_current_active_user)):
+    """手动触发全球市场分析任务
+    
+    插入任务到 analysis_tasks 集合，由 quantAnalyzer 异步处理。
+    """
+    try:
+        collections = get_db_collections()
+        tasks_col = collections["analysis_tasks"]
+        
+        today_str = datetime.now().strftime('%Y-%m-%d')
+        user_id = str(current_user["id"])
+            
+        # 避免当天重复提交 (pending or processing)
+        existing = tasks_col.find_one({
+            "type": "global_analysis",
+            "params.date": today_str,
+            "status": {"$in": ["pending", "processing"]}
+        })
+        
+        if existing:
+            return {
+                "success": True, 
+                "message": "任务已在队列中，请稍候", 
+                "task_id": str(existing["_id"])
+            }
+            
+        task_doc = {
+            "type": "global_analysis",
+            "status": "pending",
+            "priority": 20, # High priority for manual trigger
+            "user_id": user_id,
+            "stock_name": "全球市场联动",
+            "symbol": "GLOBAL",
+            "params": {
+                "date": today_str
+            },
+            "created_at": datetime.now(),
+            "source": "manual_trigger"
+        }
+        
+        result = tasks_col.insert_one(task_doc)
+        print(f"[Global Analysis] Manual trigger task {result.inserted_id}")
+        
+        return {
+            "success": True, 
+            "task_id": str(result.inserted_id),
+            "message": "分析任务已提交，请稍后刷新查看结果"
+        }
+        
+    except Exception as e:
+        print(f"[Global Analysis] Trigger failed: {e}")
+        return {"success": False, "error": str(e)}
 
 
 def fetch_market_analysis_result() -> Dict[str, Any]:
