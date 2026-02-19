@@ -69,7 +69,11 @@ async def get_daily_ladder(
             }
     
     # 获取详细股票信息
-    stocks = list(daily_col.find({"date": actual_date}).sort("streak", -1))
+    # Exclude broken stocks from the main ladder display
+    stocks = list(daily_col.find({
+        "date": actual_date,
+        "status": {"$ne": "broken"} 
+    }).sort("streak", -1))
     
     # 按梯队组织
     tiers = {
@@ -93,7 +97,27 @@ async def get_daily_ladder(
             "limit_up_time": stock.get("limit_up_time", ""),
             "open_count": stock.get("open_count", 0),
             "turnover_ratio": stock.get("turnover_ratio", 0),
-            "analysis": stock.get("analysis", None)  # AI Reasoning Result
+        "analysis": stock.get("analysis", None)  # AI Reasoning Result
+        })
+    
+    # Get broken limit-up stocks
+    broken_stocks_cursor = daily_col.find({
+        "date": actual_date,
+        "status": "broken"
+    }).sort("updated_at", -1)
+    
+    broken_limit_ups = []
+    for stock in broken_stocks_cursor:
+        broken_limit_ups.append({
+            "symbol": stock["symbol"],
+            "name": stock["name"],
+            "streak": stock["streak"],
+            "sector": stock.get("primary_sector", ""),
+            "sectors": stock.get("sectors", []),
+            "limit_up_time": stock.get("limit_up_time", ""),
+            "last_seal_time": stock.get("last_seal_time", ""),
+            "broken_time": stock.get("updated_at", "").isoformat() if isinstance(stock.get("updated_at"), datetime) else "",
+            "limit_reason": stock.get("limit_reason", "")
         })
     
     # 板块聚合（基于 ladder 中的数据）
@@ -116,6 +140,7 @@ async def get_daily_ladder(
         "is_fallback": is_fallback,
         "fallback_note": f"显示 {display_date} 数据（最近交易日）" if is_fallback else None,
         "tiers": tiers,
+        "broken_limit_ups": broken_limit_ups,
         "sector_aggregation": sector_aggregation,
         "indicators": ladder.get("indicators", {}),
         "sector_ranking": ladder.get("sector_ranking", [])
