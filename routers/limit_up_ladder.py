@@ -117,7 +117,8 @@ async def get_daily_ladder(
             "limit_up_time": stock.get("limit_up_time", ""),
             "last_seal_time": stock.get("last_seal_time", ""),
             "broken_time": stock.get("updated_at", "").isoformat() if isinstance(stock.get("updated_at"), datetime) else "",
-            "limit_reason": stock.get("limit_reason", "")
+            "limit_reason": stock.get("limit_reason", ""),
+            "analysis": stock.get("analysis", None) # AI Analysis including sustainability
         })
     
     # 板块聚合（基于 ladder 中的数据）
