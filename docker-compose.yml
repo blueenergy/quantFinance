@@ -9,52 +9,12 @@ services:
       - "3001:3001"
     environment:
       - DB_CONNECTION_URL=mongodb://host.docker.internal:27017/quantfinance # Renamed
-      - REDIS_URL=redis://:${REDIS_PASSWORD:-your-redis-password}@redis:6379/0
-      - JWT_SECRET=${JWT_SECRET:-your-jwt-secret-change-in-production}
-      - ENVIRONMENT=${ENVIRONMENT:-production}
-      - CORS_ORIGINS=${CORS_ORIGINS:-http://localhost,http://localhost:3000,http://localhost:5173}
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-    # depends_on:
-    #   - mongodb
-    restart: unless-stopped
-    networks:
-      - quant-network
-    volumes:
-      - ./logs:/app/logs
-      - .:/app  # Hot Reload: Mount source code
-    command: uvicorn main:app --host 0.0.0.0 --port 3001 --workers 1 --reload  # Hot Reload: Enabled
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:3001/health"]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 40s
 
   # Celery 任务队列 (Worker + Beat)
-  celery:
-    build: 
-      context: .
-      dockerfile: Dockerfile.backend
-    container_name: quant-celery
-    command: celery -A celery_app worker -B --loglevel=info
-    environment:
-      - DB_CONNECTION_URL=mongodb://host.docker.internal:27017/quantfinance # Renamed to avoid .env conflict
-      - REDIS_URL=redis://:${REDIS_PASSWORD:-your-redis-password}@redis:6379/0
-      - JWT_SECRET=${JWT_SECRET:-your-jwt-secret-change-in-production}
-      - ENVIRONMENT=${ENVIRONMENT:-production}
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-    depends_on:
-      # - mongodb
-      - redis
-    restart: unless-stopped
-    networks:
-      - quant-network
-    volumes:
-      - ./logs:/app/logs
-
-  # AI分析服务
   quant-analyzer:
     build:
       context: ../quantAnalyzer
@@ -126,23 +86,6 @@ services:
   #   # ...
 
   # Redis缓存 (可选，用于会话管理和缓存)
-  redis:
-    image: redis:7-alpine
-    container_name: quant-redis
-    ports:
-      - "6379:6379"
-    volumes:
-      - redis_data:/data
-    restart: unless-stopped
-    networks:
-      - quant-network
-    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD:-your-redis-password}
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-
   # Prometheus监控 (可选)
   prometheus:
     image: prom/prometheus:latest
@@ -192,8 +135,6 @@ volumes:
 #     driver: local
 #   mongodb_config:
 #     driver: local
-  redis_data:
-    driver: local
   prometheus_data:
     driver: local
   grafana_data:

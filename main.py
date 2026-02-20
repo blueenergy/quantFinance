@@ -30,9 +30,18 @@ from routers.strategy_pool import router as strategy_pool_router
 from routers.strategy_workers import router as strategy_workers_router
 from routers.limit_up_ladder import router as ladder_router
 from production_config import configure_production_app
+from contextlib import asynccontextmanager
+from scheduler import start_scheduler, stop_scheduler
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    start_scheduler()
+    yield
+    # Shutdown
+    stop_scheduler()
 
-app = FastAPI()
+app = FastAPI(lifespan=lifespan)
 
 # 应用生产环境配置
 configure_production_app(app)
