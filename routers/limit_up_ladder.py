@@ -6,12 +6,19 @@
 
 from typing import Optional, List
 from fastapi import APIRouter, Query, Depends, HTTPException
+from pydantic import BaseModel
 from datetime import datetime, date, timedelta
 from auth import get_current_active_user
 from db import get_db_collections
 from bson import ObjectId
 
 router = APIRouter(prefix="/ladder", tags=["Limit-Up Ladder"])
+
+class FeedbackRequest(BaseModel):
+    date: str
+    feedback: str
+    is_broken: bool = False
+
 
 
 def serialize_doc(doc: dict) -> dict:
@@ -426,4 +433,43 @@ async def get_reasoning_detail(
     return {
         "success": True,
         "data": serialize_doc(log)
+    }
+
+@router.post("/reasoning/{symbol}/feedback", summary="提交归因反馈并重新分析")
+async def submit_reasoning_feedback(
+    symbol: str, 
+    request: FeedbackRequest,
+    current_user: dict = Depends(get_current_active_user)
+):
+    """提取用户的反馈，创建高优先级的分析任务"""
+    collections = get_db_collections()
+    tasks_col = collections["analysis_tasks"]
+    
+    # 优先使用 request.date，如果没有提供则默认为今天
+    target_date = request.date
+    if not target_date:
+        target_date = datetime.now().strftime("%Y%m%d")
+        
+    task_type = "broken_limit_up_feedback" if request.is_broken else "limit_up_feedback"
+    
+    task_doc = {
+        "user_id": current_user["username"],
+        "symbol": symbol,
+        "type": task_type,
+        "priority": 100,  # 高优先级
+        "status": "pending",
+        "params": {
+            "date": target_date,
+            "feedback": request.feedback
+        },
+        "created_at": datetime.now(),
+        "updated_at": datetime.now()
+    }
+    
+    result = tasks_col.insert_one(task_doc)
+    
+    return {
+        "success": True,
+        "message": "反馈已提交，正在重新分析",
+        "task_id": str(result.inserted_id)
     }
