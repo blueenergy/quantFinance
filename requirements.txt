@@ -2,7 +2,7 @@ tqdm
 pandas
 numpy
 pymongo
-celery
+apscheduler
 tushare
 fastapi 
 uvicorn[standard]
