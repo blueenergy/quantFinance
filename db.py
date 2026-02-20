@@ -75,6 +75,7 @@ def get_db_collections() -> Dict[str, Collection]:
         "quota_usage": db["quota_usage"],        # 用户配额使用情况
         "global_analysis": db["global_analysis"], # 全球市场分析结果
         "market_analysis": db["market_analysis"], # 盘中/盘后大盘分析结果
+        "schedule_config": db["schedule_config"], # 定时任务调度配置
         # Add more collections as needed
     }
 

@@ -10,8 +10,9 @@ log = logging.getLogger(__name__)
 # Define global scheduler
 scheduler = BackgroundScheduler(timezone='Asia/Shanghai')
 
+
+# Default trigger configurations
 def check_worker_timeouts_task():
-    """Check for worker timeouts and send alerts."""
     from db import get_db_collections
     from services.email_service import send_worker_timeout_alert
     
@@ -301,56 +302,138 @@ def generate_global_analysis_task():
         log.error(f"[Global Analysis] Scheduling failed: {e}", exc_info=True)
 
 
+# Map of configurable tasks to logic
+TASK_MAP = {
+    'check_worker_timeouts': check_worker_timeouts_task,
+    'send_daily_reports': send_daily_reports_task,
+    'market_analysis_1000': generate_market_analysis_task,
+    'market_analysis_1130': generate_market_analysis_task,
+    'market_analysis_1630': generate_market_analysis_task,
+    'global_analysis_0830': generate_global_analysis_task,
+}
+
+# Default trigger configurations
+DEFAULT_SCHEDULES = {
+    'check_worker_timeouts': {
+        'name': "Worker状态监控",
+        'type': "interval",
+        'seconds': 60
+    },
+    'send_daily_reports': {
+        'name': "发送每日盈亏报告",
+        'type': "cron",
+        'hour': 17,
+        'minute': 0
+    },
+    'market_analysis_1000': {
+        'name': "早盘市场分析 (10:00)",
+        'type': "cron",
+        'hour': 10,
+        'minute': 0,
+        'day_of_week': 'mon-fri'
+    },
+    'market_analysis_1130': {
+        'name': "午盘市场分析 (11:30)",
+        'type': "cron",
+        'hour': 11,
+        'minute': 30,
+        'day_of_week': 'mon-fri'
+    },
+    'market_analysis_1630': {
+        'name': "收盘市场分析 (16:30)",
+        'type': "cron",
+        'hour': 16,
+        'minute': 30,
+        'day_of_week': 'mon-fri'
+    },
+    'global_analysis_0830': {
+        'name': "盘前全球市场分析 (08:30)",
+        'type': "cron",
+        'hour': 8,
+        'minute': 30,
+        'day_of_week': 'mon-fri'
+    }
+}
+
+def get_trigger_from_config(config_data):
+    """Create an APScheduler trigger from a config dict."""
+    config_type = config_data.get('type')
+    if config_type == 'interval':
+        return IntervalTrigger(seconds=config_data.get('seconds', 60))
+    elif config_type == 'cron':
+        return CronTrigger(
+            hour=config_data.get('hour'),
+            minute=config_data.get('minute'),
+            day_of_week=config_data.get('day_of_week')
+        )
+    return None
+
+def sync_job(job_id, config_data):
+    """Sync a single job to the scheduler based on config."""
+    task_func = TASK_MAP.get(job_id)
+    if not task_func:
+        return False
+        
+    trigger = get_trigger_from_config(config_data)
+    if not trigger:
+        return False
+        
+    is_active = config_data.get('is_active', True)
+    
+    # Remove existing job if it exists to cleanly replace it
+    if scheduler.get_job(job_id):
+        scheduler.remove_job(job_id)
+        
+    if is_active:
+        scheduler.add_job(
+            task_func,
+            trigger=trigger,
+            id=job_id,
+            name=config_data.get('name', job_id),
+            replace_existing=True
+        )
+        log.info(f"Loaded schedule task: {job_id} ({config_data.get('name')})")
+    else:
+        log.info(f"Task disabled: {job_id} ({config_data.get('name')})")
+        
+    return True
+
+def apply_schedule_config():
+    """Load config from DB and apply to scheduler."""
+    from db import get_db_collections
+    collections = get_db_collections()
+    config_coll = collections.get("schedule_config")
+    
+    if config_coll is None:
+        log.error("Failed to get schedule_config collection")
+        return False
+        
+    # Get all customized configs
+    custom_configs = {doc['job_id']: doc for doc in config_coll.find({})}
+    
+    # Process all default jobs
+    for job_id, default_config in DEFAULT_SCHEDULES.items():
+        if job_id in custom_configs:
+            # Use combined config (db overrides defaults)
+            db_config = custom_configs[job_id]
+            merged_config = {**default_config, **db_config}
+            sync_job(job_id, merged_config)
+        else:
+            # First time: Save default to DB and use it
+            default_config['job_id'] = job_id
+            default_config['is_active'] = True
+            default_config['updated_at'] = datetime.now()
+            config_coll.insert_one(default_config)
+            sync_job(job_id, default_config)
+            
+    return True
+
 def start_scheduler():
-    """Initialize and start the scheduler with all configured jobs."""
+    """Initialize and start the scheduler with configured jobs."""
     try:
-        # Check worker timeouts every 60 seconds
-        scheduler.add_job(
-            check_worker_timeouts_task, 
-            trigger=IntervalTrigger(seconds=60), 
-            id='check_worker_timeouts', 
-            replace_existing=True
-        )
-        
-        # Send daily reports at 17:00 (5 PM) every day
-        scheduler.add_job(
-            send_daily_reports_task,
-            trigger=CronTrigger(hour=17, minute=0),
-            id='send_daily_reports',
-            replace_existing=True
-        )
-        
-        # Market analysis 3 times a day on weekdays
-        scheduler.add_job(
-            generate_market_analysis_task,
-            trigger=CronTrigger(hour=10, minute=0, day_of_week='mon-fri'),
-            id='market_analysis_1000',
-            replace_existing=True
-        )
-        scheduler.add_job(
-            generate_market_analysis_task,
-            trigger=CronTrigger(hour=11, minute=30, day_of_week='mon-fri'),
-            id='market_analysis_1130',
-            replace_existing=True
-        )
-        scheduler.add_job(
-            generate_market_analysis_task,
-            trigger=CronTrigger(hour=16, minute=30, day_of_week='mon-fri'),
-            id='market_analysis_1630',
-            replace_existing=True
-        )
-        
-        # Global market analysis at 08:30 AM before open
-        scheduler.add_job(
-            generate_global_analysis_task,
-            trigger=CronTrigger(hour=8, minute=30, day_of_week='mon-fri'),
-            id='global_analysis_0830',
-            replace_existing=True
-        )
-        
-        # Start the scheduler background loop
         scheduler.start()
-        log.info("APScheduler started successfully with Asia/Shanghai timezone.")
+        log.info("APScheduler started successfully. Now applying configurations from database.")
+        apply_schedule_config()
     except Exception as e:
         log.error(f"Failed to start APScheduler: {e}")
 
