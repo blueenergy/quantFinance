@@ -146,8 +146,8 @@ class MarketAnalysisCache:
             最近交易日的分析结果或None
         """
         try:
-            # 查找最近7天内的分析结果
-            start_date = (date.today() - timedelta(days=7)).strftime('%Y-%m-%d')
+            # 查找最近30天内的分析结果
+            start_date = (date.today() - timedelta(days=30)).strftime('%Y-%m-%d')
             
             result = self.collection.find(
                 {"analysis_date": {"$gte": start_date}}
