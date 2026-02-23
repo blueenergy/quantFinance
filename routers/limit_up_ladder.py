@@ -271,17 +271,31 @@ async def get_sector_ranking(
     if not date:
         date = datetime.now().strftime("%Y%m%d")
     
+    # Find actual_date with data
+    requested_date = date
+    actual_date = requested_date
+
     # 获取板块数据
-    sectors = list(sector_col.find({"date": date}).sort("limit_up_count", -1))
+    sectors = list(sector_col.find({"date": actual_date}).sort("limit_up_count", -1))
     
+    # 自动回退逻辑：如果指定日期无数据，找最近的一天
+    if not sectors:
+        latest_ladder = ladder_col.find_one(
+            {"date": {"$lte": requested_date}},
+            sort=[("date", -1)]
+        )
+        if latest_ladder:
+            actual_date = latest_ladder["date"]
+            sectors = list(sector_col.find({"date": actual_date}).sort("limit_up_count", -1))
+            
     if not sectors:
         return {
             "success": False,
-            "error": f"{date} 暂无板块数据"
+            "error": f"{requested_date} 暂无板块数据"
         }
     
     # 获取天梯数据中的排名
-    ladder = ladder_col.find_one({"date": date})
+    ladder = ladder_col.find_one({"date": actual_date})
     sector_ranking = ladder.get("sector_ranking", []) if ladder else []
     
     # 识别主线
@@ -300,7 +314,8 @@ async def get_sector_ranking(
     
     return {
         "success": True,
-        "date": date,
+        "date": actual_date,
+        "requested_date": requested_date,
         "mainlines": mainlines,
         "sectors": sector_list,
         "ranking": sector_ranking
