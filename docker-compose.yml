@@ -36,6 +36,7 @@ services:
     #   - quant-network
     volumes:
       - ../quantAnalyzer/logs:/app/logs
+      - ../quant-data-engine/src/quant_data_engine:/app/src/quant_data_engine
 
   # 数据同步引擎 (每日定时任务)
   quant-data-engine:
