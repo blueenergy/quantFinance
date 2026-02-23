@@ -1,7 +1,7 @@
 services:
   # 后端API服务
   api:
-    build: 
+    build:
       context: .
       dockerfile: Dockerfile.backend
     container_name: quant-api
@@ -9,10 +9,10 @@ services:
       - "3001:3001"
     environment:
       - DB_CONNECTION_URL=mongodb://host.docker.internal:27017/quantfinance # Renamed
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 40s
+      - interval=30s
+      - timeout=10s
+      - retries=3
+      - start_period=40s
 
   # Celery 任务队列 (Worker + Beat)
   quant-analyzer:
@@ -21,8 +21,8 @@ services:
       dockerfile: Dockerfile
     container_name: quant-analyzer
     environment:
-      - MONGO_URI=${DOCKER_MONGO_URI:-mongodb://host.docker.internal:27017/}
-      - DB_NAME=finance
+      - MONGO_URI=${MONGO_URI:-mongodb://host.docker.internal:27017/}
+      - DB_NAME=${MONGO_DB}
       - TUSHARE_TOKEN=${TUSHARE_TOKEN}
       - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
       - DEEPSEEK_BASE_URL=${DEEPSEEK_BASE_URL}
@@ -56,6 +56,24 @@ services:
     networks:
       - quant-network
 
+  # Strategy Manager API 服务
+  quant-strategy-manager:
+    build:
+      context: ../quant-strategy-manager
+      dockerfile: Dockerfile
+    container_name: quant-strategy-manager
+    ports:
+      - "5001:5000"
+    environment:
+      - MONGO_URI=${MONGO_URI:-mongodb://host.docker.internal:27017/}
+      - MONGO_DB=${MONGO_DB}
+      - API_PORT=5000
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+    volumes:
+      - ../quant-strategy-manager/logs:/app/logs
+
   # 前端Web服务
   web:
     build:
@@ -68,14 +86,14 @@ services:
     depends_on:
       - api
     restart: unless-stopped
-    profiles: ["frontend"]  # Optional: Only start with --profile frontend
+    profiles: [ "frontend" ] # Optional: Only start with --profile frontend
     networks:
       - quant-network
     volumes:
       - ./nginx.conf:/etc/nginx/nginx.conf:ro
-      - ./ssl:/etc/nginx/ssl:ro  # SSL证书目录
+      - ./ssl:/etc/nginx/ssl:ro # SSL证书目录
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost/health"]
+      test: [ "CMD", "curl", "-f", "http://localhost/health" ]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -96,7 +114,7 @@ services:
       - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - prometheus_data:/prometheus
     restart: unless-stopped
-    profiles: ["monitoring"]  # Optional: Only start with --profile monitoring
+    profiles: [ "monitoring" ] # Optional: Only start with --profile monitoring
     networks:
       - quant-network
     command:
@@ -120,7 +138,7 @@ services:
       - ./monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards:ro
       - ./monitoring/grafana/datasources:/etc/grafana/provisioning/datasources:ro
     restart: unless-stopped
-    profiles: ["monitoring"]  # Optional: Only start with --profile monitoring
+    profiles: [ "monitoring" ] # Optional: Only start with --profile monitoring
     networks:
       - quant-network
     depends_on:
@@ -131,10 +149,10 @@ networks:
     driver: bridge
 
 volumes:
-#   mongodb_data:
-#     driver: local
-#   mongodb_config:
-#     driver: local
+  #   mongodb_data:
+  #     driver: local
+  #   mongodb_config:
+  #     driver: local
   prometheus_data:
     driver: local
   grafana_data:
