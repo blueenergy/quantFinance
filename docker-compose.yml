@@ -74,6 +74,7 @@ services:
     volumes:
       - ../quant-strategy-manager/logs:/app/quant-strategy-manager/logs
       - ../vnpy-live-trading:/app/vnpy-live-trading
+      - ../data-access-lib:/app/data-access-lib
 
   # 前端Web服务
   web:
