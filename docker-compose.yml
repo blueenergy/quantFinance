@@ -59,8 +59,8 @@ services:
   # Strategy Manager API 服务
   quant-strategy-manager:
     build:
-      context: ../quant-strategy-manager
-      dockerfile: Dockerfile
+      context: ..
+      dockerfile: quant-strategy-manager/Dockerfile
     container_name: quant-strategy-manager
     ports:
       - "5001:5000"
@@ -72,7 +72,8 @@ services:
       - "host.docker.internal:host-gateway"
     restart: unless-stopped
     volumes:
-      - ../quant-strategy-manager/logs:/app/logs
+      - ../quant-strategy-manager/logs:/app/quant-strategy-manager/logs
+      - ../vnpy-live-trading:/app/vnpy-live-trading
 
   # 前端Web服务
   web:
