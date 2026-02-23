@@ -5,7 +5,6 @@ from models.all_models import MarketAnalysisRequest
 from auth import get_current_active_user
 from db import get_db_collections
 from market_analysis_cache import market_analysis_cache
-from llm_service import llm_manager
 from datetime import date, datetime
 from external_data import external_market_data
 from utils.stock_utils import serialize_doc
