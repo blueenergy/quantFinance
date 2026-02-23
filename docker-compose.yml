@@ -41,19 +41,20 @@ services:
   # 数据同步引擎 (每日定时任务)
   quant-data-engine:
     build:
-      context: ../quant_data_engine
+      context: ../quant-data-engine
       dockerfile: Dockerfile
     container_name: quant-data-engine
     environment:
       # Use same DB as API
-      - MONGO_URL=mongodb://host.docker.internal:27017/quantfinance
+      - MONGO_URL=${MONGO_URI:-mongodb://host.docker.internal:27017/}
+      - MONGO_DB=${MONGO_DB}
       - TUSHARE_TOKEN=${TUSHARE_TOKEN}
       - TZ=Asia/Shanghai
     extra_hosts:
       - "host.docker.internal:host-gateway"
     restart: unless-stopped
     volumes:
-      - ../quant_data_engine/logs:/app/logs
+      - ../quant-data-engine/logs:/app/logs
     networks:
       - quant-network
 
