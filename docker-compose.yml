@@ -28,8 +28,8 @@ services:
       - TUSHARE_TOKEN=${TUSHARE_TOKEN}
       - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
       - DEEPSEEK_BASE_URL=${DEEPSEEK_BASE_URL}
-      - DEFAULT_LLM_PROVIDER=deepseek
-      - DEFAULT_MODEL=deepseek-chat
+      - DEFAULT_LLM_PROVIDER=qwen
+      - DEFAULT_MODEL=qwen-plus
       - ANALYSIS_INTERVAL=300
       - TZ=Asia/Shanghai
     extra_hosts:
@@ -59,6 +59,32 @@ services:
     restart: unless-stopped
     volumes:
       - ../quant-data-engine/logs:/app/logs
+    networks:
+      - quant-network
+
+  # 回测 Worker (轮询任务队列并执行回测)
+  backtest-worker:
+    build:
+      context: ../backtest-worker
+      dockerfile: Dockerfile
+    container_name: backtest-worker
+    environment:
+      - MONGO_URI=${MONGO_URI:-mongodb://host.docker.internal:27017/}
+      - MONGO_URL=${MONGO_URI:-mongodb://host.docker.internal:27017/}
+      - DB_NAME=${MONGO_DB}
+      - API_BASE_URL=${BACKTEST_API_BASE_URL:-http://quant-api:3001/api}
+      - API_TOKEN=${BACKTEST_API_TOKEN}
+      - WORKER_ID=${BACKTEST_WORKER_ID:-}
+      - POLL_INTERVAL=${BACKTEST_POLL_INTERVAL:-5}
+      - LOG_LEVEL=INFO
+      - TZ=Asia/Shanghai
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+    volumes:
+      - ../backtest-worker/cache:/app/cache
+      - ../data-access-lib:/deps/data-access-lib
+      - ../quant-strategies:/deps/quant-strategies
     networks:
       - quant-network
 
