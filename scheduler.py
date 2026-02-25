@@ -210,7 +210,7 @@ def send_daily_reports_task():
         log.error(f"Failed to send daily reports: {e}", exc_info=True)
 
 
-def generate_market_analysis_task():
+def generate_market_analysis_task(job_id: str):
     """Schedule AI market analysis task to MongoDB (picked up by quantAnalyzer)."""
     from db import get_db_collections
     
@@ -230,11 +230,12 @@ def generate_market_analysis_task():
         existing = tasks_col.find_one({
             "type": "market_analysis",
             "params.date": today_str,
+            "params.job_id": job_id,
             "status": {"$in": ["pending", "processing"]}
         })
         
         if existing:
-            log.info(f"[Market Analysis] Task already pending for {today_str}, skipping schedule.")
+            log.info(f"[Market Analysis] Task '{job_id}' already pending for {today_str}, skipping schedule.")
             return
             
         task_doc = {
@@ -245,7 +246,8 @@ def generate_market_analysis_task():
             "stock_name": "大盘指数",
             "symbol": "MARKET",
             "params": {
-                "date": today_str
+                "date": today_str,
+                "job_id": job_id
             },
             "created_at": datetime.now(),
             "source": "scheduler"
@@ -258,7 +260,7 @@ def generate_market_analysis_task():
         log.error(f"[Market Analysis] Scheduling failed: {e}", exc_info=True)
 
 
-def generate_global_analysis_task():
+def generate_global_analysis_task(job_id: str):
     """Schedule Global Market Analysis task (Runs at 08:30 AM)."""
     from db import get_db_collections
     
@@ -274,11 +276,12 @@ def generate_global_analysis_task():
         existing = tasks_col.find_one({
             "type": "global_analysis",
             "params.date": today_str,
+            "params.job_id": job_id,
             "status": {"$in": ["pending", "processing"]}
         })
         
         if existing:
-            log.info(f"[Global Analysis] Task already pending for {today_str}, skipping.")
+            log.info(f"[Global Analysis] Task '{job_id}' already pending for {today_str}, skipping.")
             return
             
         task_doc = {
@@ -289,7 +292,8 @@ def generate_global_analysis_task():
             "stock_name": "全球市场联动",
             "symbol": "GLOBAL",
             "params": {
-                "date": today_str
+                "date": today_str,
+                "job_id": job_id
             },
             "created_at": datetime.now(),
             "source": "scheduler"
@@ -385,8 +389,16 @@ def sync_job(job_id, config_data):
         scheduler.remove_job(job_id)
         
     if is_active:
+        import functools
+        
+        # Pass job_id if the function expects it (by name match)
+        if "market_analysis_" in job_id or "global_analysis" in job_id:
+            task_callable = functools.partial(task_func, job_id=job_id)
+        else:
+            task_callable = task_func
+
         scheduler.add_job(
-            task_func,
+            task_callable,
             trigger=trigger,
             id=job_id,
             name=config_data.get('name', job_id),

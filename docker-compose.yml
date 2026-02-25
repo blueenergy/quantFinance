@@ -1,6 +1,6 @@
 services:
   # 后端API服务
-  api:
+  quant-api:
     build:
       context: .
       dockerfile: Dockerfile.backend
@@ -8,11 +8,12 @@ services:
     ports:
       - "3001:3001"
     environment:
-      - DB_CONNECTION_URL=mongodb://host.docker.internal:27017/quantfinance # Renamed
-      - interval=30s
-      - timeout=10s
-      - retries=3
-      - start_period=40s
+      - MONGO_URI=${MONGO_URI:-mongodb://host.docker.internal:27017/}
+      - MONGO_URL=${MONGO_URI:-mongodb://host.docker.internal:27017/}
+      - DB_NAME=${MONGO_DB}
+      - JWT_SECRET_KEY=${JWT_SECRET_KEY}
+      - REMOTE_WORKER_API=${REMOTE_WORKER_API:-http://quant-strategy-manager:5000/api/workers}
+      - TZ=Asia/Shanghai
 
   # Celery 任务队列 (Worker + Beat)
   quant-analyzer:
@@ -22,6 +23,7 @@ services:
     container_name: quant-analyzer
     environment:
       - MONGO_URI=${MONGO_URI:-mongodb://host.docker.internal:27017/}
+      - MONGO_URL=${MONGO_URI:-mongodb://host.docker.internal:27017/}
       - DB_NAME=${MONGO_DB}
       - TUSHARE_TOKEN=${TUSHARE_TOKEN}
       - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
@@ -29,6 +31,7 @@ services:
       - DEFAULT_LLM_PROVIDER=deepseek
       - DEFAULT_MODEL=deepseek-chat
       - ANALYSIS_INTERVAL=300
+      - TZ=Asia/Shanghai
     extra_hosts:
       - "host.docker.internal:host-gateway"
     restart: unless-stopped
@@ -46,8 +49,14 @@ services:
     container_name: quant-data-engine
     environment:
       # Use same DB as API
+<<<<<<< HEAD
       - MONGO_URL=${MONGO_URI:-mongodb://host.docker.internal:27017/}
       - MONGO_DB=${MONGO_DB}
+=======
+      - MONGO_URI=${MONGO_URI:-mongodb://host.docker.internal:27017/}
+      - MONGO_URL=${MONGO_URI:-mongodb://host.docker.internal:27017/}
+      - DB_NAME=${MONGO_DB}
+>>>>>>> e120020 (fix(scheduler): correct container timezone and prevent same-day tasks blocking by using job_id in uniqueness check)
       - TUSHARE_TOKEN=${TUSHARE_TOKEN}
       - TZ=Asia/Shanghai
     extra_hosts:
@@ -70,7 +79,11 @@ services:
       - MONGO_URI=${MONGO_URI:-mongodb://host.docker.internal:27017/}
       - MONGO_DB=${MONGO_DB}
       - API_PORT=5000
+<<<<<<< HEAD
       - JWT_SECRET_KEY=${JWT_SECRET_KEY}
+=======
+      - TZ=Asia/Shanghai
+>>>>>>> e120020 (fix(scheduler): correct container timezone and prevent same-day tasks blocking by using job_id in uniqueness check)
     extra_hosts:
       - "host.docker.internal:host-gateway"
     restart: unless-stopped
