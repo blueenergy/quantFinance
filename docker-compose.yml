@@ -77,6 +77,9 @@ services:
       - WORKER_ID=${BACKTEST_WORKER_ID:-}
       - POLL_INTERVAL=${BACKTEST_POLL_INTERVAL:-5}
       - LOG_LEVEL=INFO
+      - ENABLE_SCREENING=${ENABLE_SCREENING:-true}
+      - SCREENING_MODE=${SCREENING_MODE:-conservative}
+      - SCREENING_RUN_AT=${SCREENING_RUN_AT:-}
       - TZ=Asia/Shanghai
     extra_hosts:
       - "host.docker.internal:host-gateway"
