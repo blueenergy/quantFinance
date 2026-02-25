@@ -207,9 +207,10 @@ async def get_portfolio_task_status(
 
 
 def _fetch_user_watchlist(user_id: str, collections) -> List[Dict[str, Any]]:
-    """获取用户自选股列表（含行业信息）"""
+    """获取用户自选股列表（含行业信息和最新价格）"""
     watchlist_col = collections["user_watchlists"]
     stock_info_col = collections["stock_info"]
+    volume_price_col = collections["volume_price"]
     
     watchlist_doc = watchlist_col.find_one({"user_id": user_id})
     watchlist_symbols = watchlist_doc.get("symbols", []) if watchlist_doc else []
@@ -219,11 +220,20 @@ def _fetch_user_watchlist(user_id: str, collections) -> List[Dict[str, Any]]:
         stock_info_docs = {doc["symbol"]: doc for doc in stock_info_col.find({"symbol": {"$in": watchlist_symbols}})}
         for symbol in watchlist_symbols:
             info = stock_info_docs.get(symbol, {})
+            name = info.get("name", "")
+            industry = info.get("industry", "")
+            
+            # Fetch latest price and pct_chg from volume_price
+            vp_doc = volume_price_col.find_one({"symbol": symbol}, sort=[("trade_date", -1)])
+            current_price = vp_doc.get("close", 0) if vp_doc else 0
+            change_pct = vp_doc.get("pct_chg", 0) if vp_doc else info.get("change_pct", 0)
+            
             watchlist.append({
                 "symbol": symbol,
-                "name": info.get("name", ""),
-                "industry": info.get("industry", ""),
-                "change_pct": info.get("change_pct", 0)
+                "name": name,
+                "industry": industry,
+                "current_price": current_price,
+                "change_pct": change_pct
             })
     return watchlist
 

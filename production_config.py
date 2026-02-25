@@ -130,7 +130,8 @@ def setup_monitoring(app: FastAPI):
         try:
             # 检查数据库连接
             from pymongo import MongoClient
-            client = MongoClient(os.getenv("MONGODB_URL"))
+            mongo_url = os.getenv("MONGO_URI") or os.getenv("MONGO_URL") or "mongodb://localhost:27017"
+            client = MongoClient(mongo_url)
             client.admin.command('ping')
             
             return {
@@ -158,7 +159,7 @@ def setup_database_pool():
     """配置数据库连接池"""
     from motor.motor_asyncio import AsyncIOMotorClient
     
-    mongodb_url = os.getenv("MONGODB_URL")
+    mongodb_url = os.getenv("MONGO_URI") or os.getenv("MONGO_URL") or "mongodb://localhost:27017"
     max_pool_size = int(os.getenv("DB_POOL_SIZE", "10"))
     min_pool_size = int(os.getenv("DB_POOL_MIN_SIZE", "5"))
     
