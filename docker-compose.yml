@@ -79,6 +79,8 @@ services:
       - LOG_LEVEL=INFO
       - ENABLE_SCREENING=${ENABLE_SCREENING:-true}
       - SCREENING_MODE=${SCREENING_MODE:-conservative}
+      - SCREENING_STRATEGIES=${SCREENING_STRATEGIES:-}
+      - SCREENING_DAYS_BACK=${SCREENING_DAYS_BACK:-}
       - SCREENING_RUN_AT=${SCREENING_RUN_AT:-}
       - TZ=Asia/Shanghai
     extra_hosts:
