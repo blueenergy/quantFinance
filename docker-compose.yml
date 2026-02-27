@@ -59,6 +59,7 @@ services:
     restart: unless-stopped
     volumes:
       - ../quant-data-engine/logs:/app/logs
+      - ../quant-data-engine/src/quant_data_engine:/app/src/quant_data_engine
     networks:
       - quant-network
 
