@@ -368,6 +368,10 @@ async def get_indicators(
     # 最新一天的指标
     latest = ladders[0].get("indicators", {})
     
+    # 额外获取跌停数以计算比例
+    limit_down_col = collections["daily_limit_down"]
+    total_limit_down = limit_down_col.count_documents({"date": ladders[0]["date"]})
+    
     return {
         "success": True,
         "date": date,
@@ -375,6 +379,7 @@ async def get_indicators(
             "sentiment_score": latest.get("sentiment_score", 50),
             "sentiment_level": _get_sentiment_level(latest.get("sentiment_score", 50)),
             "total_limit_up": latest.get("total_limit_up", 0),
+            "total_limit_down": total_limit_down,
             "promotion_rate": latest.get("promotion_rate_1to2", 0),
             "high_tier_count": latest.get("high_tier_count", 0),
             "max_streak": latest.get("max_streak", 0)

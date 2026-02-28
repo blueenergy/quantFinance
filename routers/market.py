@@ -267,8 +267,9 @@ def get_market_spectrum(
         'yang_spectrum': 1,
         'yin_spectrum': 1,
         'total_stocks': 1,
-        'above_ma5_count': 1,
-        'below_ma5_count': 1
+        'above_ma_count': 1,
+        'below_ma_count': 1,
+        'distribution': 1
     }
     cursor = collection.find(query, projection).sort('trade_date', 1)
     data = list(cursor)
@@ -313,6 +314,7 @@ def get_market_spectrum_minute(
         'total_stocks': 1,
         'above_ma_count': 1,
         'below_ma_count': 1,
+        'distribution': 1,
         'ma_period': 1,
         'granularity': 1,
     }

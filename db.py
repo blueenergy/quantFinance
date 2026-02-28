@@ -6,8 +6,8 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # MongoDB connection settings
-mongo_url = os.getenv("DB_CONNECTION_URL", os.getenv("MONGO_URL", "mongodb://localhost:27017"))
-DB_NAME = "finance"
+mongo_url = os.getenv("MONGO_URI", os.getenv("MONGO_URL", "mongodb://localhost:27017"))
+DB_NAME = os.getenv("MONGO_DB", "finance")
 
 # Singleton client (reuse across app)
 client = MongoClient(mongo_url)
@@ -76,6 +76,8 @@ def get_db_collections() -> Dict[str, Collection]:
         "global_analysis": db["global_analysis"], # 全球市场分析结果
         "market_analysis": db["market_analysis"], # 盘中/盘后大盘分析结果
         "schedule_config": db["schedule_config"], # 定时任务调度配置
+        "daily_limit_down": db["daily_limit_down"], # 每日跌停数据
+        "limit_down_ladder": db["limit_down_ladder"], # 跌停天梯数据
         # Add more collections as needed
     }
 
