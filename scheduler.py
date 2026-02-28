@@ -211,7 +211,13 @@ def send_daily_reports_task():
 
 
 def generate_market_analysis_task(job_id: str):
-    """Schedule AI market analysis task to MongoDB (picked up by quantAnalyzer)."""
+    """Schedule AI market analysis task to MongoDB (picked up by quantAnalyzer).
+    
+    Job types:
+    - market_analysis_1000: Intraday (早盘 10:00)
+    - market_analysis_1130: Intraday (午盘 11:30)
+    - market_analysis_1630: Post-market (收盘 16:30) - includes THS money flow
+    """
     from db import get_db_collections
     
     try:
@@ -237,6 +243,10 @@ def generate_market_analysis_task(job_id: str):
         if existing:
             log.info(f"[Market Analysis] Task '{job_id}' already pending for {today_str}, skipping schedule.")
             return
+        
+        # Determine analysis type based on job_id
+        # 16:30 is post-market, others are intraday
+        analysis_type = "post_market" if "1630" in job_id else "intraday"
             
         task_doc = {
             "type": "market_analysis",
@@ -247,14 +257,15 @@ def generate_market_analysis_task(job_id: str):
             "symbol": "MARKET",
             "params": {
                 "date": today_str,
-                "job_id": job_id
+                "job_id": job_id,
+                "analysis_type": analysis_type
             },
             "created_at": datetime.now(),
             "source": "scheduler"
         }
         
         result = tasks_col.insert_one(task_doc)
-        log.info(f"[Market Analysis] Scheduled task {result.inserted_id} for {today_str}")
+        log.info(f"[Market Analysis] Scheduled task {result.inserted_id} for {today_str} (type: {analysis_type})")
         
     except Exception as e:
         log.error(f"[Market Analysis] Scheduling failed: {e}", exc_info=True)
