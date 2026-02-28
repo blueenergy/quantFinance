@@ -69,16 +69,22 @@ async def trigger_global_analysis(current_user: dict = Depends(get_current_activ
         return {"success": False, "error": str(e)}
 
 
-def fetch_market_analysis_result() -> Dict[str, Any]:
+def fetch_market_analysis_result(analysis_date: Optional[str] = None) -> Dict[str, Any]:
     """Fetch cached market analysis for frontend.
 
-    - On trading days: return only today's cached result (or a clear message if none).
-    - On non-trading days: fall back to the latest trading day's cached result.
+    - If analysis_date is provided: return the cached result for that specific date.
+    - If not provided: on trading days, return today's cached result; 
+      on non-trading days, fall back to the latest available trading day.
     """
-    today = date.today()
-    today_str = today.strftime('%Y-%m-%d')
+    if analysis_date:
+        today_str = analysis_date
+        print(f"[Market Analysis] Explicit date requested: {today_str}")
+    else:
+        today = date.today()
+        today_str = today.strftime('%Y-%m-%d')
+        print(f"[Market Analysis] No date provided, using default: {today_str}")
 
-    # Try to get today's analysis first
+    # Try to get the analysis for the target date
     cached = market_analysis_cache.get_cached_analysis(today_str)
     
     if cached:
@@ -94,34 +100,37 @@ def fetch_market_analysis_result() -> Dict[str, Any]:
         result['success'] = True
         return result
     else:
-        # Fallback to latest trading day analysis (even if today is a trading day but data is not ready)
-        latest_analysis = market_analysis_cache.get_latest_trading_day_analysis()
-        if latest_analysis:
-            result = latest_analysis['analysis_result']
-            result['analysis_date'] = latest_analysis['analysis_date']
-            result['cache_info'] = {
-                'from_cache': True,
-                'cache_date': latest_analysis['analysis_date'],
-                'created_at': latest_analysis.get('created_at'),
-                'reason': f"当前无最新分析，返回最近交易日({latest_analysis['analysis_date']})的结果"
-            }
-            # Add success flag for frontend
-            result['success'] = True
-            return result
-        else:
-            return {
-                "success": False,
-                "error": "暂无任何历史大盘分析数据",
-                "is_trading_day": market_analysis_cache.is_trading_day(today)
-            }
+        # ONLY fallback if NO date was explicitly requested
+        if not analysis_date:
+            print(f"[Market Analysis] {today_str} not found, falling back to latest trading day")
+            latest_analysis = market_analysis_cache.get_latest_trading_day_analysis()
+            if latest_analysis:
+                result = latest_analysis['analysis_result']
+                result['analysis_date'] = latest_analysis['analysis_date']
+                result['cache_info'] = {
+                    'from_cache': True,
+                    'cache_date': latest_analysis['analysis_date'],
+                    'created_at': latest_analysis.get('created_at'),
+                    'reason': f"当日无分析，返回最近交易日({latest_analysis['analysis_date']})的结果"
+                }
+                result['success'] = True
+                return result
+        
+        print(f"[Market Analysis] {today_str} not found and no fallback allowed")
+        return {
+            "success": False,
+            "error": f"暂无 {today_str} 的历史大盘分析数据",
+            "is_trading_day": market_analysis_cache.is_trading_day(date.fromisoformat(today_str)) if not analysis_date else True
+        }
 
 @router.post("/analyze-market")
 async def analyze_market(request: MarketAnalysisRequest, current_user: dict = Depends(get_current_active_user)):
     """Frontend endpoint: only fetch cached market analysis result.
 
     实际分析工作由后台 Celery 定时任务完成，这里不再触发 LLM 调用。
+    支持可选的 date 参数。
     """
-    return fetch_market_analysis_result()
+    return fetch_market_analysis_result(request.date)
 
 @router.get("/global-analysis")
 async def get_global_analysis(current_user: dict = Depends(get_current_active_user)):
