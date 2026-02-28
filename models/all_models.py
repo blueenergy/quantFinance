@@ -73,6 +73,7 @@ class StockAnalysisRequest(BaseModel):
     model: Optional[str] = None      # <--- 补充
 class MarketAnalysisRequest(BaseModel):
     type: str
+    date: Optional[str] = None
     force_refresh: Optional[bool] = False
 
 # Add more models as needed for your API
