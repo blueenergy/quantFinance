@@ -27,6 +27,13 @@ class ChangePasswordRequest(BaseModel):
     old_password: str
     new_password: str
 
+class ForgotPasswordRequest(BaseModel):
+    email: EmailStr
+
+class ResetPasswordRequest(BaseModel):
+    token: str
+    new_password: str
+
 class TwoFactorRequest(BaseModel):
     enabled: bool
 
@@ -222,6 +229,117 @@ def verify_email(token: str):
         raise HTTPException(status_code=400, detail="验证链接已过期")
     except jwt.JWTError:
         raise HTTPException(status_code=400, detail="验证令牌无效")
+
+def send_password_reset_email(email: str, username: str):
+    """发送密码重置邮件"""
+    # 创建重置令牌
+    reset_data = {
+        "email": email,
+        "username": username,
+        "purpose": "password_reset",
+        "exp": datetime.utcnow() + timedelta(hours=1)  # 1小时有效
+    }
+    reset_token = jwt.encode(reset_data, EMAIL_VERIFICATION_SECRET, algorithm=ALGORITHM)
+    
+    # 构建重置链接
+    frontend_url = os.getenv("FRONTEND_URL", "http://localhost:5173")
+    reset_link = f"{frontend_url}/reset-password?token={reset_token}"
+    
+    try:
+        msg = MIMEMultipart()
+        msg['Subject'] = '密码重置 - 重置您的账户密码'
+        msg['From'] = os.getenv('SMTP_FROM_EMAIL', 'noreply@yourdomain.com')
+        msg['To'] = email
+        
+        body = f"""
+        您好 {username}，
+        
+        我们收到了重置您账户密码的请求。请点击以下链接重置密码：
+        
+        {reset_link}
+        
+        此链接将在1小时后过期。
+        
+        如果您没有请求重置密码，请忽略此邮件，您的密码不会被更改。
+        
+        此致，
+        服务团队
+        """
+        
+        msg.attach(MIMEText(body, 'plain', 'utf-8'))
+        
+        smtp_server = os.getenv('SMTP_SERVER', 'localhost')
+        smtp_port = int(os.getenv('SMTP_PORT', '587'))
+        smtp_username = os.getenv('SMTP_USERNAME')
+        smtp_password = os.getenv('SMTP_PASSWORD')
+        
+        with smtplib.SMTP(smtp_server, smtp_port) as server:
+            server.starttls()
+            server.login(smtp_username, smtp_password)
+            server.send_message(msg)
+            
+        return True
+    except Exception as e:
+        print(f"发送密码重置邮件失败: {str(e)}")
+        return False
+
+@router.post("/forgot-password")
+def forgot_password(
+    request: ForgotPasswordRequest,
+    background_tasks: BackgroundTasks = BackgroundTasks()
+):
+    """忘记密码 - 发送重置邮件"""
+    # 查找用户
+    user = users_collection.find_one({"email": request.email})
+    
+    # 无论用户是否存在，都返回成功（防止用户枚举攻击）
+    if not user:
+        return {"success": True, "message": "如果该邮箱已注册，您将收到密码重置邮件"}
+    
+    # 发送重置邮件
+    background_tasks.add_task(send_password_reset_email, user["email"], user["username"])
+    
+    return {"success": True, "message": "如果该邮箱已注册，您将收到密码重置邮件"}
+
+@router.post("/reset-password")
+def reset_password(request: ResetPasswordRequest):
+    """重置密码 - 通过邮件中的令牌"""
+    from auth import get_password_hash
+    
+    try:
+        # 解码重置令牌
+        payload = jwt.decode(request.token, EMAIL_VERIFICATION_SECRET, algorithms=[ALGORITHM])
+        
+        # 验证令牌用途
+        if payload.get("purpose") != "password_reset":
+            raise HTTPException(status_code=400, detail="无效的重置令牌")
+        
+        email = payload.get("email")
+        username = payload.get("username")
+        
+        if not email or not username:
+            raise HTTPException(status_code=400, detail="重置令牌无效")
+        
+        # 检查新密码强度
+        if len(request.new_password) < 8:
+            raise HTTPException(status_code=400, detail="新密码长度不能少于8位")
+        
+        # 更新密码
+        hashed_password = get_password_hash(request.new_password)
+        result = users_collection.update_one(
+            {"username": username, "email": email},
+            {"$set": {"hashed_password": hashed_password}}
+        )
+        
+        if result.modified_count > 0:
+            return {"success": True, "message": "密码重置成功，请使用新密码登录"}
+        else:
+            raise HTTPException(status_code=400, detail="密码重置失败，用户信息不匹配")
+            
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=400, detail="重置链接已过期，请重新申请")
+    except jwt.JWTError:
+        raise HTTPException(status_code=400, detail="重置令牌无效")
 
 @router.post("/change-password")
 def change_user_password(
