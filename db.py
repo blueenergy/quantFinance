@@ -80,6 +80,8 @@ def get_db_collections() -> Dict[str, Collection]:
         "limit_down_ladder": db["limit_down_ladder"], # 跌停天梯数据
         # Sector concept analysis (DC / THS)
         "sector_concept_analysis": db["sector_concept_analysis"],  # 概念板块分析结果
+        # Hot stock analysis (THS / DC)
+        "hot_stock_analysis": db["hot_stock_analysis"],  # 热股分析结果（每次更新一条）
         # Add more collections as needed
     }
 
