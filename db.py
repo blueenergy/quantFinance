@@ -78,6 +78,8 @@ def get_db_collections() -> Dict[str, Collection]:
         "schedule_config": db["schedule_config"], # 定时任务调度配置
         "daily_limit_down": db["daily_limit_down"], # 每日跌停数据
         "limit_down_ladder": db["limit_down_ladder"], # 跌停天梯数据
+        # Sector concept analysis (DC / THS)
+        "sector_concept_analysis": db["sector_concept_analysis"],  # 概念板块分析结果
         # Add more collections as needed
     }
 

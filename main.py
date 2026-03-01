@@ -30,6 +30,7 @@ from routers.strategy_pool import router as strategy_pool_router
 from routers.strategy_workers import router as strategy_workers_router
 from routers.limit_up_ladder import router as ladder_router
 from routers.scheduler_admin import router as scheduler_admin_router
+from routers.sector_concept import router as sector_concept_router
 from production_config import configure_production_app
 from contextlib import asynccontextmanager
 from scheduler import start_scheduler, stop_scheduler
@@ -74,3 +75,4 @@ app.include_router(strategy_pool_router, prefix="/api", tags=["策略股池"])
 app.include_router(strategy_workers_router, prefix="/api/strategy", tags=["策略Worker"])
 app.include_router(ladder_router, prefix="/api", tags=["连板天梯"])
 app.include_router(scheduler_admin_router, prefix="/api/admin/scheduler", tags=["后台任务调度"])
+app.include_router(sector_concept_router, prefix="/api", tags=["概念板块分析"])
