@@ -317,6 +317,48 @@ def generate_global_analysis_task(job_id: str):
         log.error(f"[Global Analysis] Scheduling failed: {e}", exc_info=True)
 
 
+def hot_stock_poll_task(source: str):
+    """热股轮询任务 - 每30分钟检查 THS / DC 热榜是否有新数据。"""
+    from db import get_db_collections
+
+    try:
+        collections = get_db_collections()
+        tasks_col = collections["analysis_tasks"]
+        analysis_col = collections["hot_stock_analysis"]
+
+        # Check already running task for this source
+        existing = tasks_col.find_one({
+            "type": "hot_stock_analysis",
+            "params.source": source,
+            "status": {"$in": ["pending", "processing"]},
+        })
+        if existing:
+            log.info(f"[HotStock Poll] {source.upper()} task already in queue, skipping.")
+            return
+
+        # Get last known rank_time from analysis history
+        last_doc = analysis_col.find_one({"source": source}, sort=[("created_at", -1)])
+        last_rank_time = last_doc.get("rank_time") if last_doc else None
+
+        task_doc = {
+            "user_id": "system",
+            "type": "hot_stock_analysis",
+            "priority": 20,
+            "status": "pending",
+            "params": {
+                "source": source,
+                "last_rank_time": last_rank_time,
+            },
+            "created_at": datetime.now(),
+            "source": "scheduler",
+        }
+        result = tasks_col.insert_one(task_doc)
+        log.info(f"[HotStock Poll] {source.upper()} task submitted ({result.inserted_id}), last_rank_time={last_rank_time}")
+
+    except Exception as e:
+        log.error(f"[HotStock Poll] {source.upper()} scheduling failed: {e}", exc_info=True)
+
+
 # Map of configurable tasks to logic
 TASK_MAP = {
     'check_worker_timeouts': check_worker_timeouts_task,
@@ -325,6 +367,8 @@ TASK_MAP = {
     'market_analysis_1130': generate_market_analysis_task,
     'market_analysis_1630': generate_market_analysis_task,
     'global_analysis_0830': generate_global_analysis_task,
+    'hot_stock_poll_ths': lambda: hot_stock_poll_task('ths'),
+    'hot_stock_poll_dc': lambda: hot_stock_poll_task('dc'),
 }
 
 # Default trigger configurations
@@ -367,7 +411,17 @@ DEFAULT_SCHEDULES = {
         'hour': 8,
         'minute': 30,
         'day_of_week': 'mon-fri'
-    }
+    },
+    'hot_stock_poll_ths': {
+        'name': "同花顺热股轮询 (每30分钟)",
+        'type': "interval",
+        'seconds': 1800,  # 30 minutes
+    },
+    'hot_stock_poll_dc': {
+        'name': "东方财富热股轮询 (每30分钟)",
+        'type': "interval",
+        'seconds': 1800,
+    },
 }
 
 def get_trigger_from_config(config_data):
