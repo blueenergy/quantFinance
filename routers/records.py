@@ -29,11 +29,31 @@ class RecordResponseModel(BaseModel):
     score_date: Optional[str] = None
 
 @router.get("/records/", response_model=List[RecordResponseModel])
-def get_records(symbol: Optional[str] = Query(None), limit: int = 10, sort: Optional[str] = None):
+def get_records(
+    symbol: Optional[str] = Query(None), 
+    limit: int = 10, 
+    sort: Optional[str] = None,
+    start_date: Optional[str] = Query(None),
+    end_date: Optional[str] = Query(None)
+):
     query = {}
     if symbol:
         query["symbol"] = symbol
-    # 构建聚合管道，先将 trade_date 转为 %Y%m%d 字符串
+    
+    # 构建日期范围查询
+    date_query = {}
+    if start_date:
+        s_date = start_date.replace('-', '')
+        date_query["$gte"] = s_date
+    if end_date:
+        e_date = end_date.replace('-', '')
+        date_query["$lte"] = e_date
+    
+    # 在初始 match 阶段尝试过滤（针对字符串类型的 trade_date）
+    if date_query:
+        query["trade_date"] = date_query
+
+    # 构建聚合管道
     pipeline = [
         {"$match": query},
         {"$addFields": {
@@ -46,6 +66,16 @@ def get_records(symbol: Optional[str] = Query(None), limit: int = 10, sort: Opti
             }
         }}
     ]
+
+    # 如果存在过滤需求，在标准化日期后再次过滤，以防 trade_date 是日期对象
+    if date_query:
+        match_stage = {}
+        if date_query.get("$gte"):
+            match_stage["$gte"] = date_query["$gte"]
+        if date_query.get("$lte"):
+            match_stage["$lte"] = date_query["$lte"]
+        if match_stage:
+            pipeline.append({"$match": {"trade_date_str": match_stage}})
     if sort:
         # 支持 '-trade_date' 降序
         field = sort.lstrip('-')
@@ -139,17 +169,32 @@ def get_record(record_id: str):
     return {"error": "Not found"}
 
 @router.get("/money-flow-records")
-def get_money_flow_records(symbol: str, current_user: dict = Depends(get_current_active_user)):
+def get_money_flow_records(
+    symbol: str, 
+    start_date: Optional[str] = Query(None),
+    end_date: Optional[str] = Query(None),
+    current_user: dict = Depends(get_current_active_user)
+):
     """
-    获取某只股票的资金流数据，按 trade_date 升序排列
+    获取某只股票的资金流数据，按 trade_date 升序排列，支持日期范围。
     """
     collections = get_db_collections()
     money_flow_col = collections["money_flow"]
-    # 查询所有资金流数据
-    records = list(money_flow_col.find(
-        {"symbol": symbol}
-    ).sort("trade_date", 1))
-    # 格式化 trade_date 为字符串（如有需要）
+    
+    query = {"symbol": symbol}
+    date_query = {}
+    if start_date:
+        date_query["$gte"] = start_date.replace('-', '')
+    if end_date:
+        date_query["$lte"] = end_date.replace('-', '')
+    
+    if date_query:
+        query["trade_date"] = date_query
+
+    # 查询资金流数据
+    records = list(money_flow_col.find(query).sort("trade_date", 1))
+    
+    # 格式化 trade_date 为字符串
     for r in records:
         if isinstance(r["trade_date"], (datetime, date)):
             r["trade_date"] = r["trade_date"].strftime("%Y%m%d")
