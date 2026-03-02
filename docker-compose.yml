@@ -58,6 +58,8 @@ services:
       # overseas = Yahoo Finance+BBC/CNBC新闻（本地有代理）
       # full     = 全部服务（默认，兼容原有部署）
       - DEPLOY_MODE=${DEPLOY_MODE:-full}
+      - SECONDARY_MONGO_URI=${SECONDARY_MONGO_URI:-}
+      - SECONDARY_MONGO_DB=${SECONDARY_MONGO_DB:-finance}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     restart: unless-stopped
