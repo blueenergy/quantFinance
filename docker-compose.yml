@@ -54,6 +54,10 @@ services:
       - DB_NAME=${MONGO_DB}
       - TUSHARE_TOKEN=${TUSHARE_TOKEN}
       - TZ=Asia/Shanghai
+      # domestic = Tushare同步+梯子（云服务器）
+      # overseas = Yahoo Finance+BBC/CNBC新闻（本地有代理）
+      # full     = 全部服务（默认，兼容原有部署）
+      - DEPLOY_MODE=${DEPLOY_MODE:-full}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     restart: unless-stopped
