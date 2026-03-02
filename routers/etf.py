@@ -23,10 +23,25 @@ async def get_etf_list(
     cursor = db["etf_basic"].find(query, {"_id": 0}).limit(limit)
     results = list(cursor)
     
+    import math
+    import pandas as pd
+    
+    clean_results = []
+    for row in results:
+        clean_row = {}
+        for k, v in row.items():
+            if pd.isna(v) or (isinstance(v, float) and (math.isnan(v) or math.isinf(v))):
+                clean_row[k] = None
+            else:
+                if hasattr(v, 'item'):
+                    v = v.item()
+                clean_row[k] = v
+        clean_results.append(clean_row)
+    
     return {
         "success": True,
-        "count": len(results),
-        "data": results
+        "count": len(clean_results),
+        "data": clean_results
     }
 
 @router.get("/{symbol}/kline")
@@ -123,4 +138,126 @@ async def get_etf_kline(
         "symbol": symbol,
         "count": len(merged_data),
         "data": merged_data
+    }
+
+from pydantic import BaseModel
+from auth import get_current_active_user
+from fastapi import Depends
+from bson import ObjectId
+from datetime import datetime
+
+class AnalyzeRequest(BaseModel):
+    symbol: str
+    force: bool = False
+
+@router.post("/analyze", summary="手动触发ETF智能分析")
+async def submit_etf_analysis(
+    request: AnalyzeRequest,
+    current_user: dict = Depends(get_current_active_user),
+):
+    """Submit an ETF analysis task to the background worker (quantAnalyzer)."""
+    symbol = request.symbol.upper()
+    basic = db["etf_basic"].find_one({"ts_code": symbol})
+    if not basic:
+        raise HTTPException(status_code=404, detail=f"ETF {symbol} not found")
+
+    # Check if a task is already running
+    existing = db["analysis_tasks"].find_one({
+        "type": "etf_analysis",
+        "params.symbol": symbol,
+        "status": {"$in": ["pending", "processing"]},
+    })
+    
+    if existing:
+        return {
+            "success": True,
+            "task_id": str(existing["_id"]),
+            "message": "已有该ETF的分析任务正在处理中",
+            "status": existing["status"],
+        }
+
+    task_doc = {
+        "user_id": current_user.get("username", "unknown"),
+        "type": "etf_analysis",
+        "priority": 20,
+        "status": "pending",
+        "params": {
+            "symbol": symbol,
+            "force": request.force,
+        },
+        "created_at": datetime.now(),
+        "updated_at": datetime.now(),
+    }
+    
+    result = db["analysis_tasks"].insert_one(task_doc)
+
+    return {
+        "success": True,
+        "task_id": str(result.inserted_id),
+        "message": f"ETF分析任务已提交 ({symbol})",
+        "status": "pending",
+    }
+
+
+@router.get("/task/{task_id}", summary="查询分析任务状态")
+async def get_etf_task_status(
+    task_id: str,
+    current_user: dict = Depends(get_current_active_user),
+):
+    """Poll task status."""
+    try:
+        task = db["analysis_tasks"].find_one({"_id": ObjectId(task_id)})
+    except Exception:
+        raise HTTPException(400, "Invalid task_id")
+
+    if not task:
+        raise HTTPException(404, "Task not found")
+
+    response = {
+        "success": True,
+        "task_id": task_id,
+        "status": task.get("status"),
+        "created_at": task.get("created_at").isoformat() if task.get("created_at") else None,
+    }
+
+    if task["status"] == "completed":
+        result = task.get("result", {})
+        response["analysis"] = result.get("analysis")
+        response["symbol"] = result.get("ts_code")
+        response["trade_date"] = result.get("trade_date")
+        response["completed_at"] = (
+            task.get("completed_at").isoformat() if task.get("completed_at") else None
+        )
+    elif task["status"] == "failed":
+        response["error"] = task.get("error", "Unknown error")
+
+    return response
+
+
+@router.get("/{symbol}/analysis", summary="获取ETF最新智能分析结果")
+async def get_etf_latest_analysis(
+    symbol: str,
+    current_user: dict = Depends(get_current_active_user),
+):
+    """Get the most recent cached analysis for an ETF."""
+    symbol = symbol.upper()
+    doc = db["etf_analysis"].find_one(
+        {"ts_code": symbol}, 
+        sort=[("created_at", -1)]
+    )
+    
+    if not doc:
+        return {
+            "success": False,
+            "error": f"暂无 {symbol} 的深度分析报告，请点击分析按钮生成。",
+        }
+
+    return {
+        "success": True,
+        "symbol": symbol,
+        "trade_date": doc.get("trade_date"),
+        "latest_kline_date": doc.get("latest_kline_date"),
+        "analysis": doc.get("analysis"),
+        "model": doc.get("model"),
+        "created_at": doc.get("created_at").isoformat() if doc.get("created_at") else None,
     }
