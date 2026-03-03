@@ -67,7 +67,9 @@ def get_db_collections() -> Dict[str, Collection]:
         "sector_flow": db["sector_flow"],  # 板块资金流向
         # Portfolio analysis
         "portfolio_analysis": db["portfolio_analysis"],  # 组合机会分析历史
-        "portfolio_analysis": db["portfolio_analysis"],  # 组合机会分析历史
+        # ETF data
+        "etf_basic": db["etf_basic"],
+        "etf_daily": db["etf_daily"],
         "analysis_tags": db["analysis_tags"],  # AI 分析标签
         "analysis_logs": db["analysis_logs"],  # AI 分析详单
         # Phase 10: Async Task Queue Architecture

@@ -173,17 +173,34 @@ def get_user_watchlist_stocks(current_user: dict = Depends(get_current_active_us
         result = []
 
         volume_price_col = collections["volume_price"]
+        etf_basic_col = collections.get("etf_basic")
+        etf_daily_col = collections.get("etf_daily")
+        
         for symbol in symbols:
+            # Check Stock first
             stock_info = collections["stock_info"].find_one({"symbol": symbol})
-            name = stock_info["name"] if stock_info and "name" in stock_info else symbol
-
-            # Find latest record for symbol in volume_price
-            latest_record = volume_price_col.find_one(
-                {"symbol": symbol},
-                sort=[("trade_date", -1)]
-            )
+            if stock_info:
+                name = stock_info["name"] if "name" in stock_info else symbol
+                latest_record = volume_price_col.find_one(
+                    {"symbol": symbol},
+                    sort=[("trade_date", -1)]
+                )
+            else:
+                # Check ETF
+                etf_info = etf_basic_col.find_one({"ts_code": symbol}) if etf_basic_col is not None else None
+                if etf_info:
+                    name = etf_info["name"] if "name" in etf_info else symbol
+                    latest_record = etf_daily_col.find_one(
+                        {"ts_code": symbol},
+                        sort=[("trade_date", -1)]
+                    ) if etf_daily_col is not None else None
+                else:
+                    name = symbol
+                    latest_record = None
 
             if latest_record:
+                # etf_daily uses 'amount' instead of 'turnover' natively in tushare sometimes
+                # but our ingest script maps it to amount. Let's handle both.
                 stock_data = {
                     "symbol": symbol,
                     "name": name,
@@ -316,6 +333,7 @@ def get_user_watchlist_realtime(current_user: dict = Depends(get_current_active_
         # 2. 获取昨日收盘价（用于计算涨跌幅）
         yesterday_close_map = {}  # symbol -> close_price
         volume_price_col = collections["volume_price"]
+        etf_daily_col = collections.get("etf_daily")
         
         for symbol in symbols:
             latest_record = volume_price_col.find_one(
@@ -324,6 +342,14 @@ def get_user_watchlist_realtime(current_user: dict = Depends(get_current_active_
             )
             if latest_record:
                 yesterday_close_map[symbol] = latest_record.get("close")
+            elif etf_daily_col is not None:
+                # Fallback to ETF daily
+                etf_record = etf_daily_col.find_one(
+                    {"ts_code": symbol},
+                    sort=[("trade_date", -1)]
+                )
+                if etf_record:
+                    yesterday_close_map[symbol] = etf_record.get("close")
         
         # 3. 准备查询条件（minute_bars 中 symbol 没有交易所后缀）
         # symbols 已经是不带后缀的格式，如 ["600990", "300722"]
@@ -361,11 +387,19 @@ def get_user_watchlist_realtime(current_user: dict = Depends(get_current_active_
         realtime_map = {item["_id"]: item for item in realtime_data}  # symbol -> data
         
         stock_info_col = collections["stock_info"]
+        etf_basic_col = collections.get("etf_basic")
         
         for symbol in symbols:
-            # 获取股票名称
+            # 获取股票/ETF名称
             stock_info = stock_info_col.find_one({"symbol": symbol})
-            name = stock_info["name"] if stock_info and "name" in stock_info else symbol
+            if stock_info:
+                name = stock_info["name"] if "name" in stock_info else symbol
+            else:
+                etf_info = etf_basic_col.find_one({"ts_code": symbol}) if etf_basic_col is not None else None
+                if etf_info:
+                    name = etf_info["name"] if "name" in etf_info else symbol
+                else:
+                    name = symbol
             
             if symbol in realtime_map:
                 # 有今日实时数据
