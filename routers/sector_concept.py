@@ -10,7 +10,7 @@ from typing import Optional
 from fastapi import APIRouter, Query, Depends, HTTPException
 from pydantic import BaseModel
 from auth import get_current_active_user
-from db import get_db_collections
+from db import get_db_collections, get_analyzer_db
 from bson import ObjectId
 
 router = APIRouter(prefix="/sector-concept", tags=["概念板块分析"])
@@ -144,7 +144,7 @@ async def get_latest_analysis(
 ):
     """Get the latest completed analysis for a given source, optionally filtered by date."""
     collections = get_db_collections()
-    analysis_col = collections["sector_concept_analysis"]
+    analysis_col = get_analyzer_db()["sector_concept_analysis"]
 
     source = source.lower()
     if source not in ("dc", "ths"):

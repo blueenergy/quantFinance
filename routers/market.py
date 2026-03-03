@@ -3,7 +3,7 @@ from typing import Optional, Dict, Any
 from fastapi import APIRouter,Query, Depends, HTTPException
 from models.all_models import MarketAnalysisRequest
 from auth import get_current_active_user
-from db import get_db_collections
+from db import get_db_collections, get_analyzer_db
 from market_analysis_cache import market_analysis_cache
 from datetime import date, datetime
 from external_data import external_market_data
@@ -139,7 +139,7 @@ async def get_global_analysis(current_user: dict = Depends(get_current_active_us
         collections = get_db_collections()
         # Fetch the latest document from global_analysis collection
         # Sort by _id (desc) to get the most recently inserted document regardless of timestamp field
-        doc = collections["global_analysis"].find_one(
+        doc = get_analyzer_db()["global_analysis"].find_one(
             sort=[("_id", -1)]
         )
         

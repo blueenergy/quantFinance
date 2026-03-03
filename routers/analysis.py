@@ -3,7 +3,7 @@ from typing import Optional, Dict, Any, List
 from fastapi import APIRouter, Depends, Query, HTTPException
 from models.all_models import AnalysisHistoryRequest
 from auth import get_current_active_user
-from db import get_db_collections
+from db import get_db_collections, get_analyzer_db
 from datetime import datetime
 from utils.stock_utils import serialize_doc, format_trade_date
 from bson import ObjectId
@@ -140,7 +140,7 @@ async def get_latest_portfolio_analysis(
     """
     user_id = current_user["id"]
     collections = get_db_collections()
-    portfolio_analysis_col = collections["portfolio_analysis"]
+    portfolio_analysis_col = get_analyzer_db()["portfolio_analysis"]
     
     query = {"user_id": user_id}
     if analysis_type:
@@ -397,7 +397,7 @@ def _fetch_ladder_data_for_portfolio() -> Optional[Dict[str, Any]]:
 def save_analysis_history(req: AnalysisHistoryRequest, current_user: dict = Depends(get_current_active_user)):
     """保存分析历史，统一存储为 analysis_result.analysis 结构。"""
     collections = get_db_collections()
-    analysis_col = collections["analysis_history"]
+    analysis_col = get_analyzer_db()["analysis_history"]
 
     analysis_result = getattr(req, "analysis_result", None)
     if not isinstance(analysis_result, dict):
@@ -453,7 +453,7 @@ def get_analysis_history(symbol: Optional[str] = None, page: int = 1, limit: int
     如果未提供 `symbol`，将返回当前用户的所有历史（按时间倒序），支持分页（page, limit）。
     """
     collections = get_db_collections()
-    analysis_col = collections["analysis_history"]
+    analysis_col = get_analyzer_db()["analysis_history"]
 
     query = {"user_id": current_user.get("id")}
     if symbol:
@@ -592,7 +592,7 @@ async def create_deep_analysis_task(
 @router.get("/analyze/unread-count", summary="获取未读分析数量")
 async def get_unread_count(current_user: dict = Depends(get_current_active_user)):
     collections = get_db_collections()
-    count = collections["analysis_history"].count_documents({
+    count = get_analyzer_db()["analysis_history"].count_documents({
         "user_id": current_user["id"],
         "is_read": False,
         "source": "async_task" # Only count async tasks? Or all? Let's count all unread.
@@ -613,7 +613,7 @@ async def mark_analysis_read(ids: List[str], current_user: dict = Depends(get_cu
         except:
             pass
             
-    result = collections["analysis_history"].update_many(
+    result = get_analyzer_db()["analysis_history"].update_many(
         {
             "_id": {"$in": obj_ids},
             "user_id": current_user["id"]
