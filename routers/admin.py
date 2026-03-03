@@ -2,7 +2,7 @@ from bson import ObjectId
 from fastapi import APIRouter, Depends, Query, HTTPException, Body
 from typing import List
 from auth import get_current_admin_user, log_admin_action, create_admin_user
-from db import get_db_collections
+from db import get_db_collections, get_analyzer_db
 from datetime import timedelta, datetime
 from utils.stock_utils import serialize_doc
 import time
@@ -22,7 +22,7 @@ users_collection = collections["users"]
 user_watchlists_collection = collections["user_watchlists"]
 login_logs_collection = collections["login_logs"]
 admin_logs_collection = collections["admin_logs"]
-analysis_history_collection = collections["analysis_history"]
+analysis_history_collection = get_analyzer_db()["analysis_history"]
 
 @router.get("/users")
 def get_all_users(

@@ -8,10 +8,13 @@ load_dotenv()
 # MongoDB connection settings
 mongo_url = os.getenv("MONGO_URI", os.getenv("MONGO_URL", "mongodb://localhost:27017"))
 DB_NAME = os.getenv("MONGO_DB", "finance")
+ANALYZER_DB_NAME = os.getenv("ANALYZER_DB_NAME", "quant_analyzer")
 
 # Singleton client (reuse across app)
 client = MongoClient(mongo_url)
 db = client[DB_NAME]
+# Separate DB for quantAnalyzer outputs (read-only in quantFinance)
+analyzer_db = client[ANALYZER_DB_NAME]
 
 def get_db_collections() -> Dict[str, Collection]:
     """
@@ -90,6 +93,24 @@ def get_db_collections() -> Dict[str, Collection]:
 def get_collection(name: str):
     """Get a single collection by name."""
     return db[name]
+
+def get_analyzer_db():
+    """
+    Return a dict of collections from the quantAnalyzer output DB (quant_analyzer).
+    quantFinance uses these for read-only access to AI analysis results.
+    Write access belongs exclusively to quantAnalyzer.
+    """
+    return {
+        "analysis_history": analyzer_db["analysis_history"],
+        "analysis_logs": analyzer_db["analysis_logs"],
+        "analysis_tags": analyzer_db["analysis_tags"],
+        "etf_analysis": analyzer_db["etf_analysis"],
+        "global_analysis": analyzer_db["global_analysis"],
+        "hot_stock_analysis": analyzer_db["hot_stock_analysis"],
+        "sector_concept_analysis": analyzer_db["sector_concept_analysis"],
+        "portfolio_analysis": analyzer_db["portfolio_analysis"],
+        "market_analysis_cache": analyzer_db["market_analysis_cache"],
+    }
 
 def close_db():
     """Close the MongoDB connection (if needed)."""

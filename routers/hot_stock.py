@@ -10,7 +10,7 @@ from typing import Optional
 from fastapi import APIRouter, Query, Depends, HTTPException
 from pydantic import BaseModel
 from auth import get_current_active_user
-from db import get_db_collections
+from db import get_db_collections, get_analyzer_db
 from bson import ObjectId
 
 router = APIRouter(prefix="/hot-stock", tags=["热股分析"])
@@ -49,7 +49,7 @@ async def submit_hot_stock_analysis(
         }
 
     # Get latest rank_time from DB (for dedup — skip if unchanged)
-    analysis_col = collections["hot_stock_analysis"]
+    analysis_col = get_analyzer_db()["hot_stock_analysis"]
     last_doc = analysis_col.find_one({"source": source}, sort=[("created_at", -1)])
     last_rank_time = last_doc.get("rank_time") if last_doc else None
 
@@ -125,7 +125,7 @@ async def get_latest_analysis(
 ):
     """Get the most recent hot stock analysis."""
     collections = get_db_collections()
-    analysis_col = collections["hot_stock_analysis"]
+    analysis_col = get_analyzer_db()["hot_stock_analysis"]
 
     source = source.lower()
     if source not in ("ths", "dc"):
@@ -159,7 +159,7 @@ async def get_today_history(
 ):
     """Get all analysis records for a given trade date (for timeline view)."""
     collections = get_db_collections()
-    analysis_col = collections["hot_stock_analysis"]
+    analysis_col = get_analyzer_db()["hot_stock_analysis"]
 
     source = source.lower()
     if source not in ("ths", "dc"):
