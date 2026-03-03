@@ -171,16 +171,20 @@ async def get_latest_portfolio_analysis(
     }
 
 
+@router.get("/analyze/task/{task_id}")
 @router.get("/analyze/portfolio-task/{task_id}")
-async def get_portfolio_task_status(
+async def get_analysis_task_status(
     task_id: str,
     current_user: dict = Depends(get_current_active_user)
 ):
     """
-    查询组合分析任务状态
+    通用分析任务状态查询（支持组合分析与深度分析）
     """
     collections = get_db_collections()
-    task = collections["analysis_tasks"].find_one({"_id": ObjectId(task_id)})
+    try:
+        task = collections["analysis_tasks"].find_one({"_id": ObjectId(task_id)})
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid task_id")
     
     if not task:
         raise HTTPException(status_code=404, detail="任务不存在")
