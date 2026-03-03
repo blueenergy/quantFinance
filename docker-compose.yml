@@ -31,6 +31,7 @@ services:
       - DEFAULT_LLM_PROVIDER=qwen
       - DEFAULT_MODEL=qwen-plus
       - ANALYSIS_INTERVAL=300
+      - DISABLE_AUTO_ANALYSIS=${DISABLE_AUTO_ANALYSIS:-false}
       - TZ=Asia/Shanghai
     extra_hosts:
       - "host.docker.internal:host-gateway"
