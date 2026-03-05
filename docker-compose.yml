@@ -103,6 +103,24 @@ services:
     networks:
       - quant-network
 
+  # 股票评分系统 (每日19:00定时评分)
+  quant-scorer:
+    build:
+      context: ../stock-scoring-system
+      dockerfile: Dockerfile
+    container_name: quant-scorer
+    environment:
+      - MONGO_URL=${MONGO_URI:-mongodb://host.docker.internal:27017}
+      - MONGO_DB=${MONGO_DB}
+      - TUSHARE_TOKEN=${TUSHARE_TOKEN}
+      - MAX_WORKERS=${SCORING_MAX_WORKERS:-6}
+      - TZ=Asia/Shanghai
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+    volumes:
+      - ../stock-scoring-system/logs:/app/logs
+
   # Strategy Manager API 服务
   quant-strategy-manager:
     build:
