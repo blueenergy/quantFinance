@@ -33,6 +33,7 @@ from routers.scheduler_admin import router as scheduler_admin_router
 from routers.sector_concept import router as sector_concept_router
 from routers.hot_stock import router as hot_stock_router
 from routers.etf import router as etf_router
+from routers.data_pulse import router as data_pulse_router
 from production_config import configure_production_app
 from contextlib import asynccontextmanager
 from scheduler import start_scheduler, stop_scheduler
@@ -80,3 +81,4 @@ app.include_router(scheduler_admin_router, prefix="/api/admin/scheduler", tags=[
 app.include_router(sector_concept_router, prefix="/api", tags=["概念板块分析"])
 app.include_router(hot_stock_router, prefix="/api", tags=["热股分析"])
 app.include_router(etf_router, prefix="/api", tags=["ETF淘金"])
+app.include_router(data_pulse_router, prefix="/api", tags=["数据脉搏"])
