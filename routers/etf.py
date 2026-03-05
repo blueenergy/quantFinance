@@ -1,48 +1,122 @@
-from fastapi import APIRouter, Query, HTTPException
+from fastapi import APIRouter, Query, HTTPException, Depends
 from typing import List, Optional
 from db import db
 import pandas as pd
+from auth import get_current_active_user
 
 router = APIRouter(prefix="/etf", tags=["etf"])
+
+# 核心推荐ETF（若DB未同步全量，至少保证这些显示）
+FEATURED_ETF_CODES = [
+    # ----- 宽基指数 -----
+    "510300.SH",  # 沪淳300ETF
+    "510500.SH",  # 中证500ETF
+    "588000.SH",  # 科创50ETF
+    "159949.SZ",  # 创业板100ETF
+    "510050.SH",  # 上证50ETF
+    "159919.SZ",  # 氪淳300ETF（易方达）
+    "159922.SZ",  # 中证500ETF（易方达）
+    "512100.SH",  # 中证1000ETF
+    "159852.SZ",  # A500ETF
+    # ----- 主题/行业 -----
+    "512760.SH",  # 半导体ETF
+    "159995.SZ",  # 芯片ETF
+    "515790.SH",  # 新能源车ETF
+    "512880.SH",  # 证券ETF
+    "512800.SH",  # 銀行ETF
+    "512690.SH",  # 白酒ETF
+    "159928.SZ",  # 消费ETF
+    "516160.SH",  # 光伏ETF
+    "512980.SH",  # 传媒ETF
+    "159941.SZ",  # 纳斯达ETF
+    "513500.SH",  # 标普500ETF
+    "513100.SH",  # 纳斯达ETF（华安）
+]
 
 @router.get("/list")
 async def get_etf_list(
     q: Optional[str] = Query(None, description="Search by symbol or name"),
+    featured: bool = Query(False, description="Return curated featured ETFs when no search query"),
     limit: int = 50
 ):
     """
-    Get a list of ETFs, optionally filtered by search query.
+    Get a list of ETFs.
+    - No params: returns first `limit` ETFs
+    - ?featured=true: returns curated core ETFs (宽基+主要行业)
+    - ?q=xxx: full-text search across all ETFs
     """
-    query = {}
+    import re, math
+
     if q:
-        import re
-        # Case insensitive regex search on symbol or name
+        # Full-text search mode
         pattern = re.compile(q, re.IGNORECASE)
         query = {"$or": [{"ts_code": pattern}, {"name": pattern}]}
-        
-    cursor = db["etf_basic"].find(query, {"_id": 0}).limit(limit)
+        cursor = db["etf_basic"].find(query, {"_id": 0}).limit(limit)
+    elif featured:
+        # Featured mode: return curated list in defined order
+        cursor = db["etf_basic"].find(
+            {"ts_code": {"$in": FEATURED_ETF_CODES}}, {"_id": 0}
+        )
+    else:
+        cursor = db["etf_basic"].find({}, {"_id": 0}).limit(limit)
+
     results = list(cursor)
-    
-    import math
-    import pandas as pd
-    
+
+    # Maintain featured order when in featured mode
+    if featured and not q:
+        order_map = {code: i for i, code in enumerate(FEATURED_ETF_CODES)}
+        results.sort(key=lambda r: order_map.get(r.get("ts_code", ""), 999))
+
     clean_results = []
     for row in results:
         clean_row = {}
         for k, v in row.items():
-            if pd.isna(v) or (isinstance(v, float) and (math.isnan(v) or math.isinf(v))):
+            if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
                 clean_row[k] = None
             else:
-                if hasattr(v, 'item'):
-                    v = v.item()
-                clean_row[k] = v
+                clean_row[k] = v.item() if hasattr(v, 'item') else v
         clean_results.append(clean_row)
-    
+
     return {
         "success": True,
         "count": len(clean_results),
+        "featured": featured and not q,
         "data": clean_results
     }
+
+
+@router.get("/watchlist")
+async def get_etf_watchlist(
+    current_user: dict = Depends(get_current_active_user)
+):
+    """
+    Get the current user's ETF watchlist with latest price data.
+    Returns only ETFs (ts_codes with .SH/.SZ) from the user's watchlist.
+    """
+    from db import get_db_collections
+    collections = get_db_collections()
+    user_id = str(current_user["id"])
+    doc = collections["user_watchlists"].find_one({"user_id": user_id})
+    all_symbols = doc["symbols"] if doc and "symbols" in doc else []
+
+    # Filter only ETF codes (contain a dot, e.g. 510300.SH)
+    etf_symbols = [s for s in all_symbols if "." in s]
+
+    result = []
+    for ts_code in etf_symbols:
+        basic = db["etf_basic"].find_one({"ts_code": ts_code}, {"_id": 0})
+        latest = db["etf_daily"].find_one({"ts_code": ts_code}, sort=[("trade_date", -1)])
+        result.append({
+            "ts_code": ts_code,
+            "name": (basic or {}).get("name", ts_code),
+            "close": (latest or {}).get("close"),
+            "trade_date": (latest or {}).get("trade_date"),
+            "vol": (latest or {}).get("vol"),
+            "amount": (latest or {}).get("amount"),
+        })
+
+    return {"success": True, "count": len(result), "data": result}
+
 
 @router.get("/{symbol}/kline")
 async def get_etf_kline(
