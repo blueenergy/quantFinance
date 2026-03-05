@@ -73,6 +73,39 @@ services:
     networks:
       - quant-network
 
+  # 量化小助手 (自然语言交互接口)
+  quant-assistant:
+    build:
+      context: ../quant-assistant
+      dockerfile: Dockerfile
+    container_name: quant-assistant
+    ports:
+      - "8002:8002"
+    environment:
+      # Map QWEN settings from .env -> Assistant OPENAI keys
+      - OPENAI_API_KEY=${QWEN_API_KEY:-sk-xxx}
+      - OPENAI_BASE_URL=${QWEN_BASE_URL:-https://dashscope.aliyuncs.com/compatible-mode/v1}
+      - OPENAI_MODEL=${DEFAULT_MODEL:-qwen-plus}
+      # Embeddings
+      - EMBEDDINGS_BASE_URL=${QWEN_BASE_URL:-https://dashscope.aliyuncs.com/compatible-mode/v1}
+      - EMBEDDINGS_MODEL=text-embedding-v3
+      - EMBEDDINGS_DIMENSIONS=1024
+      # MongoDB for assistant logic
+      - MONGO_URI=${MONGO_URI:-mongodb://host.docker.internal:27017/}
+      - MONGO_DB=assistant
+      # Talk to quant-api inside docker network (port 3001)
+      - INTERNAL_API_BASE=http://quant-api:3001
+      - TUSHARE_TOKEN=${TUSHARE_TOKEN}
+      - ASSISTANT_HOST=0.0.0.0
+      - ASSISTANT_PORT=8002
+      - RELOAD=false
+      - TZ=Asia/Shanghai
+    restart: unless-stopped
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - quant-network
+
   # 回测 Worker (轮询任务队列并执行回测)
   backtest-worker:
     build:
