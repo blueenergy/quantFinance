@@ -17,11 +17,12 @@ services:
       - TZ=Asia/Shanghai
 
   # Celery 任务队列 (Worker + Beat)
-  quant-analyzer:
+  # Multi-worker setup for parallel task processing
+  quant-analyzer-1:
     build:
       context: ../quantAnalyzer
       dockerfile: Dockerfile
-    container_name: quant-analyzer
+    container_name: quant-analyzer-1
     environment:
       - MONGO_URI=${MONGO_URI:-mongodb://host.docker.internal:27017/}
       - MONGO_URL=${MONGO_URI:-mongodb://host.docker.internal:27017/}
@@ -34,6 +35,35 @@ services:
       - DEFAULT_MODEL=qwen-plus
       - ANALYSIS_INTERVAL=300
       - DISABLE_AUTO_ANALYSIS=${DISABLE_AUTO_ANALYSIS:-false}
+      - WORKER_ID=analyzer-1
+      - TZ=Asia/Shanghai
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+    # networks:
+    #   - quant-network
+    volumes:
+      - ../quantAnalyzer/logs:/app/logs
+      - ../quant-data-engine/src/quant_data_engine:/app/src/quant_data_engine
+
+  quant-analyzer-2:
+    build:
+      context: ../quantAnalyzer
+      dockerfile: Dockerfile
+    container_name: quant-analyzer-2
+    environment:
+      - MONGO_URI=${MONGO_URI:-mongodb://host.docker.internal:27017/}
+      - MONGO_URL=${MONGO_URI:-mongodb://host.docker.internal:27017/}
+      - DB_NAME=${MONGO_DB}
+      - ANALYZER_DB_NAME=${ANALYZER_DB_NAME:-quant_analyzer}
+      - TUSHARE_TOKEN=${TUSHARE_TOKEN}
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
+      - DEEPSEEK_BASE_URL=${DEEPSEEK_BASE_URL}
+      - DEFAULT_LLM_PROVIDER=qwen
+      - DEFAULT_MODEL=qwen-plus
+      - ANALYSIS_INTERVAL=300
+      - DISABLE_AUTO_ANALYSIS=${DISABLE_AUTO_ANALYSIS:-false}
+      - WORKER_ID=analyzer-2
       - TZ=Asia/Shanghai
     extra_hosts:
       - "host.docker.internal:host-gateway"

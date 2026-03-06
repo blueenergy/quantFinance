@@ -1,0 +1,210 @@
+from typing import Optional, Dict, Any, List
+from fastapi import APIRouter, Depends, Query, HTTPException
+from auth import get_current_active_user
+from db import get_db_collections, get_collection
+from datetime import datetime, timedelta
+from utils.stock_utils import serialize_doc
+import pandas as pd
+
+router = APIRouter()
+
+@router.get("/hunter/signals")
+async def get_earnings_hunter_signals(
+    days: int = Query(3, description="查询最近N天的异动信号"),
+    current_user: dict = Depends(get_current_active_user) # In a real scenario, use get_premium_user
+):
+    """
+    财报猎手：扫描最近的业绩预告、快报和券商盈利预测，
+    寻找可能发生“戴维斯双击”（盈利上修 + 估值扩张）的拐点公司。
+    """
+    # 模拟 VIP 权限校验
+    # if not current_user.get("is_vip"):
+    #     raise HTTPException(status_code=403, detail="此功能仅限 VIP 用户访问")
+
+    collections = get_db_collections()
+    forecast_col = get_collection("earnings_forecast")
+    express_col = get_collection("earnings_express")
+    report_rc_col = get_collection("earnings_report_rc")
+    stock_basic_col = collections["stock_basic"]
+    
+    # Calculate cutoff date
+    cutoff_date = (datetime.now() - timedelta(days=days)).strftime("%Y%m%d")
+    
+    signals = []
+    
+    # 1. 扫描业绩预告 (Forecast) - 寻找“扭亏”或“大幅预增”
+    forecasts = list(forecast_col.find(
+        {"ann_date": {"$gte": cutoff_date}, "type": {"$in": ["预增", "扭亏"]}}
+    ).sort("ann_date", -1))
+    
+    # Process forecasts
+    for f in forecasts:
+        ts_code = f.get("ts_code")
+        stock = stock_basic_col.find_one({"ts_code": ts_code})
+        if not stock: continue
+        
+        # 估算净利润增速中位数
+        p_min = f.get("p_change_min")
+        p_max = f.get("p_change_max")
+        growth = 0
+        if p_min is not None and p_max is not None:
+            growth = (p_min + p_max) / 2
+        elif p_min is not None:
+            growth = p_min
+        
+        signals.append({
+            "id": str(f["_id"]),
+            "ts_code": ts_code,
+            "name": stock.get("name", ""),
+            "industry": stock.get("industry", ""),
+            "signal_type": "业绩预告",
+            "subtype": f.get("type"),
+            "date": f.get("ann_date"),
+            "report_period": f.get("end_date"),
+            "core_metric": f"净利润增速约 {growth:.1f}%" if growth else "增速未知",
+            "reason": f.get("change_reason", ""),
+            "ai_score": None # Placeholder for LLM Analysis
+        })
+        
+    # 2. 扫描业绩快报 (Express) - 寻找实际高增
+    expresses = list(express_col.find(
+        {
+            "ann_date": {"$gte": cutoff_date}, 
+            "yoy_net_profit": {"$gte": 30.0} # 净利润同比增长超30%
+        }
+    ).sort("ann_date", -1))
+    
+    for e in expresses:
+        ts_code = e.get("ts_code")
+        # 避免和预告重复（如果同一天发）
+        if any(s["ts_code"] == ts_code and s["report_period"] == e.get("end_date") for s in signals):
+            continue
+            
+        stock = stock_basic_col.find_one({"ts_code": ts_code})
+        if not stock: continue
+        
+        yoy_profit = e.get("yoy_net_profit", 0)
+        yoy_sales = e.get("yoy_sales", 0)
+        
+        signals.append({
+            "id": str(e["_id"]),
+            "ts_code": ts_code,
+            "name": stock.get("name", ""),
+            "industry": stock.get("industry", ""),
+            "signal_type": "业绩快报",
+            "subtype": "实际高增",
+            "date": e.get("ann_date"),
+            "report_period": e.get("end_date"),
+            "core_metric": f"净利润同比 {yoy_profit:.1f}% (营收 {yoy_sales:.1f}%)",
+            "reason": "", # Express typically lacks reason, needs AI to infer from other data
+            "ai_score": None
+        })
+        
+    # 3. 扫描券商评级上调 (Report RC) - 卖方开始猛推
+    # 比如 op_rt 包含 "上调" 或者 rating_name 包含 "买入" 且之前没发过
+    reports = list(report_rc_col.find(
+        {"report_date": {"$gte": cutoff_date}, "op_rt": {"$in": ["首次", "调高"]}}
+    ).sort("report_date", -1))
+    
+    for r in reports:
+        ts_code = r.get("ts_code")
+        stock = stock_basic_col.find_one({"ts_code": ts_code})
+        if not stock: continue
+        
+        signals.append({
+            "id": str(r["_id"]),
+            "ts_code": ts_code,
+            "name": stock.get("name", ""),
+            "industry": stock.get("industry", ""),
+            "signal_type": "卖方研报",
+            "subtype": "评级" + r.get("op_rt", ""),
+            "date": r.get("report_date"),
+            "report_period": None,
+            "core_metric": f"[{r.get('org_name')}] {r.get('rating_name')}",
+            "title": r.get("title", ""),
+            "reason": r.get("title", ""), # Use title as reason
+            "ai_score": None
+        })
+        
+    # 排序：按日期倒序
+    signals.sort(key=lambda x: x["date"], reverse=True)
+    
+    return {
+        "success": True,
+        "count": len(signals),
+        "data": signals
+    }
+
+@router.post("/hunter/analyze/{signal_id}")
+async def analyze_hunter_signal(
+    signal_id: str,
+    signal_type: str = Query(..., description="信号类型：业绩预告/业绩快报/卖方研报"),
+    current_user: dict = Depends(get_current_active_user)
+):
+    """
+    提交对某个具体财报信号的AI深度挖掘任务。
+    由 quantAnalyzer 接手执行具体的 LLM 分析，判断业务主线是否加速，剔除一次性损益，判断估值修复空间。
+    """
+    from db import get_db_collections
+    from bson import ObjectId
+    
+    # 获取需要的数据信息并验证
+    collections = get_db_collections()
+    
+    if signal_type == "业绩预告":
+        col = collections.get("earnings_forecast") or get_collection("earnings_forecast")
+    elif signal_type == "业绩快报":
+        col = collections.get("earnings_express") or get_collection("earnings_express")
+    elif signal_type == "卖方研报":
+        col = collections.get("earnings_report_rc") or get_collection("earnings_report_rc")
+    else:
+        raise HTTPException(status_code=400, detail="未知的信号类型")
+        
+    doc = col.find_one({"_id": ObjectId(signal_id)})
+    if not doc:
+        raise HTTPException(status_code=404, detail="未找到该信号数据")
+        
+    tasks_col = collections["analysis_tasks"]
+    
+    # 检查是否已经在分析中
+    existing_task = tasks_col.find_one({
+        "type": "earnings_hunter",
+        "params.signal_id": signal_id,
+        "status": {"$in": ["pending", "processing"]}
+    })
+    
+    if existing_task:
+        return {
+            "success": True,
+            "task_id": str(existing_task["_id"]),
+            "status": existing_task["status"],
+            "message": "任务已经在处理中"
+        }
+        
+    # 如果已经有分析结果而且是近期分析的，前端可以不需要再提。但这里允许复用接口触发重试或新建。
+    
+    # 创建异步任务给 quantAnalyzer
+    task_doc = {
+        "type": "earnings_hunter",
+        "status": "pending",
+        "priority": 15, # 较高优先级，仅次于用户主动的个股/大盘分析(20)
+        "user_id": current_user["id"],
+        "stock_name": doc.get("name", "Unknown"),
+        "symbol": doc.get("ts_code", ""),
+        "params": {
+            "signal_id": signal_id,
+            "signal_type": signal_type,
+            "data": serialize_doc(doc)
+        },
+        "created_at": datetime.now(),
+        "source": "earnings_hunter"
+    }
+    
+    result = tasks_col.insert_one(task_doc)
+    
+    return {
+        "success": True,
+        "task_id": str(result.inserted_id),
+        "status": "pending",
+        "message": "AI分析任务已放入队列，猎手正在解析..."
+    }

@@ -88,6 +88,7 @@ def get_db_collections() -> Dict[str, Collection]:
         # Hot stock analysis (THS / DC)
         "hot_stock_analysis": db["hot_stock_analysis"],  # 热股分析结果（每次更新一条）
         # Add more collections as needed
+        "stock_basic": db["stock_basic"]
     }
 
 def get_collection(name: str):
