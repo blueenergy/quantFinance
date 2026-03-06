@@ -67,24 +67,34 @@ async def get_earnings_hunter_signals(
         })
         
     # 2. 扫描业绩快报 (Express) - 寻找实际高增
-    expresses = list(express_col.find(
-        {
-            "ann_date": {"$gte": cutoff_date}, 
-            "yoy_net_profit": {"$gte": 30.0} # 净利润同比增长超30%
-        }
+    # yoy_net_profit from Tushare actually means the absolute value of last year's net profit!
+    expresses_raw = list(express_col.find(
+        {"ann_date": {"$gte": cutoff_date}}
     ).sort("ann_date", -1))
     
-    for e in expresses:
+    for e in expresses_raw:
         ts_code = e.get("ts_code")
         # 避免和预告重复（如果同一天发）
         if any(s["ts_code"] == ts_code and s["report_period"] == e.get("end_date") for s in signals):
             continue
             
+        n_income = e.get("n_income")
+        last_year_n_income = e.get("yoy_net_profit")
+        
+        yoy_profit_pct = 0.0
+        if n_income is not None and last_year_n_income is not None and last_year_n_income != 0:
+            yoy_profit_pct = (n_income - last_year_n_income) / abs(last_year_n_income) * 100
+        
+        # 仅保留增长超过 30% 的公司
+        if yoy_profit_pct < 30.0:
+            continue
+            
         stock = stock_basic_col.find_one({"ts_code": ts_code})
         if not stock: continue
         
-        yoy_profit = e.get("yoy_net_profit", 0)
-        yoy_sales = e.get("yoy_sales", 0)
+        # 业绩快报一般不提供 yoy_sales（营收同比），这里展示绝对营收规模（亿）
+        revenue = e.get("revenue")
+        revenue_str = f"本期营收 {revenue / 100000000:.1f}亿" if revenue else "营收未知"
         
         signals.append({
             "id": str(e["_id"]),
@@ -95,7 +105,7 @@ async def get_earnings_hunter_signals(
             "subtype": "实际高增",
             "date": e.get("ann_date"),
             "report_period": e.get("end_date"),
-            "core_metric": f"净利润同比 {yoy_profit:.1f}% (营收 {yoy_sales:.1f}%)",
+            "core_metric": f"净利润同比 {yoy_profit_pct:.1f}% ({revenue_str})",
             "reason": "", # Express typically lacks reason, needs AI to infer from other data
             "ai_score": None
         })
