@@ -25,7 +25,7 @@ async def get_earnings_hunter_signals(
     forecast_col = get_collection("earnings_forecast")
     express_col = get_collection("earnings_express")
     report_rc_col = get_collection("earnings_report_rc")
-    stock_basic_col = collections["stock_basic"]
+    stock_basic_col = collections["stock_info"]
     
     # Calculate cutoff date
     cutoff_date = (datetime.now() - timedelta(days=days)).strftime("%Y%m%d")

@@ -24,7 +24,7 @@ class MarketAnalysisCache:
         # ... (unchanged init) ...
         # Attempt to connect to MongoDB. If unavailable (e.g. during unit tests),
         # fall back to a lightweight in-memory collection to avoid import-time failures.
-        mongodb_url = os.getenv('DB_CONNECTION_URL', os.getenv('MONGO_URL', os.getenv('MONGO_URI', 'mongodb://localhost:27017')))
+        mongodb_url = os.getenv('MONGO_URI', os.getenv('MONGO_URL', 'mongodb://localhost:27017'))
         db_name = os.getenv('MONGO_DB', 'finance')
 
         class _InMemoryCollection:
@@ -81,7 +81,11 @@ class MarketAnalysisCache:
         else:
             client = MongoClient(mongodb_url, serverSelectionTimeoutMS=2000)
             self.db = client[db_name]
-            self.collection = self.db['market_analysis_cache']
+            
+            # Use quant_analyzer DB for market analysis cache (where quantAnalyzer writes)
+            analyzer_db_name = os.getenv("ANALYZER_DB_NAME", "quant_analyzer")
+            analyzer_db = client[analyzer_db_name]
+            self.collection = analyzer_db['market_analysis_cache']
             self.collection.create_index([("analysis_date", 1)], unique=True)
     
     def is_trading_day(self, check_date: date = None) -> bool:
@@ -112,20 +116,19 @@ class MarketAnalysisCache:
     def get_cached_analysis(self, analysis_date: str = None) -> Optional[Dict[str, Any]]:
         """
         获取缓存的市场分析结果
-        
+            
         Args:
             analysis_date: 分析日期，格式 YYYY-MM-DD，默认为今天
-            
+                
         Returns:
-            缓存的分析结果或None
+            缓存的分析结果或 None
         """
         if analysis_date is None:
             analysis_date = date.today().strftime('%Y-%m-%d')
-        
+            
         try:
             result = self.collection.find_one({"analysis_date": analysis_date})
             if result:
-                # 移除MongoDB的_id字段
                 result.pop('_id', None)
                 print(f"[缓存] 找到 {analysis_date} 的缓存分析结果")
                 return result
@@ -133,7 +136,7 @@ class MarketAnalysisCache:
                 print(f"[缓存] 未找到 {analysis_date} 的缓存分析结果")
                 return None
         except Exception as e:
-            print(f"[缓存] 获取缓存分析失败: {e}")
+            print(f"[缓存] 获取缓存分析失败：{e}")
             return None
     
 
@@ -141,29 +144,28 @@ class MarketAnalysisCache:
     def get_latest_trading_day_analysis(self) -> Optional[Dict[str, Any]]:
         """
         获取最近交易日的分析结果
-        
+            
         Returns:
-            最近交易日的分析结果或None
+            最近交易日的分析结果或 None
         """
         try:
-            # 查找最近30天内的分析结果
             start_date = (date.today() - timedelta(days=30)).strftime('%Y-%m-%d')
-            
+                
             result = self.collection.find(
                 {"analysis_date": {"$gte": start_date}}
             ).sort("analysis_date", -1).limit(1)
-            
+                
             result_list = list(result)
             if result_list:
                 latest = result_list[0]
                 latest.pop('_id', None)
-                print(f"[缓存] 找到最近交易日分析结果: {latest['analysis_date']}")
+                print(f"[缓存] 找到最近交易日分析结果：{latest['analysis_date']}")
                 return latest
             else:
                 print("[缓存] 未找到最近的交易日分析结果")
                 return None
         except Exception as e:
-            print(f"[缓存] 获取最近交易日分析失败: {e}")
+            print(f"[缓存] 获取最近交易日分析失败：{e}")
             return None
     
 
