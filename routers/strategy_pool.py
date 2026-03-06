@@ -5,7 +5,7 @@ from auth import get_current_user
 import time
 from datetime import datetime, timedelta
 
-router = APIRouter(prefix="/strategy-pool", tags=["strategy-pool"])
+router = APIRouter(tags=["strategy-pool"])
 
 
 def _extract_params_from_template_doc(doc: Dict[str, Any]) -> Dict[str, Any]:

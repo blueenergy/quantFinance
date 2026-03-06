@@ -34,6 +34,7 @@ from routers.sector_concept import router as sector_concept_router
 from routers.hot_stock import router as hot_stock_router
 from routers.etf import router as etf_router
 from routers.data_pulse import router as data_pulse_router
+from routers.earnings import router as earnings_router
 from production_config import configure_production_app
 from contextlib import asynccontextmanager
 from scheduler import start_scheduler, stop_scheduler
@@ -68,17 +69,18 @@ app.include_router(strategy_router,prefix="/api", tags=["策略"])
 app.include_router(trade_execution_router, prefix="/api", tags=["交易执行"])
 app.include_router(worker_monitor_router, prefix="/api", tags=["Worker监控"])
 app.include_router(notification_router, prefix="/api", tags=["通知提醒"])
-app.include_router(trader_router, prefix="/api", tags=["交易客户端"])
-app.include_router(worker_data_router, prefix="/api/worker-data", tags=["Worker数据访问"])
-app.include_router(analysis_details_router, prefix="/api", tags=["分析详情"])
-app.include_router(trading_manual_router, prefix="/api", tags=["手动交易"])
-app.include_router(backtest_router, prefix="/api", tags=["回测"])
-app.include_router(permissions_router, prefix="/api", tags=["权限管理"])
-app.include_router(strategy_pool_router, prefix="/api", tags=["策略股池"])
-app.include_router(strategy_workers_router, prefix="/api/strategy", tags=["策略Worker"])
-app.include_router(ladder_router, prefix="/api", tags=["连板天梯"])
-app.include_router(scheduler_admin_router, prefix="/api/admin/scheduler", tags=["后台任务调度"])
-app.include_router(sector_concept_router, prefix="/api", tags=["概念板块分析"])
-app.include_router(hot_stock_router, prefix="/api", tags=["热股分析"])
-app.include_router(etf_router, prefix="/api", tags=["ETF淘金"])
-app.include_router(data_pulse_router, prefix="/api", tags=["数据脉搏"])
+app.include_router(trader_router, prefix="/api", tags=["交易管理"])
+app.include_router(worker_data_router, prefix="/api", tags=["Worker数据"])
+app.include_router(analysis_details_router, prefix="/api/analysis", tags=["全量分析数据"])
+app.include_router(trading_manual_router, prefix="/api", tags=["交易操作手册"])
+app.include_router(backtest_router, prefix="/api", tags=["回测系统"])
+app.include_router(permissions_router, prefix="/api/admin", tags=["权限管理"])
+app.include_router(strategy_pool_router, prefix="/api/strategy-pool", tags=["策略池"])
+app.include_router(strategy_workers_router, prefix="/api/workers", tags=["策略集群管理"])
+app.include_router(ladder_router, prefix="/api/market", tags=["连板天梯"])
+app.include_router(scheduler_admin_router, prefix="/api/admin/scheduler", tags=["定时任务管理"])
+app.include_router(sector_concept_router, prefix="/api", tags=["板块与概念解析"])
+app.include_router(hot_stock_router, prefix="/api/hot", tags=["盘中热股捕捉"])
+app.include_router(etf_router, prefix="/api", tags=["ETF智能分析"])
+app.include_router(data_pulse_router, prefix="/api", tags=["数据脉搏健康度"])
+app.include_router(earnings_router, prefix="/api", tags=["财报猎手"])
