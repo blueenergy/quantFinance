@@ -440,7 +440,8 @@ async def get_reasoning_detail(
     if not date:
         date = datetime.now().strftime("%Y%m%d")
         
-    analysis_col = collections["analysis_logs"]
+    # Lazy access to limit_up_analysis collection
+    analysis_col = collections["limit_up_analysis"]
     
     log = analysis_col.find_one({"symbol": symbol, "date": date})
     

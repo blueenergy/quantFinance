@@ -24,6 +24,10 @@ login_logs_collection = collections["login_logs"]
 admin_logs_collection = collections["admin_logs"]
 analysis_history_collection = get_analyzer_db()["analysis_history"]
 
+def get_limit_up_analysis_collection():
+    """Lazy access to limit_up_analysis collection"""
+    return get_analyzer_db()["limit_up_analysis"]
+
 @router.get("/users")
 def get_all_users(
     page: int = Query(1, ge=1),
@@ -890,10 +894,11 @@ def get_analysis_logs(
         if symbol:
             query["symbol"] = symbol
         # 计算总数
-        total = analysis_history_collection.count_documents(query)
+        limit_up_analysis = get_limit_up_analysis_collection()
+        total = limit_up_analysis.count_documents(query)
         # 分页查询
         skip = (page - 1) * page_size
-        logs = list(analysis_history_collection.find(query).sort("timestamp", -1).skip(skip).limit(page_size))
+        logs = list(limit_up_analysis.find(query).sort("timestamp", -1).skip(skip).limit(page_size))
         for log in logs:
             log["_id"] = str(log["_id"])
         return {
