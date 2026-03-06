@@ -63,7 +63,7 @@ async def get_earnings_hunter_signals(
             "report_period": f.get("end_date"),
             "core_metric": f"净利润增速约 {growth:.1f}%" if growth else "增速未知",
             "reason": f.get("change_reason", ""),
-            "ai_score": None # Placeholder for LLM Analysis
+            "ai_analysis": f.get("ai_analysis")
         })
         
     # 2. 扫描业绩快报 (Express) - 寻找实际高增
@@ -107,7 +107,7 @@ async def get_earnings_hunter_signals(
             "report_period": e.get("end_date"),
             "core_metric": f"净利润同比 {yoy_profit_pct:.1f}% ({revenue_str})",
             "reason": "", # Express typically lacks reason, needs AI to infer from other data
-            "ai_score": None
+            "ai_analysis": e.get("ai_analysis")
         })
         
     # 3. 扫描券商评级上调 (Report RC) - 卖方开始猛推
@@ -133,7 +133,7 @@ async def get_earnings_hunter_signals(
             "core_metric": f"[{r.get('org_name')}] {r.get('rating_name')}",
             "title": r.get("title", ""),
             "reason": r.get("title", ""), # Use title as reason
-            "ai_score": None
+            "ai_analysis": r.get("ai_analysis")
         })
         
     # 排序：按日期倒序
