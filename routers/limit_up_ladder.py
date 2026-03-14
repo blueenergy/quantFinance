@@ -77,9 +77,13 @@ async def get_daily_ladder(
     
     # 获取详细股票信息
     # Exclude broken stocks from the main ladder display
+    # Include stocks where status is not "broken" OR status field doesn't exist
     stocks = list(daily_col.find({
         "date": actual_date,
-        "status": {"$ne": "broken"} 
+        "$or": [
+            {"status": {"$ne": "broken"}},
+            {"status": {"$exists": False}}
+        ]
     }).sort("streak", -1))
     
     # 按梯队组织
