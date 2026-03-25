@@ -363,7 +363,7 @@ def hot_stock_poll_task(source: str):
 TASK_MAP = {
     'check_worker_timeouts': check_worker_timeouts_task,
     'send_daily_reports': send_daily_reports_task,
-    'market_analysis_1000': generate_market_analysis_task,
+    # 'market_analysis_1000': generate_market_analysis_task,  # Disabled for token optimization
     'market_analysis_1130': generate_market_analysis_task,
     'market_analysis_1630': generate_market_analysis_task,
     'global_analysis_0830': generate_global_analysis_task,
@@ -415,7 +415,7 @@ DEFAULT_SCHEDULES = {
     'hot_stock_poll_ths': {
         'name': "同花顺热股轮询 (每30分钟)",
         'type': "interval",
-        'seconds': 1800,  # 30 minutes
+        'seconds': 3600,  # 1 hour (optimized from 30 min to reduce token usage)
     },
     'hot_stock_poll_dc': {
         'name': "东方财富热股轮询 (每30分钟)",
