@@ -218,8 +218,6 @@ services:
     ports:
       - "80:80"
       - "443:443"
-    depends_on:
-      - api
     restart: unless-stopped
     profiles: [ "frontend" ] # Optional: Only start with --profile frontend
     networks:
