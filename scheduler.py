@@ -500,7 +500,7 @@ def apply_schedule_config():
         else:
             # First time: Save default to DB and use it
             default_config['job_id'] = job_id
-            default_config['is_active'] = True
+            default_config.setdefault('is_active', True)
             default_config['updated_at'] = datetime.now()
             config_coll.insert_one(default_config)
             sync_job(job_id, default_config)
