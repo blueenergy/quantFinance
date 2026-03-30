@@ -413,14 +413,16 @@ DEFAULT_SCHEDULES = {
         'day_of_week': 'mon-fri'
     },
     'hot_stock_poll_ths': {
-        'name': "同花顺热股轮询 (每30分钟)",
+        'name': "同花顺热股轮询",
         'type': "interval",
-        'seconds': 3600,  # 1 hour (optimized from 30 min to reduce token usage)
+        'seconds': 3600,
+        'is_active': False,  # Disabled: use manual trigger from dashboard instead
     },
     'hot_stock_poll_dc': {
-        'name': "东方财富热股轮询 (每30分钟)",
+        'name': "东方财富热股轮询",
         'type': "interval",
         'seconds': 1800,
+        'is_active': False,  # Disabled: use manual trigger from dashboard instead
     },
 }
 
