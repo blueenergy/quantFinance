@@ -80,7 +80,7 @@ app.include_router(strategy_workers_router, prefix="/api/workers", tags=["策略
 app.include_router(ladder_router, prefix="/api", tags=["连板天梯"])
 app.include_router(scheduler_admin_router, prefix="/api/admin/scheduler", tags=["定时任务管理"])
 app.include_router(sector_concept_router, prefix="/api", tags=["板块与概念解析"])
-app.include_router(hot_stock_router, prefix="/api/hot", tags=["盘中热股捕捉"])
+app.include_router(hot_stock_router, prefix="/api", tags=["盘中热股捕捉"])
 app.include_router(etf_router, prefix="/api", tags=["ETF智能分析"])
 app.include_router(data_pulse_router, prefix="/api", tags=["数据脉搏健康度"])
 app.include_router(earnings_router, prefix="/api", tags=["财报猎手"])
