@@ -9,7 +9,7 @@ from fastapi import APIRouter, Query, Depends, HTTPException
 from pydantic import BaseModel
 from datetime import datetime, date, timedelta
 from auth import get_current_active_user
-from db import get_db_collections
+from db import get_db_collections, get_analyzer_db
 from bson import ObjectId
 
 router = APIRouter(prefix="/ladder", tags=["Limit-Up Ladder"])
@@ -439,13 +439,11 @@ async def get_reasoning_detail(
     current_user: dict = Depends(get_current_active_user)
 ):
     """获取指定股票的 AI 归因详情和新闻上下文"""
-    collections = get_db_collections()
-    
     if not date:
         date = datetime.now().strftime("%Y%m%d")
         
-    # Lazy access to limit_up_analysis collection
-    analysis_col = collections["limit_up_analysis"]
+    # limit_up_analysis lives in quant_analyzer DB (written by quantAnalyzer)
+    analysis_col = get_analyzer_db()["limit_up_analysis"]
     
     log = analysis_col.find_one({"symbol": symbol, "date": date})
     

@@ -103,7 +103,7 @@ def get_analyzer_db():
     """
     return {
         "analysis_history": analyzer_db["analysis_history"],
-        "analysis_logs": analyzer_db["analysis_logs"],
+        "limit_up_analysis": analyzer_db["limit_up_analysis"],
         "analysis_tags": analyzer_db["analysis_tags"],
         "etf_analysis": analyzer_db["etf_analysis"],
         "global_analysis": analyzer_db["global_analysis"],
