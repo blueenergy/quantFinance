@@ -3,7 +3,7 @@ from typing import Optional, Dict, Any, List
 from fastapi import APIRouter, Depends, Query, HTTPException
 from models.all_models import AnalysisHistoryRequest
 from auth import get_current_active_user
-from db import get_db_collections, get_analyzer_db
+from db import get_db_collections, get_analyzer_db, get_data_db
 from datetime import datetime
 from utils.stock_utils import serialize_doc, format_trade_date
 from bson import ObjectId
@@ -212,9 +212,10 @@ async def get_analysis_task_status(
 
 def _fetch_user_watchlist(user_id: str, collections) -> List[Dict[str, Any]]:
     """获取用户自选股列表（含行业信息和最新价格）"""
+    data_collections = get_data_db()
     watchlist_col = collections["user_watchlists"]
-    stock_info_col = collections["stock_info"]
-    volume_price_col = collections["volume_price"]
+    stock_info_col = data_collections["stock_info"]
+    volume_price_col = data_collections["volume_price"]
     
     watchlist_doc = watchlist_col.find_one({"user_id": user_id})
     watchlist_symbols = watchlist_doc.get("symbols", []) if watchlist_doc else []
@@ -244,8 +245,9 @@ def _fetch_user_watchlist(user_id: str, collections) -> List[Dict[str, Any]]:
 
 def _fetch_user_positions(user_id: str, collections) -> List[Dict[str, Any]]:
     """获取用户持仓列表（含行业信息和盈亏）"""
+    data_collections = get_data_db()
     positions_col = collections["trader_positions"]
-    stock_info_col = collections["stock_info"]
+    stock_info_col = data_collections["stock_info"]
     
     positions_docs = list(positions_col.find({"user_id": user_id}))
     
@@ -321,9 +323,9 @@ def _submit_portfolio_task(
 
 def _fetch_ladder_data_for_portfolio() -> Optional[Dict[str, Any]]:
     """获取连板天梯数据（给 portfolio 分析使用）"""
-    collections = get_db_collections()
-    ladder_col = collections["limit_up_ladder"]
-    daily_col = collections["daily_limit_up"]
+    data_collections = get_data_db()
+    ladder_col = data_collections["limit_up_ladder"]
+    daily_col = data_collections["daily_limit_up"]
     
     today = datetime.now().strftime("%Y%m%d")
     

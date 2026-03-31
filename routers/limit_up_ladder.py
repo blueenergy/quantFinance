@@ -9,7 +9,7 @@ from fastapi import APIRouter, Query, Depends, HTTPException
 from pydantic import BaseModel
 from datetime import datetime, date, timedelta
 from auth import get_current_active_user
-from db import get_db_collections, get_analyzer_db
+from db import get_db_collections, get_analyzer_db, get_data_db
 from bson import ObjectId
 
 router = APIRouter(prefix="/ladder", tags=["Limit-Up Ladder"])
@@ -43,9 +43,9 @@ async def get_daily_ladder(
     返回按梯队分类的涨停股票，以及情绪指标
     如果指定日期无数据，自动回退到最近有数据的交易日
     """
-    collections = get_db_collections()
-    ladder_col = collections["limit_up_ladder"]
-    daily_col = collections["daily_limit_up"]
+    data_collections = get_data_db()
+    ladder_col = data_collections["limit_up_ladder"]
+    daily_col = data_collections["daily_limit_up"]
     
     requested_date = date
     if not requested_date:
@@ -169,8 +169,8 @@ async def compare_ladder(
     
     追踪晋级、断板和新进首板
     """
-    collections = get_db_collections()
-    daily_col = collections["daily_limit_up"]
+    data_collections = get_data_db()
+    daily_col = data_collections["daily_limit_up"]
     
     # 获取两天的数据
     from_stocks = {s["symbol"]: s for s in daily_col.find({"date": from_date})}
@@ -268,9 +268,9 @@ async def get_sector_ranking(
     
     返回主线板块和板块详细统计
     """
-    collections = get_db_collections()
-    sector_col = collections["sector_flow"]
-    ladder_col = collections["limit_up_ladder"]
+    data_collections = get_data_db()
+    sector_col = data_collections["sector_flow"]
+    ladder_col = data_collections["limit_up_ladder"]
     
     if not date:
         date = datetime.now().strftime("%Y%m%d")
@@ -336,8 +336,8 @@ async def get_indicators(
     
     返回情绪得分、晋级率、炸板率等
     """
-    collections = get_db_collections()
-    ladder_col = collections["limit_up_ladder"]
+    data_collections = get_data_db()
+    ladder_col = data_collections["limit_up_ladder"]
     
     if not date:
         date = datetime.now().strftime("%Y%m%d")
@@ -373,7 +373,7 @@ async def get_indicators(
     latest = ladders[0].get("indicators", {})
     
     # 额外获取跌停数以计算比例
-    limit_down_col = collections["daily_limit_down"]
+    limit_down_col = data_collections["daily_limit_down"]
     total_limit_down = limit_down_col.count_documents({"date": ladders[0]["date"]})
     
     return {
@@ -416,8 +416,8 @@ async def get_history(
     
     用于分析趋势
     """
-    collections = get_db_collections()
-    ladder_col = collections["limit_up_ladder"]
+    data_collections = get_data_db()
+    ladder_col = data_collections["limit_up_ladder"]
     
     ladders = list(ladder_col.find({
         "date": {"$gte": start_date, "$lte": end_date}

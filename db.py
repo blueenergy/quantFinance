@@ -33,25 +33,25 @@ def get_db_collections() -> Dict[str, Collection]:
         user_col = collections['users']
     """
     return {
+        # User and auth
         "users": db["users"],
-        "stock_info": db["stock_info"],
-        "stock_scores": db["stock_scores"],
-        "volume_price": db["volume_price"],
-        "analysis_history": db["analysis_history"],
         "login_logs": db["login_logs"],
         "admin_logs": db["admin_logs"],
-        "market_analysis_cache": db["market_analysis_cache"],
         "user_watchlists": db["user_watchlists"],
         "watchlist_strategies": db["watchlist_strategies"],
         "securities_accounts": db["securities_accounts"],
-        "money_flow": db["money_flow"],  # 资金流数据
-        "market_spectrum": db["market_spectrum"],  # 阴阳谱数据
-        "market_spectrum_minute": db["market_spectrum_minute"],  # 分钟级阴阳谱数据
-        "strategy_template": db["strategy_template"],  # 策略参数模板
-        "strategy_metadata": db["strategy_metadata"],  # 策略元数据（key和name）
+        # Trading
         "trade_executions": db["trade_executions"],  # 交易执行记录
         "trade_signals": db["trade_signals"],  # 交易信号
-        "minute_bars": db["minute_bars"],  # 分钟K线数据
+        # Position and account management (from quantTrader)
+        "trader_positions": db["trader_positions"],  # 实时持仓快照
+        "trader_accounts": db["trader_accounts"],  # 账户资金信息
+        "position_snapshots": db["position_snapshots"],  # 历史持仓快照（每日）
+        # Strategy
+        "strategy_template": db["strategy_template"],  # 策略参数模板
+        "strategy_metadata": db["strategy_metadata"],  # 策略元数据（key和name）
+        "strategy_stock_pool": db["strategy_stock_pool"],  # 策略选股池结果
+        "strategy_trade_history": db["strategy_trade_history"],  # 策略选股池结果
         # Worker monitoring
         "worker_status": db["worker_status"],  # Worker 状态和心跳
         "worker_activity": db["worker_activity"],  # Worker 活动日志
@@ -61,43 +61,27 @@ def get_db_collections() -> Dict[str, Collection]:
         # Notification system
         "notifications": db["notifications"],  # 通知记录
         "notification_settings": db["notification_settings"],  # 通知设置
-        # Position and account management (from quantTrader)
-        "trader_positions": db["trader_positions"],  # 实时持仓快照
-        "trader_accounts": db["trader_accounts"],  # 账户资金信息
-        "position_snapshots": db["position_snapshots"],  # 历史持仓快照（每日）
         # Backtesting system
         "backtest_tasks": db["backtest_tasks"],  # 回测任务
         "backtest_results": db["backtest_results"],  # 回测结果
         # Permission and service upgrade
         "upgrade_requests": db["upgrade_requests"],  # 服务升级申请
-        # Strategy selection results
-        "strategy_stock_pool": db["strategy_stock_pool"],  # 策略选股池结果
-        "strategy_trade_history": db["strategy_trade_history"],  # 策略选股池结果"
-        # Limit-up ladder system (连板天梯)
-        "daily_limit_up": db["daily_limit_up"],  # 每日涨停股票
-        "limit_up_ladder": db["limit_up_ladder"],  # 连板天梯聚合数据
-        "sector_flow": db["sector_flow"],  # 板块资金流向
-        # Portfolio analysis
-        "portfolio_analysis": db["portfolio_analysis"],  # 组合机会分析历史
-        # ETF data
-        "etf_basic": db["etf_basic"],
-        "etf_daily": db["etf_daily"],
-        "analysis_tags": db["analysis_tags"],  # AI 分析标签
-        "analysis_logs": db["analysis_logs"],  # AI 分析详单
         # Phase 10: Async Task Queue Architecture
         "analysis_tasks": db["analysis_tasks"],  # 深度分析任务队列
         "quota_usage": db["quota_usage"],        # 用户配额使用情况
+        "schedule_config": db["schedule_config"], # 定时任务调度配置
+        # Analysis results (finance DB — legacy refs, also mirrored in analyzer_db)
+        "portfolio_analysis": db["portfolio_analysis"],  # 组合机会分析历史
         "global_analysis": db["global_analysis"], # 全球市场分析结果
         "market_analysis": db["market_analysis"], # 盘中/盘后大盘分析结果
-        "schedule_config": db["schedule_config"], # 定时任务调度配置
-        "daily_limit_down": db["daily_limit_down"], # 每日跌停数据
-        "limit_down_ladder": db["limit_down_ladder"], # 跌停天梯数据
-        # Sector concept analysis (DC / THS)
         "sector_concept_analysis": db["sector_concept_analysis"],  # 概念板块分析结果
-        # Hot stock analysis (THS / DC)
         "hot_stock_analysis": db["hot_stock_analysis"],  # 热股分析结果（每次更新一条）
-        # Add more collections as needed
-        "stock_basic": db["stock_basic"]
+        "analysis_history": db["analysis_history"],
+        "market_analysis_cache": db["market_analysis_cache"],
+        "analysis_tags": db["analysis_tags"],  # AI 分析标签
+        "analysis_logs": db["analysis_logs"],  # AI 分析详单
+        # Misc
+        "stock_scores": db["stock_scores"],
     }
 
 def get_collection(name: str):
@@ -126,6 +110,42 @@ def get_data_db():
     """Get quant_data database collections (raw external data)."""
     return {
         "hot_stock_raw": data_db["hot_stock_raw"],
+        # Market data
+        "volume_price": data_db["volume_price"],
+        "money_flow": data_db["money_flow"],
+        "minute_bars": data_db["minute_bars"],
+        # Limit-up/down ladder
+        "daily_limit_up": data_db["daily_limit_up"],
+        "daily_limit_down": data_db["daily_limit_down"],
+        "limit_up_ladder": data_db["limit_up_ladder"],
+        "limit_down_ladder": data_db["limit_down_ladder"],
+        "sector_flow": data_db["sector_flow"],
+        # Market sentiment
+        "market_spectrum": data_db["market_spectrum"],
+        "market_spectrum_minute": data_db["market_spectrum_minute"],
+        # ETF data
+        "etf_basic": data_db["etf_basic"],
+        "etf_daily": data_db["etf_daily"],
+        "etf_adj_factor": data_db["etf_adj_factor"],
+        "etf_shares": data_db["etf_shares"],
+        # Stock reference data
+        "stock_info": data_db["stock_info"],
+        "stock_basic": data_db["stock_basic"],
+        # Financial statements
+        "financial_daily_basic": data_db["financial_daily_basic"],
+        "financial_income": data_db["financial_income"],
+        "financial_balance": data_db["financial_balance"],
+        "financial_cashflow": data_db["financial_cashflow"],
+        "financial_indicator": data_db["financial_indicator"],
+        # Earnings data
+        "earnings_forecast": data_db["earnings_forecast"],
+        "earnings_express": data_db["earnings_express"],
+        "earnings_disclosure": data_db["earnings_disclosure"],
+        "earnings_report_rc": data_db["earnings_report_rc"],
+        # Industry data
+        "market_industry_quotes_daily": data_db["market_industry_quotes_daily"],
+        "market_etf_quotes_daily": data_db["market_etf_quotes_daily"],
+        "industry_limitup_stats": data_db["industry_limitup_stats"],
     }
 
 def close_db():

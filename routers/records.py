@@ -3,13 +3,13 @@ from datetime import date, datetime
 from bson import ObjectId
 from fastapi import APIRouter, Query, HTTPException, Depends
 from pydantic import BaseModel
-from db import get_db_collections
+from db import get_data_db
 from utils.stock_utils import serialize_doc
 from auth import get_current_active_user
 router = APIRouter()
 
-collections = get_db_collections()
-collection = collections["volume_price"] # type: ignore
+data_collections = get_data_db()
+collection = data_collections["volume_price"] # type: ignore
 class RecordResponseModel(BaseModel):
     symbol: Optional[str]
     trade_date: Optional[Any]
@@ -178,8 +178,8 @@ def get_money_flow_records(
     """
     获取某只股票的资金流数据，按 trade_date 升序排列，支持日期范围。
     """
-    collections = get_db_collections()
-    money_flow_col = collections["money_flow"]
+    data_col = get_data_db()
+    money_flow_col = data_col["money_flow"]
     
     query = {"symbol": symbol}
     date_query = {}

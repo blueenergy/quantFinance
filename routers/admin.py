@@ -2,7 +2,7 @@ from bson import ObjectId
 from fastapi import APIRouter, Depends, Query, HTTPException, Body
 from typing import List
 from auth import get_current_admin_user, log_admin_action, create_admin_user
-from db import get_db_collections, get_analyzer_db
+from db import get_db_collections, get_analyzer_db, get_data_db
 from datetime import timedelta, datetime
 from utils.stock_utils import serialize_doc
 import time
@@ -647,8 +647,8 @@ def get_data_collection_status(admin_user: dict = Depends(get_current_admin_user
     - 采集统计信息
     """
     try:
-        collections = get_db_collections()
-        minute_bars_coll = collections["minute_bars"]
+        data_collections = get_data_db()
+        minute_bars_coll = data_collections["minute_bars"]
         
         # 记录管理员操作
         log_admin_action(

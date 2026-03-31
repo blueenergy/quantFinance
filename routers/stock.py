@@ -1,5 +1,5 @@
 from fastapi import APIRouter
-from db import get_db_collections
+from db import get_data_db
 router = APIRouter()
 
 
@@ -10,8 +10,8 @@ def get_stock_info(symbol: str):
     """
     获取指定股票的基本信息
     """
-    collections = get_db_collections()
-    stock_col = collections["stock_info"]
+    data_collections = get_data_db()
+    stock_col = data_collections["stock_info"]
     stock_info = stock_col.find_one({"symbol": symbol})
 
     if stock_info:
@@ -25,9 +25,9 @@ def search_stocks(q: str):
     """
     搜索股票，支持模糊匹配股票代码或名称
     """
-    collections = get_db_collections()
-    stock_col = collections["stock_info"]
-    etf_col = collections.get("etf_basic")
+    data_collections = get_data_db()
+    stock_col = data_collections["stock_info"]
+    etf_col = data_collections.get("etf_basic")
     
     # 搜索匹配的股票，支持股票代码和名称的模糊匹配
     # 如果查询是数字开头，优先匹配股票代码
