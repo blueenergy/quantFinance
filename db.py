@@ -9,12 +9,21 @@ load_dotenv()
 mongo_url = os.getenv("MONGO_URI", os.getenv("MONGO_URL", "mongodb://localhost:27017"))
 DB_NAME = os.getenv("MONGO_DB", "finance")
 ANALYZER_DB_NAME = os.getenv("ANALYZER_DB_NAME", "quant_analyzer")
+data_db_name = os.getenv("DATA_DB_NAME", "quant_data")
 
 # Singleton client (reuse across app)
 client = MongoClient(mongo_url)
 db = client[DB_NAME]
 # Separate DB for quantAnalyzer outputs (read-only in quantFinance)
 analyzer_db = client[ANALYZER_DB_NAME]
+# Separate DB for raw external data (hot stocks, news, etc.)
+data_db = client[data_db_name]
+
+import logging as _logging
+_logging.getLogger(__name__).info(
+    "MongoDB connected: main=%s, analyzer=%s, data=%s",
+    DB_NAME, ANALYZER_DB_NAME, data_db_name
+)
 
 def get_db_collections() -> Dict[str, Collection]:
     """
@@ -111,6 +120,12 @@ def get_analyzer_db():
         "sector_concept_analysis": analyzer_db["sector_concept_analysis"],
         "portfolio_analysis": analyzer_db["portfolio_analysis"],
         "market_analysis_cache": analyzer_db["market_analysis_cache"],
+    }
+
+def get_data_db():
+    """Get quant_data database collections (raw external data)."""
+    return {
+        "hot_stock_raw": data_db["hot_stock_raw"],
     }
 
 def close_db():

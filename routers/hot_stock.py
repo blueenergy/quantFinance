@@ -193,3 +193,52 @@ async def get_today_history(
         "count": len(records),
         "records": records,
     }
+
+
+@router.get("/data-status", summary="获取原始热股数据新鲜度")
+async def get_data_status(
+    source: str = Query("ths", description="数据源: ths 或 dc"),
+):
+    """Get the freshness status of raw hot stock data."""
+    from db import get_data_db
+
+    data_collections = get_data_db()
+    raw_col = data_collections["hot_stock_raw"]
+
+    # Find the latest raw data doc for this source
+    doc = raw_col.find_one(
+        {"source": source},
+        sort=[("fetched_at", -1)]
+    )
+
+    if not doc:
+        return {
+            "success": True,
+            "data": {
+                "source": source,
+                "has_data": False,
+                "message": "No raw data available. Trigger an analysis to fetch data."
+            }
+        }
+
+    fetched_at = doc.get("fetched_at")
+    rank_time_str = doc.get("rank_time", "")
+
+    # Calculate freshness
+    freshness_minutes = None
+    if fetched_at:
+        freshness_minutes = int((datetime.now() - fetched_at).total_seconds() / 60)
+
+    return {
+        "success": True,
+        "data": {
+            "source": source,
+            "has_data": True,
+            "trade_date": doc.get("trade_date"),
+            "rank_time": rank_time_str,
+            "stock_count": doc.get("stock_count", 0),
+            "fetched_at": fetched_at.isoformat() if fetched_at else None,
+            "freshness_minutes": freshness_minutes,
+            "is_fresh": freshness_minutes is not None and freshness_minutes < 60,
+        }
+    }

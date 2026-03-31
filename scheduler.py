@@ -367,8 +367,8 @@ TASK_MAP = {
     'market_analysis_1130': generate_market_analysis_task,
     'market_analysis_1630': generate_market_analysis_task,
     'global_analysis_0830': generate_global_analysis_task,
-    'hot_stock_poll_ths': lambda: hot_stock_poll_task('ths'),
-    'hot_stock_poll_dc': lambda: hot_stock_poll_task('dc'),
+    # 'hot_stock_poll_ths': lambda: hot_stock_poll_task('ths'),  # Disabled: manual trigger only
+    # 'hot_stock_poll_dc': lambda: hot_stock_poll_task('dc'),    # Disabled: manual trigger only
 }
 
 # Default trigger configurations
