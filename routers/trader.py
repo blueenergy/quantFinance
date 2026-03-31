@@ -14,7 +14,7 @@ from typing import List, Optional, Dict, Any
 from datetime import datetime
 import time
 from auth import get_current_active_user
-from db import get_db_collections
+from db import get_db_collections, get_data_db
 from utils.stock_utils import serialize_doc
 from bson import ObjectId
 
@@ -409,8 +409,9 @@ def get_positions(
     """Get current positions synced from quantTrader."""
     try:
         collections = get_db_collections()
+        data_collections = get_data_db()
         positions_coll = collections["trader_positions"]
-        stock_info_coll = collections["stock_info"]
+        stock_info_coll = data_collections["stock_info"]
         
         user_id = current_user["id"]
         

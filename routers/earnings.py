@@ -1,7 +1,7 @@
 from typing import Optional, Dict, Any, List
 from fastapi import APIRouter, Depends, Query, HTTPException
 from auth import get_current_active_user
-from db import get_db_collections, get_collection
+from db import get_db_collections, get_data_db
 from datetime import datetime, timedelta
 from utils.stock_utils import serialize_doc
 import pandas as pd
@@ -21,11 +21,11 @@ async def get_earnings_hunter_signals(
     # if not current_user.get("is_vip"):
     #     raise HTTPException(status_code=403, detail="此功能仅限 VIP 用户访问")
 
-    collections = get_db_collections()
-    forecast_col = get_collection("earnings_forecast")
-    express_col = get_collection("earnings_express")
-    report_rc_col = get_collection("earnings_report_rc")
-    stock_basic_col = collections["stock_info"]
+    data_collections = get_data_db()
+    forecast_col = data_collections["earnings_forecast"]
+    express_col = data_collections["earnings_express"]
+    report_rc_col = data_collections["earnings_report_rc"]
+    stock_basic_col = data_collections["stock_info"]
     
     # Calculate cutoff date
     cutoff_date = (datetime.now() - timedelta(days=days)).strftime("%Y%m%d")
@@ -155,18 +155,18 @@ async def analyze_hunter_signal(
     提交对某个具体财报信号的AI深度挖掘任务。
     由 quantAnalyzer 接手执行具体的 LLM 分析，判断业务主线是否加速，剔除一次性损益，判断估值修复空间。
     """
-    from db import get_db_collections
     from bson import ObjectId
     
     # 获取需要的数据信息并验证
     collections = get_db_collections()
+    data_collections = get_data_db()
     
     if signal_type == "业绩预告":
-        col = collections.get("earnings_forecast") or get_collection("earnings_forecast")
+        col = data_collections["earnings_forecast"]
     elif signal_type == "业绩快报":
-        col = collections.get("earnings_express") or get_collection("earnings_express")
+        col = data_collections["earnings_express"]
     elif signal_type == "卖方研报":
-        col = collections.get("earnings_report_rc") or get_collection("earnings_report_rc")
+        col = data_collections["earnings_report_rc"]
     else:
         raise HTTPException(status_code=400, detail="未知的信号类型")
         

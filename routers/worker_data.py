@@ -7,7 +7,7 @@ Worker 不直接连接数据库，所有数据操作通过此 API 完成。
 from fastapi import APIRouter, HTTPException, Header
 from typing import Optional, List, Dict, Any
 from pydantic import BaseModel
-from db import get_db_collections
+from db import get_db_collections, get_data_db
 from datetime import datetime
 
 router = APIRouter()
@@ -39,8 +39,8 @@ def get_minute_bars(req: MinuteBarsRequest, x_node_id: Optional[str] = Header(No
     供 Worker 查询历史或实时分钟K线数据
     """
     try:
-        collections = get_db_collections()
-        minute_bars = collections["minute_bars"]
+        data_collections = get_data_db()
+        minute_bars = data_collections["minute_bars"]
         
         # 构建查询条件
         query = {"symbol": req.symbol}
@@ -92,8 +92,8 @@ def get_volume_price(
     供 Worker 查询历史日线数据（回测用）
     """
     try:
-        collections = get_db_collections()
-        volume_price = collections["volume_price"]
+        data_collections = get_data_db()
+        volume_price = data_collections["volume_price"]
         
         # 构建查询条件
         query = {"symbol": symbol}

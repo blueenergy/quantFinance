@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Query, HTTPException, Depends
 from typing import List, Optional, Dict, Any
 from datetime import datetime, timedelta
-from db import get_db_collections
+from db import get_db_collections, get_data_db
 from utils.stock_utils import serialize_doc
 from utils.symbol_utils import normalize_symbol, strip_exchange_suffix
 from auth import get_current_active_user
@@ -44,8 +44,8 @@ def get_minute_bars(
         }
     """
     try:
-        collections = get_db_collections()
-        minute_bars_coll = collections["minute_bars"]
+        data_collections = get_data_db()
+        minute_bars_coll = data_collections["minute_bars"]
         
         # 规范化symbol（处理带后缀和不带后缀的情况）
         symbol_normalized = normalize_symbol(symbol)
@@ -307,7 +307,8 @@ def get_all_trade_executions(
     try:
         collections = get_db_collections()
         collection = collections["trade_executions"]
-        stock_info_collection = collections["stock_info"]
+        data_collections = get_data_db()
+        stock_info_collection = data_collections["stock_info"]
         
         # 构建查询条件（按用户 + 日期）
         user_id = current_user["id"]
@@ -388,7 +389,8 @@ def get_trade_executions_by_symbol(
     try:
         collections = get_db_collections()
         collection = collections["trade_executions"]
-        stock_info_collection = collections["stock_info"]
+        data_collections = get_data_db()
+        stock_info_collection = data_collections["stock_info"]
         
         user_id = current_user["id"]
         
@@ -434,7 +436,8 @@ def get_trade_executions_by_date(
     try:
         collections = get_db_collections()
         collection = collections["trade_executions"]
-        stock_info_collection = collections["stock_info"]
+        data_collections = get_data_db()
+        stock_info_collection = data_collections["stock_info"]
         
         user_id = current_user["id"]
         query = {"date": date, "user_id": user_id}
@@ -539,8 +542,9 @@ def get_trade_pnl_summary(
     try:
         collections = get_db_collections()
         executions_coll = collections["trade_executions"]
-        stock_info_coll = collections["stock_info"]
-        minute_bars_coll = collections["minute_bars"]
+        data_collections = get_data_db()
+        stock_info_coll = data_collections["stock_info"]
+        minute_bars_coll = data_collections["minute_bars"]
         user_id = current_user["id"]
 
         # FastAPI 在实际请求中会注入已解析的值，但直接调用函数时参数可能仍然是 Query 对象
@@ -741,7 +745,8 @@ def get_all_trade_activities(
         collections = get_db_collections()
         executions_coll = collections["trade_executions"]
         signals_coll = collections["trade_signals"]
-        stock_info_coll = collections["stock_info"]
+        data_collections = get_data_db()
+        stock_info_coll = data_collections["stock_info"]
         user_id = current_user["id"]
         
         # 构建日期查询条件

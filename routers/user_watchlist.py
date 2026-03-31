@@ -10,7 +10,7 @@ from models.all_models import (
     WatchlistStrategyResponse
 )
 from auth import get_current_active_user
-from db import get_db_collections
+from db import get_db_collections, get_data_db
 from datetime import datetime
 
 router = APIRouter()
@@ -161,6 +161,7 @@ def get_user_watchlist_stocks(current_user: dict = Depends(get_current_active_us
         
         # 获取用户自选股列表
         collections = get_db_collections()
+        data_collections = get_data_db()
         user_watchlists_collection = collections["user_watchlists"]
         watchlist_doc = user_watchlists_collection.find_one({"user_id": user_id})
         if not watchlist_doc or not watchlist_doc.get("symbols"):
@@ -172,13 +173,13 @@ def get_user_watchlist_stocks(current_user: dict = Depends(get_current_active_us
         symbols = watchlist_doc["symbols"]
         result = []
 
-        volume_price_col = collections["volume_price"]
-        etf_basic_col = collections.get("etf_basic")
-        etf_daily_col = collections.get("etf_daily")
+        volume_price_col = data_collections["volume_price"]
+        etf_basic_col = data_collections.get("etf_basic")
+        etf_daily_col = data_collections.get("etf_daily")
         
         for symbol in symbols:
             # Check Stock first
-            stock_info = collections["stock_info"].find_one({"symbol": symbol})
+            stock_info = data_collections["stock_info"].find_one({"symbol": symbol})
             if stock_info:
                 name = stock_info["name"] if "name" in stock_info else symbol
                 latest_record = volume_price_col.find_one(
@@ -319,6 +320,7 @@ def get_user_watchlist_realtime(current_user: dict = Depends(get_current_active_
         
         # 1. 获取用户自选股列表
         collections = get_db_collections()
+        data_collections = get_data_db()
         user_watchlists_collection = collections["user_watchlists"]
         watchlist_doc = user_watchlists_collection.find_one({"user_id": user_id})
         
@@ -332,8 +334,8 @@ def get_user_watchlist_realtime(current_user: dict = Depends(get_current_active_
         
         # 2. 获取昨日收盘价（用于计算涨跌幅）
         yesterday_close_map = {}  # symbol -> close_price
-        volume_price_col = collections["volume_price"]
-        etf_daily_col = collections.get("etf_daily")
+        volume_price_col = data_collections["volume_price"]
+        etf_daily_col = data_collections.get("etf_daily")
         
         for symbol in symbols:
             latest_record = volume_price_col.find_one(
@@ -355,7 +357,7 @@ def get_user_watchlist_realtime(current_user: dict = Depends(get_current_active_
         # symbols 已经是不带后缀的格式，如 ["600990", "300722"]
         
         # 4. 聚合今日分钟K线数据
-        minute_bars_col = collections["minute_bars"]
+        minute_bars_col = data_collections["minute_bars"]
         today = datetime.now().strftime("%Y%m%d")  # e.g., "20251216"
         
         # minute_bars 的 trade_date 格式是 YYYYMMDDHHmm，需要按日期前缀匹配
@@ -386,8 +388,8 @@ def get_user_watchlist_realtime(current_user: dict = Depends(get_current_active_
         result = []
         realtime_map = {item["_id"]: item for item in realtime_data}  # symbol -> data
         
-        stock_info_col = collections["stock_info"]
-        etf_basic_col = collections.get("etf_basic")
+        stock_info_col = data_collections["stock_info"]
+        etf_basic_col = data_collections.get("etf_basic")
         
         for symbol in symbols:
             # 获取股票/ETF名称

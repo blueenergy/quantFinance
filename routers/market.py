@@ -3,7 +3,7 @@ from typing import Optional, Dict, Any
 from fastapi import APIRouter,Query, Depends, HTTPException
 from models.all_models import MarketAnalysisRequest
 from auth import get_current_active_user
-from db import get_db_collections, get_analyzer_db
+from db import get_db_collections, get_analyzer_db, get_data_db
 from market_analysis_cache import market_analysis_cache
 from datetime import date, datetime
 from external_data import external_market_data
@@ -136,7 +136,6 @@ async def analyze_market(request: MarketAnalysisRequest, current_user: dict = De
 async def get_global_analysis(current_user: dict = Depends(get_current_active_user)):
     """获取最新的全球市场联动分析结果"""
     try:
-        collections = get_db_collections()
         # Fetch the latest document from global_analysis collection
         # Sort by _id (desc) to get the most recently inserted document regardless of timestamp field
         doc = get_analyzer_db()["global_analysis"].find_one(
@@ -178,8 +177,8 @@ def fetch_market_data() -> Optional[Dict[str, Any]]:
         
         # 备用方案：从本地数据库获取
         print("[市场数据] 使用本地数据库数据...")
-        collections = get_db_collections()
-        collection = collections["volume_price"] # type: ignore
+        data_collections = get_data_db()
+        collection = data_collections["volume_price"] # type: ignore
         index_symbols = ['1A0001', '399001', '399006', '899050']  # 上证指数、深证成指、创业板指、北证50
         market_data = {}
         analysis_date = None
@@ -256,8 +255,8 @@ def get_market_spectrum(
     start_date: str = Query(..., description="开始日期,格式YYYYMMDD"),
     end_date: str = Query(..., description="结束日期,格式YYYYMMDD")
 ):  
-    collections = get_db_collections()
-    collection = collections['market_spectrum']
+    data_collections = get_data_db()
+    collection = data_collections['market_spectrum']
     query = {
         'trade_date': {'$gte': start_date, '$lte': end_date}
     }
@@ -292,8 +291,8 @@ def get_market_spectrum_minute(
       - above_ma_count / below_ma_count
       - ma_period, granularity 字段区分来源
     """
-    collections = get_db_collections()
-    collection = collections.get('market_spectrum_minute')  # type: ignore
+    data_collections = get_data_db()
+    collection = data_collections.get('market_spectrum_minute')  # type: ignore
 
     if collection is None:
         raise HTTPException(status_code=500, detail="market_spectrum_minute collection not configured")
