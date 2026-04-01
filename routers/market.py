@@ -132,6 +132,61 @@ async def analyze_market(request: MarketAnalysisRequest, current_user: dict = De
     """
     return fetch_market_analysis_result(request.date)
 
+
+@router.post("/trigger-market-analysis")
+async def trigger_market_analysis(request: MarketAnalysisRequest, current_user: dict = Depends(get_current_active_user)):
+    """手动触发大盘分析任务（强制生成新分析）
+
+    插入任务到 analysis_tasks 集合，由 quantAnalyzer 异步处理。
+    """
+    try:
+        collections = get_db_collections()
+        tasks_col = collections["analysis_tasks"]
+
+        target_date = request.date or datetime.now().strftime('%Y-%m-%d')
+        user_id = str(current_user["id"])
+
+        # 避免当天重复提交 (pending or processing)
+        existing = tasks_col.find_one({
+            "type": "market_analysis",
+            "params.date": target_date,
+            "status": {"$in": ["pending", "processing"]}
+        })
+
+        if existing:
+            return {
+                "success": True,
+                "message": "任务已在队列中，请稍候",
+                "task_id": str(existing["_id"])
+            }
+
+        task_doc = {
+            "type": "market_analysis",
+            "status": "pending",
+            "priority": 20,  # High priority for manual trigger
+            "user_id": user_id,
+            "stock_name": "大盘分析",
+            "symbol": "MARKET",
+            "params": {
+                "date": target_date
+            },
+            "created_at": datetime.now(),
+            "source": "manual_trigger"
+        }
+
+        result = tasks_col.insert_one(task_doc)
+        print(f"[Market Analysis] Manual trigger task {result.inserted_id}")
+
+        return {
+            "success": True,
+            "task_id": str(result.inserted_id),
+            "message": "分析任务已提交，请稍后刷新查看结果"
+        }
+
+    except Exception as e:
+        print(f"[Market Analysis] Trigger failed: {e}")
+        return {"success": False, "error": str(e)}
+
 @router.get("/global-analysis")
 async def get_global_analysis(current_user: dict = Depends(get_current_active_user)):
     """获取最新的全球市场联动分析结果"""
