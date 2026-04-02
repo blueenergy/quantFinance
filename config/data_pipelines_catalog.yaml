@@ -1,5 +1,5 @@
 # Authoritative list of quant-data-engine ingestion pipelines for monitoring UI.
-# job_status_key must match JobStatusRepository job_type strings.
+# job_status_key must match JobStatusRepository job_type and pipeline_tasks.task_type (domain=data_collection).
 # Scheduling matches quant-data-engine/start.sh + crontab*.txt (see repo).
 
 pipelines:
