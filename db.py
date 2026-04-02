@@ -27,7 +27,8 @@ _logging.getLogger(__name__).info(
 
 def get_db_collections() -> Dict[str, Collection]:
     """
-    Return a dict of commonly used collections.
+    Return a dict of commonly used collections on the main finance DB.
+    Analyzer-written collections live in quant_analyzer; use get_analyzer_db().
     Usage:
         collections = get_db_collections()
         user_col = collections['users']
@@ -70,17 +71,7 @@ def get_db_collections() -> Dict[str, Collection]:
         "analysis_tasks": db["analysis_tasks"],  # 深度分析任务队列
         "quota_usage": db["quota_usage"],        # 用户配额使用情况
         "schedule_config": db["schedule_config"], # 定时任务调度配置
-        # Analysis results (finance DB — legacy refs, also mirrored in analyzer_db)
-        "portfolio_analysis": db["portfolio_analysis"],  # 组合机会分析历史
-        "global_analysis": db["global_analysis"], # 全球市场分析结果
-        "market_analysis": db["market_analysis"], # 盘中/盘后大盘分析结果
-        "sector_concept_analysis": db["sector_concept_analysis"],  # 概念板块分析结果
-        "hot_stock_analysis": db["hot_stock_analysis"],  # 热股分析结果（每次更新一条）
-        "analysis_history": db["analysis_history"],
-        "market_analysis_cache": db["market_analysis_cache"],
-        "analysis_tags": db["analysis_tags"],  # AI 分析标签
-        "analysis_logs": db["analysis_logs"],  # AI 分析详单
-        # Misc
+        # 评分等仍落在主库；AI/分析结果请用 get_analyzer_db()
         "stock_scores": db["stock_scores"],
     }
 

@@ -319,12 +319,12 @@ def generate_global_analysis_task(job_id: str):
 
 def hot_stock_poll_task(source: str):
     """热股轮询任务 - 每30分钟检查 THS / DC 热榜是否有新数据。"""
-    from db import get_db_collections
+    from db import get_db_collections, get_analyzer_db
 
     try:
         collections = get_db_collections()
         tasks_col = collections["analysis_tasks"]
-        analysis_col = collections["hot_stock_analysis"]
+        analysis_col = get_analyzer_db()["hot_stock_analysis"]
 
         # Check already running task for this source
         existing = tasks_col.find_one({

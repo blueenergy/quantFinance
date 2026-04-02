@@ -24,10 +24,6 @@ login_logs_collection = collections["login_logs"]
 admin_logs_collection = collections["admin_logs"]
 analysis_history_collection = get_analyzer_db()["analysis_history"]
 
-def get_limit_up_analysis_collection():
-    """Lazy access to limit_up_analysis collection"""
-    return get_analyzer_db()["limit_up_analysis"]
-
 @router.get("/users")
 def get_all_users(
     page: int = Query(1, ge=1),
@@ -888,51 +884,6 @@ def initialize_admin():
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"初始化管理员失败: {str(e)}")
     
-
-
-@router.get("/analysis-logs")
-def get_analysis_logs(
-    page: int = Query(1, ge=1),
-    page_size: int = Query(50, ge=1, le=200),
-    user_id: str = Query(""),
-    symbol: str = Query(""),
-    admin_user: dict = Depends(get_current_admin_user)
-):
-    """管理员获取AI分析日志（用户、股票、时间、服务商等）"""
-    try:
-        # 记录管理员操作
-        log_admin_action(
-            admin_user=admin_user,
-            action="VIEW_ANALYSIS_LOGS",
-            details=f"Page: {page}, UserID: {user_id}, Symbol: {symbol}"
-        )
-        # 构建查询条件
-        query = {}
-        if user_id:
-            query["user_id"] = user_id
-        if symbol:
-            query["symbol"] = symbol
-        # 计算总数
-        limit_up_analysis = get_limit_up_analysis_collection()
-        total = limit_up_analysis.count_documents(query)
-        # 分页查询
-        skip = (page - 1) * page_size
-        logs = list(limit_up_analysis.find(query).sort("timestamp", -1).skip(skip).limit(page_size))
-        for log in logs:
-            log["_id"] = str(log["_id"])
-        return {
-            "success": True,
-            "data": {
-                "logs": logs,
-                "pagination": {
-                    "page": page,
-                    "page_size": page_size,
-                    "total": total
-                }
-            }
-        }
-    except Exception as e:
-        return {"success": False, "message": f"获取分析日志失败: {str(e)}"}
 
 
 # ==================== 任务管理 API ====================
