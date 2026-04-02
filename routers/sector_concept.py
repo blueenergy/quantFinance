@@ -143,7 +143,6 @@ async def get_latest_analysis(
     current_user: dict = Depends(get_current_active_user),
 ):
     """Get the latest completed analysis for a given source, optionally filtered by date."""
-    collections = get_db_collections()
     analysis_col = get_analyzer_db()["sector_concept_analysis"]
 
     source = source.lower()
