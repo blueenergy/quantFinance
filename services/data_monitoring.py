@@ -1,5 +1,6 @@
 """
-Data ingestion catalog + job_status + freshness helpers for admin / data-pulse APIs.
+Data ingestion catalog + latest run docs (pipeline_tasks preferred, job_status fallback)
++ freshness helpers for admin / data-pulse APIs.
 """
 from __future__ import annotations
 
@@ -26,6 +27,17 @@ def load_pipelines_catalog() -> List[Dict[str, Any]]:
     return list(data.get("pipelines") or [])
 
 
+def _latest_ingestion_doc_for_catalog_key(key: str) -> Optional[Dict[str, Any]]:
+    """Prefer finance.pipeline_tasks (data_collection); fall back to job_status."""
+    doc = db["pipeline_tasks"].find_one(
+        {"domain": "data_collection", "task_type": key},
+        sort=[("date", -1)],
+    )
+    if doc:
+        return doc
+    return db["job_status"].find_one({"job_type": key}, sort=[("date", -1)])
+
+
 def normalize_job_status_doc(doc: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     """Map a job_status document to API fields (supports legacy nested payload)."""
     if not doc:
@@ -50,6 +62,26 @@ def normalize_job_status_doc(doc: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         "updated_at": doc.get("updated_at"),
         "error": err,
     }
+
+
+def normalize_ingestion_monitor_doc(doc: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Normalize latest run doc from pipeline_tasks (data_collection) or legacy job_status."""
+    if not doc:
+        return normalize_job_status_doc(None)
+    if doc.get("domain") == "data_collection":
+        pl = doc.get("payload") or {}
+        status = doc.get("status") or pl.get("status") or "unknown"
+        records = pl.get("records_changed")
+        completed = doc.get("completed_at") or doc.get("updated_at")
+        err = doc.get("error") or pl.get("error")
+        return {
+            "status": status,
+            "records_changed": records,
+            "completed_at": completed,
+            "updated_at": doc.get("updated_at"),
+            "error": err,
+        }
+    return normalize_job_status_doc(doc)
 
 
 def _get_collection(database: str, collection: str):
@@ -83,14 +115,14 @@ def _max_freshness_value(
 
 
 def build_pipelines_status_rows() -> List[Dict[str, Any]]:
-    """Latest job_status per catalog pipeline."""
+    """Latest pipeline_tasks (or job_status) per catalog pipeline."""
     catalog = load_pipelines_catalog()
     rows: List[Dict[str, Any]] = []
     for p in catalog:
         key = p.get("job_status_key") or p.get("id")
         label = p.get("label") or key
-        doc = db["job_status"].find_one({"job_type": key}, sort=[("date", -1)])
-        norm = normalize_job_status_doc(doc)
+        doc = _latest_ingestion_doc_for_catalog_key(key)
+        norm = normalize_ingestion_monitor_doc(doc)
         completed = norm["completed_at"]
         rows.append(
             {
@@ -115,8 +147,8 @@ def build_sync_health_from_catalog() -> Dict[str, Any]:
     jobs_out: List[Dict[str, Any]] = []
     healthy = 0
     for key in keys:
-        doc = db["job_status"].find_one({"job_type": key}, sort=[("date", -1)])
-        norm = normalize_job_status_doc(doc)
+        doc = _latest_ingestion_doc_for_catalog_key(key)
+        norm = normalize_ingestion_monitor_doc(doc)
         st = norm["status"]
         if st == "complete":
             healthy += 1
@@ -205,6 +237,7 @@ def expected_latest_trade_date_hint() -> str:
 __all__ = [
     "load_pipelines_catalog",
     "normalize_job_status_doc",
+    "normalize_ingestion_monitor_doc",
     "build_pipelines_status_rows",
     "build_sync_health_from_catalog",
     "build_freshness_rows",
