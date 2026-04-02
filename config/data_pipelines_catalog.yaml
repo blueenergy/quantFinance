@@ -1,0 +1,104 @@
+# Authoritative list of quant-data-engine ingestion pipelines for monitoring UI.
+# job_status_key must match JobStatusRepository job_type strings.
+
+pipelines:
+  - id: stock_daily
+    label: 股票日线
+    job_status_key: stock_daily
+    schedule_hint: "crontab 17:30 Mon-Fri — daily_market_sync.sh stock"
+    freshness:
+      database: quant_data
+      collection: volume_price
+      field: trade_date
+      field_kind: date_string
+
+  - id: index_daily
+    label: 指数日线
+    job_status_key: index_daily
+    schedule_hint: "crontab 17:45 Mon-Fri — daily_market_sync.sh index"
+    freshness:
+      database: quant_data
+      collection: index_prices
+      field: trade_date
+      field_kind: date_string
+
+  - id: etf_daily
+    label: ETF日线
+    job_status_key: etf_daily
+    schedule_hint: "crontab 18:00 Mon-Fri — daily_market_sync.sh etf"
+    freshness:
+      database: quant_data
+      collection: etf_daily
+      field: trade_date
+      field_kind: date_string
+
+  - id: financial_sync
+    label: 财务数据
+    job_status_key: financial_sync
+    schedule_hint: "crontab 18:15 Mon-Fri — daily_market_sync.sh financial"
+    freshness:
+      database: quant_data
+      collection: financial_indicator
+      field: end_date
+      field_kind: date_string
+
+  - id: moneyflow
+    label: 资金流向
+    job_status_key: moneyflow
+    schedule_hint: "crontab 18:30 Mon-Fri — daily_market_sync.sh moneyflow"
+    freshness:
+      database: quant_data
+      collection: money_flow
+      field: trade_date
+      field_kind: date_string
+
+  - id: ladder_sync
+    label: 连板天梯
+    job_status_key: ladder_sync
+    schedule_hint: "crontab 15:30 — daily_market_sync.sh ladder"
+    freshness:
+      database: quant_data
+      collection: limit_up_ladder
+      field: date
+      field_kind: date_string
+
+  - id: industry_sync
+    label: 行业与ETF聚合
+    job_status_key: industry_sync
+    schedule_hint: "daily_market_sync.sh industry"
+    freshness:
+      database: quant_data
+      collection: market_industry_quotes_daily
+      field: date
+      field_kind: date_string
+
+  - id: market_sentiment
+    label: 市场情绪阴阳谱
+    job_status_key: market_sentiment
+    schedule_hint: "crontab 18:45 Mon-Fri — daily_market_sync.sh sentiment"
+    freshness:
+      database: quant_data
+      collection: market_spectrum
+      field: trade_date
+      field_kind: date_string
+
+  - id: hot_stock_sync
+    label: 热股同步
+    job_status_key: hot_stock_sync
+    schedule_hint: "crontab 22:35 Mon-Fri — daily_market_sync.sh hotstock"
+    freshness:
+      database: quant_data
+      collection: hot_stock_raw
+      field: trade_date
+      field_kind: date_string
+
+  - id: international_news
+    label: 国际新闻缓存
+    job_status_key: international_news
+    schedule_hint: "overseas crontab — run_international_news_sync"
+    freshness:
+      database: finance
+      collection: international_news_cache
+      field: fetched_at
+      field_kind: datetime
+      document_id: "latest"

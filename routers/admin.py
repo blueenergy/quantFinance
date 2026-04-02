@@ -733,6 +733,25 @@ def get_data_collection_status(admin_user: dict = Depends(get_current_admin_user
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"获取数据采集状态失败: {str(e)}")
 
+
+@router.get("/data-monitoring/overview", summary="数据采集监控总览（目录+job_status+新鲜度）")
+def get_admin_data_monitoring_overview(admin_user: dict = Depends(get_current_admin_user)):
+    """管线健康、各集合最新日期；与 data-pulse 使用同一套聚合。"""
+    try:
+        from services.data_monitoring import build_data_monitoring_overview, expected_latest_trade_date_hint
+
+        log_admin_action(
+            admin_user=admin_user,
+            action="VIEW_DATA_MONITORING",
+            details="View data monitoring overview",
+        )
+        dm = build_data_monitoring_overview()
+        dm["expected_trade_date_hint"] = expected_latest_trade_date_hint()
+        return {"success": True, "data": dm}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"获取数据监控总览失败: {str(e)}")
+
+
 @router.put("/users/{user_id}/status")
 def update_user_status(
     user_id: str,
