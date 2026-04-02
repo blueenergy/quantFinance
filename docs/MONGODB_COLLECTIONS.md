@@ -137,4 +137,4 @@
 | 集合 | 说明 | 文档数 |
 |------|------|--------|
 | `collect_state` | 数据采集状态（记录最后同步日期） | 1 |
-| `job_status` | 定时任务执行状态（每次任务跑完写入） | 4 |
+| `job_status` | 数据采集任务运行记录（`job_type`+`date` 唯一）；权威管线列表见仓库 `quantFinance/config/data_pipelines_catalog.yaml`，写入见 `quant_data_engine.utils.ingestion_job.record_ingestion_run` | — |

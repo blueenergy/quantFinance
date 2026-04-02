@@ -9,6 +9,7 @@ uvicorn[standard]
 httpx
 pydantic
 python-dotenv
+PyYAML>=6.0
 PyJWT
 passlib[bcrypt]
 bcrypt<4.0
