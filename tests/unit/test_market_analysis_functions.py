@@ -1,270 +1,263 @@
-"""Unit tests for market analysis functions added today.
-
-Tests cover:
-1. fetch_market_analysis_result() - frontend cache-only logic
-2. generate_market_analysis_task() - backend Celery task
-"""
+"""Unit tests for market analysis cache fetch and scheduler task enqueue."""
 import pytest
 from datetime import date, datetime
-from unittest.mock import MagicMock, AsyncMock
+from unittest.mock import MagicMock
+
+
+def _patch_market_date(monkeypatch, market_module, fake_today: date):
+    """Replace market.date with an object that supports today() and fromisoformat()."""
+
+    class FakeDate:
+        @staticmethod
+        def today():
+            return fake_today
+
+        @staticmethod
+        def fromisoformat(s: str):
+            return date.fromisoformat(s)
+
+    monkeypatch.setattr(market_module, "date", FakeDate)
 
 
 @pytest.mark.unit
 class TestFetchMarketAnalysisResult:
-    """Test the frontend cache-only function."""
+    """Tests for routers.market.fetch_market_analysis_result (cache-only)."""
 
     def test_trading_day_with_cache(self, monkeypatch):
         """On a trading day, if cache exists, return it."""
         from routers import market
-        from datetime import date as date_class
-        
-        # Mock today as a trading day (e.g., Monday)
-        fake_today = date_class(2025, 12, 22)  # Monday
-        
-        class FakeDate:
-            @staticmethod
-            def today():
-                return fake_today
-        
-        monkeypatch.setattr(market, 'date', FakeDate)
-        
-        # Mock is_trading_day -> True
+
+        fake_today = date(2025, 12, 22)
+        _patch_market_date(monkeypatch, market, fake_today)
+
         monkeypatch.setattr(
             market.market_analysis_cache,
-            'is_trading_day',
-            lambda d: True
+            "is_trading_day",
+            lambda d: True,
         )
-        
-        # Mock cache hit
+
         cached_data = {
-            'analysis_result': {
-                'success': True,
-                'mood': '乐观',
-                'summary': '市场表现强劲'
+            "analysis_result": {
+                "success": True,
+                "mood": "乐观",
+                "summary": "市场表现强劲",
             },
-            'analysis_date': '2025-12-22',
-            'created_at': datetime(2025, 12, 22, 10, 0, 0)
+            "analysis_date": "2025-12-22",
+            "created_at": datetime(2025, 12, 22, 10, 0, 0),
         }
         monkeypatch.setattr(
             market.market_analysis_cache,
-            'get_cached_analysis',
-            lambda date_str: cached_data
+            "get_cached_analysis",
+            lambda date_str: cached_data,
         )
-        
+
         result = market.fetch_market_analysis_result()
-        
-        assert result['success'] is True
-        assert result['analysis_date'] == '2025-12-22'
-        assert result['cache_info']['from_cache'] is True
-        assert result['cache_info']['reason'] == "返回当日缓存的大盘分析结果"
-        assert result['mood'] == '乐观'
+
+        assert result["success"] is True
+        assert result["analysis_date"] == "2025-12-22"
+        assert result["cache_info"]["from_cache"] is True
+        assert result["cache_info"]["reason"] == "返回当日缓存的大盘分析结果"
+        assert result["mood"] == "乐观"
 
     def test_trading_day_no_cache(self, monkeypatch):
-        """On a trading day, if no cache, return error message."""
+        """Trading day, no today cache, no latest fallback → dated error + is_trading_day."""
         from routers import market
-        from datetime import date as date_class
-        
-        fake_today = date_class(2025, 12, 22)
-        
-        class FakeDate:
-            @staticmethod
-            def today():
-                return fake_today
-        
-        monkeypatch.setattr(market, 'date', FakeDate)
-        
+
+        fake_today = date(2025, 12, 22)
+        _patch_market_date(monkeypatch, market, fake_today)
+
         monkeypatch.setattr(
             market.market_analysis_cache,
-            'is_trading_day',
-            lambda d: True
+            "is_trading_day",
+            lambda d: True,
         )
-        
-        # Mock cache miss
         monkeypatch.setattr(
             market.market_analysis_cache,
-            'get_cached_analysis',
-            lambda date_str: None
+            "get_cached_analysis",
+            lambda date_str: None,
         )
-        
-        # Mock latest analysis miss too
         monkeypatch.setattr(
             market.market_analysis_cache,
-            'get_latest_trading_day_analysis',
-            lambda: None
+            "get_latest_trading_day_analysis",
+            lambda: None,
         )
-        
+
         result = market.fetch_market_analysis_result()
-        
-        assert result['success'] is False
-        assert result['error'] == "暂无任何历史大盘分析数据"
-        assert result['is_trading_day'] is True
+
+        assert result["success"] is False
+        assert result["error"] == "暂无 2025-12-22 的历史大盘分析数据"
+        assert result["is_trading_day"] is True
 
     def test_non_trading_day_with_latest_analysis(self, monkeypatch):
-        """On a non-trading day, return latest trading day's analysis."""
+        """No cache for calendar today → fall back to latest trading day analysis."""
         from routers import market
-        from datetime import date as date_class
-        
-        # Mock today as a weekend (Sunday)
-        fake_today = date_class(2025, 12, 21)  # Sunday
-        
-        class FakeDate:
-            @staticmethod
-            def today():
-                return fake_today
-        
-        monkeypatch.setattr(market, 'date', FakeDate)
-        
+
+        fake_today = date(2025, 12, 21)
+        _patch_market_date(monkeypatch, market, fake_today)
+
         monkeypatch.setattr(
             market.market_analysis_cache,
-            'is_trading_day',
-            lambda d: False
+            "is_trading_day",
+            lambda d: False,
         )
-        
-        # Mock latest analysis from Friday
+
         latest_data = {
-            'analysis_result': {
-                'success': True,
-                'mood': '谨慎',
-                'summary': '周五收盘总结'
+            "analysis_result": {
+                "success": True,
+                "mood": "谨慎",
+                "summary": "周五收盘总结",
             },
-            'analysis_date': '2025-12-19',
-            'created_at': datetime(2025, 12, 19, 15, 30, 0)
+            "analysis_date": "2025-12-19",
+            "created_at": datetime(2025, 12, 19, 15, 30, 0),
         }
         monkeypatch.setattr(
             market.market_analysis_cache,
-            'get_latest_trading_day_analysis',
-            lambda: latest_data
+            "get_cached_analysis",
+            lambda date_str: None,
         )
-        
+        monkeypatch.setattr(
+            market.market_analysis_cache,
+            "get_latest_trading_day_analysis",
+            lambda: latest_data,
+        )
+
         result = market.fetch_market_analysis_result()
-        
-        assert result['success'] is True
-        assert result['analysis_date'] == '2025-12-19'
-        assert result['cache_info']['from_cache'] is True
-        assert '当前无最新分析' in result['cache_info']['reason']
-        assert '2025-12-19' in result['cache_info']['reason']
+
+        assert result["success"] is True
+        assert result["analysis_date"] == "2025-12-19"
+        assert result["cache_info"]["from_cache"] is True
+        assert "当日无分析" in result["cache_info"]["reason"]
+        assert "2025-12-19" in result["cache_info"]["reason"]
 
     def test_non_trading_day_no_latest_analysis(self, monkeypatch):
-        """On a non-trading day, if no latest analysis, return error."""
+        """No cache for today and no latest analysis → error payload."""
         from routers import market
-        from datetime import date as date_class
-        
-        fake_today = date_class(2025, 12, 21)
-        
-        class FakeDate:
-            @staticmethod
-            def today():
-                return fake_today
-        
-        monkeypatch.setattr(market, 'date', FakeDate)
-        
+
+        fake_today = date(2025, 12, 21)
+        _patch_market_date(monkeypatch, market, fake_today)
+
         monkeypatch.setattr(
             market.market_analysis_cache,
-            'is_trading_day',
-            lambda d: False
+            "is_trading_day",
+            lambda d: False,
         )
-        
         monkeypatch.setattr(
             market.market_analysis_cache,
-            'get_latest_trading_day_analysis',
-            lambda: None
+            "get_cached_analysis",
+            lambda date_str: None,
         )
-        
+        monkeypatch.setattr(
+            market.market_analysis_cache,
+            "get_latest_trading_day_analysis",
+            lambda: None,
+        )
+
         result = market.fetch_market_analysis_result()
-        
-        assert result['success'] is False
-        assert result['error'] == "暂无任何历史大盘分析数据"
-        assert result['is_trading_day'] is False
+
+        assert result["success"] is False
+        assert result["error"] == "暂无 2025-12-21 的历史大盘分析数据"
+        assert result["is_trading_day"] is False
 
 
 @pytest.mark.unit
 class TestGenerateMarketAnalysisTask:
-    """Test the backend Celery task for SCHEDULING market analysis (Async)."""
+    """scheduler.generate_market_analysis_task — enqueue to analysis_tasks (no celery_app)."""
+
+    @staticmethod
+    def _patch_collections(monkeypatch, fake_tasks_col, fake_users_coll):
+        def fake_get_collections():
+            return {
+                "analysis_tasks": fake_tasks_col,
+                "users": fake_users_coll,
+            }
+
+        import db
+
+        monkeypatch.setattr(db, "get_db_collections", fake_get_collections)
 
     def test_schedule_success(self, monkeypatch):
-        """Task should be inserted into MongoDB analysis_tasks collection."""
-        from celery_app import generate_market_analysis_task
-        from datetime import datetime
-        
-        # Mock DB collections
+        from scheduler import generate_market_analysis_task
+        import scheduler as sched_mod
+
+        fake_now = datetime(2025, 6, 15, 12, 0, 0)
+        monkeypatch.setattr(sched_mod, "datetime", MagicMock())
+        sched_mod.datetime.now.return_value = fake_now
+
         fake_tasks_col = MagicMock()
-        fake_tasks_col.find_one.return_value = None  # No existing task
-        fake_tasks_col.insert_one.return_value.inserted_id = 'new-task-id'
-        
+        fake_tasks_col.find_one.return_value = None
+        fake_tasks_col.insert_one.return_value.inserted_id = "new-task-id"
+
         fake_users_coll = MagicMock()
         fake_users_coll.find_one.return_value = {"_id": "admin-id"}
-        
-        def fake_get_collections():
-            return {
-                'analysis_tasks': fake_tasks_col,
-                'users': fake_users_coll
-            }
-        
-        import db
-        monkeypatch.setattr(db, 'get_db_collections', fake_get_collections)
-        
-        result = generate_market_analysis_task()
-        
-        assert result['success'] is True
-        assert result['task_id'] == 'new-task-id'
-        
-        # Verify insertion
+
+        self._patch_collections(monkeypatch, fake_tasks_col, fake_users_coll)
+
+        generate_market_analysis_task("market_analysis_1130")
+
         fake_tasks_col.insert_one.assert_called_once()
-        inserted_doc = fake_tasks_col.insert_one.call_args[0][0]
-        assert inserted_doc['type'] == 'market_analysis'
-        assert inserted_doc['status'] == 'pending'
-        assert inserted_doc['user_id'] == 'admin-id'
-        assert inserted_doc['symbol'] == 'MARKET'
+        inserted = fake_tasks_col.insert_one.call_args[0][0]
+        assert inserted["type"] == "market_analysis"
+        assert inserted["status"] == "pending"
+        assert inserted["user_id"] == "admin-id"
+        assert inserted["symbol"] == "MARKET"
+        assert inserted["params"]["date"] == "2025-06-15"
+        assert inserted["params"]["job_id"] == "market_analysis_1130"
+        assert inserted["params"]["analysis_type"] == "intraday"
+
+    def test_post_market_job_type(self, monkeypatch):
+        from scheduler import generate_market_analysis_task
+        import scheduler as sched_mod
+
+        monkeypatch.setattr(sched_mod, "datetime", MagicMock())
+        sched_mod.datetime.now.return_value = datetime(2025, 6, 15, 16, 30, 0)
+
+        fake_tasks_col = MagicMock()
+        fake_tasks_col.find_one.return_value = None
+        fake_tasks_col.insert_one.return_value.inserted_id = "id2"
+        fake_users_coll = MagicMock()
+        fake_users_coll.find_one.return_value = {"_id": "a"}
+
+        self._patch_collections(monkeypatch, fake_tasks_col, fake_users_coll)
+
+        generate_market_analysis_task("market_analysis_1630")
+        inserted = fake_tasks_col.insert_one.call_args[0][0]
+        assert inserted["params"]["analysis_type"] == "post_market"
 
     def test_duplicate_prevention(self, monkeypatch):
-        """If a task is already pending/processing for today, do not insert new one."""
-        from celery_app import generate_market_analysis_task
-        
-        # Mock DB with existing task
+        from scheduler import generate_market_analysis_task
+        import scheduler as sched_mod
+
+        monkeypatch.setattr(sched_mod, "datetime", MagicMock())
+        sched_mod.datetime.now.return_value = datetime(2025, 6, 15, 10, 0, 0)
+
         fake_tasks_col = MagicMock()
-        fake_tasks_col.find_one.return_value = {'_id': 'existing-task'}
-        
+        fake_tasks_col.find_one.return_value = {"_id": "existing-task"}
         fake_users_coll = MagicMock()
         fake_users_coll.find_one.return_value = {"_id": "admin-id"}
-        
-        def fake_get_collections():
-            return {
-                'analysis_tasks': fake_tasks_col,
-                'users': fake_users_coll
-            }
-        
-        import db
-        monkeypatch.setattr(db, 'get_db_collections', fake_get_collections)
-        
-        result = generate_market_analysis_task()
-        
-        assert result['success'] is True
-        assert result['message'] == 'already_queued'
+
+        self._patch_collections(monkeypatch, fake_tasks_col, fake_users_coll)
+
+        generate_market_analysis_task("market_analysis_1130")
+
         fake_tasks_col.insert_one.assert_not_called()
 
     def test_admin_fallback(self, monkeypatch):
-        """If admin user not found, task should be assigned to 'system'."""
-        from celery_app import generate_market_analysis_task
-        
+        from scheduler import generate_market_analysis_task
+        import scheduler as sched_mod
+
+        monkeypatch.setattr(sched_mod, "datetime", MagicMock())
+        sched_mod.datetime.now.return_value = datetime(2025, 6, 15, 10, 0, 0)
+
         fake_tasks_col = MagicMock()
         fake_tasks_col.find_one.return_value = None
-        fake_tasks_col.insert_one.return_value.inserted_id = 'task-id'
-        
+        fake_tasks_col.insert_one.return_value.inserted_id = "task-id"
         fake_users_coll = MagicMock()
-        fake_users_coll.find_one.return_value = None  # No admin found
-        
-        def fake_get_collections():
-            return {
-                'analysis_tasks': fake_tasks_col,
-                'users': fake_users_coll
-            }
-        
-        import db
-        monkeypatch.setattr(db, 'get_db_collections', fake_get_collections)
-        
-        result = generate_market_analysis_task()
-        
-        assert result['success'] is True
+        fake_users_coll.find_one.return_value = None
+
+        self._patch_collections(monkeypatch, fake_tasks_col, fake_users_coll)
+
+        generate_market_analysis_task("market_analysis_1130")
+
         fake_tasks_col.insert_one.assert_called_once()
-        inserted_doc = fake_tasks_col.insert_one.call_args[0][0]
-        assert inserted_doc['user_id'] == 'system'
+        inserted = fake_tasks_col.insert_one.call_args[0][0]
+        assert inserted["user_id"] == "system"
