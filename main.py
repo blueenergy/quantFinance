@@ -35,6 +35,8 @@ from routers.hot_stock import router as hot_stock_router
 from routers.etf import router as etf_router
 from routers.data_pulse import router as data_pulse_router
 from routers.earnings import router as earnings_router
+from routers.navigation_policy import user_router as navigation_user_router
+from routers.entitlements_matrix import router as entitlements_matrix_router
 from production_config import configure_production_app
 from contextlib import asynccontextmanager
 from scheduler import start_scheduler, stop_scheduler
@@ -57,9 +59,12 @@ configure_production_app(app)
 app.include_router(auth_router, prefix="/api/auth", tags=["认证"])
 app.include_router(user_watchlist_router, prefix="/api/user", tags=["自选股"])
 app.include_router(user_config_router, prefix="/api/user", tags=["用户配置"])
+app.include_router(navigation_user_router, prefix="/api/user", tags=["主导航"])
 app.include_router(stock_router, prefix="/api/stock", tags=["股票"])
 app.include_router(market_router, prefix="/api", tags=["市场分析"])
 app.include_router(admin_router, prefix="/api/admin", tags=["管理员"])
+# Admin 权限相关：权益矩阵
+app.include_router(entitlements_matrix_router, prefix="/api/admin", tags=["权限与导航配置"])
 app.include_router(analysis_router, prefix="/api", tags=["AI分析"])
 app.include_router(records_router, prefix="/api", tags=["记录查询"])
 app.include_router(stock_ranking_router, prefix="/api", tags=["股票排名"])

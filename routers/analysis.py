@@ -10,6 +10,7 @@ from bson import ObjectId
 from models.analysis_task import AnalysisTaskCreate, TaskStatus
 from services.quota_manager import QuotaManager
 from db import db
+from routers.entitlements_matrix import resolve_deep_analysis_entitlement
 
 router = APIRouter()
 
@@ -523,42 +524,60 @@ async def create_deep_analysis_task(
 ):
     """
     创建深度分析任务 (Producer)。
-    - 检查用户权限和配额 (VIP: 50次/月, 免费: 2次/周)。
-    - 投递任务到异步队列。
+    - 权益矩阵：可对「自选股 · 深度分析」按等级配置禁止 / 继承默认配额 / 指定每周次数。
+    - 继承默认时：VIP 50 次/月，其余 2 次/周（QuotaManager）。
     """
     collections = get_db_collections()
     quota_manager = QuotaManager(db)
-    
-    # 1. 确定用户等级
-    # 优先检查 is_vip 字段，其次检查 level 字段，最后默认为 free
+
+    ent = resolve_deep_analysis_entitlement(current_user)
+    if ent["type"] == "blocked":
+        raise HTTPException(status_code=403, detail=ent.get("detail", "深度分析不可用"))
+
+    # 1. 确定用户等级（QuotaManager / 展示用）
     user_level = "free"
-    # Admin is VIP
     if current_user.get("is_admin"):
-         user_level = "vip"
+        user_level = "vip"
     elif current_user.get("is_vip"):
-         user_level = "vip"
+        user_level = "vip"
     else:
-        # Check both 'level' and 'service_level' (auth.py defaults)
         level = current_user.get("level")
         service_level = current_user.get("service_level")
-        
-        print(f"[DEBUG] User Analysis Request: user={current_user.get('username')}, level={level}, service_level={service_level}")
-        
         if level == "vip" or service_level == "vip":
             user_level = "vip"
         else:
             user_level = level or service_level or "free"
-            
-        print(f"[DEBUG] Determined user_level: {user_level}")
-        
-    # 2. 检查配额
-    if not quota_manager.check_quota(current_user["id"], user_level):
-        limit = quota_manager.get_limit(user_level)
-        period_key = quota_manager._get_period_key(user_level)
-        raise HTTPException(
-            status_code=403, 
-            detail=f"配额已用完。{user_level}用户限制暂为 {limit}次/{'月' if user_level=='vip' else '周'}。当前周期: {period_key}"
-        )
+
+    use_matrix_quota = ent["type"] == "matrix"
+    feature_key = ent.get("feature_key", "") if use_matrix_quota else ""
+    matrix_limit = int(ent.get("weekly_limit", 0)) if use_matrix_quota else 0
+
+    # 2. 配额检查
+    if use_matrix_quota:
+        if not quota_manager.check_feature_weekly_quota(
+            current_user["id"], feature_key, matrix_limit
+        ):
+            rem = quota_manager.get_remaining_feature_weekly_quota(
+                current_user["id"], feature_key, matrix_limit
+            )
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    f"本周深度分析次数已用完（权益矩阵限制 {matrix_limit} 次/周）。"
+                    f"剩余: {rem}"
+                ),
+            )
+    else:
+        if not quota_manager.check_quota(current_user["id"], user_level):
+            limit = quota_manager.get_limit(user_level)
+            period_key = quota_manager._get_period_key(user_level)
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    f"配额已用完。{user_level}用户限制暂为 {limit}次/"
+                    f"{'月' if user_level == 'vip' else '周'}。当前周期: {period_key}"
+                ),
+            )
 
     # 3. 创建任务
     task_doc = {
@@ -577,9 +596,14 @@ async def create_deep_analysis_task(
         task_id = str(result.inserted_id)
         
         # 4. 扣除配额
-        quota_manager.consume_quota(current_user["id"], user_level)
-        
-        remaining = quota_manager.get_remaining(current_user["id"], user_level)
+        if use_matrix_quota:
+            quota_manager.consume_feature_weekly_quota(current_user["id"], feature_key)
+            remaining = quota_manager.get_remaining_feature_weekly_quota(
+                current_user["id"], feature_key, matrix_limit
+            )
+        else:
+            quota_manager.consume_quota(current_user["id"], user_level)
+            remaining = quota_manager.get_remaining(current_user["id"], user_level)
         
         return {
             "success": True,
