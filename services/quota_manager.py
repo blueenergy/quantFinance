@@ -15,6 +15,44 @@ class QuotaManager:
         # Weekly for Free users (Period resets every Monday)
         return now.strftime("%Y-W%W")
 
+    def _period_key_weekly(self) -> str:
+        return datetime.now().strftime("%Y-W%W")
+
+    def check_feature_weekly_quota(self, user_id: str, feature_key: str, limit: int) -> bool:
+        """Matrix-driven weekly cap; separate from level-based quota documents."""
+        if limit <= 0:
+            return False
+        period = self._period_key_weekly()
+        usage = self.usage_col.find_one(
+            {"user_id": str(user_id), "period": period, "feature": feature_key}
+        )
+        count = usage.get("count", 0) if usage else 0
+        return count < limit
+
+    def consume_feature_weekly_quota(self, user_id: str, feature_key: str):
+        period = self._period_key_weekly()
+        self.usage_col.update_one(
+            {"user_id": str(user_id), "period": period, "feature": feature_key},
+            {
+                "$inc": {"count": 1},
+                "$setOnInsert": {
+                    "created_at": datetime.now(),
+                    "updated_at": datetime.now(),
+                },
+            },
+            upsert=True,
+        )
+
+    def get_remaining_feature_weekly_quota(self, user_id: str, feature_key: str, limit: int) -> int:
+        if limit <= 0:
+            return 0
+        period = self._period_key_weekly()
+        usage = self.usage_col.find_one(
+            {"user_id": str(user_id), "period": period, "feature": feature_key}
+        )
+        count = usage.get("count", 0) if usage else 0
+        return max(0, limit - count)
+
     def get_limit(self, user_level: str) -> int:
         if user_level == "vip":
             return 50

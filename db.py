@@ -71,6 +71,7 @@ def get_db_collections() -> Dict[str, Collection]:
         "analysis_tasks": db["analysis_tasks"],  # 深度分析任务队列
         "quota_usage": db["quota_usage"],        # 用户配额使用情况
         "schedule_config": db["schedule_config"], # 定时任务调度配置
+        "app_settings": db["app_settings"],  # 全局可配置项（如主导航按等级可见性）
         # 评分等仍落在主库；AI/分析结果请用 get_analyzer_db()
         "stock_scores": db["stock_scores"],
     }
