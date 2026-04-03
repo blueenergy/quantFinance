@@ -323,7 +323,7 @@ def admin_get_entitlements_matrix(admin_user: dict = Depends(get_current_admin_u
             "updated_at": doc.get("updated_at").isoformat() if doc and doc.get("updated_at") else None,
             "help": {
                 "inheritance": "页内操作的生效条件 = 父级导航 Tab 对该用户可见 AND 本格配置允许。",
-                "tab": "inherit=沿用当前代码规则(req_vip+白名单); hidden=矩阵隐藏; visible=矩阵强制可见(待接入)",
+                "tab": "inherit=沿用后端主导航规则(各 Tab 的 req_vip + 用户等级); hidden=隐藏; visible=强制显示",
                 "action": "inherit=待接入; blocked=禁止点击; allowed=允许, weekly_limit 空=不限次",
             },
         },
