@@ -72,7 +72,7 @@ class StockAnalysisRequest(BaseModel):
     provider: Optional[str] = None   # <--- 补充
     model: Optional[str] = None      # <--- 补充
 class MarketAnalysisRequest(BaseModel):
-    type: str
+    type: Optional[str] = None
     date: Optional[str] = None
     force_refresh: Optional[bool] = False
 
