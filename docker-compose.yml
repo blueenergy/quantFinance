@@ -99,14 +99,11 @@ services:
       - DEPLOY_MODE=${DEPLOY_MODE:-full}
       - SECONDARY_MONGO_URI=${SECONDARY_MONGO_URI:-}
       - SECONDARY_MONGO_DB=${SECONDARY_MONGO_DB:-finance}
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
     restart: unless-stopped
+    network_mode: host
     volumes:
       - ../quant-data-engine/logs:/app/logs
       - ../quant-data-engine/src/quant_data_engine:/app/src/quant_data_engine
-    networks:
-      - quant-network
 
   # 量化小助手 (自然语言交互接口)
   quant-assistant:
