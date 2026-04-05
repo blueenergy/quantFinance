@@ -15,8 +15,11 @@ services:
       - JWT_SECRET_KEY=${JWT_SECRET_KEY}
       - REMOTE_WORKER_API=${REMOTE_WORKER_API:-http://quant-strategy-manager:5000/api/workers}
       - TZ=Asia/Shanghai
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - quant-network
 
-  # Celery 任务队列 (Worker + Beat)
   # Multi-worker setup for parallel task processing
   quant-analyzer-1:
     build:
@@ -216,10 +219,12 @@ services:
       dockerfile: Dockerfile.fast
     container_name: quant-web
     ports:
-      - "80:80"
-      - "443:443"
+      - "8088:80"
+      - "8443:443"
     restart: unless-stopped
     profiles: [ "frontend" ] # Optional: Only start with --profile frontend
+    environment:
+      - BACKEND_URL=http://quant-api:3001
     networks:
       - quant-network
     volumes:
