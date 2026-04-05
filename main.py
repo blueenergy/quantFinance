@@ -38,11 +38,26 @@ from routers.earnings import router as earnings_router
 from routers.navigation_policy import user_router as navigation_user_router
 from routers.entitlements_matrix import router as entitlements_matrix_router
 from production_config import configure_production_app
+import logging
 from contextlib import asynccontextmanager
 from scheduler import start_scheduler, stop_scheduler
 
+
+class _NoiseFilter(logging.Filter):
+    """Filter out high-frequency, low-value access log entries."""
+    _SKIP = ("/health", "/api/backtest/tasks/pending/poll")
+
+    def filter(self, record):
+        msg = record.getMessage()
+        return not any(p in msg for p in self._SKIP)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Apply after uvicorn has configured its own logging
+    logging.getLogger("uvicorn.access").addFilter(_NoiseFilter())
+    logging.getLogger("apscheduler.executors.default").setLevel(logging.WARNING)
+    logging.getLogger("apscheduler.scheduler").setLevel(logging.WARNING)
     # Startup
     start_scheduler()
     yield
