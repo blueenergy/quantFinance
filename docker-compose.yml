@@ -34,8 +34,14 @@ services:
       - TUSHARE_TOKEN=${TUSHARE_TOKEN}
       - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
       - DEEPSEEK_BASE_URL=${DEEPSEEK_BASE_URL}
-      - DEFAULT_LLM_PROVIDER=qwen
-      - DEFAULT_MODEL=qwen-plus
+      - QWEN_API_KEY=${QWEN_API_KEY}
+      - QWEN_BASE_URL=${QWEN_BASE_URL}
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - OPENAI_BASE_URL=${OPENAI_BASE_URL}
+      - CUSTOM_API_KEY=${CUSTOM_API_KEY}
+      - CUSTOM_BASE_URL=${CUSTOM_BASE_URL}
+      - DEFAULT_LLM_PROVIDER=${DEFAULT_LLM_PROVIDER:-qwen}
+      - DEFAULT_MODEL=${DEFAULT_MODEL:-qwen-plus}
       - ANALYSIS_INTERVAL=300
       - DISABLE_AUTO_ANALYSIS=${DISABLE_AUTO_ANALYSIS:-false}
       - WORKER_ID=analyzer-1
@@ -63,8 +69,14 @@ services:
       - TUSHARE_TOKEN=${TUSHARE_TOKEN}
       - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
       - DEEPSEEK_BASE_URL=${DEEPSEEK_BASE_URL}
-      - DEFAULT_LLM_PROVIDER=qwen
-      - DEFAULT_MODEL=qwen-plus
+      - QWEN_API_KEY=${QWEN_API_KEY}
+      - QWEN_BASE_URL=${QWEN_BASE_URL}
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - OPENAI_BASE_URL=${OPENAI_BASE_URL}
+      - CUSTOM_API_KEY=${CUSTOM_API_KEY}
+      - CUSTOM_BASE_URL=${CUSTOM_BASE_URL}  
+      - DEFAULT_LLM_PROVIDER=${DEFAULT_LLM_PROVIDER:-qwen}
+      - DEFAULT_MODEL=${DEFAULT_MODEL:-qwen-plus}
       - ANALYSIS_INTERVAL=300
       - DISABLE_AUTO_ANALYSIS=${DISABLE_AUTO_ANALYSIS:-false}
       - WORKER_ID=analyzer-2
@@ -141,8 +153,8 @@ services:
   # 回测 Worker (轮询任务队列并执行回测)
   backtest-worker:
     build:
-      context: ../backtest-worker
-      dockerfile: Dockerfile
+      context: ..
+      dockerfile: backtest-worker/Dockerfile
     container_name: backtest-worker
     environment:
       - MONGO_URI=${MONGO_URI:-mongodb://host.docker.internal:27017/}
@@ -210,7 +222,7 @@ services:
       - ../data-access-lib:/app/data-access-lib
 
   # 前端Web服务
-  web:
+  quant-web:
     build:
       context: ../quantFinance-dashboard
       dockerfile: Dockerfile.fast
@@ -240,7 +252,7 @@ services:
 
   # Redis缓存 (可选，用于会话管理和缓存)
   # Prometheus监控 (可选)
-  prometheus:
+  quant-prometheus:
     image: prom/prometheus:latest
     container_name: quant-prometheus
     ports:
@@ -261,7 +273,7 @@ services:
       - '--web.enable-lifecycle'
 
   # Grafana仪表板 (可选)
-  grafana:
+  quant-grafana:
     image: grafana/grafana:latest
     container_name: quant-grafana
     ports:
