@@ -9,7 +9,7 @@ mongo_url = os.getenv("MONGO_URL", "mongodb://localhost:27017")
 client = MongoClient(mongo_url)
 db = client[os.getenv("MONGO_DB", "finance")]
 collection = db["analysis_history"]
-stock_info = db["stock_info"]
+stock_info = client[os.getenv("DATA_DB_NAME", "quant_data")]["stock_info"]
 stock_name_cache = {}
 
 def stock_analysis_stats():
