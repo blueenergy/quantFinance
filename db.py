@@ -138,6 +138,10 @@ def get_data_db():
         "market_industry_quotes_daily": data_db["market_industry_quotes_daily"],
         "market_etf_quotes_daily": data_db["market_etf_quotes_daily"],
         "industry_limitup_stats": data_db["industry_limitup_stats"],
+        # Cached international headlines for global analysis/data pulse
+        "international_news_cache": data_db["international_news_cache"],
+        # Global quotes (yfinance sync from quant-data-engine)
+        "global_market_quotes": data_db["global_market_quotes"],
     }
 
 def close_db():

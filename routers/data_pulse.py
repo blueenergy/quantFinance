@@ -12,13 +12,26 @@ from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Query
 
-from db import db
+from db import db, get_data_db
 from services.data_monitoring import (
     build_data_monitoring_overview,
     build_pipelines_status_rows,
 )
 
 router = APIRouter(prefix="/data-pulse", tags=["data-pulse"])
+
+
+def _get_international_news_doc():
+    """
+    Read cache from quant_data first, fallback to finance for compatibility.
+    """
+    try:
+        doc = get_data_db()["international_news_cache"].find_one({"_id": "latest"})
+        if doc:
+            return doc
+    except Exception:
+        pass
+    return db["international_news_cache"].find_one({"_id": "latest"})
 
 
 def _freshness_dict_from_rows(freshness_rows: list) -> Dict[str, Any]:
@@ -43,7 +56,7 @@ def _freshness_dict_from_rows(freshness_rows: list) -> Dict[str, Any]:
 async def get_international_news(
     category: Optional[str] = Query(None, description="指定分类"),
 ):
-    doc = db["international_news_cache"].find_one({"_id": "latest"})
+    doc = _get_international_news_doc()
 
     if not doc:
         return {
@@ -96,7 +109,7 @@ async def get_data_pulse_overview():
         "pipelines_detail": dm.get("pipelines"),
     }
 
-    news_doc = db["international_news_cache"].find_one({"_id": "latest"})
+    news_doc = _get_international_news_doc()
     if news_doc:
         fetched_at = news_doc.get("fetched_at")
         age_minutes = None

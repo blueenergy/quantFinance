@@ -380,17 +380,15 @@ def get_market_spectrum_minute(
 def get_realtime_quotes(symbols: str = Query(..., description="逗号分隔的股票代码，如 ^IXIC,FXI")):
     """
     获取指定代码的最新实时报价，用于前端 Watchdog 监控。
-    数据由 quant-data-engine 侧独立脚本 (run_global_market_sync) 写入 global_market_quotes 集合。
+    数据由 quant-data-engine 侧独立脚本 (run_global_market_sync) 写入 DATA_DB_NAME（默认 quant_data）下的 global_market_quotes 集合。
     返回: { symbol: { price: float, change_pct: float, timestamp: str } }
     """
-    from db import get_collection
-    
     symbol_list = [s.strip() for s in symbols.split(',') if s.strip()]
     if not symbol_list:
         return {"success": True, "data": {}}
         
     try:
-        col = get_collection("global_market_quotes")
+        col = get_data_db()["global_market_quotes"]
         docs = list(col.find({"symbol": {"$in": symbol_list}}))
         
         result = {}

@@ -98,7 +98,7 @@ pipelines:
     job_status_key: international_news
     schedule_hint: "start.sh：DEPLOY_MODE=overseas 或 full 时常驻 run_international_news_sync --loop（INTL_NEWS_SYNC_INTERVAL，默认 1800s）；可选 SECONDARY_MONGO_URI → --sync-uri；domestic 不启动"
     freshness:
-      database: finance
+      database: quant_data
       collection: international_news_cache
       field: fetched_at
       field_kind: datetime
