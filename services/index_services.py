@@ -162,12 +162,12 @@ class IndexService:
                     
                     # 获取MongoDB连接配置（如果有环境变量）
                     mongo_uri = os.getenv("MONGO_URI", "mongodb://localhost:27017")
-                    db_name = os.getenv("MONGO_DB", "finance")
+                    db_name = os.getenv("DATA_DB_NAME", "quant_data")
                     
                     # 连接到MongoDB
                     client = MongoClient(mongo_uri)
                     self.db = client[db_name]
-                    print(f"已连接到数据库: {db_name}")
+                    print(f"已连接到数据数据库: {db_name}")
                 except Exception as e:
                     print(f"数据库连接失败，无法缓存数据: {str(e)}")
                     return False
@@ -251,7 +251,7 @@ class IndexService:
                     import os
                     
                     mongo_uri = os.getenv("MONGO_URI", "mongodb://localhost:27017")
-                    db_name = os.getenv("MONGO_DB", "finance")
+                    db_name = os.getenv("DATA_DB_NAME", "quant_data")
                     
                     client = MongoClient(mongo_uri)
                     self.db = client[db_name]

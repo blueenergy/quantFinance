@@ -116,10 +116,16 @@ def get_data_db():
         "market_spectrum": data_db["market_spectrum"],
         "market_spectrum_minute": data_db["market_spectrum_minute"],
         # ETF data
+        "etf_prices": data_db["etf_prices"],
         "etf_basic": data_db["etf_basic"],
         "etf_daily": data_db["etf_daily"],
         "etf_adj_factor": data_db["etf_adj_factor"],
         "etf_shares": data_db["etf_shares"],
+        # Index reference/meta data
+        "index_meta": data_db["index_meta"],
+        "index_constituents": data_db["index_constituents"],
+        # Fund holdings snapshots (if sync task enabled)
+        "fund_holdings": data_db["fund_holdings"],
         # Stock reference data
         "stock_info": data_db["stock_info"],
         "stock_basic": data_db["stock_basic"],

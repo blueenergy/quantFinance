@@ -191,19 +191,13 @@ async def trigger_market_analysis(request: MarketAnalysisRequest, current_user: 
 async def get_global_analysis(current_user: dict = Depends(get_current_active_user)):
     """获取最新的全球市场联动分析结果"""
     try:
-        # Fetch the latest document from global_analysis collection
-        # Sort by _id (desc) to get the most recently inserted document regardless of timestamp field
-        doc = get_analyzer_db()["global_analysis"].find_one(
-            sort=[("_id", -1)]
-        )
-        
+        # Primary-only source: quant_analyzer.global_analysis.
+        # Intentionally do NOT fallback to finance.analysis_tasks so data issues surface early.
+        doc = get_analyzer_db()["global_analysis"].find_one(sort=[("_id", -1)])
+
         if not doc:
-            return {
-                "success": False,
-                "error": "今日尚无全球市场分析数据"
-            }
-            
-        # Serialize MongoDB document
+            return {"success": False, "error": "今日尚无全球市场分析数据"}
+
         result = serialize_doc(doc)
         return {
             "success": True,
