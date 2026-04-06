@@ -23,7 +23,7 @@ class VolumePriceCollector:
         self.client = MongoClient(mongo_url)
         self.db = self.client['finance']
         self.collection = self.db['volume_price']
-        self.stock_info_collection = self.db['stock_info']
+        self.stock_info_collection = self.client['quant_data']['stock_info']
         
         # ✅ 创建复合索引（针对字符串日期格式优化）
         self.collection.create_index([
