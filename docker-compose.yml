@@ -188,7 +188,8 @@ services:
       dockerfile: Dockerfile
     container_name: quant-scorer
     environment:
-      - MONGO_URL=${MONGO_URI:-mongodb://host.docker.internal:27017}
+      - MONGO_URI=${MONGO_URI:-mongodb://host.docker.internal:27017/}
+      - MONGO_URL=${MONGO_URI:-mongodb://host.docker.internal:27017/}
       - MONGO_DB=${MONGO_DB}
       - TUSHARE_TOKEN=${TUSHARE_TOKEN}
       - MAX_WORKERS=${SCORING_MAX_WORKERS:-6}
