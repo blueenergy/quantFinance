@@ -1,4 +1,5 @@
 import os
+import logging
 from typing import Optional, Dict, Any, List
 from fastapi import APIRouter, Depends, Query, HTTPException
 from models.all_models import AnalysisHistoryRequest
@@ -13,6 +14,27 @@ from db import db
 from routers.entitlements_matrix import resolve_deep_analysis_entitlement
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
+
+
+def _normalize_task_status(raw_status: Any) -> str:
+    """
+    Normalize task status to canonical lowercase strings expected by frontend:
+    pending / processing / completed / failed.
+    """
+    if raw_status is None:
+        return "unknown"
+    # Enum instance (e.g., TaskStatus.PENDING)
+    if hasattr(raw_status, "value"):
+        try:
+            return str(raw_status.value).lower()
+        except Exception:
+            pass
+    # String forms, including legacy "TaskStatus.PENDING"
+    s = str(raw_status)
+    if s.startswith("TaskStatus."):
+        s = s.split(".", 2)[1]
+    return s.lower()
 
 
 @router.post("/analyze/portfolio-opportunities")
@@ -191,22 +213,36 @@ async def get_analysis_task_status(
         raise HTTPException(status_code=404, detail="任务不存在")
     
     if task.get("user_id") != current_user["id"]:
+        logger.warning(
+            "[portfolio-task] access denied task_id=%s task_user_id=%s current_user_id=%s",
+            task_id, task.get("user_id"), current_user.get("id")
+        )
         raise HTTPException(status_code=403, detail="无权访问此任务")
     
     response = {
         "task_id": task_id,
-        "status": task.get("status", "unknown"),
+        "status": _normalize_task_status(task.get("status", "unknown")),
         "type": task.get("params", {}).get("analysis_type", "combined"),
         "created_at": task.get("created_at").isoformat() if task.get("created_at") else None
     }
     
-    if task.get("status") == "completed":
+    if response["status"] == "completed":
         result = task.get("result", {})
         response["success"] = result.get("success", False)
         response["analysis"] = result.get("analysis")
         response["model"] = result.get("model")
-    elif task.get("status") == "failed":
+    elif response["status"] == "failed":
         response["error"] = task.get("error", "分析失败")
+
+    logger.debug(
+        "[portfolio-task] task_id=%s status=%s response_success=%s worker_id=%s completed_at=%s failed_at=%s",
+        task_id,
+        task.get("status"),
+        response.get("success"),
+        task.get("worker_id"),
+        task.get("completed_at"),
+        task.get("failed_at"),
+    )
     
     return response
 
@@ -380,7 +416,7 @@ def _submit_portfolio_task(
     task_doc = {
         "user_id": user_id,
         "type": "portfolio_analysis",
-        "status": TaskStatus.PENDING,
+        "status": TaskStatus.PENDING.value,
         "priority": 1,
         "params": {
             "watchlist": watchlist,
@@ -657,7 +693,7 @@ async def create_deep_analysis_task(
     task_doc = {
         "user_id": current_user["id"],
         "symbol": request.symbol,
-        "status": TaskStatus.PENDING,
+        "status": TaskStatus.PENDING.value,
         "priority": request.priority,
         "created_at": datetime.now(),
         "updated_at": datetime.now(),
