@@ -5,7 +5,10 @@ import pytest
 from datetime import datetime
 
 from routers import entitlements_matrix as em
-from routers.entitlements_matrix import FEATURE_WATCHLIST_DEEP_ANALYSIS
+from routers.entitlements_matrix import (
+    FEATURE_WATCHLIST_DEEP_ANALYSIS,
+    FEATURE_WATCHLIST_OPPORTUNITIES,
+)
 from services.quota_manager import QuotaManager
 
 
@@ -24,10 +27,23 @@ def test_build_categories_watchlist_has_deep_analysis_child():
 
 
 @pytest.mark.unit
+def test_build_categories_watchlist_has_opportunities_child():
+    cats = em.build_categories()
+    main = next(c for c in cats if c["category_id"] == "main_nav")
+    wl_sec = next(s for s in main["sections"] if s["section_id"] == "mod_watchlist")
+    keys = [r["key"] for r in wl_sec["rows"]]
+    assert FEATURE_WATCHLIST_OPPORTUNITIES in keys
+    child = next(r for r in wl_sec["rows"] if r["key"] == FEATURE_WATCHLIST_OPPORTUNITIES)
+    assert child["row_type"] == "action"
+    assert child["parent_nav_key"] == "nav.watchlist"
+
+
+@pytest.mark.unit
 def test_build_feature_registry_includes_deep_analysis():
     flat = em.build_feature_registry()
     keys = [r["key"] for r in flat]
     assert FEATURE_WATCHLIST_DEEP_ANALYSIS in keys
+    assert FEATURE_WATCHLIST_OPPORTUNITIES in keys
 
 
 @pytest.mark.unit
@@ -90,10 +106,30 @@ def test_resolve_deep_analysis_allowed_without_limit_is_inherit(monkeypatch):
 
 
 @pytest.mark.unit
+def test_resolve_action_entitlement_for_opportunities_matrix_limit(monkeypatch):
+    cells = {
+        FEATURE_WATCHLIST_OPPORTUNITIES: {
+            "free": {"click": "allowed", "weekly_limit": 1},
+        }
+    }
+    monkeypatch.setattr(em, "get_merged_matrix_cells", lambda: cells)
+    out = em.resolve_action_entitlement(
+        user={"service_level": "free", "id": "u1"},
+        feature_key=FEATURE_WATCHLIST_OPPORTUNITIES,
+        blocked_detail="blocked by test",
+    )
+    assert out["type"] == "matrix"
+    assert out["weekly_limit"] == 1
+    assert out["feature_key"] == FEATURE_WATCHLIST_OPPORTUNITIES
+
+
+@pytest.mark.unit
 def test_merge_cells_preserves_new_action_defaults():
     merged = em._merge_cells(None)
     assert FEATURE_WATCHLIST_DEEP_ANALYSIS in merged
     assert merged[FEATURE_WATCHLIST_DEEP_ANALYSIS]["free"]["click"] == "inherit"
+    assert FEATURE_WATCHLIST_OPPORTUNITIES in merged
+    assert merged[FEATURE_WATCHLIST_OPPORTUNITIES]["free"]["click"] == "inherit"
 
 
 @pytest.mark.unit
