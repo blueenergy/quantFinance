@@ -15,6 +15,10 @@ class QuotaManager:
         # Weekly for Free users (Period resets every Monday)
         return now.strftime("%Y-W%W")
 
+    def get_period_key(self, user_level: str) -> str:
+        """Public accessor for the active quota period key by level."""
+        return self._get_period_key(user_level)
+
     def _period_key_weekly(self) -> str:
         return datetime.now().strftime("%Y-W%W")
 
