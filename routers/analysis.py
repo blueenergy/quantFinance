@@ -223,16 +223,30 @@ def _fetch_user_watchlist(user_id: str, collections) -> List[Dict[str, Any]]:
     
     watchlist = []
     if watchlist_symbols:
+        intraday_price_map = _fetch_latest_intraday_prices(watchlist_symbols, data_collections)
         stock_info_docs = {doc["symbol"]: doc for doc in stock_info_col.find({"symbol": {"$in": watchlist_symbols}})}
         for symbol in watchlist_symbols:
             info = stock_info_docs.get(symbol, {})
             name = info.get("name", "")
             industry = info.get("industry", "")
             
-            # Fetch latest price and pct_chg from volume_price
+            # Fetch latest daily close/pct_chg (fallback path)
             vp_doc = volume_price_col.find_one({"symbol": symbol}, sort=[("trade_date", -1)])
-            current_price = vp_doc.get("close", 0) if vp_doc else 0
-            change_pct = vp_doc.get("pct_chg", 0) if vp_doc else info.get("change_pct", 0)
+            latest_daily_close = float(vp_doc.get("close", 0) or 0) if vp_doc else 0
+            latest_daily_pct = float(vp_doc.get("pct_chg", 0) or 0) if vp_doc else float(info.get("change_pct", 0) or 0)
+
+            # Prefer intraday latest minute close for today's trigger;
+            # fallback to latest daily close (usually previous close).
+            intraday_price = intraday_price_map.get(symbol)
+            if intraday_price is not None:
+                current_price = float(intraday_price)
+                if latest_daily_close > 0:
+                    change_pct = ((current_price - latest_daily_close) / latest_daily_close) * 100
+                else:
+                    change_pct = latest_daily_pct
+            else:
+                current_price = latest_daily_close
+                change_pct = latest_daily_pct
             
             watchlist.append({
                 "symbol": symbol,
@@ -249,12 +263,14 @@ def _fetch_user_positions(user_id: str, collections) -> List[Dict[str, Any]]:
     data_collections = get_data_db()
     positions_col = collections["trader_positions"]
     stock_info_col = data_collections["stock_info"]
+    volume_price_col = data_collections["volume_price"]
     
     positions_docs = list(positions_col.find({"user_id": user_id}))
     
     positions = []
     if positions_docs:
         position_symbols = [doc.get("symbol") for doc in positions_docs if doc.get("symbol")]
+        intraday_price_map = _fetch_latest_intraday_prices(position_symbols, data_collections)
         stock_info_docs = {doc["symbol"]: doc for doc in stock_info_col.find({"symbol": {"$in": position_symbols}})}
         
         for doc in positions_docs:
@@ -267,7 +283,18 @@ def _fetch_user_positions(user_id: str, collections) -> List[Dict[str, Any]]:
             quantity = raw_qty if raw_qty > 0 else can_use
             
             cost_price = doc.get("avg_price", 0) or 0
-            current_price = doc.get("last_price", 0) or 0
+            intraday_price = intraday_price_map.get(symbol)
+            if intraday_price is not None:
+                current_price = float(intraday_price)
+            else:
+                current_price = doc.get("last_price", 0) or 0
+
+            # If broker snapshot has no valid last_price, fallback to latest daily close.
+            if current_price == 0 and symbol:
+                vp_doc = volume_price_col.find_one({"symbol": symbol}, sort=[("trade_date", -1)])
+                if vp_doc:
+                    current_price = vp_doc.get("close", 0) or 0
+
             market_value = doc.get("market_value", 0) or 0
             
             # Derive prices from market_value if direct fields are 0
@@ -292,6 +319,53 @@ def _fetch_user_positions(user_id: str, collections) -> List[Dict[str, Any]]:
                 "unrealized_pnl_pct": pnl_pct
             })
     return positions
+
+
+def _fetch_latest_intraday_prices(symbols: List[str], data_collections) -> Dict[str, float]:
+    """
+    Fetch latest intraday price from today's minute_bars.
+    Return mapping: symbol -> latest close.
+    """
+    if not symbols:
+        return {}
+
+    minute_bars_col = data_collections.get("minute_bars")
+    if minute_bars_col is None:
+        return {}
+
+    today = datetime.now().strftime("%Y%m%d")
+    pipeline = [
+        {
+            "$match": {
+                "symbol": {"$in": symbols},
+                "trade_date": {"$regex": f"^{today}"}
+            }
+        },
+        {"$sort": {"trade_date": 1}},
+        {
+            "$group": {
+                "_id": "$symbol",
+                "close": {"$last": "$close"}
+            }
+        }
+    ]
+
+    try:
+        docs = list(minute_bars_col.aggregate(pipeline))
+    except Exception:
+        return {}
+
+    price_map: Dict[str, float] = {}
+    for doc in docs:
+        symbol = doc.get("_id")
+        close = doc.get("close")
+        if symbol is None or close is None:
+            continue
+        try:
+            price_map[str(symbol)] = float(close)
+        except (TypeError, ValueError):
+            continue
+    return price_map
 
 
 def _submit_portfolio_task(
