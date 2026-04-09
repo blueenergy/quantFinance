@@ -11,7 +11,11 @@ from bson import ObjectId
 from models.analysis_task import AnalysisTaskCreate, TaskStatus
 from services.quota_manager import QuotaManager
 from db import db
-from routers.entitlements_matrix import resolve_deep_analysis_entitlement
+from routers.entitlements_matrix import (
+    FEATURE_WATCHLIST_OPPORTUNITIES,
+    resolve_action_entitlement,
+    resolve_deep_analysis_entitlement,
+)
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -37,6 +41,98 @@ def _normalize_task_status(raw_status: Any) -> str:
     return s.lower()
 
 
+def _resolve_user_level(current_user: Dict[str, Any]) -> str:
+    """Resolve user level for default QuotaManager path."""
+    if current_user.get("is_admin") or current_user.get("is_vip"):
+        return "vip"
+
+    level = current_user.get("level")
+    service_level = current_user.get("service_level")
+    if level == "vip" or service_level == "vip":
+        return "vip"
+    return level or service_level or "free"
+
+
+def _build_entitlement_denied_message(
+    *,
+    current_user: Dict[str, Any],
+    entitlement: Dict[str, Any],
+    quota_manager: QuotaManager,
+    feature_label: str,
+) -> Optional[str]:
+    """Return denial reason if blocked or quota exceeded; otherwise None."""
+    if entitlement.get("type") == "blocked":
+        return entitlement.get("detail", f"{feature_label}不可用")
+
+    user_level = _resolve_user_level(current_user)
+    user_id = current_user["id"]
+
+    if entitlement.get("type") == "matrix":
+        feature_key = entitlement.get("feature_key", "")
+        matrix_limit = int(entitlement.get("weekly_limit", 0) or 0)
+        if not quota_manager.check_feature_weekly_quota(user_id, feature_key, matrix_limit):
+            rem = quota_manager.get_remaining_feature_weekly_quota(user_id, feature_key, matrix_limit)
+            return f"本周{feature_label}次数已用完（权益矩阵限制 {matrix_limit} 次/周）。剩余: {rem}"
+        return None
+
+    if not quota_manager.check_quota(user_id, user_level):
+        limit = quota_manager.get_limit(user_level)
+        period_key = quota_manager.get_period_key(user_level)
+        return (
+            f"配额已用完。{user_level}用户限制暂为 {limit}次/"
+            f"{'月' if user_level == 'vip' else '周'}。当前周期: {period_key}"
+        )
+    return None
+
+
+def _enforce_entitlement_and_quota(
+    *,
+    current_user: Dict[str, Any],
+    entitlement: Dict[str, Any],
+    quota_manager: QuotaManager,
+    feature_label: str,
+    on_denied: str = "http",  # "http" | "json"
+) -> Optional[Dict[str, Any]]:
+    denied_message = _build_entitlement_denied_message(
+        current_user=current_user,
+        entitlement=entitlement,
+        quota_manager=quota_manager,
+        feature_label=feature_label,
+    )
+    if denied_message is None:
+        return None
+
+    logger.info(
+        "[entitlement] denied feature=%s user_id=%s reason=%s",
+        entitlement.get("feature_key") or feature_label,
+        current_user.get("id"),
+        denied_message,
+    )
+    if on_denied == "json":
+        return {"success": False, "error": denied_message}
+    raise HTTPException(status_code=403, detail=denied_message)
+
+
+def _consume_quota_after_submit(
+    *,
+    current_user: Dict[str, Any],
+    entitlement: Dict[str, Any],
+    quota_manager: QuotaManager,
+) -> int:
+    """Consume quota after successful task submission and return remaining."""
+    user_id = current_user["id"]
+    user_level = _resolve_user_level(current_user)
+
+    if entitlement.get("type") == "matrix":
+        feature_key = entitlement.get("feature_key", "")
+        matrix_limit = int(entitlement.get("weekly_limit", 0) or 0)
+        quota_manager.consume_feature_weekly_quota(user_id, feature_key)
+        return quota_manager.get_remaining_feature_weekly_quota(user_id, feature_key, matrix_limit)
+
+    quota_manager.consume_quota(user_id, user_level)
+    return quota_manager.get_remaining(user_id, user_level)
+
+
 @router.post("/analyze/portfolio-opportunities")
 async def analyze_portfolio_opportunities(current_user: dict = Depends(get_current_active_user)):
     """
@@ -48,6 +144,21 @@ async def analyze_portfolio_opportunities(current_user: dict = Depends(get_curre
     """
     user_id = current_user["id"]
     collections = get_db_collections()
+    quota_manager = QuotaManager(db)
+    ent = resolve_action_entitlement(
+        user=current_user,
+        feature_key=FEATURE_WATCHLIST_OPPORTUNITIES,
+        blocked_detail="当前等级未开放机会分析（权益矩阵已关闭）。",
+    )
+    denied = _enforce_entitlement_and_quota(
+        current_user=current_user,
+        entitlement=ent,
+        quota_manager=quota_manager,
+        feature_label="机会分析",
+        on_denied="json",
+    )
+    if denied:
+        return denied
     
     watchlist = _fetch_user_watchlist(user_id, collections)
     positions = _fetch_user_positions(user_id, collections)
@@ -69,6 +180,11 @@ async def analyze_portfolio_opportunities(current_user: dict = Depends(get_curre
         analysis_type="combined",
         collections=collections
     )
+    remaining = _consume_quota_after_submit(
+        current_user=current_user,
+        entitlement=ent,
+        quota_manager=quota_manager,
+    )
     
     return {
         "success": True,
@@ -77,7 +193,8 @@ async def analyze_portfolio_opportunities(current_user: dict = Depends(get_curre
         "message": "组合分析任务已提交",
         "type": "combined",
         "watchlist_count": len(watchlist),
-        "positions_count": len(positions)
+        "positions_count": len(positions),
+        "quota_remaining": remaining,
     }
 
 
@@ -88,6 +205,21 @@ async def analyze_watchlist_opportunities(current_user: dict = Depends(get_curre
     """
     user_id = current_user["id"]
     collections = get_db_collections()
+    quota_manager = QuotaManager(db)
+    ent = resolve_action_entitlement(
+        user=current_user,
+        feature_key=FEATURE_WATCHLIST_OPPORTUNITIES,
+        blocked_detail="当前等级未开放机会分析（权益矩阵已关闭）。",
+    )
+    denied = _enforce_entitlement_and_quota(
+        current_user=current_user,
+        entitlement=ent,
+        quota_manager=quota_manager,
+        feature_label="机会分析",
+        on_denied="json",
+    )
+    if denied:
+        return denied
     
     watchlist = _fetch_user_watchlist(user_id, collections)
     
@@ -106,6 +238,11 @@ async def analyze_watchlist_opportunities(current_user: dict = Depends(get_curre
         analysis_type="watchlist",
         collections=collections
     )
+    remaining = _consume_quota_after_submit(
+        current_user=current_user,
+        entitlement=ent,
+        quota_manager=quota_manager,
+    )
     
     return {
         "success": True,
@@ -113,7 +250,8 @@ async def analyze_watchlist_opportunities(current_user: dict = Depends(get_curre
         "status": "pending",
         "message": "自选股分析任务已提交",
         "type": "watchlist",
-        "watchlist_count": len(watchlist)
+        "watchlist_count": len(watchlist),
+        "quota_remaining": remaining,
     }
 
 
@@ -641,53 +779,13 @@ async def create_deep_analysis_task(
     quota_manager = QuotaManager(db)
 
     ent = resolve_deep_analysis_entitlement(current_user)
-    if ent["type"] == "blocked":
-        raise HTTPException(status_code=403, detail=ent.get("detail", "深度分析不可用"))
-
-    # 1. 确定用户等级（QuotaManager / 展示用）
-    user_level = "free"
-    if current_user.get("is_admin"):
-        user_level = "vip"
-    elif current_user.get("is_vip"):
-        user_level = "vip"
-    else:
-        level = current_user.get("level")
-        service_level = current_user.get("service_level")
-        if level == "vip" or service_level == "vip":
-            user_level = "vip"
-        else:
-            user_level = level or service_level or "free"
-
-    use_matrix_quota = ent["type"] == "matrix"
-    feature_key = ent.get("feature_key", "") if use_matrix_quota else ""
-    matrix_limit = int(ent.get("weekly_limit", 0)) if use_matrix_quota else 0
-
-    # 2. 配额检查
-    if use_matrix_quota:
-        if not quota_manager.check_feature_weekly_quota(
-            current_user["id"], feature_key, matrix_limit
-        ):
-            rem = quota_manager.get_remaining_feature_weekly_quota(
-                current_user["id"], feature_key, matrix_limit
-            )
-            raise HTTPException(
-                status_code=403,
-                detail=(
-                    f"本周深度分析次数已用完（权益矩阵限制 {matrix_limit} 次/周）。"
-                    f"剩余: {rem}"
-                ),
-            )
-    else:
-        if not quota_manager.check_quota(current_user["id"], user_level):
-            limit = quota_manager.get_limit(user_level)
-            period_key = quota_manager._get_period_key(user_level)
-            raise HTTPException(
-                status_code=403,
-                detail=(
-                    f"配额已用完。{user_level}用户限制暂为 {limit}次/"
-                    f"{'月' if user_level == 'vip' else '周'}。当前周期: {period_key}"
-                ),
-            )
+    _enforce_entitlement_and_quota(
+        current_user=current_user,
+        entitlement=ent,
+        quota_manager=quota_manager,
+        feature_label="深度分析",
+        on_denied="http",
+    )
 
     # 3. 创建任务
     task_doc = {
@@ -706,14 +804,11 @@ async def create_deep_analysis_task(
         task_id = str(result.inserted_id)
         
         # 4. 扣除配额
-        if use_matrix_quota:
-            quota_manager.consume_feature_weekly_quota(current_user["id"], feature_key)
-            remaining = quota_manager.get_remaining_feature_weekly_quota(
-                current_user["id"], feature_key, matrix_limit
-            )
-        else:
-            quota_manager.consume_quota(current_user["id"], user_level)
-            remaining = quota_manager.get_remaining(current_user["id"], user_level)
+        remaining = _consume_quota_after_submit(
+            current_user=current_user,
+            entitlement=ent,
+            quota_manager=quota_manager,
+        )
         
         return {
             "success": True,
