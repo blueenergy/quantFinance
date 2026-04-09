@@ -72,11 +72,13 @@ _CHILD_ACTIONS_BY_NAV_SUFFIX: Dict[str, List[Tuple[str, str]]] = {
     ],
     "watchlist": [
         ("action.watchlist.deep_analysis", "深度分析（自选股）"),
+        ("action.watchlist.opportunities_analysis", "机会分析（自选股/组合）"),
     ],
 }
 
 # Runtime: deep analysis quota / allow checks (analysis router)
 FEATURE_WATCHLIST_DEEP_ANALYSIS = "action.watchlist.deep_analysis"
+FEATURE_WATCHLIST_OPPORTUNITIES = "action.watchlist.opportunities_analysis"
 
 # 顶部区域：无对应主导航 Tab，单独成段
 _TOP_SECTIONS: List[Tuple[str, str, str, List[Tuple[str, str]]]] = [
@@ -368,9 +370,13 @@ def user_tier_for_matrix(user: Dict[str, Any]) -> str:
     return sl
 
 
-def resolve_deep_analysis_entitlement(user: Dict[str, Any]) -> Dict[str, Any]:
+def resolve_action_entitlement(
+    user: Dict[str, Any],
+    feature_key: str,
+    blocked_detail: str,
+) -> Dict[str, Any]:
     """
-    How POST /analyze/deep-analysis should enforce quota:
+    Generic matrix entitlement resolver for runtime action checks:
     - blocked: deny
     - matrix: use weekly feature quota with given limit (quota_usage + feature key)
     - inherit: use existing QuotaManager (VIP 月 / 其他周等)
@@ -381,7 +387,7 @@ def resolve_deep_analysis_entitlement(user: Dict[str, Any]) -> Dict[str, Any]:
 
     tier = user_tier_for_matrix(user)
     cells = get_merged_matrix_cells()
-    row = cells.get(FEATURE_WATCHLIST_DEEP_ANALYSIS, {})
+    row = cells.get(feature_key, {})
     cell = row.get(tier) or {"click": "inherit", "weekly_limit": None}
     click = cell.get("click", "inherit")
     wl = cell.get("weekly_limit")
@@ -389,7 +395,7 @@ def resolve_deep_analysis_entitlement(user: Dict[str, Any]) -> Dict[str, Any]:
     if click == "blocked":
         return {
             "type": "blocked",
-            "detail": "当前等级未开放自选股深度分析（权益矩阵已关闭）。",
+            "detail": blocked_detail,
         }
     if click == "allowed" and wl is not None:
         try:
@@ -398,5 +404,16 @@ def resolve_deep_analysis_entitlement(user: Dict[str, Any]) -> Dict[str, Any]:
                 n = 0
         except (TypeError, ValueError):
             n = 0
-        return {"type": "matrix", "weekly_limit": n, "feature_key": FEATURE_WATCHLIST_DEEP_ANALYSIS}
+        return {"type": "matrix", "weekly_limit": n, "feature_key": feature_key}
     return {"type": "inherit"}
+
+
+def resolve_deep_analysis_entitlement(user: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    How POST /analyze/deep-analysis should enforce quota.
+    """
+    return resolve_action_entitlement(
+        user=user,
+        feature_key=FEATURE_WATCHLIST_DEEP_ANALYSIS,
+        blocked_detail="当前等级未开放自选股深度分析（权益矩阵已关闭）。",
+    )
