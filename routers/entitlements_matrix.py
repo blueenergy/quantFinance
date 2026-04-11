@@ -298,7 +298,100 @@ def _validate_and_normalize_cells(raw: Dict[str, Any]) -> Dict[str, Dict[str, An
                 if a.click != "allowed":
                     a = ActionCell(click=a.click, weekly_limit=None)
                 out[feat_key][tier] = a.model_dump()
+    _validate_monotonic_matrix(out)
     return out
+
+
+def _tab_visibility_rank(v: str) -> int:
+    # hidden < inherit < visible
+    if v == "hidden":
+        return 0
+    if v == "visible":
+        return 2
+    return 1
+
+
+def _action_click_rank(v: str) -> int:
+    # blocked < inherit < allowed
+    if v == "blocked":
+        return 0
+    if v == "allowed":
+        return 2
+    return 1
+
+
+def _limit_rank(v: Optional[int]) -> float:
+    # None means unlimited, considered greater than any finite limit.
+    return float("inf") if v is None else float(v)
+
+
+def _validate_monotonic_matrix(cells: Dict[str, Dict[str, Any]]) -> None:
+    """
+    Enforce monotonic permissions across tiers:
+    free <= basic <= vip <= premium
+    """
+    tier_order = list(TIER_KEYS)
+    registry = build_feature_registry()
+    key_to_row = {r["key"]: r for r in registry}
+
+    for feat_key, tier_map in cells.items():
+        row_meta = key_to_row.get(feat_key)
+        if not row_meta:
+            continue
+
+        if row_meta["row_type"] == "tab":
+            prev_rank = None
+            prev_tier = None
+            for tier in tier_order:
+                cell = tier_map.get(tier, {"visibility": "inherit"})
+                rank = _tab_visibility_rank(cell.get("visibility", "inherit"))
+                if prev_rank is not None and rank < prev_rank:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            f"Monotonicity violated for {feat_key}: "
+                            f"{prev_tier} -> {tier} tab visibility decreases."
+                        ),
+                    )
+                prev_rank = rank
+                prev_tier = tier
+            continue
+
+        # action row
+        prev_click_rank = None
+        prev_tier = None
+        prev_limit_rank = None
+        prev_limit_tier = None
+
+        for tier in tier_order:
+            cell = tier_map.get(tier, {"click": "inherit", "weekly_limit": None})
+            click = cell.get("click", "inherit")
+            click_rank = _action_click_rank(click)
+
+            if prev_click_rank is not None and click_rank < prev_click_rank:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"Monotonicity violated for {feat_key}: "
+                        f"{prev_tier} -> {tier} action click decreases."
+                    ),
+                )
+            prev_click_rank = click_rank
+            prev_tier = tier
+
+            # When both tiers are explicitly allowed, weekly_limit must be non-decreasing.
+            if click == "allowed":
+                limit_rank = _limit_rank(cell.get("weekly_limit"))
+                if prev_limit_rank is not None and limit_rank < prev_limit_rank:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            f"Monotonicity violated for {feat_key}: "
+                            f"{prev_limit_tier} -> {tier} weekly_limit decreases."
+                        ),
+                    )
+                prev_limit_rank = limit_rank
+                prev_limit_tier = tier
 
 
 router = APIRouter(prefix="/entitlements-matrix", tags=["权限与导航配置"])
