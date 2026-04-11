@@ -3,6 +3,7 @@ Unit tests for entitlements matrix registry, deep-analysis resolution, and featu
 """
 import pytest
 from datetime import datetime
+from fastapi import HTTPException
 
 from routers import entitlements_matrix as em
 from routers.entitlements_matrix import (
@@ -137,6 +138,62 @@ def test_validate_normalize_cells_roundtrip():
     raw = em._default_cells()
     normalized = em._validate_and_normalize_cells(raw)
     assert normalized[FEATURE_WATCHLIST_DEEP_ANALYSIS]["free"]["click"] == "inherit"
+
+
+@pytest.mark.unit
+def test_validate_monotonic_tab_visibility_passes():
+    raw = em._default_cells()
+    raw["nav.watchlist"]["free"]["visibility"] = "hidden"
+    raw["nav.watchlist"]["basic"]["visibility"] = "inherit"
+    raw["nav.watchlist"]["vip"]["visibility"] = "visible"
+    raw["nav.watchlist"]["premium"]["visibility"] = "visible"
+    normalized = em._validate_and_normalize_cells(raw)
+    assert normalized["nav.watchlist"]["vip"]["visibility"] == "visible"
+
+
+@pytest.mark.unit
+def test_validate_monotonic_tab_visibility_rejects_decrease():
+    raw = em._default_cells()
+    raw["nav.watchlist"]["free"]["visibility"] = "inherit"
+    raw["nav.watchlist"]["basic"]["visibility"] = "hidden"  # decrease
+    with pytest.raises(HTTPException, match="tab visibility decreases"):
+        em._validate_and_normalize_cells(raw)
+
+
+@pytest.mark.unit
+def test_validate_monotonic_action_click_rejects_decrease():
+    raw = em._default_cells()
+    raw[FEATURE_WATCHLIST_DEEP_ANALYSIS]["free"]["click"] = "allowed"
+    raw[FEATURE_WATCHLIST_DEEP_ANALYSIS]["free"]["weekly_limit"] = 2
+    raw[FEATURE_WATCHLIST_DEEP_ANALYSIS]["basic"]["click"] = "blocked"  # decrease
+    with pytest.raises(HTTPException, match="action click decreases"):
+        em._validate_and_normalize_cells(raw)
+
+
+@pytest.mark.unit
+def test_validate_monotonic_action_weekly_limit_rejects_decrease():
+    raw = em._default_cells()
+    raw[FEATURE_WATCHLIST_DEEP_ANALYSIS]["free"]["click"] = "allowed"
+    raw[FEATURE_WATCHLIST_DEEP_ANALYSIS]["free"]["weekly_limit"] = 5
+    raw[FEATURE_WATCHLIST_DEEP_ANALYSIS]["basic"]["click"] = "allowed"
+    raw[FEATURE_WATCHLIST_DEEP_ANALYSIS]["basic"]["weekly_limit"] = 3  # decrease
+    with pytest.raises(HTTPException, match="weekly_limit decreases"):
+        em._validate_and_normalize_cells(raw)
+
+
+@pytest.mark.unit
+def test_validate_monotonic_action_weekly_limit_none_as_unlimited_passes():
+    raw = em._default_cells()
+    raw[FEATURE_WATCHLIST_DEEP_ANALYSIS]["free"]["click"] = "allowed"
+    raw[FEATURE_WATCHLIST_DEEP_ANALYSIS]["free"]["weekly_limit"] = 3
+    raw[FEATURE_WATCHLIST_DEEP_ANALYSIS]["basic"]["click"] = "allowed"
+    raw[FEATURE_WATCHLIST_DEEP_ANALYSIS]["basic"]["weekly_limit"] = None
+    raw[FEATURE_WATCHLIST_DEEP_ANALYSIS]["vip"]["click"] = "allowed"
+    raw[FEATURE_WATCHLIST_DEEP_ANALYSIS]["vip"]["weekly_limit"] = None
+    raw[FEATURE_WATCHLIST_DEEP_ANALYSIS]["premium"]["click"] = "allowed"
+    raw[FEATURE_WATCHLIST_DEEP_ANALYSIS]["premium"]["weekly_limit"] = None
+    normalized = em._validate_and_normalize_cells(raw)
+    assert normalized[FEATURE_WATCHLIST_DEEP_ANALYSIS]["basic"]["weekly_limit"] is None
 
 
 class _FakeQuotaUsage:
