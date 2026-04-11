@@ -111,6 +111,14 @@ services:
       - DEPLOY_MODE=${DEPLOY_MODE:-full}
       - SECONDARY_MONGO_URI=${SECONDARY_MONGO_URI:-}
       - SECONDARY_MONGO_DB=${SECONDARY_MONGO_DB:-finance}
+      # Optional per-task cron overrides for daily_market_sync.sh jobs
+      - CRON_STOCK_DAILY=${CRON_STOCK_DAILY:-}
+      - CRON_INDEX_DAILY=${CRON_INDEX_DAILY:-}
+      - CRON_ETF_DAILY=${CRON_ETF_DAILY:-}
+      - CRON_FINANCIAL_DAILY=${CRON_FINANCIAL_DAILY:-}
+      - CRON_MONEYFLOW_DAILY=${CRON_MONEYFLOW_DAILY:-}
+      - CRON_SENTIMENT_DAILY=${CRON_SENTIMENT_DAILY:-}
+      - CRON_HOTSTOCK_DAILY=${CRON_HOTSTOCK_DAILY:-}
     restart: unless-stopped
     network_mode: host
     volumes:
