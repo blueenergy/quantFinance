@@ -60,7 +60,7 @@ class TestFetchMarketAnalysisResult:
         assert result["mood"] == "乐观"
 
     def test_trading_day_no_cache(self, monkeypatch):
-        """Trading day, no today cache, no latest fallback → dated error + is_trading_day."""
+        """Trading day, no cache → tell user analysis is not ready yet."""
         from routers import market
 
         fake_today = date(2025, 12, 22)
@@ -85,8 +85,10 @@ class TestFetchMarketAnalysisResult:
         result = market.fetch_market_analysis_result()
 
         assert result["success"] is False
-        assert result["error"] == "暂无 2025-12-22 的历史大盘分析数据"
+        assert result["error"] == "今日 的大盘分析尚未生成"
         assert result["is_trading_day"] is True
+        assert result["is_expected"] is True
+        assert result["expected_schedule"] == ["10:00", "11:30", "15:30"]
 
     def test_non_trading_day_with_latest_analysis(self, monkeypatch):
         """No cache for calendar today → fall back to latest trading day analysis."""
@@ -126,8 +128,9 @@ class TestFetchMarketAnalysisResult:
         assert result["success"] is True
         assert result["analysis_date"] == "2025-12-19"
         assert result["cache_info"]["from_cache"] is True
-        assert "当日无分析" in result["cache_info"]["reason"]
+        assert "今日非交易日" in result["cache_info"]["reason"]
         assert "2025-12-19" in result["cache_info"]["reason"]
+        assert "非交易日" in result["notice"]
 
     def test_non_trading_day_no_latest_analysis(self, monkeypatch):
         """No cache for today and no latest analysis → error payload."""
@@ -155,8 +158,9 @@ class TestFetchMarketAnalysisResult:
         result = market.fetch_market_analysis_result()
 
         assert result["success"] is False
-        assert result["error"] == "暂无 2025-12-21 的历史大盘分析数据"
+        assert result["error"] == "2025-12-21 为非交易日，且暂无可展示的历史大盘分析数据"
         assert result["is_trading_day"] is False
+        assert result["is_expected"] is True
 
 
 @pytest.mark.unit
