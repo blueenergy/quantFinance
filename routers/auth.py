@@ -89,6 +89,7 @@ def login(user_data: UserLogin, request: Request):
         full_name=user.get("full_name"),
         is_active=user.get("is_active", True),
         is_admin=user.get("is_admin", False),
+        service_level=user.get("service_level", "free"),
         created_at=user["created_at"],
         last_login=user.get("last_login")
     )
@@ -119,6 +120,7 @@ def refresh_token(current_user: dict = Depends(get_current_active_user)):
         full_name=current_user.get("full_name"),
         is_active=current_user.get("is_active", True),
         is_admin=current_user.get("is_admin", False),
+        service_level=current_user.get("service_level", "free"),
         created_at=current_user["created_at"],
         last_login=current_user.get("last_login"),
         llm_provider=current_user.get("llm_provider"),
