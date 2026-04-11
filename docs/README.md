@@ -95,6 +95,7 @@ chmod +x deploy.sh
 详细部署指南请查看:
 - 📘 [完整部署指南](CLOUD_DEPLOYMENT_GUIDE.md)
 - ⚡ [快速部署指南](DEPLOYMENT_QUICK_START.md)
+- 🧰 [WebSocket 实时日志排障手册](WEBSOCKET_REALTIME_LOG_TROUBLESHOOTING.md)
 
 ### 安装依赖
 ```bash
