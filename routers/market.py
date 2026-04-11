@@ -76,19 +76,24 @@ def fetch_market_analysis_result(analysis_date: Optional[str] = None) -> Dict[st
     - If not provided: on trading days, return today's cached result; 
       on non-trading days, fall back to the latest available trading day.
     """
+    target_day = date.today()
+    is_explicit_date = bool(analysis_date)
+
     if analysis_date:
+        target_day = date.fromisoformat(analysis_date)
         today_str = analysis_date
         print(f"[Market Analysis] Explicit date requested: {today_str}")
     else:
-        today = date.today()
-        today_str = today.strftime('%Y-%m-%d')
+        today_str = target_day.strftime('%Y-%m-%d')
         print(f"[Market Analysis] No date provided, using default: {today_str}")
+
+    is_trading_day = market_analysis_cache.is_trading_day(target_day)
 
     # Try to get the analysis for the target date
     cached = market_analysis_cache.get_cached_analysis(today_str)
     
     if cached:
-        result = cached['analysis_result']
+        result = dict(cached.get('analysis_result', {}))
         result['analysis_date'] = cached.get('analysis_date', today_str)
         result['cache_info'] = {
             'from_cache': True,
@@ -99,29 +104,44 @@ def fetch_market_analysis_result(analysis_date: Optional[str] = None) -> Dict[st
         # Add success flag for frontend
         result['success'] = True
         return result
-    else:
-        # ONLY fallback if NO date was explicitly requested
-        if not analysis_date:
-            print(f"[Market Analysis] {today_str} not found, falling back to latest trading day")
-            latest_analysis = market_analysis_cache.get_latest_trading_day_analysis()
-            if latest_analysis:
-                result = latest_analysis['analysis_result']
-                result['analysis_date'] = latest_analysis['analysis_date']
-                result['cache_info'] = {
-                    'from_cache': True,
-                    'cache_date': latest_analysis['analysis_date'],
-                    'created_at': latest_analysis.get('created_at'),
-                    'reason': f"当日无分析，返回最近交易日({latest_analysis['analysis_date']})的结果"
-                }
-                result['success'] = True
-                return result
-        
-        print(f"[Market Analysis] {today_str} not found and no fallback allowed")
+
+    # 非交易日：优先回退到最近交易日结果，避免用户误判系统异常
+    if not is_trading_day:
+        print(f"[Market Analysis] {today_str} is non-trading day, falling back to latest trading day")
+        latest_analysis = market_analysis_cache.get_latest_trading_day_analysis()
+        if latest_analysis:
+            result = dict(latest_analysis.get('analysis_result', {}))
+            result['analysis_date'] = latest_analysis['analysis_date']
+            result['cache_info'] = {
+                'from_cache': True,
+                'cache_date': latest_analysis['analysis_date'],
+                'created_at': latest_analysis.get('created_at'),
+                'reason': f"今日非交易日，展示最近交易日({latest_analysis['analysis_date']})的分析结果"
+            }
+            result['success'] = True
+            result['notice'] = f"{today_str} 为非交易日，已展示最近交易日数据。"
+            return result
+
         return {
             "success": False,
-            "error": f"暂无 {today_str} 的历史大盘分析数据",
-            "is_trading_day": market_analysis_cache.is_trading_day(date.fromisoformat(today_str)) if not analysis_date else True
+            "error": f"{today_str} 为非交易日，且暂无可展示的历史大盘分析数据",
+            "is_trading_day": False,
+            "is_expected": True,
+            "user_tip": "今日不是交易日，系统不会生成新大盘分析。"
         }
+
+    # 交易日：若分析未产出，明确提示预计时间，不做回退以免误导用户
+    schedule_text = "10:00 / 11:30 / 15:30"
+    print(f"[Market Analysis] {today_str} trading-day analysis not ready")
+    message_date = "今日" if target_day == date.today() and not is_explicit_date else today_str
+    return {
+        "success": False,
+        "error": f"{message_date} 的大盘分析尚未生成",
+        "is_trading_day": True,
+        "is_expected": True,
+        "expected_schedule": ["10:00", "11:30", "15:30"],
+        "user_tip": f"系统会在交易日 {schedule_text} 自动更新，请稍后刷新查看。"
+    }
 
 @router.post("/analyze-market")
 async def analyze_market(request: MarketAnalysisRequest, current_user: dict = Depends(get_current_active_user)):
