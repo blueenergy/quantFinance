@@ -226,6 +226,31 @@ HOST=0.0.0.0
 PORT=3001
 ```
 
+### 部署配置（WebSocket 实时日志）
+
+实盘实时日志支持两种模式，通过 `.env` 中以下变量控制：
+
+```bash
+# 远程 worker API
+REMOTE_WORKER_API=http://quant-strategy-manager:5000/api/workers
+
+# WebSocket URL 输出模式（quant-strategy-manager）
+# true: 返回 ws://<PUBLIC_HOST>/ws/{port}（通过 Nginx 代理，推荐生产）
+# false: 返回 ws://<worker-host>:<worker-port>（直连端口，适合本地开发）
+USE_NGINX_WEBSOCKET=true
+
+# 对外可访问地址（host[:port]），例如 10.181.200.185:8088
+PUBLIC_HOST=10.181.200.185:8088
+
+# 是否启用 HTTPS（决定返回 ws:// 或 wss://）
+USE_HTTPS=false
+```
+
+生产环境建议：
+- 使用 `USE_NGINX_WEBSOCKET=true`，统一走 Nginx `/ws/{port}`，避免浏览器直连动态端口失败。
+- `PUBLIC_HOST` 维护在 `.env`，不要写死在 `docker-compose.yml`，便于按环境切换。
+- 当 `proxy_pass` 使用变量端口（如 `$1`）时，Nginx 需配置 Docker DNS 解析器：`resolver 127.0.0.11 ipv6=off;`。
+
 ## 开发指南
 
 ### 添加新的数据源
