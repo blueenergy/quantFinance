@@ -27,6 +27,7 @@ class UserResponse(UserBase):
     id: str
     is_active: bool
     is_admin: bool = False
+    service_level: Optional[str] = "free"
     created_at: datetime
     last_login: Optional[datetime] = None
     llm_provider: Optional[str] = None
