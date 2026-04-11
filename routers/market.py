@@ -6,12 +6,44 @@ from auth import get_current_active_user
 from db import get_db_collections, get_analyzer_db, get_data_db
 from market_analysis_cache import market_analysis_cache
 from datetime import date, datetime
+from services.tushare_cached import get_latest_trade_date
 from external_data import external_market_data
 from utils.stock_utils import serialize_doc
 from bson import ObjectId
 from models.analysis_task import TaskStatus
 
 router = APIRouter()
+
+
+def _format_trade_date(raw_date: str) -> Optional[str]:
+    """Normalize date string to YYYY-MM-DD."""
+    if not raw_date:
+        return None
+    date_str = str(raw_date).strip()
+    if len(date_str) == 8 and date_str.isdigit():
+        return f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:]}"
+    if len(date_str) == 10 and "-" in date_str:
+        return date_str
+    return None
+
+
+def _resolve_effective_market_analysis_date(requested_date: str) -> Dict[str, Any]:
+    """Resolve effective trading date for market analysis tasks."""
+    requested_day = date.fromisoformat(requested_date)
+    if market_analysis_cache.is_trading_day(requested_day):
+        return {
+            "requested_date": requested_date,
+            "effective_analysis_date": requested_date,
+            "is_non_trading_trigger": False
+        }
+
+    latest_trade_date_raw = get_latest_trade_date()
+    effective_date = _format_trade_date(latest_trade_date_raw or "") or requested_date
+    return {
+        "requested_date": requested_date,
+        "effective_analysis_date": effective_date,
+        "is_non_trading_trigger": True
+    }
 
 
 @router.post("/analyze-global")
@@ -163,21 +195,42 @@ async def trigger_market_analysis(request: MarketAnalysisRequest, current_user: 
         collections = get_db_collections()
         tasks_col = collections["analysis_tasks"]
 
-        target_date = request.date or datetime.now().strftime('%Y-%m-%d')
+        requested_date = request.date or datetime.now().strftime('%Y-%m-%d')
         user_id = str(current_user["id"])
+        trigger_context = _resolve_effective_market_analysis_date(requested_date)
+        effective_date = trigger_context["effective_analysis_date"]
+        is_non_trading_trigger = trigger_context["is_non_trading_trigger"]
 
-        # 避免当天重复提交 (pending or processing)
+        if is_non_trading_trigger and not request.force_refresh:
+            existing_analysis = market_analysis_cache.get_cached_analysis(effective_date)
+            if existing_analysis:
+                return {
+                    "success": True,
+                    "skipped_existing": True,
+                    "message": f"所选日期为非交易日，最近交易日({effective_date})已有分析结果，无需重复触发",
+                    "requested_date": requested_date,
+                    "effective_analysis_date": effective_date,
+                    "is_non_trading_trigger": True
+                }
+
+        # 避免重复提交 (pending or processing)
         existing = tasks_col.find_one({
             "type": "market_analysis",
-            "params.date": target_date,
-            "status": {"$in": ["pending", "processing"]}
+            "status": {"$in": ["pending", "processing"]},
+            "$or": [
+                {"params.effective_analysis_date": effective_date},
+                {"params.date": effective_date},
+            ]
         })
 
         if existing:
             return {
                 "success": True,
                 "message": "任务已在队列中，请稍候",
-                "task_id": str(existing["_id"])
+                "task_id": str(existing["_id"]),
+                "requested_date": requested_date,
+                "effective_analysis_date": effective_date,
+                "is_non_trading_trigger": is_non_trading_trigger
             }
 
         task_doc = {
@@ -188,7 +241,11 @@ async def trigger_market_analysis(request: MarketAnalysisRequest, current_user: 
             "stock_name": "大盘分析",
             "symbol": "MARKET",
             "params": {
-                "date": target_date
+                "date": effective_date,
+                "requested_date": requested_date,
+                "effective_analysis_date": effective_date,
+                "is_non_trading_trigger": is_non_trading_trigger,
+                "force_refresh": bool(request.force_refresh),
             },
             "created_at": datetime.now(),
             "source": "manual_trigger"
@@ -200,7 +257,14 @@ async def trigger_market_analysis(request: MarketAnalysisRequest, current_user: 
         return {
             "success": True,
             "task_id": str(result.inserted_id),
-            "message": "分析任务已提交，请稍后刷新查看结果"
+            "message": (
+                f"所选日期为非交易日，将按最近交易日({effective_date})口径生成分析"
+                if is_non_trading_trigger
+                else "分析任务已提交，请稍后刷新查看结果"
+            ),
+            "requested_date": requested_date,
+            "effective_analysis_date": effective_date,
+            "is_non_trading_trigger": is_non_trading_trigger
         }
 
     except Exception as e:

@@ -1,4 +1,5 @@
 """Unit tests for market analysis cache fetch and scheduler task enqueue."""
+import asyncio
 import pytest
 from datetime import date, datetime
 from unittest.mock import MagicMock
@@ -265,3 +266,65 @@ class TestGenerateMarketAnalysisTask:
         fake_tasks_col.insert_one.assert_called_once()
         inserted = fake_tasks_col.insert_one.call_args[0][0]
         assert inserted["user_id"] == "system"
+
+
+@pytest.mark.unit
+class TestTriggerMarketAnalysis:
+    """Tests for routers.market.trigger_market_analysis effective date handling."""
+
+    @staticmethod
+    def _patch_collections(monkeypatch, market_module, fake_tasks_col):
+        monkeypatch.setattr(
+            market_module,
+            "get_db_collections",
+            lambda: {"analysis_tasks": fake_tasks_col},
+        )
+
+    def test_non_trading_trigger_uses_effective_trading_day(self, monkeypatch):
+        from routers import market
+        from models.all_models import MarketAnalysisRequest
+
+        fake_tasks_col = MagicMock()
+        fake_tasks_col.find_one.return_value = None
+        fake_tasks_col.insert_one.return_value.inserted_id = "task-1"
+
+        self._patch_collections(monkeypatch, market, fake_tasks_col)
+        monkeypatch.setattr(market, "get_latest_trade_date", lambda: "20251219")
+        monkeypatch.setattr(market.market_analysis_cache, "is_trading_day", lambda d: False)
+        monkeypatch.setattr(market.market_analysis_cache, "get_cached_analysis", lambda d: None)
+
+        req = MarketAnalysisRequest(date="2025-12-21", force_refresh=False)
+        result = asyncio.run(market.trigger_market_analysis(req, current_user={"id": "u1"}))
+
+        assert result["success"] is True
+        assert result["requested_date"] == "2025-12-21"
+        assert result["effective_analysis_date"] == "2025-12-19"
+        assert result["is_non_trading_trigger"] is True
+
+        inserted = fake_tasks_col.insert_one.call_args[0][0]
+        assert inserted["params"]["date"] == "2025-12-19"
+        assert inserted["params"]["requested_date"] == "2025-12-21"
+        assert inserted["params"]["effective_analysis_date"] == "2025-12-19"
+        assert inserted["params"]["is_non_trading_trigger"] is True
+
+    def test_non_trading_trigger_skips_when_cache_exists(self, monkeypatch):
+        from routers import market
+        from models.all_models import MarketAnalysisRequest
+
+        fake_tasks_col = MagicMock()
+        self._patch_collections(monkeypatch, market, fake_tasks_col)
+        monkeypatch.setattr(market, "get_latest_trade_date", lambda: "20251219")
+        monkeypatch.setattr(market.market_analysis_cache, "is_trading_day", lambda d: False)
+        monkeypatch.setattr(
+            market.market_analysis_cache,
+            "get_cached_analysis",
+            lambda d: {"analysis_date": "2025-12-19", "analysis_result": {"summary": "ok"}},
+        )
+
+        req = MarketAnalysisRequest(date="2025-12-21", force_refresh=False)
+        result = asyncio.run(market.trigger_market_analysis(req, current_user={"id": "u1"}))
+
+        assert result["success"] is True
+        assert result["skipped_existing"] is True
+        assert result["effective_analysis_date"] == "2025-12-19"
+        fake_tasks_col.insert_one.assert_not_called()
