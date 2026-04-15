@@ -90,6 +90,38 @@ resolver 127.0.0.11 ipv6=off;
 
 ## 最小验证流程
 
+### 0) 一键连通性自检脚本（推荐先跑）
+
+仓库根目录提供了跨机器联调脚本：
+
+- `check_remote_strategy_manager.sh`
+
+用途：
+
+- 在 `quantFinance` 所在机器上模拟 `quantFinance -> 远端 quant-strategy-manager` 的核心调用链路
+- 校验关键配置是否可用：`REMOTE_WORKER_API`、`JWT_SECRET_KEY`、`USE_NGINX_WEBSOCKET`、`PUBLIC_HOST`、`USE_HTTPS`
+
+执行方式：
+
+```bash
+cd /home/shuyolin/trading/quantFinance
+chmod +x ./check_remote_strategy_manager.sh
+./check_remote_strategy_manager.sh ./.env
+```
+
+通过判定（全部满足即视为配置有效）：
+
+1. 远端健康检查 `GET <base>/health` 返回 `200`
+2. 远端 workers 接口 `GET REMOTE_WORKER_API` 返回 `200`
+3. 返回 JSON 含 `workers` 字段
+4. 若存在 `log_stream_url`，其 URL 形态与 `USE_NGINX_WEBSOCKET/PUBLIC_HOST/USE_HTTPS` 一致
+
+失败定位建议：
+
+- 健康检查失败：优先检查 `REMOTE_WORKER_API` 地址可达性、防火墙与服务进程
+- workers 401/403：优先检查两端 `JWT_SECRET_KEY` 是否一致
+- URL 形态校验失败：优先检查 `USE_NGINX_WEBSOCKET`、`PUBLIC_HOST`、`USE_HTTPS` 是否与部署网关一致
+
 ### 第 1 步：重启关键服务
 
 ```bash
