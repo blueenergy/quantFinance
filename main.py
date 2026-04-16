@@ -1,7 +1,24 @@
 from dotenv import load_dotenv
-
+import logging
 # 加载 .env 文件中的环境变量
 load_dotenv()
+
+
+def silence_pymongo_debug_logs():
+    """Force pymongo debug noise down to WARNING."""
+    for name in (
+        "pymongo",
+        "pymongo.topology",
+        "pymongo.driver",
+        "pymongo.command",
+        "pymongo.connection",
+        "pymongo.serverSelection",
+    ):
+        logger = logging.getLogger(name)
+        logger.setLevel(logging.WARNING)
+
+
+silence_pymongo_debug_logs()
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -38,7 +55,6 @@ from routers.earnings import router as earnings_router
 from routers.navigation_policy import user_router as navigation_user_router
 from routers.entitlements_matrix import router as entitlements_matrix_router
 from production_config import configure_production_app
-import logging
 from contextlib import asynccontextmanager
 from scheduler import start_scheduler, stop_scheduler
 
@@ -94,6 +110,10 @@ app.include_router(worker_data_router, prefix="/api", tags=["Worker数据"])
 app.include_router(analysis_details_router, prefix="/api/analysis", tags=["全量分析数据"])
 app.include_router(trading_manual_router, prefix="/api", tags=["交易操作手册"])
 app.include_router(backtest_router, prefix="/api", tags=["回测系统"])
+# 兼容前端与后台两套历史路径：
+# - /api/permissions/...（前端在用）
+# - /api/admin/permissions/...（后台旧路径）
+app.include_router(permissions_router, prefix="/api", tags=["权限管理"])
 app.include_router(permissions_router, prefix="/api/admin", tags=["权限管理"])
 app.include_router(strategy_pool_router, prefix="/api/strategy-pool", tags=["策略池"])
 app.include_router(strategy_workers_router, prefix="/api/strategy", tags=["策略集群管理"])
