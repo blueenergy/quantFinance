@@ -20,6 +20,23 @@ def silence_pymongo_debug_logs():
 
 silence_pymongo_debug_logs()
 
+
+def silence_http_debug_logs():
+    """Force httpx/httpcore debug noise down to WARNING."""
+    for name in (
+        "httpx",
+        "httpcore",
+        "httpcore.connection",
+        "httpcore.http11",
+        "httpcore.http2",
+        "httpcore.proxy",
+    ):
+        logger = logging.getLogger(name)
+        logger.setLevel(logging.WARNING)
+
+
+silence_http_debug_logs()
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from routers.auth import router as auth_router

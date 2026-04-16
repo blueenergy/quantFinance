@@ -29,6 +29,20 @@ def silence_pymongo_debug_logs():
         logger.setLevel(logging.WARNING)
 
 
+def silence_http_debug_logs():
+    """Force httpx/httpcore debug noise down to WARNING."""
+    for name in (
+        "httpx",
+        "httpcore",
+        "httpcore.connection",
+        "httpcore.http11",
+        "httpcore.http2",
+        "httpcore.proxy",
+    ):
+        logger = logging.getLogger(name)
+        logger.setLevel(logging.WARNING)
+
+
 def setup_production_middleware(app: FastAPI):
     """配置生产环境中间件"""
     
@@ -128,7 +142,7 @@ def setup_logging():
     
     # 设置第三方库日志级别
     logging.getLogger("uvicorn").setLevel(logging.WARNING)
-    logging.getLogger("httpx").setLevel(logging.WARNING)
+    silence_http_debug_logs()
     silence_pymongo_debug_logs()
 
 def setup_monitoring(app: FastAPI):
