@@ -1,40 +1,57 @@
-FROM rockylinux:9
+# =============================================================================
+# Stage 1: Build — install gcc for C-extension packages, use China pip mirror
+# =============================================================================
+FROM python:3.11-slim AS builder
 
-# 设置工作目录
-# 设置工作目录
+WORKDIR /app
+
+# China pip mirror (fastest in China)
+RUN pip config set global.index-url https://mirrors.aliyun.com/pypi/simple/ && \
+    pip config set global.trusted-host mirrors.aliyun.com
+
+# Build deps for C extensions: cryptography, bcrypt, numpy, psutil
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        gcc \
+        libffi-dev \
+        python3-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# COPY requirements FIRST — Docker caches this layer until file changes
+COPY requirements.txt .
+
+# Install all deps in one layer (heavy, but fully cached after first build)
+RUN pip install --no-cache-dir -r requirements.txt
+
+# =============================================================================
+# Stage 2: Runtime — minimal slim image, no build tools
+# =============================================================================
+FROM python:3.11-slim
+
 WORKDIR /app
 ENV PYTHONPATH=/app
 
-# 安装系统依赖
-RUN dnf install -y gcc gcc-c++ make curl python3 python3-pip --allowerasing && \
-    dnf clean all
+# Runtime deps only
+RUN apt-get update && apt-get install -y --no-install-recommends curl && \
+    rm -rf /var/lib/apt/lists/*
 
-# 创建非root用户
-RUN groupadd -r appuser && useradd -r -g appuser appuser
+# Copy pre-installed packages from builder (avoids re-downloading)
+COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
+COPY --from=builder /usr/local/bin /usr/local/bin
 
-# 复制依赖文件
-COPY requirements.txt .
+# Non-root user (must exist before COPY --chown)
+RUN groupadd -r appuser && useradd -r -g appuser appuser && \
+    mkdir -p /app/logs
 
-# 安装Python依赖
-RUN python3 -m pip install --no-cache-dir --upgrade pip && \
-    python3 -m pip install --no-cache-dir -r requirements.txt
+# Copy source code (this layer changes most often)
+COPY --chown=appuser:appuser . .
 
-# 复制应用代码
-COPY . .
+RUN chown -R appuser:appuser /app
 
-# 创建必要的目录并设置权限
-RUN mkdir -p /app/logs && \
-    chown -R appuser:appuser /app
-
-# 切换到非root用户
 USER appuser
 
-# 健康检查
-HEALTHCHECK --interval=30s --timeout=30s --start-period=5s --retries=3 \
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD curl -f http://localhost:3001/health || exit 1
 
-# 暴露端口
 EXPOSE 3001
 
-# 启动命令
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "3001", "--workers", "4", "--log-level", "info"]
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "3001", "--log-level", "info"]
