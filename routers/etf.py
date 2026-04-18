@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Query, HTTPException, Depends
 from typing import List, Optional
-from db import db
+from db import db, data_db, analyzer_db
 import pandas as pd
 from auth import get_current_active_user
 
@@ -51,14 +51,14 @@ async def get_etf_list(
         # Full-text search mode
         pattern = re.compile(q, re.IGNORECASE)
         query = {"$or": [{"ts_code": pattern}, {"name": pattern}]}
-        cursor = db["etf_basic"].find(query, {"_id": 0}).limit(limit)
+        cursor = data_db["etf_basic"].find(query, {"_id": 0}).limit(limit)
     elif featured:
         # Featured mode: return curated list in defined order
-        cursor = db["etf_basic"].find(
+        cursor = data_db["etf_basic"].find(
             {"ts_code": {"$in": FEATURED_ETF_CODES}}, {"_id": 0}
         )
     else:
-        cursor = db["etf_basic"].find({}, {"_id": 0}).limit(limit)
+        cursor = data_db["etf_basic"].find({}, {"_id": 0}).limit(limit)
 
     results = list(cursor)
 
@@ -104,8 +104,8 @@ async def get_etf_watchlist(
 
     result = []
     for ts_code in etf_symbols:
-        basic = db["etf_basic"].find_one({"ts_code": ts_code}, {"_id": 0})
-        latest = db["etf_daily"].find_one({"ts_code": ts_code}, sort=[("trade_date", -1)])
+        basic = data_db["etf_basic"].find_one({"ts_code": ts_code}, {"_id": 0})
+        latest = data_db["etf_daily"].find_one({"ts_code": ts_code}, sort=[("trade_date", -1)])
         result.append({
             "ts_code": ts_code,
             "name": (basic or {}).get("name", ts_code),
@@ -143,9 +143,9 @@ async def get_etf_kline(
         query["trade_date"] = date_filter
         
     # Execute queries synchronously (pymongo client is sync)
-    daily_results = list(db["etf_daily"].find(query, {"_id": 0}).sort("trade_date", -1).limit(limit))
-    adj_results = list(db["etf_adj_factor"].find(query, {"_id": 0}).sort("trade_date", -1).limit(limit))
-    share_results = list(db["etf_shares"].find(query, {"_id": 0}).sort("trade_date", -1).limit(limit))
+    daily_results = list(data_db["etf_daily"].find(query, {"_id": 0}).sort("trade_date", -1).limit(limit))
+    adj_results = list(data_db["etf_adj_factor"].find(query, {"_id": 0}).sort("trade_date", -1).limit(limit))
+    share_results = list(data_db["etf_shares"].find(query, {"_id": 0}).sort("trade_date", -1).limit(limit))
     
     if not daily_results:
         return {"success": True, "symbol": symbol, "data": []}
@@ -231,7 +231,7 @@ async def submit_etf_analysis(
 ):
     """Submit an ETF analysis task to the background worker (quantAnalyzer)."""
     symbol = request.symbol.upper()
-    basic = db["etf_basic"].find_one({"ts_code": symbol})
+    basic = data_db["etf_basic"].find_one({"ts_code": symbol})
     if not basic:
         raise HTTPException(status_code=404, detail=f"ETF {symbol} not found")
 
@@ -315,7 +315,7 @@ async def get_etf_latest_analysis(
 ):
     """Get the most recent cached analysis for an ETF."""
     symbol = symbol.upper()
-    doc = db["etf_analysis"].find_one(
+    doc = analyzer_db["etf_analysis"].find_one(
         {"ts_code": symbol}, 
         sort=[("created_at", -1)]
     )
