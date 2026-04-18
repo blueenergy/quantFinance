@@ -134,6 +134,8 @@ services:
       - CRON_MONEYFLOW_DAILY=${CRON_MONEYFLOW_DAILY:-}
       - CRON_SENTIMENT_DAILY=${CRON_SENTIMENT_DAILY:-}
       - CRON_HOTSTOCK_DAILY=${CRON_HOTSTOCK_DAILY:-}
+      # Weekly fund holdings (Tushare fund_portfolio); default Sun 19:00 in crontab
+      - CRON_FUND_PORTFOLIO=${CRON_FUND_PORTFOLIO:-}
     restart: unless-stopped
     network_mode: host
     volumes:
