@@ -152,20 +152,28 @@ async def get_etf_kline(
         
     # Convert to pandas DataFrames for easy merging and calculation
     df_daily = pd.DataFrame(daily_results)
-    
+    # Mongo 可能存 Decimal128 / 字符串，与 float 运算会 TypeError → 接口 500
+    for col in ("open", "high", "low", "close", "vol", "amount"):
+        if col in df_daily.columns:
+            df_daily[col] = pd.to_numeric(df_daily[col], errors="coerce")
+
     # --- 1. Process Adjustment Factors (Pre-adjustment) ---
     if adj_results:
         df_adj = pd.DataFrame(adj_results)
+        if "adj_factor" in df_adj.columns:
+            df_adj["adj_factor"] = pd.to_numeric(df_adj["adj_factor"], errors="coerce")
         # Merge on trade_date
-        df = pd.merge(df_daily, df_adj[['trade_date', 'adj_factor']], on='trade_date', how='left')
+        df = pd.merge(df_daily, df_adj[["trade_date", "adj_factor"]], on="trade_date", how="left")
         
         # Forward fill adj_factors if some days are missing but earlier days exist
-        df['adj_factor'] = df['adj_factor'].fillna(method='ffill').fillna(method='bfill').fillna(1.0)
+        df["adj_factor"] = df["adj_factor"].ffill().bfill().fillna(1.0)
         
         # Calculate pre-adjusted prices
         # Pre-adjusted price = Current Price * (Current Adj Factor / Latest Adj Factor)
         # Since we sorted by trade_date descending, the latest available is at index 0
-        latest_adj_factor = df['adj_factor'].iloc[0]
+        latest_adj_factor = df["adj_factor"].iloc[0]
+        if pd.isna(latest_adj_factor) or float(latest_adj_factor) == 0.0:
+            latest_adj_factor = 1.0
         
         for col in ['open', 'high', 'low', 'close']:
             df[f'pre_adj_{col}'] = df[col] * (df['adj_factor'] / latest_adj_factor)
@@ -179,13 +187,15 @@ async def get_etf_kline(
     # --- 2. Process Share Scale ---
     if share_results:
         df_share = pd.DataFrame(share_results)
+        if "fd_share" in df_share.columns:
+            df_share["fd_share"] = pd.to_numeric(df_share["fd_share"], errors="coerce")
         # Tushare fund_share might not be updated daily for all ETFs, typically week/month ends for some, daily for others.
         # We merge and forward fill the share scale so user always sees the 'latest known' scale.
-        df = pd.merge(df, df_share[['trade_date', 'fd_share']], on='trade_date', how='left')
+        df = pd.merge(df, df_share[["trade_date", "fd_share"]], on="trade_date", how="left")
         
         # Need to sort by date ascending to safely forward fill shares into the future
         df = df.sort_values('trade_date', ascending=True)
-        df['fd_share'] = df['fd_share'].fillna(method='ffill')
+        df["fd_share"] = df["fd_share"].ffill()
         
         # Sort back to descending for API output
         df = df.sort_values('trade_date', ascending=False)
