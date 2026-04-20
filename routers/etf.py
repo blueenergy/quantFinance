@@ -37,33 +37,91 @@ FEATURED_ETF_CODES = [
 async def get_etf_list(
     q: Optional[str] = Query(None, description="Search by symbol or name"),
     featured: bool = Query(False, description="Return curated featured ETFs when no search query"),
-    limit: int = 50
+    limit: int = Query(50, ge=1, le=10000, description="Max rows; use with offset when sort is set for full-market lists"),
+    offset: int = Query(0, ge=0, description="Skip rows (only when sort=total_size|total_share)"),
+    sort: Optional[str] = Query(
+        None,
+        description="Scale sort: total_size or total_share (reads etf_share_size; ignored when q is set)",
+    ),
+    trade_date: Optional[str] = Query(
+        None,
+        description="YYYYMMDD for scale sort; default latest trade_date in etf_share_size",
+    ),
 ):
     """
     Get a list of ETFs.
     - No params: returns first `limit` ETFs
     - ?featured=true: returns curated core ETFs (宽基+主要行业)
     - ?q=xxx: full-text search across all ETFs
+    - ?sort=total_size|total_share: sort by Tushare etf_share_size field for one trade_date (no q);
+      supports offset/limit pagination; response includes total for that trade_date.
     """
     import re, math
 
-    if q:
+    sort_scale_trade_date: Optional[str] = None
+    sort_key = (sort or "").strip().lower() if sort and not q else None
+    if sort_key and sort_key not in ("total_size", "total_share"):
+        raise HTTPException(status_code=400, detail="sort must be total_size or total_share")
+
+    if sort_key:
+        td_raw = (trade_date or "").strip().replace("-", "")[:8]
+        if not td_raw:
+            tip = data_db["etf_share_size"].find_one(
+                {}, sort=[("trade_date", -1)], projection={"trade_date": 1}
+            )
+            if not tip or not tip.get("trade_date"):
+                return {
+                    "success": True,
+                    "count": 0,
+                    "featured": False,
+                    "sort": sort_key,
+                    "trade_date": None,
+                    "data": [],
+                    "message": "etf_share_size 集合无数据，请先运行 quant-data-engine 同步任务",
+                }
+            td = str(tip["trade_date"])
+        else:
+            td = td_raw
+        sort_scale_trade_date = td
+        total_for_td = data_db["etf_share_size"].count_documents({"trade_date": td})
+        cursor = (
+            data_db["etf_share_size"]
+            .find({"trade_date": td}, {"_id": 0})
+            .sort(sort_key, -1)
+            .skip(offset)
+            .limit(limit)
+        )
+        scale_rows = list(cursor)
+        codes = [r["ts_code"] for r in scale_rows if r.get("ts_code")]
+        basics = {
+            b["ts_code"]: b
+            for b in data_db["etf_basic"].find({"ts_code": {"$in": codes}}, {"_id": 0})
+        }
+        merged = []
+        for r in scale_rows:
+            ts = r.get("ts_code")
+            base = dict(basics.get(ts, {}))
+            base.update(r)
+            merged.append(base)
+        results = merged
+    elif q:
         # Full-text search mode
         pattern = re.compile(q, re.IGNORECASE)
         query = {"$or": [{"ts_code": pattern}, {"name": pattern}]}
         cursor = data_db["etf_basic"].find(query, {"_id": 0}).limit(limit)
+        results = list(cursor)
     elif featured:
         # Featured mode: return curated list in defined order
         cursor = data_db["etf_basic"].find(
             {"ts_code": {"$in": FEATURED_ETF_CODES}}, {"_id": 0}
         )
+        results = list(cursor)
     else:
         cursor = data_db["etf_basic"].find({}, {"_id": 0}).limit(limit)
-
-    results = list(cursor)
+        results = list(cursor)
 
     # Maintain featured order when in featured mode
-    if featured and not q:
+    if featured and not q and not sort_key:
         order_map = {code: i for i, code in enumerate(FEATURED_ETF_CODES)}
         results.sort(key=lambda r: order_map.get(r.get("ts_code", ""), 999))
 
@@ -74,15 +132,30 @@ async def get_etf_list(
             if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
                 clean_row[k] = None
             else:
-                clean_row[k] = v.item() if hasattr(v, 'item') else v
+                try:
+                    from bson.decimal128 import Decimal128
+
+                    if isinstance(v, Decimal128):
+                        clean_row[k] = float(str(v))
+                        continue
+                except Exception:
+                    pass
+                clean_row[k] = v.item() if hasattr(v, "item") else v
         clean_results.append(clean_row)
 
-    return {
+    out = {
         "success": True,
         "count": len(clean_results),
-        "featured": featured and not q,
-        "data": clean_results
+        "featured": featured and not q and not sort_key,
+        "data": clean_results,
     }
+    if sort_key:
+        out["sort"] = sort_key
+        out["trade_date"] = sort_scale_trade_date
+        out["offset"] = offset
+        out["limit"] = limit
+        out["total"] = total_for_td if sort_scale_trade_date is not None else None
+    return out
 
 
 @router.get("/watchlist")
