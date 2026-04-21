@@ -26,6 +26,14 @@ RECOMMENDED_INDEXES = {
         [("symbol", ASCENDING)],
         [("trade_date", DESCENDING)],
     ],
+    "stock_weekly": [
+        [("ts_code", ASCENDING), ("trade_date", DESCENDING)],
+        [("trade_date", DESCENDING)],
+    ],
+    "stock_monthly": [
+        [("ts_code", ASCENDING), ("trade_date", DESCENDING)],
+        [("trade_date", DESCENDING)],
+    ],
     "money_flow": [
         [("symbol", ASCENDING), ("trade_date", DESCENDING)],
         [("trade_date", DESCENDING)],
@@ -71,6 +79,19 @@ RECOMMENDED_INDEXES = {
     "etf_daily": [
         [("ts_code", ASCENDING), ("trade_date", DESCENDING)],
         [("trade_date", DESCENDING)],
+    ],
+    "etf_basic": [
+        [("ts_code", ASCENDING)],
+    ],
+    "etf_adj_factor": [
+        [("ts_code", ASCENDING), ("trade_date", ASCENDING)],
+    ],
+    "etf_shares": [
+        [("ts_code", ASCENDING), ("trade_date", ASCENDING)],
+    ],
+    "etf_share_size": [
+        [("ts_code", ASCENDING), ("trade_date", ASCENDING)],
+        [("trade_date", ASCENDING), ("total_size", DESCENDING)],
     ],
 }
 

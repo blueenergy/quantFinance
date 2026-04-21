@@ -13,6 +13,26 @@ pipelines:
       field: trade_date
       field_kind: date_string
 
+  - id: stock_weekly
+    label: 股票周线
+    job_status_key: stock_weekly
+    schedule_hint: "Supercronic 周六 02:30 → daily_market_sync.sh stock_weekly（Tushare weekly）"
+    freshness:
+      database: quant_data
+      collection: stock_weekly
+      field: trade_date
+      field_kind: date_string
+
+  - id: stock_monthly
+    label: 股票月线
+    job_status_key: stock_monthly
+    schedule_hint: "Supercronic 每月 1 日 03:30 → daily_market_sync.sh stock_monthly（Tushare monthly）"
+    freshness:
+      database: quant_data
+      collection: stock_monthly
+      field: trade_date
+      field_kind: date_string
+
   - id: index_daily
     label: 指数日线
     job_status_key: index_daily
