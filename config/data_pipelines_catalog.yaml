@@ -53,6 +53,16 @@ pipelines:
       field: trade_date
       field_kind: date_string
 
+  - id: etf_share_size
+    label: ETF份额规模
+    job_status_key: etf_share_size
+    schedule_hint: "Supercronic 工作日 19:05 → daily_market_sync.sh etf_share_size（Tushare etf_share_size，建议 19 点后）"
+    freshness:
+      database: quant_data
+      collection: etf_share_size
+      field: trade_date
+      field_kind: date_string
+
   - id: financial_sync
     label: 财务数据
     job_status_key: financial_sync
