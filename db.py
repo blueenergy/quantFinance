@@ -106,6 +106,8 @@ def get_data_db():
         "hot_stock_raw": data_db["hot_stock_raw"],
         # Market data
         "volume_price": data_db["volume_price"],
+        "stock_weekly": data_db["stock_weekly"],
+        "stock_monthly": data_db["stock_monthly"],
         "money_flow": data_db["money_flow"],
         "minute_bars": data_db["minute_bars"],
         # Limit-up/down ladder
