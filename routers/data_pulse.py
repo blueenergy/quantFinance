@@ -46,9 +46,14 @@ def _freshness_dict_from_rows(freshness_rows: list) -> Dict[str, Any]:
         s = str(lv)
         # YYYYMMDD embedded in ISO or plain
         if len(s) >= 8 and s[:8].isdigit():
-            out[label] = s[:8]
+            base = s[:8]
         else:
-            out[label] = s[:32]
+            base = s[:32]
+        pct = row.get("coverage_pct")
+        if pct is not None and row.get("coverage_denominator"):
+            out[label] = f"{base} · 覆盖 {pct:.1f}%"
+        else:
+            out[label] = base
     return out
 
 

@@ -72,6 +72,11 @@ pipelines:
       collection: financial_indicator
       field: end_date
       field_kind: date_string
+      # 全库 max(end_date) 下，有多少比例的股票（universe）已有该 end_date 的指标行
+      coverage:
+        universe_database: quant_data
+        universe_collection: stock_info
+        match_key: ts_code
 
   - id: moneyflow
     label: 资金流向
