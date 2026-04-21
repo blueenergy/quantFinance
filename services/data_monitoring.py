@@ -92,6 +92,93 @@ def _get_collection(database: str, collection: str):
     raise ValueError(f"Unknown database: {database}")
 
 
+def _normalize_yyyymmdd(value: Any) -> Optional[str]:
+    """Normalize stored date-ish values to ``YYYYMMDD`` string for comparisons."""
+    if value is None:
+        return None
+    if hasattr(value, "strftime"):
+        try:
+            return value.strftime("%Y%m%d")
+        except Exception:
+            return None
+    s = str(value).replace("-", "").strip()
+    if len(s) >= 8 and s[:8].isdigit():
+        return s[:8]
+    return None
+
+
+def _field_equality_filter(field: str, norm: str) -> Dict[str, Any]:
+    """Match common Mongo representations (string vs int) for a calendar end date."""
+    if not norm or len(norm) != 8 or not norm.isdigit():
+        return {field: norm}
+    try:
+        as_int = int(norm)
+    except ValueError:
+        return {field: norm}
+    return {"$or": [{field: norm}, {field: as_int}]}
+
+
+def _coverage_latest_ratio(
+    data_coll,
+    field: str,
+    latest_raw: Any,
+    universe_coll,
+    match_key: str,
+) -> Optional[Dict[str, Any]]:
+    """
+    Global max ``field`` in ``data_coll`` defines the target period ``L``.
+
+    Denominator: universe rows with non-empty ``match_key`` (e.g. ``stock_info``).
+
+    Numerator: distinct ``match_key`` in ``data_coll`` at period ``L`` that also exist
+    in the universe collection (intersection), so the ratio is "of listed stocks we
+    track, how many already have this report period".
+    """
+    norm = _normalize_yyyymmdd(latest_raw)
+    if not norm:
+        return None
+    try:
+        denom = int(
+            universe_coll.count_documents(
+                {match_key: {"$exists": True, "$nin": [None, ""]}},
+            )
+        )
+    except Exception:
+        return None
+    if denom <= 0:
+        return None
+    universe_name = universe_coll.name
+    try:
+        pipeline = [
+            {"$match": {**_field_equality_filter(field, norm), match_key: {"$exists": True, "$nin": [None, ""]}}},
+            {
+                "$lookup": {
+                    "from": universe_name,
+                    "let": {"mk": f"${match_key}"},
+                    "pipeline": [
+                        {"$match": {"$expr": {"$eq": [f"${match_key}", "$$mk"]}}},
+                        {"$limit": 1},
+                    ],
+                    "as": "_universe_hit",
+                }
+            },
+            {"$match": {"_universe_hit": {"$ne": []}}},
+            {"$group": {"_id": f"${match_key}"}},
+            {"$count": "n"},
+        ]
+        agg = list(data_coll.aggregate(pipeline))
+        num = int(agg[0]["n"]) if agg else 0
+    except Exception:
+        return None
+    pct = round(100.0 * float(num) / float(denom), 2)
+    return {
+        "coverage_as_of": norm,
+        "coverage_numerator": num,
+        "coverage_denominator": denom,
+        "coverage_pct": pct,
+    }
+
+
 def _max_freshness_value(
     database: str,
     collection: str,
@@ -197,18 +284,34 @@ def build_freshness_rows() -> List[Dict[str, Any]]:
                 iso = raw.isoformat()
             else:
                 iso = str(raw)
-        out.append(
-            {
-                "pipeline_id": p.get("id"),
-                "label": p.get("label"),
-                "database": database,
-                "collection": fr.get("collection"),
-                "field": fr.get("field"),
-                "latest_value": iso,
-                "raw_value": raw,
-                "error": err,
-            }
-        )
+        row: Dict[str, Any] = {
+            "pipeline_id": p.get("id"),
+            "label": p.get("label"),
+            "database": database,
+            "collection": fr.get("collection"),
+            "field": fr.get("field"),
+            "latest_value": iso,
+            "raw_value": raw,
+            "error": err,
+        }
+        cov_cfg = fr.get("coverage") or {}
+        if raw is not None and not err and cov_cfg.get("universe_collection") and cov_cfg.get("match_key"):
+            try:
+                u_db = cov_cfg.get("universe_database") or database
+                data_coll = _get_collection(database, fr["collection"])
+                universe_coll = _get_collection(u_db, cov_cfg["universe_collection"])
+                cov = _coverage_latest_ratio(
+                    data_coll,
+                    fr["field"],
+                    raw,
+                    universe_coll,
+                    str(cov_cfg["match_key"]),
+                )
+                if cov:
+                    row.update(cov)
+            except Exception as cov_err:
+                row["coverage_error"] = str(cov_err)
+        out.append(row)
     return out
 
 
