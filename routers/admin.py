@@ -3,7 +3,7 @@ from fastapi import APIRouter, Depends, Query, HTTPException, Body
 from typing import List
 from auth import get_current_admin_user, log_admin_action, create_admin_user
 from db import get_db_collections, get_analyzer_db, get_data_db
-from datetime import timedelta, datetime
+from datetime import timedelta, datetime, timezone
 from utils.stock_utils import serialize_doc
 import time
 from models.all_models import (
@@ -23,6 +23,25 @@ user_watchlists_collection = collections["user_watchlists"]
 login_logs_collection = collections["login_logs"]
 admin_logs_collection = collections["admin_logs"]
 analysis_history_collection = get_analyzer_db()["analysis_history"]
+
+BEIJING_TZ = timezone(timedelta(hours=8))
+
+
+def _to_beijing_iso(dt):
+    """将数据库中的UTC时间转换为北京时间ISO字符串。"""
+    if not isinstance(dt, datetime):
+        return dt
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(BEIJING_TZ).isoformat()
+
+
+def _convert_datetime_fields(doc: dict, fields: List[str]) -> dict:
+    """按字段名将文档中的datetime转换为北京时间字符串。"""
+    for field in fields:
+        if field in doc and isinstance(doc.get(field), datetime):
+            doc[field] = _to_beijing_iso(doc[field])
+    return doc
 
 @router.get("/users")
 def get_all_users(
@@ -64,6 +83,7 @@ def get_all_users(
         # 处理用户数据，使用serialize_doc处理ObjectId和datetime
         users = []
         for user in users_cursor:
+            user = _convert_datetime_fields(user, ["created_at", "last_login", "approved_at"])
             user_data = serialize_doc(user)
             user_data["id"] = user_data.pop("_id")  # 将_id重命名为id
             users.append(user_data)
@@ -113,6 +133,7 @@ def get_user_detail(
             raise HTTPException(status_code=404, detail="用户不存在")
         
         # 使用serialize_doc处理ObjectId和datetime
+        user = _convert_datetime_fields(user, ["created_at", "last_login", "approved_at"])
         user_data = serialize_doc(user)
         user_data["id"] = user_data.pop("_id")
         
@@ -126,7 +147,10 @@ def get_user_detail(
             sort=[("login_time", -1)]
         ).limit(5)
         
-        recent_logins = [serialize_doc(log) for log in recent_logins_cursor]
+        recent_logins = []
+        for log in recent_logins_cursor:
+            log = _convert_datetime_fields(log, ["login_time"])
+            recent_logins.append(serialize_doc(log))
         
         return {
             "success": True,
@@ -176,7 +200,10 @@ def get_login_logs(
         logs_cursor = login_logs_collection.find(query).sort("login_time", -1).skip(skip).limit(page_size)
         
         # 处理日志数据，使用serialize_doc处理ObjectId和datetime
-        logs = [serialize_doc(log) for log in logs_cursor]
+        logs = []
+        for log in logs_cursor:
+            log = _convert_datetime_fields(log, ["login_time"])
+            logs.append(serialize_doc(log))
         
         return {
             "success": True,
@@ -226,6 +253,7 @@ def get_pending_users(
         # 处理用户数据，使用serialize_doc处理ObjectId和datetime
         users = []
         for user in users_cursor:
+            user = _convert_datetime_fields(user, ["created_at", "last_login", "approved_at"])
             user_data = serialize_doc(user)
             user_data["id"] = user_data.pop("_id")  # 将_id重命名为id
             users.append(user_data)
@@ -758,20 +786,32 @@ def update_user_status(
     try:
         collections = get_db_collections()
         users_collection = collections["users"]
+        try:
+            oid = ObjectId(user_id)
+        except Exception:
+            raise HTTPException(status_code=400, detail="无效的用户ID")
+
         # 不能禁用自己
         if user_id == admin_user["id"]:
             raise HTTPException(status_code=400, detail="不能禁用自己的账户")
         
         # 查找目标用户
-        target_user = users_collection.find_one({"_id": ObjectId(user_id)})
+        target_user = users_collection.find_one({"_id": oid})
         if not target_user:
             raise HTTPException(status_code=404, detail="用户不存在")
         
         # 准备更新数据
         update_data = {"is_active": is_active}
+        should_auto_approve = is_active and target_user.get("approval_status") == "pending"
+        current_is_active = bool(target_user.get("is_active", False))
+        if current_is_active == is_active and not should_auto_approve:
+            return {
+                "success": True,
+                "message": f"用户已是{'激活' if is_active else '禁用'}状态，无需更新"
+            }
         
         # 如果用户处于待审批状态，且正在激活，则自动批准
-        if is_active and target_user.get("approval_status") == "pending":
+        if should_auto_approve:
             now = datetime.utcnow()
             update_data.update({
                 "approval_status": "approved",
@@ -781,10 +821,12 @@ def update_user_status(
         
         # 更新用户状态
         result = users_collection.update_one(
-            {"_id": ObjectId(user_id)},
+            {"_id": oid},
             {"$set": update_data}
         )
         
+        if result.matched_count == 0:
+            raise HTTPException(status_code=404, detail="用户不存在")
         if result.modified_count == 0:
             raise HTTPException(status_code=400, detail="更新失败")
         
@@ -805,7 +847,8 @@ def update_user_status(
             "success": True,
             "message": f"用户状态已更新为 {'激活' if is_active else '禁用'}"
         }
-        
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"更新用户状态失败: {str(e)}")
 

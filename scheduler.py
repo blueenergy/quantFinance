@@ -219,6 +219,7 @@ def generate_market_analysis_task(job_id: str):
     - market_analysis_1630: Post-market (收盘 16:30) - includes THS money flow
     """
     from db import get_db_collections
+    from services.analysis_tasks import build_task_doc
     
     try:
         collections = get_db_collections()
@@ -248,21 +249,22 @@ def generate_market_analysis_task(job_id: str):
         # 16:30 is post-market, others are intraday
         analysis_type = "post_market" if "1630" in job_id else "intraday"
             
-        task_doc = {
-            "type": "market_analysis",
-            "status": "pending",
-            "priority": 10,
-            "user_id": user_id,
-            "stock_name": "大盘指数",
-            "symbol": "MARKET",
-            "params": {
+        task_doc = build_task_doc(
+            current_user={
+                "id": user_id,
+                "username": "system" if user_id == "system" else "admin",
+            },
+            task_type="market_analysis",
+            priority=10,
+            symbol="MARKET",
+            stock_name="大盘指数",
+            params={
                 "date": today_str,
                 "job_id": job_id,
-                "analysis_type": analysis_type
+                "analysis_type": analysis_type,
             },
-            "created_at": datetime.now(),
-            "source": "scheduler"
-        }
+            source="scheduler",
+        )
         
         result = tasks_col.insert_one(task_doc)
         log.info(f"[Market Analysis] Scheduled task {result.inserted_id} for {today_str} (type: {analysis_type})")
@@ -274,6 +276,7 @@ def generate_market_analysis_task(job_id: str):
 def generate_global_analysis_task(job_id: str):
     """Schedule Global Market Analysis task (Runs at 08:30 AM)."""
     from db import get_db_collections
+    from services.analysis_tasks import build_task_doc
     
     try:
         collections = get_db_collections()
@@ -295,20 +298,21 @@ def generate_global_analysis_task(job_id: str):
             log.info(f"[Global Analysis] Task '{job_id}' already pending for {today_str}, skipping.")
             return
             
-        task_doc = {
-            "type": "global_analysis",
-            "status": "pending",
-            "priority": 15,
-            "user_id": user_id,
-            "stock_name": "全球市场联动",
-            "symbol": "GLOBAL",
-            "params": {
-                "date": today_str,
-                "job_id": job_id
+        task_doc = build_task_doc(
+            current_user={
+                "id": user_id,
+                "username": "system" if user_id == "system" else "admin",
             },
-            "created_at": datetime.now(),
-            "source": "scheduler"
-        }
+            task_type="global_analysis",
+            priority=15,
+            symbol="GLOBAL",
+            stock_name="全球市场联动",
+            params={
+                "date": today_str,
+                "job_id": job_id,
+            },
+            source="scheduler",
+        )
         
         result = tasks_col.insert_one(task_doc)
         log.info(f"[Global Analysis] Scheduled task {result.inserted_id} for {today_str}")
@@ -320,6 +324,7 @@ def generate_global_analysis_task(job_id: str):
 def hot_stock_poll_task(source: str):
     """热股轮询任务 - 每30分钟检查 THS / DC 热榜是否有新数据。"""
     from db import get_db_collections, get_analyzer_db
+    from services.analysis_tasks import build_task_doc
 
     try:
         collections = get_db_collections()
@@ -340,18 +345,16 @@ def hot_stock_poll_task(source: str):
         last_doc = analysis_col.find_one({"source": source}, sort=[("created_at", -1)])
         last_rank_time = last_doc.get("rank_time") if last_doc else None
 
-        task_doc = {
-            "user_id": "system",
-            "type": "hot_stock_analysis",
-            "priority": 20,
-            "status": "pending",
-            "params": {
+        task_doc = build_task_doc(
+            current_user={"id": "system", "username": "system"},
+            task_type="hot_stock_analysis",
+            priority=20,
+            params={
                 "source": source,
                 "last_rank_time": last_rank_time,
             },
-            "created_at": datetime.now(),
-            "source": "scheduler",
-        }
+            source="scheduler",
+        )
         result = tasks_col.insert_one(task_doc)
         log.info(f"[HotStock Poll] {source.upper()} task submitted ({result.inserted_id}), last_rank_time={last_rank_time}")
 

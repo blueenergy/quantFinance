@@ -4,6 +4,7 @@ from auth import get_current_active_user
 from db import get_db_collections, get_data_db
 from datetime import datetime, timedelta
 from utils.stock_utils import serialize_doc
+from services.analysis_tasks import build_task_doc
 import pandas as pd
 
 router = APIRouter()
@@ -194,21 +195,19 @@ async def analyze_hunter_signal(
     # 如果已经有分析结果而且是近期分析的，前端可以不需要再提。但这里允许复用接口触发重试或新建。
     
     # 创建异步任务给 quantAnalyzer
-    task_doc = {
-        "type": "earnings_hunter",
-        "status": "pending",
-        "priority": 15, # 较高优先级，仅次于用户主动的个股/大盘分析(20)
-        "user_id": current_user["id"],
-        "stock_name": doc.get("name", "Unknown"),
-        "symbol": doc.get("ts_code", ""),
-        "params": {
+    task_doc = build_task_doc(
+        current_user=current_user,
+        task_type="earnings_hunter",
+        priority=15,
+        symbol=doc.get("ts_code", ""),
+        stock_name=doc.get("name", "Unknown"),
+        params={
             "signal_id": signal_id,
             "signal_type": signal_type,
-            "data": serialize_doc(doc)
+            "data": serialize_doc(doc),
         },
-        "created_at": datetime.now(),
-        "source": "earnings_hunter"
-    }
+        source="earnings_hunter",
+    )
     
     result = tasks_col.insert_one(task_doc)
     

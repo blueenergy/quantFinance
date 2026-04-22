@@ -8,8 +8,9 @@ from db import get_db_collections, get_analyzer_db, get_data_db
 from datetime import datetime
 from utils.stock_utils import serialize_doc, format_trade_date
 from bson import ObjectId
-from models.analysis_task import AnalysisTaskCreate, TaskStatus
+from models.analysis_task import AnalysisTaskCreate
 from services.quota_manager import QuotaManager
+from services.analysis_tasks import build_task_doc, can_access_task
 from db import db
 from routers.entitlements_matrix import (
     FEATURE_WATCHLIST_OPPORTUNITIES,
@@ -173,7 +174,7 @@ async def analyze_portfolio_opportunities(current_user: dict = Depends(get_curre
         }
     
     task_id = _submit_portfolio_task(
-        user_id=user_id,
+        current_user=current_user,
         watchlist=watchlist,
         positions=positions,
         ladder_data=ladder_data,
@@ -231,7 +232,7 @@ async def analyze_watchlist_opportunities(current_user: dict = Depends(get_curre
         return {"success": False, "error": "无法获取连板天梯数据"}
     
     task_id = _submit_portfolio_task(
-        user_id=user_id,
+        current_user=current_user,
         watchlist=watchlist,
         positions=[],
         ladder_data=ladder_data,
@@ -273,7 +274,7 @@ async def analyze_positions_opportunities(current_user: dict = Depends(get_curre
         return {"success": False, "error": "无法获取连板天梯数据"}
     
     task_id = _submit_portfolio_task(
-        user_id=user_id,
+        current_user=current_user,
         watchlist=[],
         positions=positions,
         ladder_data=ladder_data,
@@ -350,10 +351,13 @@ async def get_analysis_task_status(
     if not task:
         raise HTTPException(status_code=404, detail="任务不存在")
     
-    if task.get("user_id") != current_user["id"]:
+    if not can_access_task(task, current_user):
         logger.warning(
-            "[portfolio-task] access denied task_id=%s task_user_id=%s current_user_id=%s",
-            task_id, task.get("user_id"), current_user.get("id")
+            "[portfolio-task] access denied task_id=%s task_user_id=%s current_user_id=%s current_username=%s",
+            task_id,
+            task.get("user_id"),
+            current_user.get("id"),
+            current_user.get("username"),
         )
         raise HTTPException(status_code=403, detail="无权访问此任务")
     
@@ -369,6 +373,12 @@ async def get_analysis_task_status(
         response["success"] = result.get("success", False)
         response["analysis"] = result.get("analysis")
         response["model"] = result.get("model")
+    elif response["status"] == "completed_with_parse_error":
+        result = task.get("result", {})
+        response["success"] = False
+        response["analysis"] = result.get("analysis")
+        response["model"] = result.get("model")
+        response["error"] = task.get("error") or result.get("error_detail") or result.get("error") or "结果解析失败"
     elif response["status"] == "failed":
         response["error"] = task.get("error", "分析失败")
 
@@ -543,7 +553,7 @@ def _fetch_latest_intraday_prices(symbols: List[str], data_collections) -> Dict[
 
 
 def _submit_portfolio_task(
-    user_id: str,
+    current_user: Dict[str, Any],
     watchlist: List[Dict[str, Any]],
     positions: List[Dict[str, Any]],
     ladder_data: Dict[str, Any],
@@ -551,20 +561,18 @@ def _submit_portfolio_task(
     collections
 ) -> str:
     """提交组合分析异步任务"""
-    task_doc = {
-        "user_id": user_id,
-        "type": "portfolio_analysis",
-        "status": TaskStatus.PENDING.value,
-        "priority": 1,
-        "params": {
+    task_doc = build_task_doc(
+        current_user=current_user,
+        task_type="portfolio_analysis",
+        priority=1,
+        params={
             "watchlist": watchlist,
             "positions": positions,
             "ladder_data": ladder_data,
-            "analysis_type": analysis_type
+            "analysis_type": analysis_type,
         },
-        "created_at": datetime.now(),
-        "updated_at": datetime.now()
-    }
+        source="manual_trigger",
+    )
     
     result = collections["analysis_tasks"].insert_one(task_doc)
     return str(result.inserted_id)
@@ -788,16 +796,18 @@ async def create_deep_analysis_task(
     )
 
     # 3. 创建任务
-    task_doc = {
-        "user_id": current_user["id"],
-        "symbol": request.symbol,
-        "status": TaskStatus.PENDING.value,
-        "priority": request.priority,
-        "created_at": datetime.now(),
-        "updated_at": datetime.now(),
-        "provider": request.provider,
-        "model": request.model
-    }
+    task_doc = build_task_doc(
+        current_user=current_user,
+        task_type="deep_analysis",
+        priority=request.priority,
+        symbol=request.symbol,
+        params={"feedback": request.feedback} if request.feedback else {},
+        provider=request.provider,
+        model=request.model,
+        source="manual_trigger",
+        revision_of=request.revision_of,
+        feedback=request.feedback,
+    )
     
     try:
         result = collections["analysis_tasks"].insert_one(task_doc)

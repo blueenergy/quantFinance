@@ -11,6 +11,7 @@ from datetime import datetime, date, timedelta
 from auth import get_current_active_user
 from db import get_db_collections, get_analyzer_db, get_data_db
 from bson import ObjectId
+from services.analysis_tasks import build_task_doc
 
 router = APIRouter(prefix="/ladder", tags=["Limit-Up Ladder"])
 
@@ -475,19 +476,18 @@ async def submit_reasoning_feedback(
         
     task_type = "broken_limit_up_feedback" if request.is_broken else "limit_up_feedback"
     
-    task_doc = {
-        "user_id": current_user["username"],
-        "symbol": symbol,
-        "type": task_type,
-        "priority": 100,  # 高优先级
-        "status": "pending",
-        "params": {
+    task_doc = build_task_doc(
+        current_user=current_user,
+        task_type=task_type,
+        priority=100,
+        symbol=symbol,
+        params={
             "date": target_date,
-            "feedback": request.feedback
+            "feedback": request.feedback,
         },
-        "created_at": datetime.now(),
-        "updated_at": datetime.now()
-    }
+        source="ladder_feedback",
+        feedback=request.feedback,
+    )
     
     result = tasks_col.insert_one(task_doc)
     
