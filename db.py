@@ -69,6 +69,7 @@ def get_db_collections() -> Dict[str, Collection]:
         "upgrade_requests": db["upgrade_requests"],  # 服务升级申请
         # Phase 10: Async Task Queue Architecture
         "analysis_tasks": db["analysis_tasks"],  # 深度分析任务队列
+        "analysis_task_revisions": db["analysis_task_revisions"],  # 分析任务版本历史
         "quota_usage": db["quota_usage"],        # 用户配额使用情况
         "schedule_config": db["schedule_config"], # 定时任务调度配置
         "app_settings": db["app_settings"],  # 全局可配置项（如主导航按等级可见性）
