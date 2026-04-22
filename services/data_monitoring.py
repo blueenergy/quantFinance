@@ -27,15 +27,47 @@ def load_pipelines_catalog() -> List[Dict[str, Any]]:
     return list(data.get("pipelines") or [])
 
 
+def _ingestion_date_ymd_int(value: Any) -> int:
+    """
+    将 job_status / pipeline_tasks 的 date 归一为 YYYYMMDD 整型，用于比大小。
+    非 8 位数字、缺失或非法时返回 0（避免把 7 位脏数据 2060408 当成「最大」与 20260421 混排）。
+    """
+    if value is None:
+        return 0
+    s = str(value).replace("-", "").replace("/", "").strip()
+    digits = "".join(c for c in s if c.isdigit())[:8]
+    if len(digits) < 8:
+        return 0
+    return int(digits)
+
+
+def _ingestion_row_sort_key(doc: Optional[Dict[str, Any]]) -> tuple:
+    """(业务日期, 时间戳) — 按业务日期选最新，同日复用 updated 最大的。"""
+    if not doc:
+        return (0, 0.0)
+    y = _ingestion_date_ymd_int(doc.get("date"))
+    u = doc.get("updated_at") or doc.get("completed_at")
+    if not isinstance(u, datetime):
+        return (y, 0.0)
+    if u.tzinfo is None:
+        u = u.replace(tzinfo=timezone.utc)
+    return (y, float(u.timestamp()))
+
+
 def _latest_ingestion_doc_for_catalog_key(key: str) -> Optional[Dict[str, Any]]:
-    """Prefer finance.pipeline_tasks (data_collection); fall back to job_status."""
-    doc = db["pipeline_tasks"].find_one(
-        {"domain": "data_collection", "task_type": key},
-        sort=[("date", -1)],
+    """取「业务上最新」的入库记录：合并 pipeline_tasks 与 job_status 后按归一化 date 比大小。
+
+    原因：1) 不可依赖 Mongo 对 `date` 的 sort（int/str、7/8 位混存会排错）；
+    2) 仅看 pipeline 时，若其中只有脏 date，会漏掉 job_status 里正确的记录。
+    """
+    pt_docs = list(
+        db["pipeline_tasks"].find({"domain": "data_collection", "task_type": key})
     )
-    if doc:
-        return doc
-    return db["job_status"].find_one({"job_type": key}, sort=[("date", -1)])
+    js_docs = list(db["job_status"].find({"job_type": key}))
+    all_docs = pt_docs + js_docs
+    if not all_docs:
+        return None
+    return max(all_docs, key=_ingestion_row_sort_key)
 
 
 def normalize_job_status_doc(doc: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -230,6 +262,7 @@ def build_pipelines_status_rows() -> List[Dict[str, Any]]:
 def build_sync_health_from_catalog() -> Dict[str, Any]:
     """Healthy = latest run status == complete for each distinct job_type in DB that appears in catalog."""
     catalog = load_pipelines_catalog()
+    key_to_label = {p.get("job_status_key") or p.get("id"): p.get("label") or p.get("id") for p in catalog}
     keys = {p.get("job_status_key") or p.get("id") for p in catalog}
     jobs_out: List[Dict[str, Any]] = []
     healthy = 0
@@ -242,6 +275,7 @@ def build_sync_health_from_catalog() -> Dict[str, Any]:
         jobs_out.append(
             {
                 "type": key,
+                "label": key_to_label.get(key, key),
                 "latest_date": doc.get("date") if doc else None,
                 "status": st if doc else "no_record",
             }
