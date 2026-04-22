@@ -12,6 +12,7 @@ from pydantic import BaseModel
 from auth import get_current_active_user
 from db import get_db_collections, get_analyzer_db
 from bson import ObjectId
+from services.analysis_tasks import build_task_doc, can_access_task
 
 router = APIRouter(prefix="/hot-stock", tags=["热股分析"])
 
@@ -53,18 +54,16 @@ async def submit_hot_stock_analysis(
     last_doc = analysis_col.find_one({"source": source}, sort=[("created_at", -1)])
     last_rank_time = last_doc.get("rank_time") if last_doc else None
 
-    task_doc = {
-        "user_id": current_user.get("username", "unknown"),
-        "type": "hot_stock_analysis",
-        "priority": 20,
-        "status": "pending",
-        "params": {
+    task_doc = build_task_doc(
+        current_user=current_user,
+        task_type="hot_stock_analysis",
+        priority=20,
+        params={
             "source": source,
             "last_rank_time": None if request.force else last_rank_time,
         },
-        "created_at": datetime.now(),
-        "updated_at": datetime.now(),
-    }
+        source="manual_trigger",
+    )
     result = tasks_col.insert_one(task_doc)
 
     return {
@@ -91,6 +90,8 @@ async def get_task_status(
 
     if not task:
         raise HTTPException(404, "Task not found")
+    if not can_access_task(task, current_user):
+        raise HTTPException(403, "无权访问此任务")
 
     response = {
         "success": True,
@@ -112,7 +113,22 @@ async def get_task_status(
         response["completed_at"] = (
             task.get("completed_at").isoformat() if task.get("completed_at") else None
         )
-    elif task["status"] == "failed":
+    elif task.get("status") == "completed_with_parse_error":
+        result = task.get("result", {})
+        response["analysis"] = result.get("analysis")
+        response["source"] = result.get("source")
+        response["source_name"] = result.get("source_name")
+        response["rank_time"] = result.get("rank_time")
+        response["trade_date"] = result.get("trade_date")
+        response["model"] = result.get("model")
+        response["stock_count"] = result.get("stock_count")
+        response["error"] = (
+            task.get("error") or result.get("error_detail") or result.get("error") or "结果解析失败"
+        )
+        response["completed_at"] = (
+            task.get("completed_at").isoformat() if task.get("completed_at") else None
+        )
+    elif task.get("status") == "failed":
         response["error"] = task.get("error", "Unknown error")
 
     return response

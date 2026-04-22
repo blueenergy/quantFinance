@@ -12,6 +12,7 @@ from pydantic import BaseModel
 from auth import get_current_active_user
 from db import get_db_collections, get_analyzer_db
 from bson import ObjectId
+from services.analysis_tasks import build_task_doc, can_access_task
 
 router = APIRouter(prefix="/sector-concept", tags=["概念板块分析"])
 
@@ -73,18 +74,16 @@ async def submit_sector_analysis(
         }
 
     # Insert new task
-    task_doc = {
-        "user_id": current_user.get("username", "unknown"),
-        "type": "sector_concept_analysis",
-        "priority": 50,
-        "status": "pending",
-        "params": {
+    task_doc = build_task_doc(
+        current_user=current_user,
+        task_type="sector_concept_analysis",
+        priority=50,
+        params={
             "date": trade_date,
             "source": source,
         },
-        "created_at": datetime.now(),
-        "updated_at": datetime.now(),
-    }
+        source="manual_trigger",
+    )
     result = tasks_col.insert_one(task_doc)
 
     return {
@@ -111,6 +110,8 @@ async def get_task_status(
 
     if not task:
         raise HTTPException(404, "Task not found")
+    if not can_access_task(task, current_user):
+        raise HTTPException(403, "无权访问此任务")
 
     response = {
         "success": True,
@@ -130,7 +131,21 @@ async def get_task_status(
         response["completed_at"] = (
             task.get("completed_at").isoformat() if task.get("completed_at") else None
         )
-    elif task["status"] == "failed":
+    elif task.get("status") == "completed_with_parse_error":
+        result = task.get("result", {})
+        response["analysis"] = result.get("analysis")
+        response["source"] = result.get("source")
+        response["source_name"] = result.get("source_name")
+        response["trade_date"] = result.get("trade_date")
+        response["model"] = result.get("model")
+        response["data_summary"] = result.get("data_summary")
+        response["error"] = (
+            task.get("error") or result.get("error_detail") or result.get("error") or "结果解析失败"
+        )
+        response["completed_at"] = (
+            task.get("completed_at").isoformat() if task.get("completed_at") else None
+        )
+    elif task.get("status") == "failed":
         response["error"] = task.get("error", "Unknown error")
 
     return response

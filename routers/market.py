@@ -10,7 +10,7 @@ from services.tushare_cached import get_latest_trade_date
 from external_data import external_market_data
 from utils.stock_utils import serialize_doc
 from bson import ObjectId
-from models.analysis_task import TaskStatus
+from services.analysis_tasks import build_task_doc
 
 router = APIRouter()
 
@@ -73,19 +73,15 @@ async def trigger_global_analysis(current_user: dict = Depends(get_current_activ
                 "task_id": str(existing["_id"])
             }
             
-        task_doc = {
-            "type": "global_analysis",
-            "status": "pending",
-            "priority": 20, # High priority for manual trigger
-            "user_id": user_id,
-            "stock_name": "全球市场联动",
-            "symbol": "GLOBAL",
-            "params": {
-                "date": today_str
-            },
-            "created_at": datetime.now(),
-            "source": "manual_trigger"
-        }
+        task_doc = build_task_doc(
+            current_user=current_user,
+            task_type="global_analysis",
+            priority=20,
+            symbol="GLOBAL",
+            stock_name="全球市场联动",
+            params={"date": today_str},
+            source="manual_trigger",
+        )
         
         result = tasks_col.insert_one(task_doc)
         print(f"[Global Analysis] Manual trigger task {result.inserted_id}")
@@ -233,23 +229,21 @@ async def trigger_market_analysis(request: MarketAnalysisRequest, current_user: 
                 "is_non_trading_trigger": is_non_trading_trigger
             }
 
-        task_doc = {
-            "type": "market_analysis",
-            "status": "pending",
-            "priority": 20,  # High priority for manual trigger
-            "user_id": user_id,
-            "stock_name": "大盘分析",
-            "symbol": "MARKET",
-            "params": {
+        task_doc = build_task_doc(
+            current_user=current_user,
+            task_type="market_analysis",
+            priority=20,
+            symbol="MARKET",
+            stock_name="大盘分析",
+            params={
                 "date": effective_date,
                 "requested_date": requested_date,
                 "effective_analysis_date": effective_date,
                 "is_non_trading_trigger": is_non_trading_trigger,
                 "force_refresh": bool(request.force_refresh),
             },
-            "created_at": datetime.now(),
-            "source": "manual_trigger"
-        }
+            source="manual_trigger",
+        )
 
         result = tasks_col.insert_one(task_doc)
         print(f"[Market Analysis] Manual trigger task {result.inserted_id}")
