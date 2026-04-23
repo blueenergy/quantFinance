@@ -49,6 +49,8 @@ services:
       - DEFAULT_MODEL=${DEFAULT_MODEL:-qwen-plus}
       # ETF 分析是否传 response_format=json_object：on=与生产强制一致，auto=按模型名推断，off=关闭
       - ETF_ANALYSIS_RESPONSE_FORMAT=${ETF_ANALYSIS_RESPONSE_FORMAT:-auto}
+      - LIMIT_UP_ATTRIBUTION_MODE=${LIMIT_UP_ATTRIBUTION_MODE:-legacy_daily}
+      - LIMIT_UP_TRIGGER_MODE=${LIMIT_UP_TRIGGER_MODE:-scheduled}
       - ANALYSIS_INTERVAL=300
       - DISABLE_AUTO_ANALYSIS=${DISABLE_AUTO_ANALYSIS:-false}
       - WORKER_ID=analyzer-1
@@ -90,6 +92,8 @@ services:
       - DEFAULT_LLM_PROVIDER=${DEFAULT_LLM_PROVIDER:-qwen}
       - DEFAULT_MODEL=${DEFAULT_MODEL:-qwen-plus}
       - ETF_ANALYSIS_RESPONSE_FORMAT=${ETF_ANALYSIS_RESPONSE_FORMAT:-auto}
+      - LIMIT_UP_ATTRIBUTION_MODE=${LIMIT_UP_ATTRIBUTION_MODE:-legacy_daily}
+      - LIMIT_UP_TRIGGER_MODE=${LIMIT_UP_TRIGGER_MODE:-scheduled}
       - ANALYSIS_INTERVAL=300
       - DISABLE_AUTO_ANALYSIS=${DISABLE_AUTO_ANALYSIS:-false}
       - WORKER_ID=analyzer-2
