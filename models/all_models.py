@@ -106,25 +106,6 @@ class WatchlistStrategyResponse(BaseModel):
     strategy: str
     params: dict
 
-class AnalysisHistoryRequest(BaseModel):
-    symbol: str
-    prompt: Optional[str] = None
-    # Legacy-compatible payload: analysis must live under analysis_result.analysis
-    analysis_result: Any
-    # Accept raw analysis for callers that haven't migrated; we will wrap it into analysis_result
-    analysis: Optional[Any] = None
-    provider: Optional[str] = None
-    model: Optional[str] = None
-    timestamp: Optional[str] = None
-    stock_name: Optional[str] = None
-
-    @model_validator(mode='before')
-    def ensure_analysis_result(cls, values: Dict[str, Any]) -> Dict[str, Any]:
-        # If caller only provided `analysis`, wrap it into the canonical structure
-        if values.get("analysis_result") is None and values.get("analysis") is not None:
-            values["analysis_result"] = {"analysis": values.get("analysis")}
-        return values
-
 # --- Securities accounts ---
 class SecuritiesAccountBase(BaseModel):
     broker: str

@@ -2,7 +2,6 @@ import os
 import logging
 from typing import Optional, Dict, Any, List
 from fastapi import APIRouter, Depends, Query, HTTPException
-from models.all_models import AnalysisHistoryRequest
 from auth import get_current_active_user
 from db import get_db_collections, get_analyzer_db, get_data_db
 from datetime import datetime
@@ -652,59 +651,6 @@ def _fetch_ladder_data_for_portfolio() -> Optional[Dict[str, Any]]:
     }
 
 
-@router.post("/analysis-history")
-def save_analysis_history(req: AnalysisHistoryRequest, current_user: dict = Depends(get_current_active_user)):
-    """保存分析历史，统一存储为 analysis_result.analysis 结构。"""
-    collections = get_db_collections()
-    analysis_col = get_analyzer_db()["analysis_history"]
-
-    analysis_result = getattr(req, "analysis_result", None)
-    if not isinstance(analysis_result, dict):
-        raise HTTPException(status_code=400, detail="analysis_result 必须为对象，且包含 analysis 字段")
-
-    analysis_obj = analysis_result.get("analysis")
-    # 防止被二次包裹成 analysis_result.analysis.analysis
-    if isinstance(analysis_obj, dict) and "analysis" in analysis_obj:
-        core = analysis_obj.get("analysis")
-        # 仅在缺少核心字段且发现再次嵌套时解包
-        known_keys = {"technical_analysis", "investment_advice", "risk_level", "support_level", "resistance_level", "long_term_forecast", "mid_term_forecast", "short_term_forecast", "key_points", "confidence_score", "stock_name", "symbol"}
-        if not (known_keys & set(analysis_obj.keys())) and core is not None:
-            analysis_obj = core
-    if analysis_obj is None:
-        raise HTTPException(status_code=400, detail="analysis_result.analysis 不能为空")
-
-    created_at = getattr(req, "timestamp", None) or datetime.utcnow().isoformat() + "Z"
-
-    stock_name = getattr(req, "stock_name", None) or (analysis_obj.get("stock_name") if isinstance(analysis_obj, dict) else None)
-
-    # 确保嵌套结构中包含股票代码/名称，便于前端展示
-    if isinstance(analysis_obj, dict):
-        updated_analysis = dict(analysis_obj)
-        updated_analysis.setdefault("symbol", req.symbol)
-        if stock_name:
-            updated_analysis.setdefault("stock_name", stock_name)
-    else:
-        updated_analysis = analysis_obj
-
-    stored_analysis_result = dict(analysis_result)
-    stored_analysis_result["analysis"] = updated_analysis
-
-    provider = req.provider or (analysis_result.get("provider") if isinstance(analysis_result, dict) else None)
-    model = req.model or (analysis_result.get("model") if isinstance(analysis_result, dict) else None)
-
-    history_doc = {
-        "user_id": current_user["id"],
-        "symbol": req.symbol,
-        "stock_name": stock_name,
-        "analysis_result": stored_analysis_result,
-        "provider": provider,
-        "model": model,
-        "created_at": created_at,
-        "timestamp": created_at,
-        "prompt": req.prompt
-    }
-    analysis_col.insert_one(history_doc)
-    return {"success": True}
 @router.get("/analysis-history")
 def get_analysis_history(symbol: Optional[str] = None, page: int = 1, limit: int = 50, current_user: dict = Depends(get_current_active_user)):
     """
