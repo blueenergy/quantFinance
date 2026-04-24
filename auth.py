@@ -10,6 +10,7 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, EmailStr
 from passlib.context import CryptContext
 import jwt
+import logging
 import os
 from pymongo import MongoClient
 from dotenv import load_dotenv
@@ -17,11 +18,20 @@ from dotenv import load_dotenv
 # 加载环境变量
 load_dotenv()
 
+_log = logging.getLogger(__name__)
+
 # JWT配置
 SECRET_KEY = os.getenv("JWT_SECRET_KEY", "your-secret-key-change-in-production")
 ALGORITHM = "HS256"
 # 默认 8 小时，可通过环境变量 JWT_ACCESS_EXPIRE_MINUTES 调整
 ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("JWT_ACCESS_EXPIRE_MINUTES", "480"))
+# 邮箱验证 / 自助激活等邮件链接的 JWT 密钥（与 user_config 中邮件令牌共用此变量）
+EMAIL_VERIFICATION_SECRET = os.getenv(
+    "EMAIL_VERIFICATION_SECRET", "email-verification-secret-change-in-production"
+)
+ACCOUNT_ACTIVATION_TOKEN_DAYS = int(os.getenv("ACCOUNT_ACTIVATION_TOKEN_DAYS", "7"))
+# 用户通过注册邮件自行激活时写入 approved_by
+APPROVED_BY_EMAIL_SELF_SERVICE = "email_link"
 
 # 密码加密
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
@@ -205,6 +215,19 @@ def notify_admins_new_user(user_doc: dict):
         import traceback
         traceback.print_exc()
 
+
+def issue_account_activation_jwt(user_id: str, username: str, email: str) -> str:
+    """自助开通账号用的邮件链接 JWT（与 /api/auth/activate 校验一致）。"""
+    data = {
+        "purpose": "account_activation",
+        "user_id": user_id,
+        "username": username,
+        "email": email,
+        "exp": datetime.utcnow() + timedelta(days=ACCOUNT_ACTIVATION_TOKEN_DAYS),
+    }
+    return jwt.encode(data, EMAIL_VERIFICATION_SECRET, algorithm=ALGORITHM)
+
+
 def create_user(user_data: UserCreate):
     """创建新用户"""
     print(f"DEBUG: 尝试创建用户: username={user_data.username}, email={user_data.email}")
@@ -254,21 +277,35 @@ def create_user(user_data: UserCreate):
     del user_doc["_id"]
     del user_doc["hashed_password"]  # 不返回密码哈希
     
-    print(f"DEBUG: 用户 {user_data.username} 创建成功，ID: {user_doc['id']}，等待管理员审批")
+    print(
+        f"DEBUG: 用户 {user_data.username} 创建成功，ID: {user_doc['id']}，"
+        f"可自助邮件激活或等待管理员审批"
+    )
     
-    # 注释掉邮件发送，改为管理员审批流程
-    # try:
-    #     from routers.user_config import send_verification_email
-    #     print(f"DEBUG: 开始发送验证邮件到 {user_data.email}")
-    #     email_sent = send_verification_email(user_data.email, user_data.username)
-    #     if email_sent:
-    #         print(f"SUCCESS: 验证邮件已成功发送到 {user_data.email}")
-    #     else:
-    #         print(f"WARNING: 向 {user_data.email} 发送验证邮件失败，请检查SMTP配置")
-    # except Exception as e:
-    #     print(f"ERROR: 发送验证邮件时出错: {e}")
-    #     import traceback
-    #     traceback.print_exc()
+    # 发送自助开通邮件（未配置 SMTP 时静默跳过，不阻断注册）
+    if os.getenv("SEND_REGISTRATION_ACTIVATION_EMAIL", "true").lower() not in (
+        "0",
+        "false",
+        "no",
+    ):
+        try:
+            from services.email_service import email_service
+
+            act_token = issue_account_activation_jwt(
+                user_doc["id"], user_data.username, user_data.email
+            )
+            fe = os.getenv("FRONTEND_URL", "http://localhost:5173").rstrip("/")
+            activation_url = f"{fe}/activate?token={act_token}"
+            sent = email_service.send_self_activation_email(
+                user_data.email, user_data.username, activation_url
+            )
+            if not sent:
+                _log.warning(
+                    "注册激活邮件未发出（未配置邮件或失败），用户仍可由管理员审批: %s",
+                    user_data.email,
+                )
+        except Exception as e:
+            _log.warning("发送注册激活邮件失败: %s", e, exc_info=True)
     
     # 给管理员发送通知
     try:

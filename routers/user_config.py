@@ -5,7 +5,13 @@ from typing import Optional, List
 from datetime import datetime, timedelta
 import jwt
 import os
-from auth import get_current_active_user, users_collection, SECRET_KEY, ALGORITHM
+from auth import (
+    get_current_active_user,
+    users_collection,
+    SECRET_KEY,
+    ALGORITHM,
+    EMAIL_VERIFICATION_SECRET,
+)
 from models.all_models import UpdateLLMConfigRequest
 from bson.objectid import ObjectId
 import smtplib
@@ -14,8 +20,7 @@ from email.mime.multipart import MIMEMultipart
 
 router = APIRouter()
 
-# 邮箱验证相关
-EMAIL_VERIFICATION_SECRET = os.getenv("EMAIL_VERIFICATION_SECRET", "email-verification-secret-change-in-production")
+# 邮箱验证 JWT 使用 auth.EMAIL_VERIFICATION_SECRET
 
 class UpdateProfileRequest(BaseModel):
     full_name: Optional[str] = None
@@ -72,8 +77,16 @@ def send_verification_email(email: str, username: str):
     }
     verification_token = jwt.encode(verification_data, EMAIL_VERIFICATION_SECRET, algorithm=ALGORITHM)
     
-    # 构建验证链接 (这里使用占位符，实际使用时需要替换为真实URL)
-    verification_link = f"http://yourdomain.com/api/user/verify-email?token={verification_token}"
+    # 与自助激活一样：可指向「前端 + 调 API」或直链 API；这里直链 API 以兼容无前端场景
+    base = os.getenv("API_PUBLIC_URL", "").rstrip("/")
+    if not base:
+        use_https = os.getenv("USE_HTTPS", "false").lower() == "true"
+        public_host = os.getenv("PUBLIC_HOST", "localhost")
+        scheme = "https" if use_https else "http"
+        port = os.getenv("PUBLIC_API_PORT", "").strip()
+        host_part = f"{public_host}:{port}" if port else public_host
+        base = f"{scheme}://{host_part}"
+    verification_link = f"{base}/api/user/verify-email?token={verification_token}"
     
     # 发送邮件的逻辑 (这里使用伪代码，实际需要配置邮件服务器)
     try:

@@ -481,6 +481,69 @@ Worker 明细:
             text_body=text
         )
 
+    def send_self_activation_email(
+        self,
+        to_email: str,
+        username: str,
+        activation_url: str
+    ) -> bool:
+        """新用户注册后：邮件内链接在前端 /activate 完成账户开通（与管理员审批可并存，幂等）。"""
+        html = f"""<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <style>
+    body {{ margin: 0; padding: 0; background: #f0f2f5; font-family: 'PingFang SC', 'Helvetica Neue', Arial, sans-serif; }}
+    .wrapper {{ max-width: 620px; margin: 30px auto; background: #ffffff; border-radius: 12px; overflow: hidden; box-shadow: 0 4px 24px rgba(0,0,0,0.10); }}
+    .header {{ background: linear-gradient(135deg, #6b8ef7 0%, #a78bfa 100%); padding: 40px 30px 32px; text-align: center; }}
+    .header h1 {{ margin: 0 0 6px; color: #fff; font-size: 22px; font-weight: 700; }}
+    .header p {{ margin: 0; color: rgba(255,255,255,0.9); font-size: 14px; }}
+    .content {{ padding: 32px 30px; }}
+    .greeting {{ font-size: 15px; color: #333; margin-bottom: 12px; }}
+    .intro {{ font-size: 14px; color: #555; line-height: 1.7; margin-bottom: 24px; }}
+    .cta-wrap {{ text-align: center; margin: 8px 0; }}
+    .cta-btn {{ display: inline-block; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: #fff !important; text-decoration: none; padding: 14px 36px; border-radius: 30px; font-size: 15px; font-weight: 600; box-shadow: 0 4px 14px rgba(102,126,234,0.35); }}
+    .tip {{ font-size: 12px; color: #999; margin-top: 20px; line-height: 1.6; }}
+    .footer {{ background: #f7f8fc; padding: 16px 30px; text-align: center; font-size: 12px; color: #aaa; }}
+  </style>
+</head>
+<body>
+  <div class="wrapper">
+    <div class="header">
+      <h1>请确认您的悟空量化注册</h1>
+      <p>点击按钮即可完成开通，无需等待人工审批</p>
+    </div>
+    <div class="content">
+      <p class="greeting">Hi <strong>{username}</strong>，</p>
+      <p class="intro">感谢您注册。点击下方按钮确认邮箱并开通账户。管理员也可能为您审批；若已开通，再次打开本邮件中的链接时我们会提示您直接登录。</p>
+      <div class="cta-wrap">
+        <a href="{activation_url}" class="cta-btn">完成开通</a>
+      </div>
+      <p class="tip">若按钮无法点击，请将以下链接复制到浏览器地址栏打开：<br>{activation_url}</p>
+    </div>
+    <div class="footer">本邮件由系统自动发出，请勿直接回复</div>
+  </div>
+</body>
+</html>"""
+
+        text = f"""Hi {username}，
+
+感谢您注册悟空量化。请访问以下链接完成账户开通（也可等待管理员人工审批后登录）：
+
+{activation_url}
+
+若链接已失效，可在登录页通过「重发开通邮件」再次获取（若本功能已在前端提供）。
+
+— 悟空量化"""
+
+        return self.send_email(
+            to_email=to_email,
+            subject="请确认并开通您的悟空量化账户",
+            html_body=html,
+            text_body=text
+        )
+
     def send_never_logged_in_reminder(
         self,
         to_email: str,
