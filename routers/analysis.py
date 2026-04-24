@@ -690,7 +690,7 @@ def get_analysis_history(symbol: Optional[str] = None, page: int = 1, limit: int
         # 解包可能的二次嵌套
         if isinstance(analysis_obj, dict) and "analysis" in analysis_obj:
             core = analysis_obj.get("analysis")
-            known_keys = {"technical_analysis", "investment_advice", "risk_level", "support_level", "resistance_level", "long_term_forecast", "mid_term_forecast", "short_term_forecast", "key_points", "confidence_score", "stock_name", "symbol"}
+            known_keys = {"technical_analysis", "investment_advice", "risk_level", "support_level", "resistance_level", "risk_price_levels", "long_term_forecast", "mid_term_forecast", "short_term_forecast", "key_points", "confidence_score", "stock_name", "symbol"}
             if not (known_keys & set(analysis_obj.keys())) and core is not None:
                 analysis_obj = core
 
