@@ -1,3 +1,4 @@
+import os
 from bson import ObjectId
 from fastapi import APIRouter, Depends, Query, HTTPException, Body
 from typing import List
@@ -5,6 +6,7 @@ from auth import get_current_admin_user, log_admin_action, create_admin_user
 from db import get_db_collections, get_analyzer_db, get_data_db
 from datetime import timedelta, datetime, timezone
 from utils.stock_utils import serialize_doc
+from services.email_service import email_service
 import time
 from models.all_models import (
     WorkerNodeRegisterRequest,
@@ -315,7 +317,22 @@ def approve_user(
             target_user_id=user_id,
             details=f"Approved user {user.get('username')} ({user.get('email')})"
         )
-        
+
+        # 发送审批通过邮件通知（非阻断，失败不影响审批结果）
+        try:
+            use_https = os.getenv("USE_HTTPS", "false").lower() == "true"
+            public_host = os.getenv("PUBLIC_HOST", "localhost")
+            scheme = "https" if use_https else "http"
+            login_url = f"{scheme}://{public_host}"
+            email_service.send_account_approved_email(
+                to_email=user.get("email", ""),
+                username=user.get("username", ""),
+                login_url=login_url
+            )
+        except Exception as email_err:
+            import logging
+            logging.getLogger(__name__).warning(f"审批通知邮件发送失败: {email_err}")
+
         return {
             "success": True,
             "message": f"已成功批准用户 {user.get('username')}",
@@ -392,6 +409,125 @@ def reject_user(
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"拒绝用户失败: {str(e)}")
+
+
+@router.post("/users/notify-never-logged-in")
+def notify_never_logged_in_users(
+    admin_user: dict = Depends(get_current_admin_user)
+):
+    """批量给所有已审批但从未登录过的用户发送登录提醒邮件"""
+    try:
+        never_logged_in = list(users_collection.find({
+            "approval_status": "approved",
+            "is_active": True,
+            "last_login": None
+        }))
+
+        use_https = os.getenv("USE_HTTPS", "false").lower() == "true"
+        public_host = os.getenv("PUBLIC_HOST", "localhost")
+        scheme = "https" if use_https else "http"
+        login_url = f"{scheme}://{public_host}"
+
+        total = len(never_logged_in)
+        sent = 0
+        failed_users = []
+
+        for user in never_logged_in:
+            to_email = user.get("email", "")
+            username = user.get("username", "")
+            if not to_email:
+                failed_users.append({"username": username, "reason": "邮箱为空"})
+                continue
+            success = email_service.send_never_logged_in_reminder(
+                to_email=to_email,
+                username=username,
+                login_url=login_url
+            )
+            if success:
+                sent += 1
+            else:
+                failed_users.append({"username": username, "email": to_email, "reason": "SMTP发送失败"})
+
+        log_admin_action(
+            admin_user=admin_user,
+            action="NOTIFY_NEVER_LOGGED_IN",
+            target_user_id=None,
+            details=f"Sent login reminders: {sent}/{total} succeeded"
+        )
+
+        return {
+            "success": True,
+            "message": f"提醒发送完成：{sent}/{total} 封成功",
+            "data": {
+                "total": total,
+                "sent": sent,
+                "failed": len(failed_users),
+                "failed_users": failed_users
+            }
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"批量发送提醒失败: {str(e)}")
+
+
+@router.post("/users/{user_id}/send-reminder")
+def send_user_reminder(
+    user_id: str,
+    admin_user: dict = Depends(get_current_admin_user)
+):
+    """给指定已审批但从未登录的用户发送登录提醒邮件"""
+    try:
+        user = users_collection.find_one({"_id": ObjectId(user_id)})
+        if not user:
+            raise HTTPException(status_code=404, detail="用户不存在")
+
+        if user.get("approval_status") != "approved":
+            raise HTTPException(status_code=400, detail="只能向已审批通过的用户发送提醒")
+
+        if user.get("last_login") is not None:
+            raise HTTPException(status_code=400, detail="该用户已经登录过，无需发送提醒")
+
+        to_email = user.get("email", "")
+        if not to_email:
+            raise HTTPException(status_code=400, detail="用户邮箱为空，无法发送提醒")
+
+        use_https = os.getenv("USE_HTTPS", "false").lower() == "true"
+        public_host = os.getenv("PUBLIC_HOST", "localhost")
+        scheme = "https" if use_https else "http"
+        login_url = f"{scheme}://{public_host}"
+
+        success = email_service.send_never_logged_in_reminder(
+            to_email=to_email,
+            username=user.get("username", ""),
+            login_url=login_url
+        )
+
+        if not success:
+            raise HTTPException(status_code=503, detail="邮件发送失败，请检查 SMTP 配置")
+
+        log_admin_action(
+            admin_user=admin_user,
+            action="SEND_LOGIN_REMINDER",
+            target_user_id=user_id,
+            details=f"Sent login reminder to {user.get('username')} ({to_email})"
+        )
+
+        return {
+            "success": True,
+            "message": f"已向 {user.get('username')} 发送登录提醒",
+            "data": {
+                "user_id": user_id,
+                "username": user.get("username"),
+                "email": to_email
+            }
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"发送提醒失败: {str(e)}")
 
 
 @router.post("/worker-nodes/register")

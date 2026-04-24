@@ -9,6 +9,7 @@ Provides email sending capabilities for:
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+from email.utils import formataddr
 from datetime import datetime
 from typing import Dict, List, Any, Optional
 import logging
@@ -22,11 +23,11 @@ class EmailService:
     
     def __init__(self):
         """Initialize email service with configuration from environment."""
-        self.smtp_host = os.getenv("SMTP_HOST", "smtp.gmail.com")
+        self.smtp_host = os.getenv("SMTP_SERVER", "smtp.gmail.com")
         self.smtp_port = int(os.getenv("SMTP_PORT", "587"))
-        self.smtp_user = os.getenv("SMTP_USER", "")
+        self.smtp_user = os.getenv("SMTP_USERNAME", "")
         self.smtp_password = os.getenv("SMTP_PASSWORD", "")
-        self.from_email = os.getenv("FROM_EMAIL", self.smtp_user)
+        self.from_email = os.getenv("SMTP_FROM_EMAIL", self.smtp_user)
         self.from_name = os.getenv("FROM_NAME", "悟空量化")
         
         self.enabled = bool(self.smtp_user and self.smtp_password)
@@ -60,7 +61,7 @@ class EmailService:
             # Create message
             msg = MIMEMultipart('alternative')
             msg['Subject'] = subject
-            msg['From'] = f"{self.from_name} <{self.from_email}>"
+            msg['From'] = formataddr((self.from_name, self.from_email))
             msg['To'] = to_email
             
             # Add text and HTML parts
@@ -331,6 +332,241 @@ Worker 明细:
             to_email=to_email,
             subject=f"⚡ 新信号 - {symbol} {action}",
             html_body=html
+        )
+
+
+    def send_account_approved_email(
+        self,
+        to_email: str,
+        username: str,
+        login_url: str
+    ) -> bool:
+        """Send account approval notification to user.
+
+        Args:
+            to_email: Recipient email
+            username: User's username
+            login_url: URL to login page
+        """
+        html = f"""<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <style>
+    body {{ margin: 0; padding: 0; background: #f0f2f5; font-family: 'PingFang SC', 'Helvetica Neue', Arial, sans-serif; }}
+    .wrapper {{ max-width: 620px; margin: 30px auto; background: #ffffff; border-radius: 12px; overflow: hidden; box-shadow: 0 4px 24px rgba(0,0,0,0.10); }}
+    .header {{ background: linear-gradient(135deg, #667eea 0%, #f6d365 100%); padding: 42px 30px 32px; text-align: center; }}
+    .header-icon {{ font-size: 48px; line-height: 1; margin-bottom: 10px; }}
+    .header h1 {{ margin: 0 0 6px; color: #fff; font-size: 22px; font-weight: 700; letter-spacing: 1px; text-shadow: 0 1px 4px rgba(0,0,0,0.18); }}
+    .header p {{ margin: 0; color: rgba(255,255,255,0.90); font-size: 14px; }}
+    .content {{ padding: 32px 30px 24px; }}
+    .greeting {{ font-size: 15px; color: #333; margin-bottom: 6px; }}
+    .intro {{ font-size: 14px; color: #555; margin-bottom: 24px; line-height: 1.7; }}
+    .section-title {{ font-size: 13px; font-weight: 600; color: #888; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 14px; }}
+    .feature-grid {{ display: table; width: 100%; border-collapse: separate; border-spacing: 0 10px; }}
+    .feature-item {{ display: table-row; }}
+    .feature-icon-cell {{ display: table-cell; width: 52px; vertical-align: top; padding: 14px 0 14px 16px; background: #f7f8fc; border-radius: 10px 0 0 10px; border-left: 3px solid #667eea; }}
+    .feature-icon {{ font-size: 24px; line-height: 1; }}
+    .feature-body-cell {{ display: table-cell; vertical-align: top; padding: 14px 16px; background: #f7f8fc; border-radius: 0 10px 10px 0; }}
+    .feature-name {{ font-size: 14px; font-weight: 700; color: #333; margin-bottom: 3px; }}
+    .feature-desc {{ font-size: 12px; color: #777; line-height: 1.6; }}
+    .spacer {{ height: 10px; }}
+    .cta-wrap {{ text-align: center; margin: 28px 0 8px; }}
+    .cta-btn {{ display: inline-block; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: #ffffff !important; text-decoration: none; padding: 14px 40px; border-radius: 30px; font-size: 15px; font-weight: 700; letter-spacing: 0.5px; box-shadow: 0 4px 14px rgba(102,126,234,0.40); }}
+    .footer {{ background: #f7f8fc; padding: 18px 30px; text-align: center; font-size: 12px; color: #aaa; line-height: 1.7; }}
+    .footer a {{ color: #667eea; text-decoration: none; }}
+  </style>
+</head>
+<body>
+  <div class="wrapper">
+    <div class="header">
+      <div class="header-icon">🔥</div>
+      <h1>悟空量化金融智能助手</h1>
+      <p>您的账号已通过审批，欢迎加入！</p>
+    </div>
+    <div class="content">
+      <p class="greeting">Hi <strong>{username}</strong>，</p>
+      <p class="intro">
+        恭喜您，您的悟空量化账号已正式开通！<br>
+        以下是平台五大核心功能导览，助您快速上手，抓住每一个量化机会。
+      </p>
+
+      <p class="section-title">平台核心功能</p>
+
+      <div class="feature-grid">
+        <div class="feature-item">
+          <div class="feature-icon-cell"><div class="feature-icon">🌍</div></div>
+          <div class="feature-body-cell">
+            <div class="feature-name">隔夜全球市场联动分析</div>
+            <div class="feature-desc">盘前掌握美股、港股、期货隔夜动向，AI 研判 A 股开盘方向，比市场早一步布局。</div>
+          </div>
+        </div>
+        <div class="spacer"></div>
+        <div class="feature-item">
+          <div class="feature-icon-cell"><div class="feature-icon">📢</div></div>
+          <div class="feature-body-cell">
+            <div class="feature-name">AI 大盘分析公告栏</div>
+            <div class="feature-desc">AI 实时解读大盘走势与市场情绪，盘中盘后关键信号一目了然，永远不错过重要节点。</div>
+          </div>
+        </div>
+        <div class="spacer"></div>
+        <div class="feature-item">
+          <div class="feature-icon-cell"><div class="feature-icon">🏆</div></div>
+          <div class="feature-body-cell">
+            <div class="feature-name">股票金榜排名</div>
+            <div class="feature-desc">多维度量化评分驱动的选股排行，每日精选最强潜力股，让好股票主动找到您。</div>
+          </div>
+        </div>
+        <div class="spacer"></div>
+        <div class="feature-item">
+          <div class="feature-icon-cell"><div class="feature-icon">📊</div></div>
+          <div class="feature-body-cell">
+            <div class="feature-name">连板天梯</div>
+            <div class="feature-desc">实时追踪涨停连板个股，精准捕捉热点轮动与强势趋势延续机会，跟上主线节奏。</div>
+          </div>
+        </div>
+        <div class="spacer"></div>
+        <div class="feature-item">
+          <div class="feature-icon-cell"><div class="feature-icon">☯</div></div>
+          <div class="feature-body-cell">
+            <div class="feature-name">大盘阴阳谱</div>
+            <div class="feature-desc">独家市场多空强弱图谱，直观呈现资金博弈格局与趋势拐点信号，读懂市场内在节律。</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="cta-wrap">
+        <a href="{login_url}" class="cta-btn">🚀 立即登录，开始量化之旅</a>
+      </div>
+    </div>
+    <div class="footer">
+      悟空量化金融智能助手 &nbsp;·&nbsp; 本邮件由系统自动发送，请勿回复<br>
+      如有问题请联系管理员
+    </div>
+  </div>
+</body>
+</html>"""
+
+        text = f"""Hi {username}，
+
+恭喜您，您的悟空量化账号已正式开通！
+
+平台核心功能导览：
+
+🌍 隔夜全球市场联动分析
+   盘前掌握美股、港股、期货隔夜动向，AI 研判 A 股开盘方向。
+
+📢 AI 大盘分析公告栏
+   AI 实时解读大盘走势与市场情绪，盘中盘后关键信号一目了然。
+
+🏆 股票金榜排名
+   多维度量化评分驱动的选股排行，每日精选最强潜力股。
+
+📊 连板天梯
+   实时追踪涨停连板个股，精准捕捉热点轮动与强势趋势延续机会。
+
+☯ 大盘阴阳谱
+   独家市场多空强弱图谱，直观呈现资金博弈格局与趋势拐点信号。
+
+立即登录：{login_url}
+
+---
+悟空量化金融智能助手 · 本邮件由系统自动发送，请勿回复"""
+
+        return self.send_email(
+            to_email=to_email,
+            subject="🎉 您的悟空量化账号已开通 — 立即开始量化之旅",
+            html_body=html,
+            text_body=text
+        )
+
+    def send_never_logged_in_reminder(
+        self,
+        to_email: str,
+        username: str,
+        login_url: str
+    ) -> bool:
+        """Send login reminder to an approved-but-never-logged-in user.
+
+        Args:
+            to_email: Recipient email
+            username: User's username
+            login_url: URL to login page
+        """
+        html = f"""<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <style>
+    body {{ margin: 0; padding: 0; background: #f0f2f5; font-family: 'PingFang SC', 'Helvetica Neue', Arial, sans-serif; }}
+    .wrapper {{ max-width: 620px; margin: 30px auto; background: #ffffff; border-radius: 12px; overflow: hidden; box-shadow: 0 4px 24px rgba(0,0,0,0.10); }}
+    .header {{ background: linear-gradient(135deg, #f6d365 0%, #fd7043 100%); padding: 40px 30px 30px; text-align: center; }}
+    .header-icon {{ font-size: 48px; line-height: 1; margin-bottom: 10px; }}
+    .header h1 {{ margin: 0 0 6px; color: #fff; font-size: 22px; font-weight: 700; letter-spacing: 1px; text-shadow: 0 1px 4px rgba(0,0,0,0.18); }}
+    .header p {{ margin: 0; color: rgba(255,255,255,0.90); font-size: 14px; }}
+    .content {{ padding: 32px 30px 24px; }}
+    .greeting {{ font-size: 15px; color: #333; margin-bottom: 6px; }}
+    .intro {{ font-size: 14px; color: #555; margin-bottom: 24px; line-height: 1.7; }}
+    .highlight-box {{ background: linear-gradient(135deg, #fff8e1 0%, #fff3e0 100%); border-left: 4px solid #fd7043; border-radius: 0 8px 8px 0; padding: 16px 20px; margin-bottom: 24px; font-size: 13px; color: #555; line-height: 1.8; }}
+    .highlight-box strong {{ color: #e65100; }}
+    .cta-wrap {{ text-align: center; margin: 28px 0 8px; }}
+    .cta-btn {{ display: inline-block; background: linear-gradient(135deg, #f6d365 0%, #fd7043 100%); color: #ffffff !important; text-decoration: none; padding: 14px 40px; border-radius: 30px; font-size: 15px; font-weight: 700; letter-spacing: 0.5px; box-shadow: 0 4px 14px rgba(253,112,67,0.40); }}
+    .footer {{ background: #f7f8fc; padding: 18px 30px; text-align: center; font-size: 12px; color: #aaa; line-height: 1.7; }}
+  </style>
+</head>
+<body>
+  <div class="wrapper">
+    <div class="header">
+      <div class="header-icon">👋</div>
+      <h1>悟空量化金融智能助手</h1>
+      <p>您的账号还在等待您的第一次登录</p>
+    </div>
+    <div class="content">
+      <p class="greeting">Hi <strong>{username}</strong>，</p>
+      <p class="intro">
+        您的悟空量化账号已通过审批并开通，但我们注意到您还<strong>从未登录过</strong>。<br>
+        量化市场每天都在变化，不想错过每日盘前的全球联动分析、AI 大盘公告栏与金榜选股吧？
+      </p>
+      <div class="highlight-box">
+        <strong>现在登录，您可以立即体验：</strong><br>
+        🌍 隔夜全球市场联动分析，盘前占据先机<br>
+        📢 AI 大盘分析公告栏，盘中盘后实时播报<br>
+        🏆 股票金榜排名，量化评分筛出强势股<br>
+        📊 连板天梯 &amp; ☯ 大盘阴阳谱，读懂市场节律
+      </div>
+      <div class="cta-wrap">
+        <a href="{login_url}" class="cta-btn">🚀 立即登录</a>
+      </div>
+    </div>
+    <div class="footer">
+      悟空量化金融智能助手 &nbsp;·&nbsp; 本邮件由管理员触发发送，请勿回复
+    </div>
+  </div>
+</body>
+</html>"""
+
+        text = f"""Hi {username}，
+
+您的悟空量化账号已开通，但我们注意到您还从未登录过。
+
+现在登录，您可以立即体验：
+🌍 隔夜全球市场联动分析，盘前占据先机
+📢 AI 大盘分析公告栏，盘中盘后实时播报
+🏆 股票金榜排名，量化评分筛出强势股
+📊 连板天梯 & ☯ 大盘阴阳谱，读懂市场节律
+
+立即登录：{login_url}
+
+---
+悟空量化金融智能助手 · 本邮件由管理员触发发送，请勿回复"""
+
+        return self.send_email(
+            to_email=to_email,
+            subject="👋 您的悟空量化账号还未激活 — 快来探索量化世界",
+            html_body=html,
+            text_body=text
         )
 
 
