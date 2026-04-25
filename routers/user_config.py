@@ -1,10 +1,11 @@
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, EmailStr
-from typing import Optional, List
+from typing import Optional, List, Any, Dict
 from datetime import datetime, timedelta
 import jwt
 import os
+import logging
 from auth import (
     get_current_active_user,
     users_collection,
@@ -19,8 +20,40 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 
 router = APIRouter()
+_log = logging.getLogger(__name__)
 
 # 邮箱验证 JWT 使用 auth.EMAIL_VERIFICATION_SECRET
+
+
+def _llm_config_id_str(raw_id: Any) -> str:
+    if raw_id is None:
+        return ""
+    return str(raw_id).strip()
+
+
+def _llm_config_ids_equal(a: Any, b: Any) -> bool:
+    """Match llm_configs._id whether stored as ObjectId or str (24-hex)."""
+    sa = _llm_config_id_str(a)
+    sb = _llm_config_id_str(b)
+    if not sa or not sb:
+        return False
+    if sa == sb:
+        return True
+    try:
+        return ObjectId(sa) == ObjectId(sb)
+    except Exception:
+        return False
+
+
+def _safe_created_at_iso(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    if hasattr(value, "isoformat"):
+        try:
+            return value.isoformat()
+        except Exception:
+            return str(value)
+    return str(value)
 
 class UpdateProfileRequest(BaseModel):
     full_name: Optional[str] = None
@@ -507,48 +540,29 @@ def get_llm_configs(current_user: dict = Depends(get_current_active_user)):
         configs = user.get("llm_configs", [])
         if not isinstance(configs, list):
             configs = []
-        
-        result = []
+
+        result: List[Dict[str, Any]] = []
         for idx, config in enumerate(configs):
-            try:
-                print(f"处理配置 {idx}: {config}")  # 调试日志
-                
-                config_id = config.get("_id")
-                # 安全串行化ObjectId
-                if config_id:
-                    config_id_str = str(config_id) if not isinstance(config_id, str) else config_id
-                    print(f"配置ID: {config_id_str}, 类型: {type(config_id)}")  # 调试日志
-                else:
-                    config_id_str = ""
-                    print(f"警告: 配置 {idx} 没有_id字段")
-                
-                item = {
-                    "id": config_id_str,
-                    "name": config.get("name", ""),
-                    "provider": config.get("provider", ""),
-                    "base_url": config.get("base_url"),
-                    "model": config.get("model"),
-                }
-                
-                # 只在created_at是日期时添加
-                created_at = config.get("created_at")
-                if created_at:
-                    try:
-                        item["created_at"] = created_at.isoformat() if hasattr(created_at, 'isoformat') else str(created_at)
-                        print(f"created_at处理成功: {item['created_at']}")
-                    except Exception as dt_err:
-                        print(f"created_at处理失败: {dt_err}, 值: {created_at}, 类型: {type(created_at)}")
-                        item["created_at"] = str(created_at)
-                
-                result.append(item)
-                print(f"成功添加配置 {idx}")
-            except Exception as e:
-                print(f"处理配置 {idx} 出错: {e}, config: {config}")
-                import traceback
-                traceback.print_exc()
+            if not isinstance(config, dict):
+                _log.warning("llm_configs[%s] is not a dict, skipped", idx)
                 continue
-        
-        print(f"成功获取{len(result)}个配置")
+            rid = _llm_config_id_str(config.get("_id"))
+            if not rid:
+                _log.warning("llm_configs[%s] missing _id, skipped name=%r", idx, config.get("name"))
+                continue
+            item = {
+                "id": rid,
+                "name": config.get("name", ""),
+                "provider": config.get("provider", ""),
+                "base_url": config.get("base_url"),
+                "model": config.get("model"),
+            }
+            ca = _safe_created_at_iso(config.get("created_at"))
+            if ca:
+                item["created_at"] = ca
+            result.append(item)
+
+        _log.debug("get_llm_configs: %s entries -> %s rows", len(configs), len(result))
         return result
     except HTTPException:
         raise
@@ -619,13 +633,13 @@ def update_llm_config(
     if not user:
         raise HTTPException(status_code=404, detail="用户不存在")
     
-    # 查找配置
+    # 查找配置（子文档 _id 可能是 ObjectId 或 str）
     config_index = None
     for i, cfg in enumerate(user.get("llm_configs", [])):
-        if cfg.get("_id") == config_oid:
+        if isinstance(cfg, dict) and _llm_config_ids_equal(cfg.get("_id"), config_id):
             config_index = i
             break
-    
+
     if config_index is None:
         raise HTTPException(status_code=404, detail="配置不存在")
     
@@ -644,10 +658,10 @@ def update_llm_config(
     if request.model is not None:
         update_data["model"] = request.model
     
-    # 更新配置
+    # 按数组下标更新，避免子文档 _id 类型与查询条件不一致导致 matched=0
     result = users_collection.update_one(
-        {"_id": ObjectId(current_user["id"]), "llm_configs._id": config_oid},
-        {"$set": {f"llm_configs.$.{k}": v for k, v in update_data.items()}}
+        {"_id": ObjectId(current_user["id"])},
+        {"$set": {f"llm_configs.{config_index}.{k}": v for k, v in update_data.items()}},
     )
     
     if result.modified_count > 0:
@@ -655,12 +669,12 @@ def update_llm_config(
         user = users_collection.find_one({"_id": ObjectId(current_user["id"])})
         updated_config = None
         for cfg in user.get("llm_configs", []):
-            if cfg.get("_id") == config_oid:
+            if isinstance(cfg, dict) and _llm_config_ids_equal(cfg.get("_id"), config_id):
                 updated_config = cfg
                 break
-        
+
         return {
-            "id": str(updated_config["_id"]),
+            "id": _llm_config_id_str(updated_config["_id"]),
             "name": updated_config["name"],
             "provider": updated_config["provider"],
             "base_url": updated_config.get("base_url"),
@@ -678,28 +692,35 @@ def delete_llm_config(
 ):
     """删除指定的LLM配置"""
     try:
-        config_oid = ObjectId(config_id)
-    except:
+        ObjectId(config_id)
+    except Exception:
         raise HTTPException(status_code=400, detail="无效的配置ID")
-    
-    # 如果删除的是激活的配置，先取消激活
+
     user = users_collection.find_one({"_id": ObjectId(current_user["id"])})
-    if user and user.get("active_llm_config_id") == config_id:
-        users_collection.update_one(
-            {"_id": ObjectId(current_user["id"])},
-            {"$set": {"active_llm_config_id": None}}
-        )
-    
-    # 删除配置
+    if not user:
+        raise HTTPException(status_code=404, detail="用户不存在")
+
+    configs = list(user.get("llm_configs") or [])
+    new_cfgs = [
+        c
+        for c in configs
+        if isinstance(c, dict) and not _llm_config_ids_equal(c.get("_id"), config_id)
+    ]
+    if len(new_cfgs) == len(configs):
+        raise HTTPException(status_code=404, detail="配置不存在")
+
+    set_doc: Dict[str, Any] = {"llm_configs": new_cfgs}
+    if _llm_config_ids_equal(user.get("active_llm_config_id"), config_id):
+        set_doc["active_llm_config_id"] = None
+
     result = users_collection.update_one(
         {"_id": ObjectId(current_user["id"])},
-        {"$pull": {"llm_configs": {"_id": config_oid}}}
+        {"$set": set_doc},
     )
-    
-    if result.modified_count > 0:
+
+    if result.modified_count > 0 or result.matched_count > 0:
         return {"success": True, "message": "配置删除成功"}
-    else:
-        raise HTTPException(status_code=404, detail="配置不存在")
+    raise HTTPException(status_code=404, detail="配置不存在")
 
 
 @router.post("/llm-configs/{config_id}/activate")
@@ -709,21 +730,24 @@ def activate_llm_config(
 ):
     """激活指定的LLM配置"""
     try:
-        config_oid = ObjectId(config_id)
-    except:
+        ObjectId(config_id)
+    except Exception:
         raise HTTPException(status_code=400, detail="无效的配置ID")
-    
+
     # 验证配置存在
     user = users_collection.find_one({"_id": ObjectId(current_user["id"])})
     if not user:
         raise HTTPException(status_code=404, detail="用户不存在")
     
-    config_exists = any(cfg.get("_id") == config_oid for cfg in user.get("llm_configs", []))
+    config_exists = any(
+        isinstance(cfg, dict) and _llm_config_ids_equal(cfg.get("_id"), config_id)
+        for cfg in user.get("llm_configs", [])
+    )
     if not config_exists:
         raise HTTPException(status_code=404, detail="配置不存在")
-    
-    # 检查是否已经激活
-    if user.get("active_llm_config_id") == config_id:
+
+    # 检查是否已经激活（兼容 active_llm_config_id 存 ObjectId / str）
+    if _llm_config_ids_equal(user.get("active_llm_config_id"), config_id):
         return {"success": True, "message": "该配置已经是激活状态"}
     
     # 激活配置
