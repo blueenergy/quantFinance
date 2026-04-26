@@ -1,5 +1,5 @@
 from fastapi import APIRouter, Query, HTTPException, Depends
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 from db import db, data_db, analyzer_db
 import pandas as pd
 from auth import get_current_active_user
@@ -191,37 +191,109 @@ async def get_etf_watchlist(
     return {"success": True, "count": len(result), "data": result}
 
 
+def _etf_kline_fetch_limit(tf: str, user_limit: int, has_date_filter: bool) -> int:
+    """
+    For weekly/monthly bars we need enough daily points before resampling.
+    With an explicit date range, cap raw daily rows; otherwise use heuristics.
+    """
+    if has_date_filter:
+        return min(20_000, 10_000)  # enough dailies for any reasonable range; hard cap
+    if tf in ("1w", "1m", "w", "m"):
+        return min(5_000, max(int(user_limit) * 35, 800))
+    return int(user_limit)
+
+
+def _agg_etf_ohlc_to_df(df: pd.DataFrame, rule: str) -> pd.DataFrame:
+    """
+    Resample pre-adjusted daily rows to week/month.
+    - OHLC + pre_adj_*: first|max|min|last; vol/amount: sum; fd_share: last.
+    - Same as shenwan_index _agg: W-FRI / month-end. Input df: ascending trade_date.
+    """
+    if df is None or df.empty or "trade_date" not in df.columns:
+        return pd.DataFrame()
+    d = df.copy()
+    d["td"] = pd.to_datetime(d["trade_date"].astype(str), format="%Y%m%d", errors="coerce")
+    d = d.dropna(subset=["td"]).set_index("td").sort_index()
+    ag: Dict[str, str] = {"open": "first", "high": "max", "low": "min", "close": "last"}
+    ohlc_cols: Dict[str, str] = {}
+    for c, how in ag.items():
+        if c in d.columns:
+            ohlc_cols[c] = how
+    for base in ("open", "high", "low", "close"):
+        pac = f"pre_adj_{base}"
+        if pac in d.columns and pac not in ohlc_cols:
+            ohlc_cols[pac] = ag[base]
+    if not ohlc_cols:
+        return pd.DataFrame()
+    if rule == "1w":
+        rule_s = "W-FRI"
+        ohlc = d.resample(rule_s, label="right", closed="right").agg(ohlc_cols)
+        if "vol" in d.columns:
+            ohlc["vol"] = d["vol"].resample(rule_s, label="right", closed="right").sum()
+        if "amount" in d.columns:
+            ohlc["amount"] = d["amount"].resample(rule_s, label="right", closed="right").sum()
+        if "fd_share" in d.columns:
+            ohlc["fd_share"] = d["fd_share"].resample(rule_s, label="right", closed="right").last()
+    elif rule == "1m":
+        rule_s = "ME"
+        ohlc = d.resample(rule_s, label="right", closed="right").agg(ohlc_cols)
+        if "vol" in d.columns:
+            ohlc["vol"] = d["vol"].resample(rule_s, label="right", closed="right").sum()
+        if "amount" in d.columns:
+            ohlc["amount"] = d["amount"].resample(rule_s, label="right", closed="right").sum()
+        if "fd_share" in d.columns:
+            ohlc["fd_share"] = d["fd_share"].resample(rule_s, label="right", closed="right").last()
+    else:
+        return pd.DataFrame()
+    _sub = [c for c in ("close", "pre_adj_close") if c in ohlc.columns]
+    if _sub:
+        ohlc = ohlc.dropna(how="all", subset=_sub)
+    return ohlc
+
+
 @router.get("/{symbol}/kline")
 async def get_etf_kline(
     symbol: str, 
     start_date: Optional[str] = None, 
     end_date: Optional[str] = None,
-    limit: int = 1000
+    limit: int = 1000,
+    tf: str = Query("1d", description="1d daily, 1w weekly, 1m monthly (from daily bars)"),
 ):
     """
-    Get ETF daily K-line data, merged with adjustment factors (for pre-adjusted prices) 
-    and daily share scale.
+    Get ETF K-line: daily rows, or weekly/monthly resampled from pre-adjusted dailies.
     """
+    tfc = (tf or "1d").strip().lower()
+    if tfc in ("d",):
+        tfc = "1d"
+    if tfc in ("w",):
+        tfc = "1w"
+    if tfc in ("m",):
+        tfc = "1m"
+    if tfc not in ("1d", "1w", "1m"):
+        raise HTTPException(400, "tf must be 1d, 1w, or 1m")
+
     # Base query for the specific ETF
     query = {"ts_code": symbol}
     
     # Add date filters if provided
-    date_filter = {}
+    date_filter: Dict[str, str] = {}
     if start_date:
         date_filter["$gte"] = start_date.replace('-', '')
     if end_date:
         date_filter["$lte"] = end_date.replace('-', '')
-        
+    has_date_filter = bool(date_filter)        
     if date_filter:
         query["trade_date"] = date_filter
+
+    fetch_limit = _etf_kline_fetch_limit(tfc, int(limit), has_date_filter)
         
     # Execute queries synchronously (pymongo client is sync)
-    daily_results = list(data_db["etf_daily"].find(query, {"_id": 0}).sort("trade_date", -1).limit(limit))
-    adj_results = list(data_db["etf_adj_factor"].find(query, {"_id": 0}).sort("trade_date", -1).limit(limit))
-    share_results = list(data_db["etf_shares"].find(query, {"_id": 0}).sort("trade_date", -1).limit(limit))
+    daily_results = list(data_db["etf_daily"].find(query, {"_id": 0}).sort("trade_date", -1).limit(fetch_limit))
+    adj_results = list(data_db["etf_adj_factor"].find(query, {"_id": 0}).sort("trade_date", -1).limit(fetch_limit))
+    share_results = list(data_db["etf_shares"].find(query, {"_id": 0}).sort("trade_date", -1).limit(fetch_limit))
     
     if not daily_results:
-        return {"success": True, "symbol": symbol, "data": []}
+        return {"success": True, "symbol": symbol, "tf": tfc, "count": 0, "data": []}
         
     # Convert to pandas DataFrames for easy merging and calculation
     df_daily = pd.DataFrame(daily_results)
@@ -270,13 +342,61 @@ async def get_etf_kline(
         df = df.sort_values('trade_date', ascending=True)
         df["fd_share"] = df["fd_share"].ffill()
         
-        # Sort back to descending for API output
+        # Sort back to descending for API output (1d)
         df = df.sort_values('trade_date', ascending=False)
     else:
         df['fd_share'] = None
-        
-    
+
     import math
+
+    def _rows_to_json(df_in: pd.DataFrame) -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
+        for row in df_in.to_dict("records"):
+            clean_row: Dict[str, Any] = {}
+            for k, v in row.items():
+                if k == "td":
+                    continue
+                if pd.isna(v) or (isinstance(v, float) and (math.isnan(v) or math.isinf(v))):
+                    clean_row[k] = None
+                else:
+                    if hasattr(v, "item"):
+                        v = v.item()
+                    clean_row[k] = v
+            out.append(clean_row)
+        return out
+
+    if tfc in ("1w", "1m"):
+        df_asc = df.sort_values("trade_date", ascending=True)
+        ohlc_df = _agg_etf_ohlc_to_df(df_asc, tfc)
+        if ohlc_df is None or ohlc_df.empty:
+            return {
+                "success": True,
+                "symbol": symbol,
+                "tf": tfc,
+                "count": 0,
+                "data": [],
+            }
+        ohlc_df = ohlc_df.reset_index()
+        time_col = ohlc_df.columns[0]
+        ohlc_df["trade_date"] = pd.to_datetime(ohlc_df[time_col], errors="coerce").map(
+            lambda x: x.strftime("%Y%m%d") if pd.notna(x) else None
+        )
+        ohlc_df = ohlc_df.drop(columns=[time_col], errors="ignore")
+        for _c in ohlc_df.columns:
+            if str(_c).startswith("pre_adj_"):
+                ohlc_df[_c] = ohlc_df[_c].round(3)
+        ohlc_df = ohlc_df.sort_values("trade_date", ascending=True)
+        ohlc_df = ohlc_df.tail(int(limit))
+        ohlc_df = ohlc_df.sort_values("trade_date", ascending=False)
+        merged_data = _rows_to_json(ohlc_df)
+        return {
+            "success": True,
+            "symbol": symbol,
+            "tf": tfc,
+            "count": len(merged_data),
+            "data": merged_data,
+        }
+
     merged_data = []
     for row in df.to_dict('records'):
         clean_row = {}
@@ -293,6 +413,7 @@ async def get_etf_kline(
     return {
         "success": True,
         "symbol": symbol,
+        "tf": tfc,
         "count": len(merged_data),
         "data": merged_data
     }

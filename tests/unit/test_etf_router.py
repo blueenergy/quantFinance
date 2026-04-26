@@ -1,4 +1,5 @@
 """Unit tests for routers.etf (Mongo faked via monkeypatch; no real DB)."""
+import pandas as pd
 import pytest
 from fastapi.testclient import TestClient
 from bson.decimal128 import Decimal128
@@ -228,7 +229,216 @@ def test_etf_kline_coerces_string_ohlc(monkeypatch):
     assert r.status_code == 200
     body = r.json()
     assert body["success"] is True
+    assert body["tf"] == "1d"
     assert body["count"] == 1
     bar = body["data"][0]
     assert bar["close"] == pytest.approx(3.15)
     assert "pre_adj_close" in bar
+
+
+@pytest.mark.unit
+def test_etf_kline_invalid_tf_returns_400():
+    client = TestClient(app)
+    r = client.get("/api/etf/510300.SH/kline", params={"tf": "1h"})
+    assert r.status_code == 400
+
+
+@pytest.mark.unit
+def test_etf_kline_weekly_sums_vol_and_labels_friday(monkeypatch):
+    """Two trading weeks: W-FRI resample, vol sum per week, pre_adj close = last in period."""
+    daily = []
+    w1 = ["20250331", "20250401", "20250402", "20250403", "20250404"]
+    w2 = ["20250407", "20250408", "20250409", "20250410", "20250411"]
+    for td in w1:
+        daily.append(
+            {
+                "ts_code": "510300.SH",
+                "trade_date": td,
+                "open": 1.0,
+                "high": 1.1,
+                "low": 0.9,
+                "close": 2.0 if td == "20250404" else 1.0,
+                "vol": 10.0,
+                "amount": 100.0,
+            }
+        )
+    for td in w2:
+        daily.append(
+            {
+                "ts_code": "510300.SH",
+                "trade_date": td,
+                "open": 1.0,
+                "high": 1.1,
+                "low": 0.9,
+                "close": 2.5 if td == "20250411" else 1.0,
+                "vol": 10.0,
+                "amount": 100.0,
+            }
+        )
+    monkeypatch.setattr(
+        etf_mod,
+        "data_db",
+        _make_data_db(
+            {
+                "etf_daily": DailyCollection(daily),
+                "etf_adj_factor": EmptyCollection(),
+                "etf_shares": EmptyCollection(),
+            }
+        ),
+    )
+    client = TestClient(app)
+    r = client.get("/api/etf/510300.SH/kline", params={"tf": "1w", "limit": 5})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["tf"] == "1w"
+    assert body["count"] == 2
+    # Newest first (20250411 week end)
+    w_new, w_old = body["data"][0], body["data"][1]
+    assert w_new["trade_date"] == "20250411"
+    assert w_new["pre_adj_close"] == pytest.approx(2.5)
+    assert w_new["vol"] == pytest.approx(50.0)
+    assert w_old["trade_date"] == "20250404"
+    assert w_old["pre_adj_close"] == pytest.approx(2.0)
+    assert w_old["vol"] == pytest.approx(50.0)
+
+
+@pytest.mark.unit
+def test_agg_etf_ohlc_weekly_pre_adj_vol_amount_fd_share():
+    """_agg_etf_ohlc_to_df 1w: 前复权列参与 OHLC 聚合；vol/amount 求和；fd_share 取周期末 last。"""
+    w1 = ["20250331", "20250401", "20250402", "20250403", "20250404"]
+    w2 = ["20250407", "20250408", "20250409", "20250410", "20250411"]
+    rows = []
+    for i, td in enumerate(w1):
+        rows.append(
+            {
+                "trade_date": td,
+                "open": 1.0,
+                "high": 1.1,
+                "low": 0.9,
+                "close": 1.0,
+                "pre_adj_open": 1.0,
+                "pre_adj_high": 1.1,
+                "pre_adj_low": 0.9,
+                "pre_adj_close": 2.0 if td == "20250404" else 1.0,
+                "vol": 10.0,
+                "amount": 100.0,
+                "fd_share": 100.0 if i < 4 else 999.0,
+            }
+        )
+    for i, td in enumerate(w2):
+        rows.append(
+            {
+                "trade_date": td,
+                "open": 1.0,
+                "high": 1.1,
+                "low": 0.9,
+                "close": 1.0,
+                "pre_adj_open": 1.0,
+                "pre_adj_high": 1.1,
+                "pre_adj_low": 0.9,
+                "pre_adj_close": 2.5 if td == "20250411" else 1.0,
+                "vol": 10.0,
+                "amount": 100.0,
+                "fd_share": 200.0 if i < 4 else 888.0,
+            }
+        )
+    df = pd.DataFrame(rows)
+    ohlc = etf_mod._agg_etf_ohlc_to_df(df, "1w")
+    assert not ohlc.empty
+    assert len(ohlc) == 2
+    ohlc = ohlc.sort_index()
+    r0, r1 = ohlc.iloc[0], ohlc.iloc[1]
+    assert r0["pre_adj_close"] == pytest.approx(2.0)
+    assert r0["pre_adj_open"] == pytest.approx(1.0)
+    assert r0["vol"] == pytest.approx(50.0)
+    assert r0["amount"] == pytest.approx(500.0)
+    assert r0["fd_share"] == pytest.approx(999.0)
+    assert r1["pre_adj_close"] == pytest.approx(2.5)
+    assert r1["vol"] == pytest.approx(50.0)
+    assert r1["fd_share"] == pytest.approx(888.0)
+
+
+@pytest.mark.unit
+def test_agg_etf_ohlc_monthly_pre_adj_and_fd_share():
+    """_agg_etf_ohlc_to_df 1m: 两月；量额求和；pre_adj_close=月末日；fd_share=月末 last。"""
+    df = pd.DataFrame(
+        [
+            {
+                "trade_date": "20250102",
+                "open": 1,
+                "high": 1.1,
+                "low": 0.9,
+                "close": 1.0,
+                "pre_adj_open": 1,
+                "pre_adj_high": 1.1,
+                "pre_adj_low": 0.9,
+                "pre_adj_close": 1.0,
+                "vol": 1,
+                "amount": 10.0,
+                "fd_share": 100.0,
+            },
+            {
+                "trade_date": "20250120",
+                "open": 1,
+                "high": 1.1,
+                "low": 0.9,
+                "close": 1.0,
+                "pre_adj_open": 1,
+                "pre_adj_high": 1.1,
+                "pre_adj_low": 0.9,
+                "pre_adj_close": 1.0,
+                "vol": 1,
+                "amount": 10.0,
+                "fd_share": 100.0,
+            },
+            {
+                "trade_date": "20250128",
+                "open": 1,
+                "high": 1.1,
+                "low": 0.9,
+                "close": 1.0,
+                "pre_adj_open": 1,
+                "pre_adj_high": 1.1,
+                "pre_adj_low": 0.9,
+                "pre_adj_close": 1.1,
+                "vol": 1,
+                "amount": 10.0,
+                "fd_share": 500.0,
+            },
+            {
+                "trade_date": "20250210",
+                "open": 2,
+                "high": 2.1,
+                "low": 1.9,
+                "close": 2.0,
+                "pre_adj_open": 2,
+                "pre_adj_high": 2.1,
+                "pre_adj_low": 1.9,
+                "pre_adj_close": 2.0,
+                "vol": 2,
+                "amount": 20.0,
+                "fd_share": 300.0,
+            },
+        ]
+    )
+    ohlc = etf_mod._agg_etf_ohlc_to_df(df, "1m")
+    assert len(ohlc) == 2
+    ohlc = ohlc.sort_index()
+    m0, m1 = ohlc.iloc[0], ohlc.iloc[1]
+    assert m0["pre_adj_close"] == pytest.approx(1.1)
+    assert m0["vol"] == pytest.approx(3.0)
+    assert m0["amount"] == pytest.approx(30.0)
+    assert m0["fd_share"] == pytest.approx(500.0)
+    assert m1["pre_adj_close"] == pytest.approx(2.0)
+    assert m1["vol"] == pytest.approx(2.0)
+    assert m1["fd_share"] == pytest.approx(300.0)
+
+
+@pytest.mark.unit
+def test_agg_etf_ohlc_empty_or_bad_rule():
+    assert etf_mod._agg_etf_ohlc_to_df(pd.DataFrame(), "1w").empty
+    assert etf_mod._agg_etf_ohlc_to_df(pd.DataFrame({"x": [1]}), "1w").empty
+    df = pd.DataFrame(
+        {"trade_date": ["20250102"], "open": [1.0], "high": [1.1], "low": [0.9], "close": [1.0], "pre_adj_close": [1.0]}
+    )
+    assert etf_mod._agg_etf_ohlc_to_df(df, "1x").empty
