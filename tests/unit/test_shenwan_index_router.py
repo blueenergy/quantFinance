@@ -1,4 +1,5 @@
 """shenwan_index 路由：参数校验与无数据路径（Mongo 用假集合，不连真库）。"""
+import pandas as pd
 import pytest
 from fastapi.testclient import TestClient
 
@@ -39,6 +40,9 @@ def test_kline_no_data_returns_message(monkeypatch):
 
     class _EmptyCur:
         def sort(self, *a, **k):
+            return self
+
+        def limit(self, *a, **k):
             return self
 
         def __iter__(self):
@@ -163,3 +167,64 @@ def test_tree_no_classify_returns_message(monkeypatch):
         assert "run_sw_industry_backfill" in (j.get("message") or "")
     finally:
         teardown_dep()
+
+
+@pytest.mark.unit
+def test_agg_ohlc_weekly_sums_vol_and_ohlc():
+    """W-FRI: open=first, high=max, low=min, close=last, vol/amount=sum。"""
+    rows = [
+        {
+            "trade_date": d,
+            "open": 1.0,
+            "high": 1.1,
+            "low": 0.9,
+            "close": 2.0 if d == "20250404" else 1.0,
+            "vol": 10.0,
+            "amount": 100.0,
+        }
+        for d in ["20250331", "20250401", "20250402", "20250403", "20250404"]
+    ]
+    rows += [
+        {
+            "trade_date": d,
+            "open": 1.0,
+            "high": 1.1,
+            "low": 0.9,
+            "close": 2.5 if d == "20250411" else 1.0,
+            "vol": 10.0,
+            "amount": 100.0,
+        }
+        for d in ["20250407", "20250408", "20250409", "20250410", "20250411"]
+    ]
+    df = pd.DataFrame(rows)
+    out = sm._agg_ohlc(df, "1w")
+    assert len(out) == 2
+    w_old, w_new = out[0], out[1]
+    assert w_new["trade_date"] == "20250411"
+    assert w_new["close"] == pytest.approx(2.5)
+    assert w_new["vol"] == pytest.approx(50.0)
+    assert w_old["trade_date"] == "20250404"
+    assert w_old["close"] == pytest.approx(2.0)
+    assert w_old["vol"] == pytest.approx(50.0)
+    assert w_new["amount"] == pytest.approx(500.0)
+
+
+@pytest.mark.unit
+def test_agg_ohlc_monthly_two_months():
+    """两自然月：量求和、收盘取各月最后一根日。"""
+    df = pd.DataFrame(
+        [
+            {"trade_date": "20250102", "open": 1, "high": 1.1, "low": 0.9, "close": 1.0, "vol": 1, "amount": 10},
+            {"trade_date": "20250110", "open": 1, "high": 1.1, "low": 0.9, "close": 1.0, "vol": 1, "amount": 10},
+            {"trade_date": "20250120", "open": 1, "high": 1.1, "low": 0.9, "close": 1.0, "vol": 1, "amount": 10},
+            {"trade_date": "20250210", "open": 2, "high": 2.1, "low": 1.9, "close": 2.0, "vol": 2, "amount": 20},
+        ]
+    )
+    out = sm._agg_ohlc(df, "1m")
+    assert len(out) == 2
+    assert out[0]["vol"] == pytest.approx(3.0)
+    assert out[0]["close"] == pytest.approx(1.0)
+    assert out[1]["vol"] == pytest.approx(2.0)
+    assert out[1]["close"] == pytest.approx(2.0)
+    assert out[0]["trade_date"][:6] == "202501"
+    assert out[1]["trade_date"][:6] == "202502"

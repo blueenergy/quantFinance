@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Optional
 
 import pandas as pd
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
-from pymongo import ASCENDING
+from pymongo import ASCENDING, DESCENDING
 
 from auth import get_current_active_user
 from db import data_db
@@ -220,10 +220,22 @@ async def get_children(
     }
 
 
-def _load_daily_ohlc(ts_code: str, start: str, end: str) -> pd.DataFrame:
+def _load_daily_ohlc(
+    ts_code: str, start: str, end: str, *, last_n: Optional[int] = None
+) -> pd.DataFrame:
+    """
+    加载 sw_daily 在 [start,end] 内的行。
+    - last_n: 仅取该区间内按日期最近的 last_n 条（Mongo 侧 sort desc + limit），降低日线量。
+    - 周/月聚合不传 last_n，需区间内全部日线。
+    """
     flt = _sw_daily_flt_ts_date_range(ts_code, start, end)
-    cur = _DAILY.find(flt, PROJ_KLINE).sort("trade_date", ASCENDING)
-    rows = list(cur)
+    if last_n is not None and int(last_n) > 0:
+        cur = _DAILY.find(flt, PROJ_KLINE).sort("trade_date", DESCENDING).limit(int(last_n))
+        rows = list(cur)
+        rows.reverse()  # ascending by trade_date，等同于全量后 tail(n)
+    else:
+        cur = _DAILY.find(flt, PROJ_KLINE).sort("trade_date", ASCENDING)
+        rows = list(cur)
     if not rows:
         return pd.DataFrame()
     df = pd.DataFrame(rows)
@@ -334,10 +346,13 @@ async def get_kline(
     if start_s > end_s:
         raise HTTPException(400, "start must be <= end")
 
-    n_doc = _DAILY.find_one(
-        _sw_daily_flt_ts_date_range(ts_code, start_s, end_s), {"_id": 1}
-    )
-    if n_doc is None:
+    # 日线在 Mongo 侧按 limit 截取；周/月需全区间日线再 resample
+    if tfc == "1d":
+        df = _load_daily_ohlc(ts_code, start_s, end_s, last_n=int(limit))
+    else:
+        df = _load_daily_ohlc(ts_code, start_s, end_s)
+
+    if df is None or df.empty:
         n_any = _DAILY.find_one({"ts_code": ts_code}, {"_id": 1})
         if n_any is None:
             return {
@@ -348,9 +363,6 @@ async def get_kline(
                 "count": 0,
                 "message": f"无 {ts_code} 的 sw_daily 数据。请回填补跑: run_sw_industry_backfill --sync daily",
             }
-
-    df = _load_daily_ohlc(ts_code, start_s, end_s)
-    if df is None or df.empty:
         return {
             "success": True,
             "tf": tfc,
@@ -382,24 +394,25 @@ async def get_kline(
             if c in df.columns
         ]
         if "open" in df.columns and _cols:
-            df2 = df.sort_values("trade_date").tail(int(limit))[_cols].copy()
+            df2 = df[_cols].copy()
         else:
-            df2 = df.sort_values("trade_date").tail(int(limit))
+            df2 = df.sort_values("trade_date").copy()
 
-        out = []
-        for _, r in df2.iterrows():
-            row: Dict[str, Any] = {"trade_date": str(int(r["trade_date"])) if not isinstance(r["trade_date"], str) else r["trade_date"][:8]}
+        out: List[Dict[str, Any]] = []
+        for row in df2.to_dict(orient="records"):
+            tdr = row.get("trade_date")
+            rec: Dict[str, Any] = {
+                "trade_date": (str(int(tdr)) if tdr is not None and not isinstance(tdr, str) else (tdr[:8] if isinstance(tdr, str) else "")),
+            }
             for c in ("name", "open", "high", "low", "close", "vol", "amount", "change", "pct_change", "float_mv", "total_mv", "pe", "pb"):
-                if c in df2.columns and pd.notna(r.get(c)):
-                    try:
-                        v = r[c]
-                        if isinstance(v, (int, float)):
-                            row[c] = float(v) if c != "name" else str(v)
-                        else:
-                            row[c] = v
-                    except Exception:  # pragma: no cover
-                        pass
-            out.append(row)
+                if c not in row or row.get(c) is None or (isinstance(row.get(c), float) and pd.isna(row.get(c))):
+                    continue
+                try:
+                    v = row[c]
+                    rec[c] = float(v) if c != "name" else str(v)
+                except Exception:  # pragma: no cover
+                    rec[c] = v
+            out.append(rec)
         return {
             "success": True,
             "tf": "1d",
