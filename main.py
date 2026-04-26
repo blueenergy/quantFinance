@@ -70,6 +70,7 @@ from routers.etf import router as etf_router
 from routers.data_pulse import router as data_pulse_router
 from routers.earnings import router as earnings_router
 from routers.analysis_tasks import router as analysis_tasks_router
+from routers.shenwan_index import router as shenwan_index_router
 from routers.navigation_policy import user_router as navigation_user_router
 from routers.entitlements_matrix import router as entitlements_matrix_router
 from production_config import configure_production_app
@@ -143,3 +144,4 @@ app.include_router(etf_router, prefix="/api", tags=["ETF智能分析"])
 app.include_router(data_pulse_router, prefix="/api", tags=["数据脉搏健康度"])
 app.include_router(earnings_router, prefix="/api", tags=["财报猎手"])
 app.include_router(analysis_tasks_router, prefix="/api", tags=["分析任务中心"])
+app.include_router(shenwan_index_router, prefix="/api/shenwan-index", tags=["申万行业指数"])

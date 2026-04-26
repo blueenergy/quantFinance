@@ -21,6 +21,7 @@ KNOWN_MAIN_TABS: List[tuple] = [
     ("hot-stock", True),
     ("etf", True),
     ("earnings-hunter", True),
+    ("shenwan-index", True),
     ("strategy-pool", False),
     ("ranking", False),
     ("watchlist", False),

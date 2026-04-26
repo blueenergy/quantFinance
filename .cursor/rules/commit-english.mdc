@@ -1,0 +1,13 @@
+---
+description: Git commit messages default to English in quantFinance
+globs:
+  - "**/*"
+alwaysApply: true
+---
+
+# Commits (quantFinance)
+
+Use **English** for commit **subject and body** by default. Reserve other languages for exceptional cases (e.g. product names or quoted errors).
+
+- Subject: imperative mood, ~50–72 characters, one line; optional body with bullets for what/why.
+- If the same change is user-facing, you may add a one-line 中文说明 in the PR, but the **git** message stays English.

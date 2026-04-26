@@ -46,6 +46,7 @@ _NAV_ROWS: List[Tuple[str, str, int]] = [
     ("hot-stock", "🔥 热股分析", 30),
     ("etf", "💰 ETF淘金", 40),
     ("earnings-hunter", "🎯 财报猎手", 50),
+    ("shenwan-index", "📊 申万行业指数", 55),
     ("strategy-pool", "🎯 策略股池", 60),
     ("ranking", "金榜", 70),
     ("watchlist", "自选股", 80),
