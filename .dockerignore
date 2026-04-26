@@ -1,0 +1,32 @@
+# Runtime / local data (unreadable to build user e.g. nobody-owned 700; not needed in image)
+hermes-data/
+
+# VCS and caches
+.git
+.github
+**/__pycache__
+**/*.pyc
+.pytest_cache
+.coverage
+htmlcov
+
+# Secrets and local env (do not bake credentials into image)
+.env
+.env.local
+.env.production
+
+# Logs and artifacts
+logs/
+*.log
+build/
+dist/
+*.egg-info
+
+# Frontend build artifacts (backend image)
+node_modules/
+dashboard/node_modules/
+dashboard/dist/
+
+# IDE
+.vscode
+.idea
