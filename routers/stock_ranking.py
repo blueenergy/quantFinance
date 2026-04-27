@@ -1,8 +1,8 @@
 # routers/stock_scoring.py
 from fastapi import APIRouter, HTTPException, Depends, Query, Request
-from db import get_db_collections
+from db import get_db_collections, get_data_db
 from utils.score_utils import safe_round, safe_float, extract_strategy_score
-from typing import Optional, List, Any, cast
+from typing import Optional, List, Any, cast, Dict, Tuple, Set
 from pydantic import BaseModel
 from datetime import datetime, timedelta
 from bson import ObjectId
@@ -16,6 +16,207 @@ router = APIRouter(tags=["股票排名"])
 def get_db_collections_from_request(request: Request):
     # keep a small shim for compatibility with other routers
     return get_db_collections()
+
+
+RETURN_SINCE_EMPTY: Dict[str, Any] = {
+    "return_since_score_pct": None,
+    "price_base_trade_date": None,
+    "price_latest_trade_date": None,
+}
+
+
+def _close_from_volume_price_doc(doc: Optional[dict]) -> Optional[float]:
+    if not doc:
+        return None
+    try:
+        c = float(doc.get("close"))
+        return c if c > 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _trade_date_str(doc: Optional[dict]) -> Optional[str]:
+    if not doc:
+        return None
+    td = doc.get("trade_date")
+    if td is None:
+        return None
+    if hasattr(td, "strftime"):
+        return td.strftime("%Y%m%d")
+    if isinstance(td, int):
+        s = str(td)
+        return s[:8] if len(s) >= 8 else s
+    s = str(td)
+    return s.replace("-", "")[:8] if s else None
+
+
+def _fetch_base_doc_single(volume_price_col: Any, symbol: str, sd: str) -> Optional[dict]:
+    """单只股票基准 K：字符串 / BSON date / int 三种 trade_date 存法依次尝试。"""
+    base_doc = volume_price_col.find_one(
+        {"symbol": symbol, "trade_date": {"$lte": sd}},
+        sort=[("trade_date", -1)],
+    )
+    if not base_doc:
+        try:
+            y, mo, day = int(sd[:4]), int(sd[4:6]), int(sd[6:8])
+            dt_end = datetime(y, mo, day)
+            base_doc = volume_price_col.find_one(
+                {"symbol": symbol, "trade_date": {"$lte": dt_end}},
+                sort=[("trade_date", -1)],
+            )
+        except (ValueError, IndexError):
+            base_doc = None
+    if not base_doc:
+        try:
+            as_int = int(sd)
+            base_doc = volume_price_col.find_one(
+                {"symbol": symbol, "trade_date": {"$lte": as_int}},
+                sort=[("trade_date", -1)],
+            )
+        except ValueError:
+            base_doc = None
+    return base_doc
+
+
+def _return_since_from_docs(latest_doc: Optional[dict], base_doc: Optional[dict]) -> dict:
+    out = dict(RETURN_SINCE_EMPTY)
+    latest_close = _close_from_volume_price_doc(latest_doc)
+    base_close = _close_from_volume_price_doc(base_doc)
+    if latest_close is None or base_close is None:
+        return out
+    pct = (latest_close / base_close - 1.0) * 100.0
+    out["return_since_score_pct"] = round(pct, 2)
+    out["price_base_trade_date"] = _trade_date_str(base_doc)
+    out["price_latest_trade_date"] = _trade_date_str(latest_doc)
+    return out
+
+
+def _bulk_latest_by_symbol(volume_price_col: Any, symbols: List[str]) -> Dict[str, Any]:
+    """一次聚合：每只股票最新一根日线。"""
+    if not symbols:
+        return {}
+    uniq = list(dict.fromkeys(symbols))
+    try:
+        cur = volume_price_col.aggregate(
+            [
+                {"$match": {"symbol": {"$in": uniq}}},
+                {"$sort": {"trade_date": -1}},
+                {"$group": {"_id": "$symbol", "doc": {"$first": "$$ROOT"}}},
+            ]
+        )
+        return {row["_id"]: row["doc"] for row in cur if row.get("_id") and row.get("doc")}
+    except Exception:
+        return {}
+
+
+def _bulk_base_by_symbol_string(
+    volume_price_col: Any, symbols: List[str], sd: str
+) -> Dict[str, Any]:
+    """一次聚合：trade_date 为字符串时可比较的「不晚于 score_date 的最近一根」。"""
+    if not symbols or len(sd) < 8:
+        return {}
+    uniq = list(dict.fromkeys(symbols))
+    try:
+        cur = volume_price_col.aggregate(
+            [
+                {"$match": {"symbol": {"$in": uniq}, "trade_date": {"$lte": sd}}},
+                {"$sort": {"symbol": 1, "trade_date": -1}},
+                {"$group": {"_id": "$symbol", "doc": {"$first": "$$ROOT"}}},
+            ]
+        )
+        return {row["_id"]: row["doc"] for row in cur if row.get("_id") and row.get("doc")}
+    except Exception:
+        return {}
+
+
+def compute_return_since_score(
+    volume_price_col: Any,
+    symbol: str,
+    score_date: str,
+    latest_by_symbol: Dict[str, Any],
+    base_by_key: Dict[Tuple[str, str], Any],
+) -> dict:
+    """
+    Baseline: last trading day's close on or before score_date.
+    Latest: most recent close in volume_price for symbol.
+    """
+    if not symbol or not score_date or len(str(score_date).strip()) < 8:
+        return dict(RETURN_SINCE_EMPTY)
+    sd = str(score_date).strip()[:8]
+
+    if symbol not in latest_by_symbol:
+        latest_by_symbol[symbol] = volume_price_col.find_one(
+            {"symbol": symbol},
+            sort=[("trade_date", -1)],
+        )
+    latest_doc = latest_by_symbol[symbol]
+
+    bkey = (symbol, sd)
+    if bkey not in base_by_key:
+        base_by_key[bkey] = _fetch_base_doc_single(volume_price_col, symbol, sd)
+    base_doc = base_by_key[bkey]
+
+    return _return_since_from_docs(latest_doc, base_doc)
+
+
+def enrich_rows_return_since_score(rows: List[dict], volume_price_col: Any) -> None:
+    """批量写涨跌字段：Mongo 往返约 1 + 不同 score_date 种数 + 少量回退查询。"""
+    if not rows:
+        return
+    if not hasattr(volume_price_col, "aggregate"):
+        latest_by_symbol: Dict[str, Any] = {}
+        base_by_key: Dict[Tuple[str, str], Any] = {}
+        for row in rows:
+            row.update(
+                compute_return_since_score(
+                    volume_price_col,
+                    row.get("symbol") or "",
+                    str(row.get("score_date") or ""),
+                    latest_by_symbol,
+                    base_by_key,
+                )
+            )
+        return
+
+    symbols: List[str] = []
+    seen: Set[str] = set()
+    for row in rows:
+        sym = row.get("symbol") or ""
+        if sym and sym not in seen:
+            seen.add(sym)
+            symbols.append(sym)
+    latest_map = _bulk_latest_by_symbol(volume_price_col, symbols)
+
+    by_sd: Dict[str, List[str]] = {}
+    for row in rows:
+        sym = row.get("symbol") or ""
+        sd = str(row.get("score_date") or "").strip()[:8]
+        if len(sd) < 8 or not sym:
+            continue
+        by_sd.setdefault(sd, []).append(sym)
+
+    base_map: Dict[Tuple[str, str], Any] = {}
+    for sd, syms in by_sd.items():
+        uniq_syms = list(dict.fromkeys(syms))
+        bulk = _bulk_base_by_symbol_string(volume_price_col, uniq_syms, sd)
+        for sym in uniq_syms:
+            doc = bulk.get(sym)
+            if doc and _close_from_volume_price_doc(doc) is not None:
+                base_map[(sym, sd)] = doc
+        for sym in uniq_syms:
+            if (sym, sd) in base_map:
+                continue
+            base_map[(sym, sd)] = _fetch_base_doc_single(volume_price_col, sym, sd)
+
+    for row in rows:
+        sym = row.get("symbol") or ""
+        sd = str(row.get("score_date") or "").strip()[:8]
+        if not sym or len(sd) < 8:
+            row.update(dict(RETURN_SINCE_EMPTY))
+            continue
+        latest_doc = latest_map.get(sym)
+        base_doc = base_map.get((sym, sd))
+        row.update(_return_since_from_docs(latest_doc, base_doc))
 
 
 @router.get("/stock-rankings")
@@ -131,6 +332,11 @@ async def get_stock_rankings(
                 'money_flow_score': safe_round(stock.get('money_flow_score', 0), 2),
                 'score_date': stock.get('score_date', '')
             })
+
+        try:
+            enrich_rows_return_since_score(formatted, get_data_db()["volume_price"])
+        except Exception as ex:
+            print(f"[stock-rankings] enrich return_since_score failed: {ex}")
 
         return {
             "success": True,
@@ -455,11 +661,28 @@ async def get_selected_stock_rankings(
             # build a lightweight per-date structure for each requested symbol
             info_cache = {s['symbol']: s for s in stock_info.find({"symbol": {"$in": symbols}})}
             formatted_stocks = []
+            try:
+                vp_col = get_data_db()["volume_price"]
+            except Exception:
+                vp_col = None
             for sym in symbols:
                 per_date_scores = {}
                 per_date_fields = {}
+                per_date_return_since: Dict[str, dict] = {}
+                latest_by_symbol: Dict[str, Any] = {}
+                base_by_key: Dict[Tuple[str, str], Any] = {}
                 latest_any = None
                 for d in dates:
+                    if vp_col is not None:
+                        per_date_return_since[d] = compute_return_since_score(
+                            vp_col, sym, d, latest_by_symbol, base_by_key
+                        )
+                    else:
+                        per_date_return_since[d] = {
+                            "return_since_score_pct": None,
+                            "price_base_trade_date": None,
+                            "price_latest_trade_date": None,
+                        }
                     doc = stock_scores.find_one({"symbol": sym, "score_date": d})
                     if doc:
                         latest_any = latest_any or doc
@@ -483,6 +706,7 @@ async def get_selected_stock_rankings(
                     'composite_score': latest_any.get('composite_score', {}) if latest_any else {},
                     'per_date_scores': per_date_scores,
                     'per_date_fields': per_date_fields,
+                    'per_date_return_since': per_date_return_since,
                     'score_date': latest_any.get('score_date') if latest_any else ''
                 })
             return {
@@ -545,6 +769,10 @@ async def get_selected_stock_rankings(
                 'score_date': stock.get('score_date', date if date else '')
             }
             formatted_stocks.append(formatted_stock)
+        try:
+            enrich_rows_return_since_score(formatted_stocks, get_data_db()["volume_price"])
+        except Exception as ex:
+            print(f"[stock-rankings/selected] enrich return_since_score failed: {ex}")
         return {
             "success": True,
             "data": formatted_stocks,
