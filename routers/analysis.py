@@ -369,9 +369,14 @@ async def get_analysis_task_status(
     
     if response["status"] == "completed":
         result = task.get("result", {})
-        response["success"] = result.get("success", False)
-        response["analysis"] = result.get("analysis")
-        response["model"] = result.get("model")
+        if isinstance(result, dict):
+            # 缺省为 True：深度分析等流水线往往只存分析正文，不设顶层 success；
+            # 使用 False 作为缺省会导致 task 轮询误报“失败/异常”，而 history 仍正常显示。
+            response["success"] = result.get("success", True)
+        else:
+            response["success"] = result is not None
+        response["analysis"] = result.get("analysis") if isinstance(result, dict) else None
+        response["model"] = result.get("model") if isinstance(result, dict) else None
     elif response["status"] == "completed_with_parse_error":
         result = task.get("result", {})
         response["success"] = False
