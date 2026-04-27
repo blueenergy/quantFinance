@@ -191,16 +191,31 @@ async def get_etf_watchlist(
     return {"success": True, "count": len(result), "data": result}
 
 
+# 带起止日期时 Mongo 拉取日线的条数上限（与无日期时的 heuristics 区分，避免 min(2e4,1e4) 等困惑写法）
+ETF_KLINE_DAILY_CAP_WITH_DATE_RANGE = 20_000
+
+
 def _etf_kline_fetch_limit(tf: str, user_limit: int, has_date_filter: bool) -> int:
     """
     For weekly/monthly bars we need enough daily points before resampling.
     With an explicit date range, cap raw daily rows; otherwise use heuristics.
     """
     if has_date_filter:
-        return min(20_000, 10_000)  # enough dailies for any reasonable range; hard cap
+        return min(ETF_KLINE_DAILY_CAP_WITH_DATE_RANGE, max(int(user_limit) * 35, 800))
     if tf in ("1w", "1m", "w", "m"):
         return min(5_000, max(int(user_limit) * 35, 800))
     return int(user_limit)
+
+
+def _etf_kline_date_truncation_message(
+    has_date_filter: bool, n_daily: int, cap: int
+) -> Optional[str]:
+    """有起止且拉满 cap 时提示，避免用户以为区间內日级别数据完整。"""
+    if not has_date_filter or n_daily < cap:
+        return None
+    return (
+        f"日期区间内已按最多 {cap} 条日线拉取；若区间极宽，K 线可能未覆盖全部交易日"
+    )
 
 
 def _agg_etf_ohlc_to_df(df: pd.DataFrame, rule: str) -> pd.DataFrame:
@@ -225,26 +240,16 @@ def _agg_etf_ohlc_to_df(df: pd.DataFrame, rule: str) -> pd.DataFrame:
             ohlc_cols[pac] = ag[base]
     if not ohlc_cols:
         return pd.DataFrame()
-    if rule == "1w":
-        rule_s = "W-FRI"
-        ohlc = d.resample(rule_s, label="right", closed="right").agg(ohlc_cols)
-        if "vol" in d.columns:
-            ohlc["vol"] = d["vol"].resample(rule_s, label="right", closed="right").sum()
-        if "amount" in d.columns:
-            ohlc["amount"] = d["amount"].resample(rule_s, label="right", closed="right").sum()
-        if "fd_share" in d.columns:
-            ohlc["fd_share"] = d["fd_share"].resample(rule_s, label="right", closed="right").last()
-    elif rule == "1m":
-        rule_s = "ME"
-        ohlc = d.resample(rule_s, label="right", closed="right").agg(ohlc_cols)
-        if "vol" in d.columns:
-            ohlc["vol"] = d["vol"].resample(rule_s, label="right", closed="right").sum()
-        if "amount" in d.columns:
-            ohlc["amount"] = d["amount"].resample(rule_s, label="right", closed="right").sum()
-        if "fd_share" in d.columns:
-            ohlc["fd_share"] = d["fd_share"].resample(rule_s, label="right", closed="right").last()
-    else:
+    if rule not in ("1w", "1m"):
         return pd.DataFrame()
+    rule_s = "W-FRI" if rule == "1w" else "ME"
+    rs_kw = {"label": "right", "closed": "right"}
+    ohlc = d.resample(rule_s, **rs_kw).agg(ohlc_cols)
+    for col, method in (("vol", "sum"), ("amount", "sum"), ("fd_share", "last")):
+        if col not in d.columns:
+            continue
+        s = d[col].resample(rule_s, **rs_kw)
+        ohlc[col] = s.sum() if method == "sum" else s.last()
     _sub = [c for c in ("close", "pre_adj_close") if c in ohlc.columns]
     if _sub:
         ohlc = ohlc.dropna(how="all", subset=_sub)
@@ -291,9 +296,15 @@ async def get_etf_kline(
     daily_results = list(data_db["etf_daily"].find(query, {"_id": 0}).sort("trade_date", -1).limit(fetch_limit))
     adj_results = list(data_db["etf_adj_factor"].find(query, {"_id": 0}).sort("trade_date", -1).limit(fetch_limit))
     share_results = list(data_db["etf_shares"].find(query, {"_id": 0}).sort("trade_date", -1).limit(fetch_limit))
+
+    n_daily = len(daily_results)
+    date_trunc_msg = _etf_kline_date_truncation_message(has_date_filter, n_daily, fetch_limit)
     
     if not daily_results:
-        return {"success": True, "symbol": symbol, "tf": tfc, "count": 0, "data": []}
+        out0: Dict[str, Any] = {"success": True, "symbol": symbol, "tf": tfc, "count": 0, "data": []}
+        if date_trunc_msg:
+            out0["message"] = date_trunc_msg
+        return out0
         
     # Convert to pandas DataFrames for easy merging and calculation
     df_daily = pd.DataFrame(daily_results)
@@ -369,13 +380,16 @@ async def get_etf_kline(
         df_asc = df.sort_values("trade_date", ascending=True)
         ohlc_df = _agg_etf_ohlc_to_df(df_asc, tfc)
         if ohlc_df is None or ohlc_df.empty:
-            return {
+            out_emp: Dict[str, Any] = {
                 "success": True,
                 "symbol": symbol,
                 "tf": tfc,
                 "count": 0,
                 "data": [],
             }
+            if date_trunc_msg:
+                out_emp["message"] = date_trunc_msg
+            return out_emp
         ohlc_df = ohlc_df.reset_index()
         time_col = ohlc_df.columns[0]
         ohlc_df["trade_date"] = pd.to_datetime(ohlc_df[time_col], errors="coerce").map(
@@ -389,13 +403,16 @@ async def get_etf_kline(
         ohlc_df = ohlc_df.tail(int(limit))
         ohlc_df = ohlc_df.sort_values("trade_date", ascending=False)
         merged_data = _rows_to_json(ohlc_df)
-        return {
+        out_wm: Dict[str, Any] = {
             "success": True,
             "symbol": symbol,
             "tf": tfc,
             "count": len(merged_data),
             "data": merged_data,
         }
+        if date_trunc_msg:
+            out_wm["message"] = date_trunc_msg
+        return out_wm
 
     merged_data = []
     for row in df.to_dict('records'):
@@ -409,14 +426,17 @@ async def get_etf_kline(
                     v = v.item()
                 clean_row[k] = v
         merged_data.append(clean_row)
-    
-    return {
+
+    out_d: Dict[str, Any] = {
         "success": True,
         "symbol": symbol,
         "tf": tfc,
         "count": len(merged_data),
-        "data": merged_data
+        "data": merged_data,
     }
+    if date_trunc_msg:
+        out_d["message"] = date_trunc_msg
+    return out_d
 
 from pydantic import BaseModel
 from auth import get_current_active_user
