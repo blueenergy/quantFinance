@@ -1,5 +1,6 @@
 """
-申万行业指数：从 quant_data 只读 sw_index_classify、sw_daily；周/月由日线服务端聚合（pandas）。
+申万行业指数：从 quant_data 只读 sw_index_classify、sw_daily、sw_weekly、sw_monthly。
+周/月优先查预计算集合，回退至日线 pandas 聚合。
 无数据时返回 success+空数组与 message 提示回填补跑。
 """
 from __future__ import annotations
@@ -18,6 +19,8 @@ router = APIRouter()
 
 _CLASSIFY = data_db["sw_index_classify"]
 _DAILY = data_db["sw_daily"]
+_WEEKLY = data_db["sw_weekly"]
+_MONTHLY = data_db["sw_monthly"]
 
 MAX_KLINE_LIMIT = 1000
 MAX_DAILY_LOOKBACK_DAYS = 4000  # ~10y+ 自然日
@@ -318,7 +321,7 @@ async def get_kline(
 ):
     # 与 db.data_db 实际一致，便于和 Mongo Shell / Compass 核对（疑连错库时看响应头）
     response.headers["X-Quant-Data-DB"] = str(data_db.name)
-    response.headers["X-Quant-Data-Collection"] = "sw_daily"
+    response.headers["X-Quant-Data-Collection"] = "sw_daily"  # updated later for weekly/monthly
 
     ts_code = (ts_code or "").strip()
     tfc = (tf or "1d").strip().lower()
@@ -345,6 +348,44 @@ async def get_kline(
         start_s = str(start).replace("-", "")[:8]
     if start_s > end_s:
         raise HTTPException(400, "start must be <= end")
+
+    # ── 周/月：优先查预计算集合，空结果则回退 pandas resample ──────────────────
+    if tfc in ("1w", "1m"):
+        col_name = "sw_weekly" if tfc == "1w" else "sw_monthly"
+        pre_col = _WEEKLY if tfc == "1w" else _MONTHLY
+        flt_pre = _sw_daily_flt_ts_date_range(ts_code, start_s, end_s)
+        pre_rows = list(
+            pre_col.find(flt_pre, PROJ_KLINE)
+            .sort("trade_date", DESCENDING)
+            .limit(int(limit))
+        )
+        if pre_rows:
+            pre_rows.reverse()  # ascending by trade_date
+            response.headers["X-Quant-Data-Collection"] = col_name
+            ohlc_list: List[Dict[str, Any]] = []
+            for raw in pre_rows:
+                tdr = raw.get("trade_date", "")
+                rec: Dict[str, Any] = {"trade_date": str(tdr)[:8] if tdr else ""}
+                for c in ("name", "open", "high", "low", "close", "vol", "amount",
+                          "change", "pct_change", "float_mv", "total_mv", "pe", "pb"):
+                    v = raw.get(c)
+                    if v is None or (isinstance(v, float) and pd.isna(v)):
+                        continue
+                    try:
+                        rec[c] = float(v) if c != "name" else str(v)
+                    except Exception:  # pragma: no cover
+                        rec[c] = v
+                ohlc_list.append(rec)
+            return {
+                "success": True,
+                "tf": tfc,
+                "ts_code": ts_code,
+                "start": ohlc_list[0]["trade_date"] if ohlc_list else start_s,
+                "end": ohlc_list[-1]["trade_date"] if ohlc_list else end_s,
+                "data": ohlc_list,
+                "count": len(ohlc_list),
+            }
+        # pre-computed collection empty → fall back to daily resample
 
     # 日线在 Mongo 侧按 limit 截取；周/月需全区间日线再 resample
     if tfc == "1d":
