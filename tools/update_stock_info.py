@@ -2,7 +2,6 @@ import os, sys
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 import tushare as ts
 from pymongo import MongoClient
-from utils import get_ts_code
 from dotenv import load_dotenv
 import pandas as pd
 from datetime import datetime
@@ -19,6 +18,14 @@ mongo_url = os.getenv("MONGO_URL", "mongodb://localhost:27017")
 client = MongoClient(mongo_url)
 db = client["finance"]
 collection = db["stock_info"]
+
+
+def _stock_info_match_filter(ts_code: str) -> dict:
+    """Match doc by ts_code, full symbol, or legacy 6-digit symbol only."""
+    ts_code = str(ts_code).strip()
+    short = ts_code.split(".", 1)[0] if "." in ts_code else ts_code
+    return {"$or": [{"ts_code": ts_code}, {"symbol": ts_code}, {"symbol": short}]}
+
 
 def update_stock_basic_info():
     """更新股票基础信息到数据库"""
@@ -43,14 +50,12 @@ def update_stock_basic_info():
         
         for _, row in df.iterrows():
             try:
-                # 从 ts_code 提取 symbol (去掉 .SZ/.SH 后缀)
-                ts_code = row['ts_code']
-                symbol = ts_code.split('.')[0]
-                
-                # 构建更新数据
+                ts_code = row["ts_code"]
+
+                # 构建更新数据（symbol 与 ts_code 均为 Tushare 全码）
                 stock_data = {
-                    'symbol': symbol,
-                    'ts_code': ts_code,
+                    "symbol": ts_code,
+                    "ts_code": ts_code,
                     'name': row.get('name', ''),
                     'industry': row.get('industry', ''),
                     'pe': float(row['pe']) if pd.notna(row['pe']) else None,
@@ -71,16 +76,16 @@ def update_stock_basic_info():
                     'last_update': datetime.now()
                 }
                 
-                # 使用 upsert 更新或插入数据
+                # 使用 upsert 更新或插入数据（兼容历史仅 6 位 symbol 的文档）
                 result = collection.replace_one(
-                    {"symbol": symbol},
+                    _stock_info_match_filter(ts_code),
                     stock_data,
-                    upsert=True
+                    upsert=True,
                 )
-                
+
                 if result.upserted_id:
                     new_count += 1
-                    print(f"新增股票: {symbol} - {row.get('name', '')}")
+                    print(f"新增股票: {ts_code} - {row.get('name', '')}")
                 else:
                     updated_count += 1
                     if updated_count % 100 == 0:
@@ -100,67 +105,59 @@ def update_stock_basic_info():
 
 def update_existing_stocks_pe_pb():
     """为现有股票更新 PE/PB 等估值指标"""
-    existing_symbols = collection.distinct("symbol")
-    print(f"开始为 {len(existing_symbols)} 只现有股票更新估值数据...")
-    
-    updated_count = 0
-    
     try:
         # 获取全部股票的估值数据
         df = pro.bak_basic(
-            trade_date='20250909',
-            fields='trade_date,ts_code,name,industry,pe,pb,total_share,float_share,eps,bvps,' \
-            'list_date,undp,per_undp,rev_yoy,profit_yoy,gpr,npr,holder_num'
+            trade_date="20250909",
+            fields="trade_date,ts_code,name,industry,pe,pb,total_share,float_share,eps,bvps,"
+            "list_date,undp,per_undp,rev_yoy,profit_yoy,gpr,npr,holder_num",
         )
-        
+
         if df.empty:
             print("未获取到估值数据")
             return
-        
-        # 创建 ts_code 到数据的映射
-        pe_pb_data = {}
+
+        print(f"开始为 API 返回的 {len(df)} 只股票更新估值数据...")
+
+        updated_count = 0
         for _, row in df.iterrows():
-            symbol = row['ts_code'].split('.')[0]
-            pe_pb_data[symbol] = {
-                'pe': float(row['pe']) if pd.notna(row['pe']) else None,
-                'pb': float(row['pb']) if pd.notna(row['pb']) else None,
-                'industry': row['industry'] if pd.notna(row['industry']) else None,
-                'total_share': float(row['total_share']) if pd.notna(row['total_share']) else None,  # 总股本(万股)
-                'float_share': float(row['float_share']) if pd.notna(row['float_share']) else None,  # 流通股本(万股)
-                'eps': float(row['eps']) if pd.notna(row['eps']) else None,         # 每股收益
-                'bvps': float(row['bvps']) if pd.notna(row['bvps']) else None,     # 每股净资产
-                'list_date': row['list_date'],                                     # 上市日期
-                'undp': float(row['undp']) if pd.notna(row['undp']) else None,     # 未分利润(万元)
-                'per_undp': float(row['per_undp']) if pd.notna(row['per_undp']) else None,  # 每股未分配利润
-                'rev_yoy': float(row['rev_yoy']) if pd.notna(row['rev_yoy']) else None,     # 营业收入同比(%)
-                'profit_yoy': float(row['profit_yoy']) if pd.notna(row['profit_yoy']) else None,  # 利润同比(%)
-                'gpr': float(row['gpr']) if pd.notna(row['gpr']) else None,         # 毛利率
-                'npr': float(row['npr']) if pd.notna(row['npr']) else None,         # 净利率
-                'holder_num': float(row['holder_num']) if pd.notna(row['holder_num']) else None,  # 股东人数
-                'valuation_date': row['trade_date']
+            ts_code = str(row.get("ts_code", "")).strip()
+            if not ts_code:
+                continue
+            payload = {
+                "pe": float(row["pe"]) if pd.notna(row["pe"]) else None,
+                "pb": float(row["pb"]) if pd.notna(row["pb"]) else None,
+                "industry": row["industry"] if pd.notna(row["industry"]) else None,
+                "total_share": float(row["total_share"]) if pd.notna(row["total_share"]) else None,  # 总股本(万股)
+                "float_share": float(row["float_share"]) if pd.notna(row["float_share"]) else None,  # 流通股本(万股)
+                "eps": float(row["eps"]) if pd.notna(row["eps"]) else None,  # 每股收益
+                "bvps": float(row["bvps"]) if pd.notna(row["bvps"]) else None,  # 每股净资产
+                "list_date": row["list_date"],  # 上市日期
+                "undp": float(row["undp"]) if pd.notna(row["undp"]) else None,  # 未分利润(万元)
+                "per_undp": float(row["per_undp"]) if pd.notna(row["per_undp"]) else None,  # 每股未分配利润
+                "rev_yoy": float(row["rev_yoy"]) if pd.notna(row["rev_yoy"]) else None,  # 营业收入同比(%)
+                "profit_yoy": float(row["profit_yoy"]) if pd.notna(row["profit_yoy"]) else None,  # 利润同比(%)
+                "gpr": float(row["gpr"]) if pd.notna(row["gpr"]) else None,  # 毛利率
+                "npr": float(row["npr"]) if pd.notna(row["npr"]) else None,  # 净利率
+                "holder_num": float(row["holder_num"]) if pd.notna(row["holder_num"]) else None,  # 股东人数
+                "valuation_date": row["trade_date"],
+                "symbol": ts_code,
+                "ts_code": ts_code,
             }
-        
-        # 更新现有股票的估值数据
-        for symbol in existing_symbols:
-            if symbol in pe_pb_data:
-                print(pe_pb_data[symbol])
-                try:
-                    result = collection.update_one(
-                        {"symbol": symbol},
-                        {"$set": pe_pb_data[symbol]}
-                    )
-                    
-                    if result.modified_count > 0:
-                        updated_count += 1
-                        if updated_count % 100 == 0:
-                            print(f"已更新 {updated_count} 只股票的估值数据...")
-                
-                except Exception as e:
-                    print(f"更新股票 {symbol} 估值数据失败: {e}")
-            
-            # API 限流
+            try:
+                result = collection.update_one(
+                    _stock_info_match_filter(ts_code),
+                    {"$set": payload},
+                    upsert=False,
+                )
+                if result.modified_count > 0:
+                    updated_count += 1
+                    if updated_count % 100 == 0:
+                        print(f"已更新 {updated_count} 只股票的估值数据...")
+            except Exception as e:
+                print(f"更新股票 {ts_code} 估值数据失败: {e}")
             time.sleep(0.1)
-        
+
         print(f"估值数据更新完成，共更新 {updated_count} 只股票")
         
     except Exception as e:
@@ -178,27 +175,29 @@ def update_specific_fields_only():
         updated_count = 0
         
         for _, row in df.iterrows():
-            symbol = row['ts_code'].split('.')[0]
-            
+            ts_code = str(row.get("ts_code", "")).strip()
+            if not ts_code:
+                continue
+
             # 只更新特定字段，不影响其他已有数据
-            update_fields = {}
-            
-            if pd.notna(row['pe']):
-                update_fields['pe'] = float(row['pe'])
-            if pd.notna(row['pb']):
-                update_fields['pb'] = float(row['pb'])
-            if pd.notna(row['total_mv']):
-                update_fields['market_cap'] = float(row['total_mv']) / 10000  # 转换为亿元
-            if pd.notna(row['circ_mv']):
-                update_fields['circ_market_cap'] = float(row['circ_mv']) / 10000
-            
-            update_fields['valuation_update_date'] = row['trade_date']
-            
+            update_fields: dict = {}
+
+            if pd.notna(row["pe"]):
+                update_fields["pe"] = float(row["pe"])
+            if pd.notna(row["pb"]):
+                update_fields["pb"] = float(row["pb"])
+            if pd.notna(row["total_mv"]):
+                update_fields["market_cap"] = float(row["total_mv"]) / 10000  # 转换为亿元
+            if pd.notna(row["circ_mv"]):
+                update_fields["circ_market_cap"] = float(row["circ_mv"]) / 10000
+
+            update_fields["valuation_update_date"] = row["trade_date"]
+
             if update_fields:
                 result = collection.update_one(
-                    {"symbol": symbol},
+                    _stock_info_match_filter(ts_code),
                     {"$set": update_fields},
-                    upsert=False  # 不创建新记录，只更新已有记录
+                    upsert=False,  # 不创建新记录，只更新已有记录
                 )
                 
                 if result.modified_count > 0:
