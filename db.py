@@ -127,7 +127,7 @@ def get_data_db():
         "etf_adj_factor": data_db["etf_adj_factor"],
         "etf_shares": data_db["etf_shares"],
         "etf_share_size": data_db["etf_share_size"],
-        # Index reference/meta data
+        # Index reference/meta data (index_constituents: only quant_data; never finance)
         "index_meta": data_db["index_meta"],
         "index_constituents": data_db["index_constituents"],
         # Fund holdings snapshots (if sync task enabled)

@@ -1,5 +1,7 @@
 # app/services/index_service.py
 from typing import List, Optional
+
+from db import get_data_db
 from models.index_models import IndexConstituent, HS300Constituent
 from services.tushare_cached import (
     get_index_weight,
@@ -9,12 +11,26 @@ from services.tushare_cached import (
     TushareNotConfigured
 )
 class IndexService:
-    """指数数据服务 - 处理业务逻辑"""
-    
+    """指数数据服务 - 处理业务逻辑。
+
+    成分缓存读写仅通过 ``get_data_db()[\"index_constituents\"]``（即 DATA_DB_NAME / quant_data）。
+    不再使用 finance 库下的 index_constituents；遗留数据可用 tools 脚本删除。
+    """
+
     def __init__(self):
-        # self.db = get_database()
-        # self.pro = ts.pro_api()  # tushare API
-        pass
+        self._index_constituents_col = None
+
+    def _index_constituents_collection(self):
+        if self._index_constituents_col is None:
+            self._index_constituents_col = get_data_db()["index_constituents"]
+            try:
+                self._index_constituents_col.create_index(
+                    [("index_code", 1), ("symbol", 1)]
+                )
+                self._index_constituents_col.create_index([("update_date", 1)])
+            except Exception:
+                pass
+        return self._index_constituents_col
     
     async def get_index_constituents(self, index_code: str, force_refresh: bool = False) -> List[IndexConstituent]:
         """获取任意指数成分股（优先缓存）
@@ -151,50 +167,17 @@ class IndexService:
         return await self.get_index_constituents_from_api("399300.SZ")
 
     def _cache_constituents(self, constituents: List[IndexConstituent], index_code: str):
-        """缓存任意指数成分股数据到数据库"""
+        """缓存任意指数成分股数据到 quant_data.index_constituents。"""
         try:
-            # 检查是否有数据库连接
-            if not hasattr(self, 'db') or self.db is None:
-                # 尝试导入和连接数据库
-                try:
-                    from pymongo import MongoClient
-                    import os
-                    
-                    # 获取MongoDB连接配置（如果有环境变量）
-                    mongo_uri = os.getenv("MONGO_URI", "mongodb://localhost:27017")
-                    db_name = os.getenv("DATA_DB_NAME", "quant_data")
-                    
-                    # 连接到MongoDB
-                    client = MongoClient(mongo_uri)
-                    self.db = client[db_name]
-                    print(f"已连接到数据数据库: {db_name}")
-                except Exception as e:
-                    print(f"数据库连接失败，无法缓存数据: {str(e)}")
-                    return False
-            
-            # 确保集合存在
-            if not hasattr(self, 'index_constituents_collection'):
-                self.index_constituents_collection = self.db['index_constituents']
-                
-                # 创建索引（如果不存在）
-                try:
-                    self.index_constituents_collection.create_index([
-                        ("index_code", 1),
-                        ("symbol", 1)
-                    ])
-                    self.index_constituents_collection.create_index([
-                        ("update_date", 1)
-                    ])
-                except Exception as e:
-                    print(f"创建索引失败: {str(e)}")
-            
+            coll = self._index_constituents_collection()
+
             # 当前日期
             from datetime import datetime
             today = datetime.now().strftime('%Y%m%d')
             
             # 删除当日该指数旧数据
             try:
-                self.index_constituents_collection.delete_many({
+                coll.delete_many({
                     "index_code": index_code,
                     "update_date": today
                 })
@@ -231,7 +214,7 @@ class IndexService:
                 
             # 批量插入数据
             if documents:
-                result = self.index_constituents_collection.insert_many(documents)
+                result = coll.insert_many(documents)
                 print(f"成功缓存 {len(result.inserted_ids)} 只 {index_code} 成分股")
                 return True
             
@@ -242,27 +225,10 @@ class IndexService:
             return False
 
     async def _get_cached_constituents(self, index_code: str):
-        """从缓存获取任意指数成分股数据"""
+        """从 quant_data.index_constituents 读缓存。"""
         try:
-            # 检查是否有数据库连接
-            if not hasattr(self, 'db') or self.db is None:
-                try:
-                    from pymongo import MongoClient
-                    import os
-                    
-                    mongo_uri = os.getenv("MONGO_URI", "mongodb://localhost:27017")
-                    db_name = os.getenv("DATA_DB_NAME", "quant_data")
-                    
-                    client = MongoClient(mongo_uri)
-                    self.db = client[db_name]
-                except Exception as e:
-                    print(f"数据库连接失败，无法读取缓存: {str(e)}")
-                    return []
-            
-            # 确保集合存在
-            if not hasattr(self, 'index_constituents_collection'):
-                self.index_constituents_collection = self.db['index_constituents']
-            
+            coll = self._index_constituents_collection()
+
             # 获取最近缓存的数据（2天内）
             from datetime import datetime, timedelta
             today = datetime.now().strftime('%Y%m%d')
@@ -281,7 +247,7 @@ class IndexService:
                 {"$replaceRoot": {"newRoot": "$doc"}}
             ]
             
-            cached_records = list(self.index_constituents_collection.aggregate(pipeline))
+            cached_records = list(coll.aggregate(pipeline))
             
             if not cached_records:
                 print(f"缓存中没有找到近期的 {index_code} 成分股数据")
