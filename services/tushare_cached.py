@@ -80,25 +80,6 @@ def get_latest_trade_date() -> Optional[str]:
     except Exception:
         return None
 
-def get_index_weight(real_code: str, trade_date: str) -> Any:
-    """Fetch index weight for a specific date; if empty, attempt fallback to latest trade date.
-    Cached per (index_code, trade_date) for 1 hour."""
-    key = f"index_weight:{real_code}:{trade_date}"
-    cached = _cache_get(key, _DEFAULT_TTL)
-    if cached is not None:
-        return cached
-    pro = _get_pro()
-    df = pro.index_weight(index_code=real_code, trade_date=trade_date)
-    if df is None or df.empty:
-        # fallback to latest
-        latest = get_latest_trade_date()
-        if latest and latest != trade_date:
-            df2 = pro.index_weight(index_code=real_code, trade_date=latest)
-            if df2 is not None and not df2.empty:
-                df = df2
-    _cache_set(key, df)
-    return df
-
 def get_stock_basic_map() -> Dict[str, Dict[str, Any]]:
     """Return mapping ts_code -> { name, industry } (industry may be blank).
     Cached for 6 hours.

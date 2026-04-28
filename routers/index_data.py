@@ -7,39 +7,39 @@ router = APIRouter()
 
 # 沪深300
 @router.get("/hs300/constituents", response_model=HS300ConstituentsResponse)
-async def get_hs300_constituents(force_refresh: bool = False):
+async def get_hs300_constituents():
     try:
         service = IndexService()
-        data = await service.get_index_constituents("hs300", force_refresh=force_refresh)
+        data = await service.get_index_constituents("hs300")
         return IndexConstituentsResponse(success=True, data=data, total_count=len(data))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 # 科创50
 @router.get("/star50/constituents", response_model=IndexConstituentsResponse)
-async def get_star50_constituents(force_refresh: bool = False):
+async def get_star50_constituents():
     try:
         service = IndexService()
-        data = await service.get_index_constituents("star50", force_refresh=force_refresh)
+        data = await service.get_index_constituents("star50")
         return IndexConstituentsResponse(success=True, data=data, total_count=len(data))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 # 中证A500
 @router.get("/a500/constituents", response_model=IndexConstituentsResponse)
-async def get_a500_constituents(force_refresh: bool = False):
+async def get_a500_constituents():
     try:
         service = IndexService()
-        data = await service.get_index_constituents("a500", force_refresh=force_refresh)
+        data = await service.get_index_constituents("a500")
         return IndexConstituentsResponse(success=True, data=data, total_count=len(data))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 # 中证500
 @router.get("/csi500/constituents", response_model=IndexConstituentsResponse)
-async def get_csi500_constituents(force_refresh: bool = False):
+async def get_csi500_constituents():
     try:
         service = IndexService()
-        data = await service.get_index_constituents("csi500", force_refresh=force_refresh)
+        data = await service.get_index_constituents("csi500")
         return IndexConstituentsResponse(success=True, data=data, total_count=len(data))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
