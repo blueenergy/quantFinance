@@ -131,7 +131,7 @@ pipelines:
   - id: stock_composite_scoring
     label: 综合评分
     job_status_key: stock_composite_scoring
-    schedule_hint: "日终/收盘后：本机或 cron 调 stock-scoring score_util --action all（与交易日检查一致时）；写入 job_status 与 data_collection pipeline_tasks"
+    schedule_hint: "日终/收盘后：本机或 cron 调 stock-scoring score_util --action core（沪深300+中证A500+中证500+中证1000+科创50 成分并集；全市场可用 --action all；与交易日检查一致时）；写入 job_status 与 data_collection pipeline_tasks"
     freshness:
       database: finance
       collection: stock_scores
