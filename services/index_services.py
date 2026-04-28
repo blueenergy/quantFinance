@@ -10,6 +10,7 @@ class IndexService:
 
     成分股只读 ``quant_data.index_constituents``（由 quant-data-engine 定时任务写入）。
     不再从 Finance 侧调用 Tushare 拉取或回写该集合。
+    返回的 ``IndexConstituent.symbol`` 为带交易所后缀的 ts_code（如 ``600519.SH``）。
     """
 
     def __init__(self):
@@ -50,11 +51,40 @@ class IndexService:
         return low
 
     @staticmethod
-    def _normalize_symbol(symbol: str) -> str:
+    def _infer_ts_suffix(bare_digits: str) -> str:
+        """为无后缀的 6 位代码推断 Tushare 风格交易所后缀。"""
+        c = "".join(ch for ch in bare_digits if ch.isdigit())
+        if len(c) < 6:
+            return ""
+        c6 = c[:6]
+        p3, p2 = c6[:3], c6[:2]
+        if p3 in ("600", "601", "603", "605", "688", "689"):
+            return ".SH"
+        if p2 in ("00", "30") or c6.startswith(("001", "002", "003")):
+            return ".SZ"
+        if p2 in ("43", "83", "87", "88"):
+            return ".BJ"
+        if c6[0] == "6":
+            return ".SH"
+        if c6[0] in ("0", "3"):
+            return ".SZ"
+        return ".SH"
+
+    @staticmethod
+    def _ensure_ts_code(symbol: str) -> str:
+        """统一为带交易所后缀的 ts_code（如 ``600519.SH``）。库内已有后缀则规范化大小写；无则按代码推断。"""
         s = (symbol or "").strip()
+        if not s:
+            return s
+        u = s.upper()
         for suf in (".SH", ".SZ", ".BJ"):
-            if s.upper().endswith(suf):
-                return s[: -len(suf)]
+            if u.endswith(suf):
+                base = s[: len(s) - len(suf)].rstrip(".")
+                return f"{base}{suf}"
+        digits = "".join(ch for ch in s if ch.isdigit())
+        suf = IndexService._infer_ts_suffix(digits)
+        if suf:
+            return f"{digits[:6]}{suf}"
         return s
 
     def _load_latest_constituents(self, store_key: str) -> List[IndexConstituent]:
@@ -80,7 +110,7 @@ class IndexService:
             for record in records:
                 out.append(
                     IndexConstituent(
-                        symbol=self._normalize_symbol(record.get("symbol", "")),
+                        symbol=self._ensure_ts_code(record.get("symbol", "")),
                         name=record.get("name", ""),
                         industry=record.get("industry", ""),
                         market_cap=float(record.get("market_cap") or 0),
@@ -109,21 +139,21 @@ class IndexService:
         fallback_map = {
             "399300.SZ": [
                 {
-                    "symbol": "000001",
+                    "symbol": "000001.SZ",
                     "name": "平安银行",
                     "industry": "银行",
                     "market_cap": 280000000000,
                     "weight": 0.85,
                 },
                 {
-                    "symbol": "000002",
+                    "symbol": "000002.SZ",
                     "name": "万科A",
                     "industry": "房地产开发",
                     "market_cap": 250000000000,
                     "weight": 0.78,
                 },
                 {
-                    "symbol": "600519",
+                    "symbol": "600519.SH",
                     "name": "贵州茅台",
                     "industry": "食品饮料",
                     "market_cap": 2200000000000,
@@ -132,21 +162,21 @@ class IndexService:
             ],
             "hs300": [
                 {
-                    "symbol": "000001",
+                    "symbol": "000001.SZ",
                     "name": "平安银行",
                     "industry": "银行",
                     "market_cap": 280000000000,
                     "weight": 0.85,
                 },
                 {
-                    "symbol": "000002",
+                    "symbol": "000002.SZ",
                     "name": "万科A",
                     "industry": "房地产开发",
                     "market_cap": 250000000000,
                     "weight": 0.78,
                 },
                 {
-                    "symbol": "600519",
+                    "symbol": "600519.SH",
                     "name": "贵州茅台",
                     "industry": "食品饮料",
                     "market_cap": 2200000000000,
@@ -155,14 +185,14 @@ class IndexService:
             ],
             "STAR50": [
                 {
-                    "symbol": "688001",
+                    "symbol": "688001.SH",
                     "name": "华兴源创",
                     "industry": "半导体",
                     "market_cap": 45000000000,
                     "weight": 1.10,
                 },
                 {
-                    "symbol": "688012",
+                    "symbol": "688012.SH",
                     "name": "中微公司",
                     "industry": "半导体设备",
                     "market_cap": 120000000000,
@@ -171,14 +201,14 @@ class IndexService:
             ],
             "star50": [
                 {
-                    "symbol": "688001",
+                    "symbol": "688001.SH",
                     "name": "华兴源创",
                     "industry": "半导体",
                     "market_cap": 45000000000,
                     "weight": 1.10,
                 },
                 {
-                    "symbol": "688012",
+                    "symbol": "688012.SH",
                     "name": "中微公司",
                     "industry": "半导体设备",
                     "market_cap": 120000000000,
@@ -187,14 +217,14 @@ class IndexService:
             ],
             "A500": [
                 {
-                    "symbol": "600519",
+                    "symbol": "600519.SH",
                     "name": "贵州茅台",
                     "industry": "白酒",
                     "market_cap": 2500000000000,
                     "weight": 2.50,
                 },
                 {
-                    "symbol": "000333",
+                    "symbol": "000333.SZ",
                     "name": "美的集团",
                     "industry": "家电",
                     "market_cap": 450000000000,
@@ -203,14 +233,14 @@ class IndexService:
             ],
             "a500": [
                 {
-                    "symbol": "600519",
+                    "symbol": "600519.SH",
                     "name": "贵州茅台",
                     "industry": "白酒",
                     "market_cap": 2500000000000,
                     "weight": 2.50,
                 },
                 {
-                    "symbol": "000333",
+                    "symbol": "000333.SZ",
                     "name": "美的集团",
                     "industry": "家电",
                     "market_cap": 450000000000,
@@ -219,14 +249,14 @@ class IndexService:
             ],
             "csi500": [
                 {
-                    "symbol": "600519",
+                    "symbol": "600519.SH",
                     "name": "贵州茅台",
                     "industry": "白酒",
                     "market_cap": 2500000000000,
                     "weight": 2.50,
                 },
                 {
-                    "symbol": "000333",
+                    "symbol": "000333.SZ",
                     "name": "美的集团",
                     "industry": "家电",
                     "market_cap": 450000000000,

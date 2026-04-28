@@ -3,7 +3,7 @@ from pydantic import BaseModel
 from typing import List, Optional
 
 class IndexConstituent(BaseModel):
-    """通用指数成分股模型"""
+    """通用指数成分股模型；symbol 为 Tushare 风格 ts_code（含 .SH/.SZ/.BJ）。"""
     symbol: str
     name: str
     industry: Optional[str] = None

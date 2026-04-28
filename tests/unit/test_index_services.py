@@ -59,10 +59,24 @@ def test_store_key_for_index(code: str, expected: str) -> None:
 
 
 @pytest.mark.unit
-def test_normalize_symbol() -> None:
-    assert IndexService._normalize_symbol("000001.SZ") == "000001"
-    assert IndexService._normalize_symbol("688001.SH") == "688001"
-    assert IndexService._normalize_symbol("foo") == "foo"
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        ("000001.SZ", "000001.SZ"),
+        ("688001.sh", "688001.SH"),
+        ("600519.SH", "600519.SH"),
+        ("600519", "600519.SH"),
+        ("000001", "000001.SZ"),
+        ("688001", "688001.SH"),
+    ],
+)
+def test_ensure_ts_code(raw: str, expected: str) -> None:
+    assert IndexService._ensure_ts_code(raw) == expected
+
+
+@pytest.mark.unit
+def test_ensure_ts_code_unknown_returns_stripped() -> None:
+    assert IndexService._ensure_ts_code("  foo  ") == "foo"
 
 
 @pytest.mark.unit
@@ -98,7 +112,7 @@ def test_get_index_constituents_prefers_newer_snapshot(monkeypatch: pytest.Monke
     svc = IndexService()
     out = asyncio.run(svc.get_index_constituents("hs300"))
     assert len(out) == 1
-    assert out[0].symbol == "000001"
+    assert out[0].symbol == "000001.SZ"
     assert out[0].name == "NewName"
     assert out[0].weight == 2.0
 
@@ -113,4 +127,4 @@ def test_get_index_constituents_empty_db_uses_fallback(monkeypatch: pytest.Monke
     svc = IndexService()
     out = asyncio.run(svc.get_index_constituents("hs300"))
     assert len(out) >= 1
-    assert any(c.symbol == "000001" for c in out)
+    assert any(c.symbol == "000001.SZ" for c in out)
