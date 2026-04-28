@@ -26,6 +26,144 @@ _DASHBOARD_MARKET_SYMBOLS: Dict[str, List[str]] = {
     "crypto": ["BTC-USD", "ETH-USD"],
 }
 
+# 与 quant_analyzer GlobalMarketService.TICKERS 中仪表盘用到的名称对齐（供前端展示）
+_DASHBOARD_SYMBOL_NAMES: Dict[str, Dict[str, str]] = {
+    "indices": {
+        "^IXIC": "Nasdaq",
+        "^GSPC": "S&P 500",
+        "^DJI": "Dow Jones",
+        "^RUT": "Russell 2000",
+        "^VIX": "VIX Volatility",
+    },
+    "us_index_futures": {
+        "ES=F": "S&P 500 Futures",
+        "YM=F": "Dow Futures",
+        "NQ=F": "Nasdaq Futures",
+        "RTY=F": "Russell 2000 Futures",
+    },
+    "china_concepts": {
+        "FXI": "iShares China Large-Cap ETF",
+        "2823.HK": "iShares A50 China (HK)",
+        "PGJ": "Golden Dragon ETF",
+        "BABA": "Alibaba",
+        "PDD": "Pinduoduo",
+        "JD": "JD.com",
+        "NIO": "NIO",
+    },
+    "tech_giants": {
+        "NVDA": "NVIDIA",
+        "TSLA": "Tesla",
+        "AAPL": "Apple",
+        "MSFT": "Microsoft",
+        "AMD": "AMD",
+        "INTC": "Intel",
+        "GOOG": "Google",
+        "META": "Meta",
+        "AMZN": "Amazon",
+    },
+    "commodities": {"GC=F": "Gold", "SI=F": "Silver", "CL=F": "Crude Oil"},
+    "forex": {"DX-Y.NYB": "USD Index", "CNH=X": "USD/CNH (Offshore)"},
+    "bonds": {"^TNX": "US 10Y Treasury Yield"},
+    "crypto": {"BTC-USD": "Bitcoin", "ETH-USD": "Ethereum"},
+}
+
+
+def _parse_quote_ts(raw: Any) -> Optional[datetime]:
+    if raw is None:
+        return None
+    if isinstance(raw, datetime):
+        return raw
+    s = str(raw).strip()
+    if not s:
+        return None
+    try:
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        return datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+def read_global_market_dashboard_from_db() -> Dict[str, Any]:
+    """
+    从 quant_data.global_market_quotes 读取 GlobalMarketBrief 仪表盘所需的最新同步行情
+   （与 quant-data-engine run_global_market_sync 写入结构一致）。
+    """
+    categories: Dict[str, Dict[str, Any]] = {cat: {} for cat in _DASHBOARD_MARKET_SYMBOLS}
+    max_dt: Optional[datetime] = None
+    symbol_flat: List[str] = []
+    for cat, syms in _DASHBOARD_MARKET_SYMBOLS.items():
+        symbol_flat.extend(syms)
+    symbol_flat = list(dict.fromkeys(symbol_flat))
+
+    try:
+        col = get_data_db()["global_market_quotes"]
+        docs = list(col.find({"symbol": {"$in": symbol_flat}}))
+    except Exception as e:
+        return {"success": False, "error": str(e), "categories": categories}
+
+    by_sym = {d.get("symbol"): d for d in docs if d.get("symbol")}
+
+    for category, symbols in _DASHBOARD_MARKET_SYMBOLS.items():
+        names = _DASHBOARD_SYMBOL_NAMES.get(category, {})
+        for symbol in symbols:
+            doc = by_sym.get(symbol)
+            if not doc:
+                continue
+            price = doc.get("price", 0.0)
+            change_pct = doc.get("change_pct", 0.0)
+            timestamp_str = doc.get("timestamp", "") or ""
+            dt = _parse_quote_ts(timestamp_str)
+            if dt is not None and (max_dt is None or dt > max_dt):
+                max_dt = dt
+
+            date_val = ""
+            if timestamp_str:
+                try:
+                    date_val = str(timestamp_str).split("T")[0] if "T" in str(timestamp_str) else str(timestamp_str)[:10]
+                except Exception:
+                    date_val = ""
+
+            try:
+                price_f = round(float(price), 2) if price is not None else 0.0
+            except (TypeError, ValueError):
+                price_f = 0.0
+            try:
+                chg_f = round(float(change_pct), 2) if change_pct is not None else 0.0
+            except (TypeError, ValueError):
+                chg_f = 0.0
+
+            item: Dict[str, Any] = {
+                "symbol": symbol,
+                "name": names.get(symbol, symbol),
+                "price": price_f,
+                "change_pct": chg_f,
+                "volume": 0,
+                "date": date_val,
+            }
+            if doc.get("prev_close") is not None:
+                try:
+                    item["prev_close"] = round(float(doc.get("prev_close")), 2)
+                except (TypeError, ValueError):
+                    pass
+            if doc.get("change_pct_source"):
+                item["change_pct_source"] = str(doc.get("change_pct_source"))
+            if doc.get("prev_close_source"):
+                item["prev_close_source"] = str(doc.get("prev_close_source"))
+            if timestamp_str:
+                item["quote_timestamp"] = str(timestamp_str)
+
+            categories[category][symbol] = item
+
+    synced_max = max_dt.isoformat() if max_dt else None
+    return {
+        "success": True,
+        "categories": categories,
+        "synced_at_max": synced_max,
+        "data_source": "global_market_quotes",
+        "source_note": "Yahoo Finance（经 quant-data-engine 同步至本地库）",
+    }
+
 
 def _prune_market_data_for_dashboard(market_data: Mapping[str, Any]) -> Dict[str, Any]:
     """仅保留前端卡片用到的行情键，避免整包同步数据拖慢 JSON 与浏览器。"""
@@ -338,6 +476,17 @@ async def get_global_analysis(
             "success": False,
             "error": f"系统错误: {str(e)}"
         }
+
+
+@router.get("/global-market-dashboard")
+async def get_global_market_dashboard(current_user: dict = Depends(get_current_active_user)):
+    """GlobalMarketBrief 仪表盘：返回 MongoDB 中最新同步的全球行情（与 AI 分析报告解耦）。"""
+    _ = current_user
+    payload = read_global_market_dashboard_from_db()
+    if payload.get("success"):
+        return {"success": True, "data": payload}
+    return {"success": False, "error": payload.get("error", "unknown")}
+
 
 def fetch_market_data() -> Optional[Dict[str, Any]]:
     """获取用于市场分析的数据 - 优先使用外部数据源"""
