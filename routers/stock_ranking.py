@@ -9,6 +9,58 @@ from bson import ObjectId
 
 router = APIRouter(tags=["股票排名"])
 
+# 指数/批量「指定股票」请求时：按批查 stock_scores / stock_info，volume_price 另分段；峰值更低、往返略多。
+SELECTED_SYMBOLS_QUERY_CHUNK = 50
+STOCK_INFO_IN_CHUNK = 160
+VOLUME_PRICE_IN_CHUNK = 80
+# 超过该数量时默认不算「评分以来涨跌」（volume_price 聚合很重）；传 skip_return_since=false 可强制计算。
+SELECTED_RETURN_SINCE_AUTO_THRESHOLD = 100
+
+_STOCK_SCORE_LIST_PROJECTION = {
+    "_id": 1,
+    "symbol": 1,
+    "score_date": 1,
+    "composite_score": 1,
+    "cycle_score": 1,
+    "value_score": 1,
+    "fundamental_score": 1,
+    "growth_score": 1,
+    "technical_score": 1,
+    "money_flow_score": 1,
+}
+
+# 与 stock-scoring-system data_manager.SCORE_INDEX_LABEL_CODES 一致；按 index_codes 查榜
+STOCK_RANKING_INDEX_CODES: Tuple[str, ...] = (
+    "hs300",
+    "a500",
+    "csi500",
+    "csi1000",
+    "star50",
+)
+
+
+def _aggregate_index_ranking_score_docs(
+    stock_scores: Any, index_code: str, score_date: Optional[str]
+) -> List[dict]:
+    """按 index_codes 拉取评分行：有 date 则当日截面；否则每 symbol 取 score_date 最新一条再筛指数。"""
+    if score_date:
+        pipeline = [
+            {"$match": {"score_date": score_date, "index_codes": index_code}},
+            {"$project": _STOCK_SCORE_LIST_PROJECTION},
+        ]
+    else:
+        pipeline = [
+            {"$sort": {"score_date": -1}},
+            {"$group": {"_id": "$symbol", "doc": {"$first": "$$ROOT"}}},
+            {"$replaceRoot": {"newRoot": "$doc"}},
+            {"$match": {"index_codes": index_code}},
+            {"$project": _STOCK_SCORE_LIST_PROJECTION},
+        ]
+    try:
+        return list(stock_scores.aggregate(pipeline))
+    except Exception:
+        return []
+
 
 # using helpers from stock-scoring-system/utils/score_utils.py
 
@@ -23,6 +75,126 @@ RETURN_SINCE_EMPTY: Dict[str, Any] = {
     "price_base_trade_date": None,
     "price_latest_trade_date": None,
 }
+
+
+def _symbol_key_variants(sym: str) -> List[str]:
+    """同一标的在库中可能存 ``600519``、``600519.SH`` 等，用于查询与匹配。"""
+    s = (sym or "").strip()
+    if not s:
+        return []
+    u = s.upper()
+    out: List[str] = []
+    seen: Set[str] = set()
+
+    def add(x: str) -> None:
+        if x and x not in seen:
+            seen.add(x)
+            out.append(x)
+
+    add(s)
+    if u.endswith((".SH", ".SZ", ".BJ")):
+        dot = s.rfind(".")
+        if dot > 0:
+            add(s[:dot].strip())
+    else:
+        digits = "".join(ch for ch in s if ch.isdigit())
+        bare = digits[:6] if len(digits) >= 6 else s
+        add(bare)
+        for suf in (".SH", ".SZ", ".BJ"):
+            add(bare + suf)
+    return out
+
+
+def _expanded_query_symbols(symbols: List[str]) -> List[str]:
+    keys: List[str] = []
+    seen: Set[str] = set()
+    for sym in symbols:
+        for v in _symbol_key_variants(sym):
+            if v not in seen:
+                seen.add(v)
+                keys.append(v)
+    return keys
+
+
+def _chunk_list(items: List[str], chunk_size: int) -> List[List[str]]:
+    if chunk_size <= 0:
+        return [items] if items else []
+    return [items[i : i + chunk_size] for i in range(0, len(items), chunk_size)]
+
+
+def _aggregate_latest_score_doc_per_symbol(stock_scores: Any, symbols_in: List[str]) -> List[dict]:
+    """按 symbol 取 score_date 最新的一条；避免 $push 全历史；$project 减少网卡与 BSON 解码量。"""
+    if not symbols_in:
+        return []
+    pipeline = [
+        {"$match": {"symbol": {"$in": symbols_in}}},
+        {"$sort": {"symbol": 1, "score_date": -1}},
+        {"$group": {"_id": "$symbol", "doc": {"$first": "$$ROOT"}}},
+        {"$replaceRoot": {"newRoot": "$doc"}},
+        {"$project": _STOCK_SCORE_LIST_PROJECTION},
+    ]
+    try:
+        return list(stock_scores.aggregate(pipeline))
+    except Exception:
+        return []
+
+
+def _find_latest_per_symbol_fallback(stock_scores: Any, symbols_in: List[str]) -> List[dict]:
+    """主聚合异常时的备用路径：仍用 $group+$first，禁止无 projection 的 find 拉回全历史。"""
+    if not symbols_in:
+        return []
+    pipeline = [
+        {"$match": {"symbol": {"$in": symbols_in}}},
+        {"$sort": {"score_date": -1}},
+        {"$group": {"_id": "$symbol", "doc": {"$first": "$$ROOT"}}},
+        {"$replaceRoot": {"newRoot": "$doc"}},
+        {"$project": _STOCK_SCORE_LIST_PROJECTION},
+    ]
+    try:
+        return list(stock_scores.aggregate(pipeline))
+    except Exception:
+        return []
+
+
+def _stock_info_find_in_chunks(
+    stock_info: Any, score_query_symbols: List[str], projection: Optional[dict]
+) -> List[dict]:
+    out: List[dict] = []
+    for chunk in _chunk_list(score_query_symbols, STOCK_INFO_IN_CHUNK):
+        if not chunk:
+            continue
+        cur = stock_info.find({"symbol": {"$in": chunk}}, projection or None)
+        out.extend(list(cur))
+    return out
+
+
+def _requested_symbol_for_db_row(db_symbol: Optional[str], requested: List[str]) -> str:
+    """将库里的 symbol 映射回调用方传入的代码（优先保留 ts_code 写法）。"""
+    dbs = (db_symbol or "").strip()
+    if not dbs:
+        return dbs or ""
+    for req in requested:
+        if dbs in _symbol_key_variants(req):
+            return req.strip()
+    return dbs
+
+
+def _find_one_stock_score(
+    stock_scores: Any, symbol: str, score_date: str
+) -> Optional[dict]:
+    for k in _symbol_key_variants(symbol):
+        doc = stock_scores.find_one({"symbol": k, "score_date": score_date})
+        if doc:
+            return doc
+    return None
+
+
+def _find_one_stock_info(stock_info: Any, symbol: str) -> Optional[dict]:
+    for k in _symbol_key_variants(symbol):
+        doc = stock_info.find_one({"symbol": k})
+        if doc:
+            return doc
+    return None
 
 
 def _close_from_volume_price_doc(doc: Optional[dict]) -> Optional[float]:
@@ -91,42 +263,65 @@ def _return_since_from_docs(latest_doc: Optional[dict], base_doc: Optional[dict]
     return out
 
 
+def _pick_vp_doc(vp_by_symbol: Dict[str, Any], sym: str) -> Optional[dict]:
+    """从 bulk 结果中取文档：``volume_price.symbol`` 可能与 ``stock_scores`` 后缀不一致。"""
+    for k in _symbol_key_variants(sym):
+        d = vp_by_symbol.get(k)
+        if d:
+            return d
+    return None
+
+
 def _bulk_latest_by_symbol(volume_price_col: Any, symbols: List[str]) -> Dict[str, Any]:
-    """一次聚合：每只股票最新一根日线。"""
+    """每只股票最新一根日线；symbol 较多时分段 $match 聚合后在内存合并。"""
     if not symbols:
         return {}
     uniq = list(dict.fromkeys(symbols))
-    try:
-        cur = volume_price_col.aggregate(
-            [
-                {"$match": {"symbol": {"$in": uniq}}},
-                {"$sort": {"trade_date": -1}},
-                {"$group": {"_id": "$symbol", "doc": {"$first": "$$ROOT"}}},
-            ]
-        )
-        return {row["_id"]: row["doc"] for row in cur if row.get("_id") and row.get("doc")}
-    except Exception:
-        return {}
+    merged: Dict[str, Any] = {}
+    for chunk in _chunk_list(uniq, VOLUME_PRICE_IN_CHUNK):
+        if not chunk:
+            continue
+        try:
+            cur = volume_price_col.aggregate(
+                [
+                    {"$match": {"symbol": {"$in": chunk}}},
+                    {"$sort": {"trade_date": -1}},
+                    {"$group": {"_id": "$symbol", "doc": {"$first": "$$ROOT"}}},
+                ]
+            )
+            for row in cur:
+                if row.get("_id") and row.get("doc"):
+                    merged[row["_id"]] = row["doc"]
+        except Exception:
+            continue
+    return merged
 
 
 def _bulk_base_by_symbol_string(
     volume_price_col: Any, symbols: List[str], sd: str
 ) -> Dict[str, Any]:
-    """一次聚合：trade_date 为字符串时可比较的「不晚于 score_date 的最近一根」。"""
+    """不晚于 score_date 的最近一根 K；symbol 较多时分段聚合后合并。"""
     if not symbols or len(sd) < 8:
         return {}
     uniq = list(dict.fromkeys(symbols))
-    try:
-        cur = volume_price_col.aggregate(
-            [
-                {"$match": {"symbol": {"$in": uniq}, "trade_date": {"$lte": sd}}},
-                {"$sort": {"symbol": 1, "trade_date": -1}},
-                {"$group": {"_id": "$symbol", "doc": {"$first": "$$ROOT"}}},
-            ]
-        )
-        return {row["_id"]: row["doc"] for row in cur if row.get("_id") and row.get("doc")}
-    except Exception:
-        return {}
+    merged: Dict[str, Any] = {}
+    for chunk in _chunk_list(uniq, VOLUME_PRICE_IN_CHUNK):
+        if not chunk:
+            continue
+        try:
+            cur = volume_price_col.aggregate(
+                [
+                    {"$match": {"symbol": {"$in": chunk}, "trade_date": {"$lte": sd}}},
+                    {"$sort": {"symbol": 1, "trade_date": -1}},
+                    {"$group": {"_id": "$symbol", "doc": {"$first": "$$ROOT"}}},
+                ]
+            )
+            for row in cur:
+                if row.get("_id") and row.get("doc"):
+                    merged[row["_id"]] = row["doc"]
+        except Exception:
+            continue
+    return merged
 
 
 def compute_return_since_score(
@@ -185,7 +380,8 @@ def enrich_rows_return_since_score(rows: List[dict], volume_price_col: Any) -> N
         if sym and sym not in seen:
             seen.add(sym)
             symbols.append(sym)
-    latest_map = _bulk_latest_by_symbol(volume_price_col, symbols)
+    symbols_vp = _expanded_query_symbols(symbols)
+    latest_map = _bulk_latest_by_symbol(volume_price_col, symbols_vp)
 
     by_sd: Dict[str, List[str]] = {}
     for row in rows:
@@ -198,15 +394,22 @@ def enrich_rows_return_since_score(rows: List[dict], volume_price_col: Any) -> N
     base_map: Dict[Tuple[str, str], Any] = {}
     for sd, syms in by_sd.items():
         uniq_syms = list(dict.fromkeys(syms))
-        bulk = _bulk_base_by_symbol_string(volume_price_col, uniq_syms, sd)
+        uniq_vp = _expanded_query_symbols(uniq_syms)
+        bulk = _bulk_base_by_symbol_string(volume_price_col, uniq_vp, sd)
         for sym in uniq_syms:
-            doc = bulk.get(sym)
+            doc = _pick_vp_doc(bulk, sym)
             if doc and _close_from_volume_price_doc(doc) is not None:
                 base_map[(sym, sd)] = doc
         for sym in uniq_syms:
             if (sym, sd) in base_map:
                 continue
-            base_map[(sym, sd)] = _fetch_base_doc_single(volume_price_col, sym, sd)
+            doc = None
+            for k in _symbol_key_variants(sym):
+                fd = _fetch_base_doc_single(volume_price_col, k, sd)
+                if fd and _close_from_volume_price_doc(fd) is not None:
+                    doc = fd
+                    break
+            base_map[(sym, sd)] = doc
 
     for row in rows:
         sym = row.get("symbol") or ""
@@ -214,9 +417,111 @@ def enrich_rows_return_since_score(rows: List[dict], volume_price_col: Any) -> N
         if not sym or len(sd) < 8:
             row.update(dict(RETURN_SINCE_EMPTY))
             continue
-        latest_doc = latest_map.get(sym)
+        latest_doc = _pick_vp_doc(latest_map, sym)
         base_doc = base_map.get((sym, sd))
         row.update(_return_since_from_docs(latest_doc, base_doc))
+
+
+@router.get("/stock-rankings/by-index/{index_code}")
+async def get_stock_rankings_by_index(
+    request: Request,
+    index_code: str,
+    strategy: str = Query(
+        "balanced",
+        description="与全市场榜一致：balanced/aggressive/conservative 等",
+    ),
+    date: Optional[str] = Query(
+        None,
+        description="YYYYMMDD；不传则每只股票取最新 score_date 后再筛 index_codes",
+    ),
+    exclude_st: bool = Query(True, description="是否排除名称含 ST 的股票"),
+    offset: int = Query(0, ge=0, description="分页起点"),
+    page_size: int = Query(30, ge=1, le=500, description="本页条数"),
+):
+    """
+    按 ``stock_scores.index_codes`` 拉指数成分榜（不在库内回退 POST 全量 symbols）。
+    无 ``index_codes`` 或未回填的历史数据时结果为空列表。
+    """
+    ic = (index_code or "").strip().lower()
+    if ic not in STOCK_RANKING_INDEX_CODES:
+        raise HTTPException(
+            status_code=400,
+            detail="不支持的 index_code: %s；允许: %s"
+            % (index_code, ", ".join(STOCK_RANKING_INDEX_CODES)),
+        )
+    try:
+        db = get_db_collections_from_request(request)
+        stock_scores = db["stock_scores"]
+        stock_info = db["stock_info"]
+        effective_strategy = (strategy or "balanced").strip() or "balanced"
+        raw = _aggregate_index_ranking_score_docs(stock_scores, ic, date)
+        raw.sort(
+            key=lambda d: extract_strategy_score(
+                d.get("composite_score", 0), effective_strategy
+            ),
+            reverse=True,
+        )
+        symbols = [s.get("symbol") for s in raw if s.get("symbol")]
+        info_map: Dict[str, Any] = {}
+        if symbols:
+            for info in stock_info.find(
+                {"symbol": {"$in": symbols}},
+                {"symbol": 1, "name": 1, "industry": 1},
+            ):
+                sy = info.get("symbol")
+                if sy:
+                    info_map[str(sy)] = info
+        ranked: List[dict] = []
+        for stock in raw:
+            sym = stock.get("symbol") or ""
+            info = info_map.get(sym)
+            name = (info or {}).get("name", "") if info else ""
+            if exclude_st and "ST" in (name or ""):
+                continue
+            ranked.append(stock)
+        total = len(ranked)
+        page = ranked[offset : offset + page_size]
+        formatted: List[dict] = []
+        for stock in page:
+            sym = stock.get("symbol") or ""
+            inf = info_map.get(sym)
+            cs = stock.get("composite_score", 0)
+            if not isinstance(cs, dict):
+                cs = {"balanced": cs}
+            row = {
+                "symbol": sym,
+                "name": (inf or {}).get("name", "") if inf else "",
+                "industry": (inf or {}).get("industry", "") if inf else "",
+                "composite_score": cs,
+                "cycle_score": safe_round(stock.get("cycle_score", 0), 2),
+                "value_score": safe_round(stock.get("value_score", 0), 2),
+                "fundamental_score": safe_round(stock.get("fundamental_score", 0), 2),
+                "growth_score": safe_round(stock.get("growth_score", 0), 2),
+                "technical_score": safe_round(stock.get("technical_score", 0), 2),
+                "money_flow_score": safe_round(stock.get("money_flow_score", 0), 2),
+                "score_date": stock.get("score_date", ""),
+            }
+            row.update(dict(RETURN_SINCE_EMPTY))
+            formatted.append(row)
+        return {
+            "success": True,
+            "data": formatted,
+            "total": total,
+            "offset": offset,
+            "page_size": page_size,
+            "date": date or "",
+            "index_code": ic,
+            "message": "按指数 %s 获取评分成功" % ic,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback
+
+        print("按指数获取股票评分失败: %s\n%s" % (str(e), traceback.format_exc()))
+        raise HTTPException(
+            status_code=500, detail="按指数获取股票评分失败: %s" % str(e)
+        )
 
 
 @router.get("/stock-rankings")
@@ -636,6 +941,19 @@ async def get_stock_dates(request: Request, symbol: str = Query(..., description
 class SelectedStocksRequest(BaseModel):
     symbols: List[str]
     dates: Optional[List[str]] = None
+    strategy: Optional[str] = None
+    # 指数视图（沪深300/中证500 等）批量拉榜：为 true 时不访问 volume_price，只返回评分表字段
+    index_mode: bool = False
+    # True: 不算评分以来涨跌；False: 强制算；None: 由 index_mode / 只数阈值决定
+    skip_return_since: Optional[bool] = None
+
+
+def _should_enrich_return_since(body: SelectedStocksRequest, n_symbols: int) -> bool:
+    if body.index_mode or body.skip_return_since is True:
+        return False
+    if body.skip_return_since is False:
+        return True
+    return n_symbols <= SELECTED_RETURN_SINCE_AUTO_THRESHOLD
 
 # ✅ 修复 selected 端点 - 确保每只股票只显示最新评分
 
@@ -643,7 +961,18 @@ class SelectedStocksRequest(BaseModel):
 async def get_selected_stock_rankings(
     request: Request,
     body: SelectedStocksRequest,
-    date: Optional[str] = Query(None, description="指定日期 YYYYMMDD,默认为每只股票的最新日期")
+    date: Optional[str] = Query(None, description="指定日期 YYYYMMDD,默认为每只股票的最新日期"),
+    strategy: Optional[str] = Query(
+        None,
+        description="与 /stock-rankings 一致，如 balanced/aggressive/conservative；优先于 body.strategy",
+    ),
+    offset: int = Query(0, ge=0, description="分页：排序后截取起点"),
+    page_size: Optional[int] = Query(
+        None,
+        ge=1,
+        le=500,
+        description="分页：本页条数；不传则返回全部（兼容旧客户端）",
+    ),
 ):
     """
     获取指定股票的评分 - 每只股票只显示最新一天的评分（直接查数据库）
@@ -655,11 +984,24 @@ async def get_selected_stock_rankings(
         db = get_db_collections_from_request(request)
         stock_scores = db['stock_scores']
         stock_info = db['stock_info']
+        score_query_symbols = _expanded_query_symbols(symbols)
+        qs = (strategy or "").strip()
+        bs = (body.strategy or "").strip() if body.strategy else ""
+        effective_strategy = qs or bs or "balanced"
         # support optional multi-date per-symbol queries via body.dates
         dates = getattr(body, 'dates', None) or None
         if dates:
             # build a lightweight per-date structure for each requested symbol
-            info_cache = {s['symbol']: s for s in stock_info.find({"symbol": {"$in": symbols}})}
+            info_docs = _stock_info_find_in_chunks(
+                stock_info, score_query_symbols, {"symbol": 1, "name": 1, "industry": 1}
+            )
+            info_cache: Dict[str, Any] = {}
+            for doc in info_docs:
+                sy = doc.get("symbol")
+                if not sy:
+                    continue
+                for k in _symbol_key_variants(str(sy)):
+                    info_cache[k] = doc
             formatted_stocks = []
             try:
                 vp_col = get_data_db()["volume_price"]
@@ -683,7 +1025,7 @@ async def get_selected_stock_rankings(
                             "price_base_trade_date": None,
                             "price_latest_trade_date": None,
                         }
-                    doc = stock_scores.find_one({"symbol": sym, "score_date": d})
+                    doc = _find_one_stock_score(stock_scores, sym, d)
                     if doc:
                         latest_any = latest_any or doc
                         cs = doc.get('composite_score', 0)
@@ -698,7 +1040,13 @@ async def get_selected_stock_rankings(
                             'technical_score': safe_round(doc.get('technical_score', 0), 2),
                             'money_flow_score': safe_round(doc.get('money_flow_score', 0), 2)
                         }
-                info = info_cache.get(sym) or stock_info.find_one({"symbol": sym})
+                info = None
+                for k in _symbol_key_variants(sym):
+                    if k in info_cache:
+                        info = info_cache[k]
+                        break
+                if not info:
+                    info = _find_one_stock_info(stock_info, sym)
                 formatted_stocks.append({
                     'symbol': sym,
                     'name': info.get('name', '') if info else '',
@@ -709,6 +1057,10 @@ async def get_selected_stock_rankings(
                     'per_date_return_since': per_date_return_since,
                     'score_date': latest_any.get('score_date') if latest_any else ''
                 })
+            formatted_stocks.sort(
+                key=lambda row: extract_strategy_score(row.get("composite_score", 0), effective_strategy),
+                reverse=True,
+            )
             return {
                 'success': True,
                 'data': formatted_stocks,
@@ -718,35 +1070,56 @@ async def get_selected_stock_rankings(
             }
 
         else:
+            selected_stocks = []
             if date:
-                query = {"symbol": {"$in": symbols}, "score_date": date}
-                selected_stocks = list(stock_scores.find(query))
+                for batch in _chunk_list(symbols, SELECTED_SYMBOLS_QUERY_CHUNK):
+                    exp = _expanded_query_symbols(batch)
+                    if not exp:
+                        continue
+                    q = {"symbol": {"$in": exp}, "score_date": date}
+                    selected_stocks.extend(
+                        list(stock_scores.find(q, _STOCK_SCORE_LIST_PROJECTION))
+                    )
             else:
-                pipeline = [
-                    {"$match": {"symbol": {"$in": symbols}}},
-                    {"$group": {
-                        "_id": "$symbol",
-                        "latest_date": {"$max": "$score_date"},
-                        "docs": {"$push": "$$ROOT"}
-                    }},
-                    {"$unwind": "$docs"},
-                    {"$match": {"$expr": {"$eq": ["$docs.score_date", "$latest_date"]}}},
-                    {"$replaceRoot": {"newRoot": "$docs"}},
-                    {"$sort": {"composite_score": -1}}
-                ]
-                selected_stocks = list(stock_scores.aggregate(pipeline))
-                if not selected_stocks:
-                    base_query = {"symbol": {"$in": symbols}}
-                    selected_stocks = list(stock_scores.find(base_query))
-        # 添加股票名称和行业信息
+                for batch in _chunk_list(symbols, SELECTED_SYMBOLS_QUERY_CHUNK):
+                    exp = _expanded_query_symbols(batch)
+                    if not exp:
+                        continue
+                    part = _aggregate_latest_score_doc_per_symbol(stock_scores, exp)
+                    if not part:
+                        part = _find_latest_per_symbol_fallback(stock_scores, exp)
+                    selected_stocks.extend(part)
+        # 同一标的若库中多条键（极少见），按请求侧 symbol 去重并保留当前策略下分更高的一条
+        if selected_stocks:
+            by_req: Dict[str, dict] = {}
+            for st in selected_stocks:
+                rk = _requested_symbol_for_db_row(st.get("symbol", ""), symbols)
+                cur = by_req.get(rk)
+                if cur is None or extract_strategy_score(
+                    st.get("composite_score", 0), effective_strategy
+                ) > extract_strategy_score(cur.get("composite_score", 0), effective_strategy):
+                    by_req[rk] = st
+            selected_stocks = list(by_req.values())
+        # 批量补全股票名称和行业（分段 $in 后在内存建索引）
+        info_docs = _stock_info_find_in_chunks(
+            stock_info, score_query_symbols, {"symbol": 1, "name": 1, "industry": 1}
+        )
+        info_by_key: Dict[str, Any] = {}
+        for doc in info_docs:
+            sy = doc.get("symbol")
+            if not sy:
+                continue
+            for k in _symbol_key_variants(str(sy)):
+                info_by_key[k] = doc
         for stock in selected_stocks:
-            info = stock_info.find_one({"symbol": stock['symbol']})
-            stock['name'] = info.get('name', '') if info else ''
-            stock['industry'] = info.get('industry', '') if info else ''
-        # 如果没有指定日期，按总分降序排序（兼容 composite_score 为 dict 或数值）
-        if not date:
-            # default to 'balanced' strategy when sorting selected stocks
-            selected_stocks.sort(key=lambda x: extract_strategy_score(x.get('composite_score', 0), 'balanced'), reverse=True)
+            inf = _pick_vp_doc(info_by_key, stock.get("symbol", ""))
+            stock["name"] = inf.get("name", "") if inf else ""
+            stock["industry"] = inf.get("industry", "") if inf else ""
+        # 按当前策略降序（兼容 composite_score 为 dict 或数值；聚合 $sort 对 dict 不可靠，统一在 Python 侧排序）
+        selected_stocks.sort(
+            key=lambda x: extract_strategy_score(x.get("composite_score", 0), effective_strategy),
+            reverse=True,
+        )
         # 格式化返回数据
         formatted_stocks = []
         for stock in selected_stocks:
@@ -769,16 +1142,36 @@ async def get_selected_stock_rankings(
                 'score_date': stock.get('score_date', date if date else '')
             }
             formatted_stocks.append(formatted_stock)
-        try:
-            enrich_rows_return_since_score(formatted_stocks, get_data_db()["volume_price"])
-        except Exception as ex:
-            print(f"[stock-rankings/selected] enrich return_since_score failed: {ex}")
+        total_all = len(formatted_stocks)
+        if page_size is not None:
+            page_rows = formatted_stocks[offset : offset + page_size]
+        else:
+            page_rows = formatted_stocks
+        if _should_enrich_return_since(body, len(symbols)):
+            try:
+                enrich_rows_return_since_score(
+                    page_rows, get_data_db()["volume_price"]
+                )
+            except Exception as ex:
+                print(f"[stock-rankings/selected] enrich return_since_score failed: {ex}")
+        else:
+            for fs in page_rows:
+                fs.update(RETURN_SINCE_EMPTY)
+        for fs in page_rows:
+            fs["symbol"] = _requested_symbol_for_db_row(fs.get("symbol", ""), symbols)
+        eff_page_size = page_size if page_size is not None else total_all
         return {
             "success": True,
-            "data": formatted_stocks,
-            "total": len(formatted_stocks),
+            "data": page_rows,
+            "total": total_all,
+            "offset": offset if page_size is not None else 0,
+            "page_size": eff_page_size,
             "date": date if date else "",
-            "message": f"成功获取 {len(formatted_stocks)} 只指定股票评分 (每只股票显示最新评分)"
+            "message": (
+                f"成功获取 {len(page_rows)} 只指定股票评分 (共 {total_all} 只；offset={offset})"
+                if page_size is not None
+                else f"成功获取 {len(page_rows)} 只指定股票评分 (每只股票显示最新评分)"
+            ),
         }
     except HTTPException:
         raise
