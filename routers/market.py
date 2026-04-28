@@ -1,6 +1,6 @@
 # 新增：获取market spectrum的API接口
-from typing import Optional, Dict, Any
-from fastapi import APIRouter,Query, Depends, HTTPException
+from typing import Optional, Dict, Any, List, Mapping
+from fastapi import APIRouter, Query, Depends, HTTPException
 from models.all_models import MarketAnalysisRequest
 from auth import get_current_active_user
 from db import get_db_collections, get_analyzer_db, get_data_db
@@ -13,6 +13,41 @@ from bson import ObjectId
 from services.analysis_tasks import build_task_doc
 
 router = APIRouter()
+
+# GlobalMarketBrief 仪表盘实际用到的标的（与 Vue 模板一致）；默认裁剪以减小序列化与传输耗时。
+_DASHBOARD_MARKET_SYMBOLS: Dict[str, List[str]] = {
+    "indices": ["^IXIC", "^GSPC", "^DJI", "^RUT", "^VIX"],
+    "us_index_futures": ["NQ=F", "ES=F", "YM=F", "RTY=F"],
+    "china_concepts": ["FXI", "2823.HK", "PGJ", "BABA", "PDD", "JD", "NIO"],
+    "tech_giants": ["NVDA", "TSLA", "AAPL", "MSFT", "GOOG", "META", "AMZN", "AMD", "INTC"],
+    "commodities": ["GC=F", "SI=F", "CL=F"],
+    "forex": ["CNH=X", "DX-Y.NYB"],
+    "bonds": ["^TNX"],
+    "crypto": ["BTC-USD", "ETH-USD"],
+}
+
+
+def _prune_market_data_for_dashboard(market_data: Mapping[str, Any]) -> Dict[str, Any]:
+    """仅保留前端卡片用到的行情键，避免整包同步数据拖慢 JSON 与浏览器。"""
+    out: Dict[str, Any] = dict(market_data)
+    cats = out.get("categories")
+    if isinstance(cats, dict):
+        new_cats: Dict[str, Any] = {}
+        for cat, allow in _DASHBOARD_MARKET_SYMBOLS.items():
+            src = cats.get(cat)
+            if isinstance(src, dict):
+                allow_set = set(allow)
+                new_cats[cat] = {k: v for k, v in src.items() if k in allow_set}
+            else:
+                new_cats[cat] = {}
+        out["categories"] = new_cats
+        return out
+    for cat, allow in _DASHBOARD_MARKET_SYMBOLS.items():
+        src = out.get(cat)
+        if isinstance(src, dict):
+            allow_set = set(allow)
+            out[cat] = {k: v for k, v in src.items() if k in allow_set}
+    return out
 
 
 def _format_trade_date(raw_date: str) -> Optional[str]:
@@ -266,8 +301,18 @@ async def trigger_market_analysis(request: MarketAnalysisRequest, current_user: 
         return {"success": False, "error": str(e)}
 
 @router.get("/global-analysis")
-async def get_global_analysis(current_user: dict = Depends(get_current_active_user)):
-    """获取最新的全球市场联动分析结果"""
+async def get_global_analysis(
+    current_user: dict = Depends(get_current_active_user),
+    full: bool = Query(
+        False,
+        description="为 true 时返回完整 market_data（体积大）；默认 false 仅返回仪表盘用到的标的",
+    ),
+):
+    """获取最新的全球市场联动分析结果。
+
+    默认可显著减小响应体：``market_data`` 中仅保留 GlobalMarketBrief 模板用到的代码，
+    以降低 ``serialize_doc`` / JSON 与网络耗时（Mongo 仍读取整文档；若需全量请传 ``full=true``）。
+    """
     try:
         # Primary-only source: quant_analyzer.global_analysis.
         # Intentionally do NOT fallback to finance.analysis_tasks so data issues surface early.
@@ -276,7 +321,13 @@ async def get_global_analysis(current_user: dict = Depends(get_current_active_us
         if not doc:
             return {"success": False, "error": "今日尚无全球市场分析数据"}
 
-        result = serialize_doc(doc)
+        payload = dict(doc)
+        if not full:
+            md = payload.get("market_data")
+            if isinstance(md, dict):
+                payload["market_data"] = _prune_market_data_for_dashboard(md)
+
+        result = serialize_doc(payload)
         return {
             "success": True,
             "data": result

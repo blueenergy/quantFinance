@@ -97,3 +97,31 @@ def test_fetch_market_data_no_data(monkeypatch):
 
     result = market.fetch_market_data()
     assert result is None
+
+
+@pytest.mark.unit
+def test_prune_market_data_for_dashboard_categories_shape():
+    md = {
+        "categories": {
+            "indices": {"^IXIC": {"price": 1}, "EXTRA": {"price": 99}},
+            "commodities": {"GC=F": {"price": 2000}, "IGNORE": {}},
+        },
+        "meta": "keep",
+    }
+    out = market._prune_market_data_for_dashboard(md)
+    assert out["meta"] == "keep"
+    assert "^IXIC" in out["categories"]["indices"]
+    assert "EXTRA" not in out["categories"]["indices"]
+    assert "GC=F" in out["categories"]["commodities"]
+    assert "IGNORE" not in out["categories"]["commodities"]
+
+
+@pytest.mark.unit
+def test_prune_market_data_for_dashboard_flat_shape():
+    md = {
+        "indices": {"^IXIC": {"p": 1}, "ZZ": {}},
+        "forex": {"CNH=X": {"p": 7}, "OTHER": {}},
+    }
+    out = market._prune_market_data_for_dashboard(md)
+    assert "^IXIC" in out["indices"] and "ZZ" not in out["indices"]
+    assert "CNH=X" in out["forex"] and "OTHER" not in out["forex"]
