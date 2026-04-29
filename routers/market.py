@@ -14,6 +14,18 @@ from services.analysis_tasks import build_task_doc
 
 router = APIRouter()
 
+
+def _theme_lag_trade_date_compact(trade_date: str) -> str:
+    """Normalize to YYYYMMDD."""
+    raw = (trade_date or "").strip()
+    if not raw:
+        raise HTTPException(status_code=400, detail="trade_date 不能为空")
+    digits = "".join(c for c in raw if c.isdigit())[:8]
+    if len(digits) != 8:
+        raise HTTPException(status_code=400, detail="trade_date 须为 YYYYMMDD 或 YYYY-MM-DD")
+    return digits
+
+
 # GlobalMarketBrief 仪表盘实际用到的标的（与 Vue 模板一致）；默认裁剪以减小序列化与传输耗时。
 _DASHBOARD_MARKET_SYMBOLS: Dict[str, List[str]] = {
     "indices": ["^IXIC", "^GSPC", "^DJI", "^RUT", "^VIX"],
@@ -647,6 +659,93 @@ def get_market_spectrum_minute(
     cursor = collection.find(query, projection).sort('trade_date', 1)
     data = list(cursor)
     return {"data": data}
+
+@router.get(
+    "/theme-lag-panel",
+    summary="主题补涨候选 + 叙事（只读）",
+    tags=["Market"],
+)
+def get_theme_lag_panel(
+    trade_date: str = Query(..., description="交易日期 YYYYMMDD 或 YYYY-MM-DD"),
+    index_store_key: str = Query("csi1000", description="index_constituents.index_code"),
+    current_user: dict = Depends(get_current_active_user),
+):
+    """
+    登录可读：``quant_data.theme_lag_candidates`` 与 ``finance.analysis_tasks`` 中
+    ``theme_lag_narrative`` 最新一条（按更新时间），不校验任务属主。
+    """
+    _ = current_user
+    td = _theme_lag_trade_date_compact(trade_date)
+    sk = (index_store_key or "csi1000").strip() or "csi1000"
+
+    data_db = get_data_db()
+    cand_col = data_db.get("theme_lag_candidates")
+    if cand_col is None:
+        raise HTTPException(status_code=500, detail="theme_lag_candidates 集合不可用")
+
+    cand_cursor = cand_col.find({"trade_date": td, "index_store_key": sk}).sort(
+        [("bucket_rank", 1), ("symbol", 1)]
+    )
+    candidates: List[Dict[str, Any]] = []
+    for doc in cand_cursor:
+        row = dict(doc)
+        if "_id" in row:
+            row["_id"] = str(row["_id"])
+        for k, v in list(row.items()):
+            if isinstance(v, datetime):
+                row[k] = v.isoformat()
+        candidates.append(row)
+
+    tasks_col = get_db_collections()["analysis_tasks"]
+    cur = tasks_col.find(
+        {
+            "$or": [{"type": "theme_lag_narrative"}, {"task_type": "theme_lag_narrative"}],
+            "params.trade_date": td,
+            "params.index_store_key": sk,
+        }
+    ).sort([("updated_at", -1), ("_id", -1)]).limit(1)
+    task = next(cur, None)
+    # 防御：历史或异常文档若 params.index_store_key 与查询不一致，不当作本池叙事
+    if task:
+        p = task.get("params") if isinstance(task.get("params"), dict) else {}
+        if str(p.get("index_store_key") or "").strip() != sk:
+            task = None
+
+    narrative: Optional[Dict[str, Any]] = None
+    if task:
+        tid = str(task["_id"])
+        st = str(task.get("status") or "").lower()
+        ca = task.get("completed_at")
+        ca_out = ca.isoformat() if isinstance(ca, datetime) else (str(ca) if ca else None)
+        ua = task.get("updated_at")
+        ua_out = ua.isoformat() if isinstance(ua, datetime) else (str(ua) if ua else None)
+        res = task.get("result") if isinstance(task.get("result"), dict) else {}
+        if st == "completed":
+            narrative = {
+                "status": "completed",
+                "task_id": tid,
+                "narrative_markdown": res.get("narrative_markdown"),
+                "model": res.get("model"),
+                "completed_at": ca_out,
+                "updated_at": ua_out,
+            }
+        else:
+            narrative = {
+                "status": st,
+                "task_id": tid,
+                "error": task.get("error"),
+                "updated_at": ua_out,
+            }
+
+    return {
+        "success": True,
+        "trade_date": td,
+        "index_store_key": sk,
+        "candidate_count": len(candidates),
+        "candidates": candidates,
+        "narrative": narrative,
+    }
+
 
 @router.get("/market-quotes", summary="获取实时市场报价(Lightweight)", tags=["Market"])
 def get_realtime_quotes(symbols: str = Query(..., description="逗号分隔的股票代码，如 ^IXIC,FXI")):

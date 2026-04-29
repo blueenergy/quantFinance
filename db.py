@@ -117,6 +117,7 @@ def get_data_db():
         "limit_up_ladder": data_db["limit_up_ladder"],
         "limit_down_ladder": data_db["limit_down_ladder"],
         "sector_flow": data_db["sector_flow"],
+        "theme_lag_candidates": data_db["theme_lag_candidates"],
         # Market sentiment
         "market_spectrum": data_db["market_spectrum"],
         "market_spectrum_minute": data_db["market_spectrum_minute"],

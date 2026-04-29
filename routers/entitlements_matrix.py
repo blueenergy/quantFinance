@@ -42,6 +42,7 @@ class ActionCell(BaseModel):
 # --- 主导航 Tab（顺序即模块排序）---
 _NAV_ROWS: List[Tuple[str, str, int]] = [
     ("limit-up-ladder", "📊 连板天梯", 10),
+    ("theme-lag-recommend", "📌 主题补涨", 15),
     ("sector-concept", "📈 概念板块", 20),
     ("hot-stock", "🔥 热股分析", 30),
     ("etf", "💰 ETF淘金", 40),
