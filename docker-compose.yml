@@ -338,6 +338,36 @@ services:
         max-size: "50m"
         max-file: "3"
 
+  # Hermes 官方 Web Dashboard（与 gateway 共享 /opt/data）
+  # 勿与 gateway 共用 latest：Hub 上 latest 曾不含 dashboard 子命令导致容器反复重启，见
+  # https://github.com/NousResearch/hermes-agent/issues/9153 — 此处固定版本；gateway 仍可用 latest。
+  # 文档：https://hermes-agent.nousresearch.com/docs/user-guide/docker/
+  hermes-dashboard:
+    image: nousresearch/hermes-agent:v2026.4.23
+    container_name: hermes-dashboard
+    restart: unless-stopped
+    # 无 --insecure 时多版本仅绑 127.0.0.1，宿主机 port 映射无法连上；仅私网/受信环境用 --insecure
+    command: ["dashboard", "--host", "0.0.0.0", "--port", "9119", "--no-open", "--insecure"]
+    ports:
+      - "9119:9119"
+    volumes:
+      - ./hermes-data:/opt/data
+    environment:
+      - TZ=Asia/Shanghai
+      # 同网络下用服务名访问 gateway 健康检查与状态
+      - GATEWAY_HEALTH_URL=http://hermes:8642
+      - GATEWAY_HEALTH_TIMEOUT=5
+    depends_on:
+      hermes:
+        condition: service_healthy
+    networks:
+      - quant-network
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "2"
+
   # 前端Web服务
   quant-web:
     build:
