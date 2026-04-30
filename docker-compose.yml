@@ -23,6 +23,11 @@ services:
       - FROM_NAME=${FROM_NAME:-悟空量化}
       - PUBLIC_HOST=${PUBLIC_HOST:-}
       - USE_HTTPS=${USE_HTTPS:-false}
+      # Hermes BFF (ChatPanel when VITE_ASSISTANT_STREAM_BACKEND=hermes)
+      - HERMES_OPENAI_BASE_URL=${HERMES_OPENAI_BASE_URL:-http://hermes:8642}
+      - HERMES_API_SERVER_KEY=${HERMES_API_SERVER_KEY:-dev-hermes-api-key-change-me}
+      - HERMES_OPENAI_MODEL=${HERMES_OPENAI_MODEL:-hermes-agent}
+      - HERMES_CHAT_TEMPERATURE=${HERMES_CHAT_TEMPERATURE:-0.7}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     networks:
@@ -176,7 +181,7 @@ services:
       - OPENAI_BASE_URL=${QWEN_BASE_URL:-https://dashscope.aliyuncs.com/compatible-mode/v1}
       - OPENAI_MODEL=${DEFAULT_MODEL:-qwen-plus}
       # Embeddings（模型名/维度以环境为准；Mongo 命中时 base_url 与 chat 同源，见 quant-assistant llm/request_context）
-      - EMBEDDINGS_BASE_URL=${QWEN_BASE_URL:-https://dashscope.aliyuncs.com/compatible-mode/v1}
+      - EMBEDDINGS_BASE_URL=${EMBEDDINGS_BASE_URL:-https://dashscope.aliyuncs.com/compatible-mode/v1}
       - EMBEDDINGS_MODEL=${EMBEDDINGS_MODEL:-text-embedding-v3}
       - EMBEDDINGS_DIMENSIONS=${EMBEDDINGS_DIMENSIONS:-1024}
       # MongoDB for assistant logic
