@@ -10,6 +10,7 @@ from bson import ObjectId
 from models.analysis_task import AnalysisTaskCreate
 from services.quota_manager import QuotaManager
 from services.analysis_tasks import build_task_doc, can_access_task
+from services.analysis_history import build_user_analysis_history_payload
 from db import db
 from routers.entitlements_matrix import (
     FEATURE_WATCHLIST_OPPORTUNITIES,
@@ -662,66 +663,12 @@ def get_analysis_history(symbol: Optional[str] = None, page: int = 1, limit: int
     获取当前用户指定股票的分析历史。
     如果未提供 `symbol`，将返回当前用户的所有历史（按时间倒序），支持分页（page, limit）。
     """
-    collections = get_db_collections()
-    analysis_col = get_analyzer_db()["analysis_history"]
-
-    query = {"user_id": current_user.get("id")}
-    if symbol:
-        query["symbol"] = symbol
-
-    try:
-        page = max(1, int(page))
-    except Exception:
-        page = 1
-    try:
-        limit = max(1, min(1000, int(limit)))
-    except Exception:
-        limit = 50
-
-    skip = (page - 1) * limit
-
-    total = analysis_col.count_documents(query)
-    history = list(analysis_col.find(query).sort("timestamp", -1).skip(skip).limit(limit))
-
-    normalized = []
-    for h in history:
-        h_id = str(h.get("_id")) if h.get("_id") else ""
-        analysis_result = h.get("analysis_result") if isinstance(h.get("analysis_result"), dict) else None
-        analysis_obj = analysis_result.get("analysis") if isinstance(analysis_result, dict) else None
-
-        # 兼容旧数据
-        if analysis_obj is None and isinstance(h.get("analysis"), dict):
-            analysis_obj = h.get("analysis")
-        # 解包可能的二次嵌套
-        if isinstance(analysis_obj, dict) and "analysis" in analysis_obj:
-            core = analysis_obj.get("analysis")
-            known_keys = {"technical_analysis", "investment_advice", "risk_level", "support_level", "resistance_level", "risk_price_levels", "long_term_forecast", "mid_term_forecast", "short_term_forecast", "key_points", "confidence_score", "stock_name", "symbol"}
-            if not (known_keys & set(analysis_obj.keys())) and core is not None:
-                analysis_obj = core
-
-        # 兼容旧数据: 若无 symbol 则从历史 stock_code 填充
-        symbol_val = h.get("symbol") or h.get("stock_code")
-        if not symbol_val and isinstance(analysis_obj, dict):
-            symbol_val = analysis_obj.get("symbol") or analysis_obj.get("stock_code")
-
-        stock_name = h.get("stock_name")
-        if not stock_name and isinstance(analysis_obj, dict):
-            stock_name = analysis_obj.get("stock_name")
-
-        created_at = h.get("created_at") or h.get("timestamp") or None
-
-        normalized.append({
-            "id": h_id,
-            "stock_name": stock_name,
-            "symbol": symbol_val,
-            "analysis": analysis_obj,
-            "analysis_result": analysis_result,
-            "provider": h.get("provider") or (analysis_result.get("provider") if analysis_result else None),
-            "model": h.get("model") or (analysis_result.get("model") if analysis_result else None),
-            "created_at": created_at
-        })
-
-    return {"success": True, "data": normalized, "page": page, "limit": limit, "total": total}
+    return build_user_analysis_history_payload(
+        current_user.get("id"),
+        symbol=symbol,
+        page=page,
+        limit=limit,
+    )
 
 
 @router.post("/analyze/deep-analysis")

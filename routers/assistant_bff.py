@@ -10,7 +10,9 @@ import asyncio
 import json
 import logging
 import os
+import re
 import uuid
+from datetime import date, datetime
 from typing import Any, AsyncIterator, Dict, List, Optional
 
 import httpx
@@ -19,6 +21,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from auth import get_current_active_user
+from services.analysis_history import build_user_analysis_history_payload
 from services.ladder_daily import build_daily_ladder_payload
 
 _log = logging.getLogger(__name__)
@@ -58,6 +61,58 @@ _LADDER_TRIGGERS: tuple[str, ...] = (
     "ladder daily",
 )
 
+# 与 GET /api/analysis-history（build_user_analysis_history_payload）同源
+_ANALYSIS_HISTORY_INJECT_ENABLED = os.getenv("HERMES_ANALYSIS_HISTORY_INJECT_ENABLED", "true").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+)
+
+
+def _read_analysis_history_inject_max_chars() -> int:
+    raw = os.getenv("HERMES_ANALYSIS_HISTORY_INJECT_MAX_CHARS", "12000")
+    try:
+        return max(2000, int(raw))
+    except ValueError:
+        return 12000
+
+
+_ANALYSIS_HISTORY_INJECT_MAX_CHARS = _read_analysis_history_inject_max_chars()
+
+
+def _read_analysis_history_limit() -> int:
+    raw = os.getenv("HERMES_ANALYSIS_HISTORY_LIMIT", "15")
+    try:
+        return max(1, min(100, int(raw)))
+    except ValueError:
+        return 15
+
+
+_ANALYSIS_HISTORY_LIMIT = _read_analysis_history_limit()
+
+
+def _read_analysis_history_item_max_chars() -> int:
+    raw = os.getenv("HERMES_ANALYSIS_HISTORY_ITEM_MAX_CHARS", "6000")
+    try:
+        return max(500, int(raw))
+    except ValueError:
+        return 6000
+
+
+_ANALYSIS_HISTORY_ITEM_MAX_CHARS = _read_analysis_history_item_max_chars()
+
+_ANALYSIS_HISTORY_TRIGGERS: tuple[str, ...] = (
+    "自选股深度分析",
+    "深度分析历史",
+    "分析历史",
+    "我的深度分析",
+    "深度分析记录",
+    "股票分析历史",
+    "之前的深度分析",
+    "watchlist deep analysis",
+    "analysis history",
+)
+
 
 class HermesChatStreamRequest(BaseModel):
     message: str = Field(..., min_length=1)
@@ -93,6 +148,89 @@ def _ladder_json_for_system_prompt(payload: dict, max_chars: int) -> str:
     return (
         "【连板天梯数据】以下为 quant-api 与 /api/hermes-tools/ladder/daily 同源的 JSON。"
         "请仅依据其中事实回答；若 success 为 false，说明 error/suggestion，勿编造梯队或股票。"
+        "\n\n"
+        + body
+    )
+
+
+def _user_wants_analysis_history_context(text: str) -> bool:
+    if not _ANALYSIS_HISTORY_INJECT_ENABLED:
+        return False
+    t = text.strip()
+    if not t:
+        return False
+    tl = t.lower()
+    for kw in _ANALYSIS_HISTORY_TRIGGERS:
+        if kw.isascii():
+            if kw.lower() in tl:
+                return True
+        elif kw in t:
+            return True
+    return False
+
+
+def _guess_symbol_for_history(text: str) -> Optional[str]:
+    """识别消息中的 A 股代码（可选），裸 6 位数字可与 .SH/.SZ 多种形式匹配。"""
+    m = re.search(r"\b(\d{6})(\.(?:SZ|SH|BJ))?\b", text, re.I)
+    if not m:
+        return None
+    digits = m.group(1)
+    suf = m.group(2)
+    return digits.upper() + (suf.upper() if suf else "")
+
+
+def _json_dt_default(o: Any) -> Any:
+    if isinstance(o, (datetime, date)):
+        return o.isoformat()
+    raise TypeError(repr(o))
+
+
+def _compact_analysis_history_row(rec: dict, max_analysis_chars: int) -> dict:
+    out: Dict[str, Any] = {
+        "id": rec.get("id"),
+        "symbol": rec.get("symbol"),
+        "stock_name": rec.get("stock_name"),
+        "provider": rec.get("provider"),
+        "model": rec.get("model"),
+        "created_at": rec.get("created_at"),
+    }
+    created = out["created_at"]
+    if hasattr(created, "isoformat"):
+        try:
+            out["created_at"] = created.isoformat()
+        except Exception:
+            out["created_at"] = str(created)
+
+    a = rec.get("analysis")
+    if isinstance(a, dict):
+        dumped = json.dumps(a, ensure_ascii=False, default=_json_dt_default)
+        if len(dumped) > max_analysis_chars:
+            out["analysis_excerpt"] = dumped[:max_analysis_chars] + "..."
+        else:
+            out["analysis"] = a
+    elif a is not None:
+        out["analysis"] = str(a)[:max_analysis_chars]
+
+    return out
+
+
+def _analysis_history_json_for_system_prompt(payload: dict, max_chars: int, item_max: int) -> str:
+    meta = {
+        "page": payload.get("page"),
+        "limit": payload.get("limit"),
+        "total": payload.get("total"),
+        "record_count": len(payload.get("data") or []),
+    }
+    rows = [_compact_analysis_history_row(r, item_max) for r in (payload.get("data") or [])]
+    body_obj = {"meta": meta, "records": rows}
+    raw = json.dumps(body_obj, ensure_ascii=False, separators=(",", ":"), default=_json_dt_default)
+    if len(raw) <= max_chars:
+        body = raw
+    else:
+        body = raw[: max_chars - 40] + "\n...[truncated by HERMES_ANALYSIS_HISTORY_INJECT_MAX_CHARS]"
+    return (
+        "【自选股深度分析历史】以下为当前登录用户在 GET /api/analysis-history 同源数据中的近期记录（按时间倒序）。"
+        "请仅依据其中内容归纳、对比或答疑；若无记录则说明暂无历史，勿编造报告。"
         "\n\n"
         + body
     )
@@ -182,7 +320,7 @@ async def _hermes_stream_events(
 @router.post("/chat/stream")
 async def chat_stream_hermes(
     req: HermesChatStreamRequest,
-    _current_user: dict = Depends(get_current_active_user),
+    current_user: dict = Depends(get_current_active_user),
 ):
     """
     Hermes-backed streaming chat; SSE matches quant-assistant token/error/[DONE] shape.
@@ -194,22 +332,47 @@ async def chat_stream_hermes(
     cid = (req.conversation_id or "").strip()
     conv_id = cid if cid else str(uuid.uuid4())
 
-    messages: List[Dict[str, str]] = []
+    system_fragments: List[str] = []
+
     if _user_wants_ladder_context(text):
         try:
             ladder_payload = await asyncio.to_thread(build_daily_ladder_payload, None)
-            sys_content = _ladder_json_for_system_prompt(ladder_payload, _LADDER_INJECT_MAX_CHARS)
-            messages.append({"role": "system", "content": sys_content})
+            system_fragments.append(
+                _ladder_json_for_system_prompt(ladder_payload, _LADDER_INJECT_MAX_CHARS)
+            )
         except Exception as e:  # noqa: BLE001
             _log.exception("Hermes BFF ladder prefetch failed: %s", e)
-            messages.append(
-                {
-                    "role": "system",
-                    "content": (
-                        "【连板天梯数据】服务端暂时无法加载数据。请勿编造涨停梯队或股票列表；可说明暂时不可用。"
-                    ),
-                }
+            system_fragments.append(
+                "【连板天梯数据】服务端暂时无法加载数据。请勿编造涨停梯队或股票列表；可说明暂时不可用。"
             )
+
+    if _user_wants_analysis_history_context(text):
+        uid = current_user.get("id")
+        sym_guess = _guess_symbol_for_history(text)
+        try:
+            hist_payload = await asyncio.to_thread(
+                build_user_analysis_history_payload,
+                uid,
+                symbol=sym_guess if sym_guess else None,
+                page=1,
+                limit=_ANALYSIS_HISTORY_LIMIT,
+            )
+            system_fragments.append(
+                _analysis_history_json_for_system_prompt(
+                    hist_payload,
+                    _ANALYSIS_HISTORY_INJECT_MAX_CHARS,
+                    _ANALYSIS_HISTORY_ITEM_MAX_CHARS,
+                )
+            )
+        except Exception as e:  # noqa: BLE001
+            _log.exception("Hermes BFF analysis history prefetch failed: %s", e)
+            system_fragments.append(
+                "【自选股深度分析历史】暂时无法从服务端读取历史记录。请勿编造分析内容；可说明暂时不可用。"
+            )
+
+    messages: List[Dict[str, str]] = []
+    if system_fragments:
+        messages.append({"role": "system", "content": "\n\n---\n\n".join(system_fragments)})
     messages.append({"role": "user", "content": text})
 
     payload = {
