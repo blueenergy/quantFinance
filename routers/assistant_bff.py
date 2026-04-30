@@ -6,11 +6,12 @@ MVP: single-user; no Mongo persistence; maps OpenAI stream deltas to {"type":"to
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
 import uuid
-from typing import AsyncIterator, Dict, List, Optional
+from typing import Any, AsyncIterator, Dict, List, Optional
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException
@@ -18,6 +19,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from auth import get_current_active_user
+from services.ladder_daily import build_daily_ladder_payload
 
 _log = logging.getLogger(__name__)
 
@@ -28,6 +30,34 @@ _HERMES_BASE = os.getenv("HERMES_OPENAI_BASE_URL", "http://hermes:8642").rstrip(
 _HERMES_KEY = os.getenv("HERMES_API_SERVER_KEY", "").strip()
 _HERMES_MODEL = os.getenv("HERMES_OPENAI_MODEL", "hermes-agent").strip()
 
+# 命中则注入与 /api/hermes-tools/ladder/daily 同源 JSON（见 build_daily_ladder_payload）
+_LADDER_INJECT_ENABLED = os.getenv("HERMES_LADDER_INJECT_ENABLED", "true").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+)
+def _read_ladder_inject_max_chars() -> int:
+    raw = os.getenv("HERMES_LADDER_INJECT_MAX_CHARS", "10000")
+    try:
+        return max(2000, int(raw))
+    except ValueError:
+        return 10000
+
+
+_LADDER_INJECT_MAX_CHARS = _read_ladder_inject_max_chars()
+
+_LADDER_TRIGGERS: tuple[str, ...] = (
+    "连板天梯",
+    "涨停梯队",
+    "几连板",
+    "今日连板",
+    "连板股",
+    "连板榜",
+    "涨停天梯",
+    "limit-up ladder",
+    "ladder daily",
+)
+
 
 class HermesChatStreamRequest(BaseModel):
     message: str = Field(..., min_length=1)
@@ -36,6 +66,36 @@ class HermesChatStreamRequest(BaseModel):
 
 def _sse_data(obj: Dict[str, Any]) -> str:
     return f"data: {json.dumps(obj, ensure_ascii=False)}\n\n"
+
+
+def _user_wants_ladder_context(text: str) -> bool:
+    if not _LADDER_INJECT_ENABLED:
+        return False
+    t = text.strip()
+    if not t:
+        return False
+    tl = t.lower()
+    for kw in _LADDER_TRIGGERS:
+        if kw.isascii():
+            if kw.lower() in tl:
+                return True
+        elif kw in t:
+            return True
+    return False
+
+
+def _ladder_json_for_system_prompt(payload: dict, max_chars: int) -> str:
+    raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    if len(raw) <= max_chars:
+        body = raw
+    else:
+        body = raw[: max_chars - 40] + "\n...[truncated by HERMES_LADDER_INJECT_MAX_CHARS]"
+    return (
+        "【连板天梯数据】以下为 quant-api 与 /api/hermes-tools/ladder/daily 同源的 JSON。"
+        "请仅依据其中事实回答；若 success 为 false，说明 error/suggestion，勿编造梯队或股票。"
+        "\n\n"
+        + body
+    )
 
 
 def _parse_openai_sse_line(line: str) -> Optional[str]:
@@ -134,9 +194,23 @@ async def chat_stream_hermes(
     cid = (req.conversation_id or "").strip()
     conv_id = cid if cid else str(uuid.uuid4())
 
-    messages: List[Dict[str, str]] = [
-        {"role": "user", "content": text},
-    ]
+    messages: List[Dict[str, str]] = []
+    if _user_wants_ladder_context(text):
+        try:
+            ladder_payload = await asyncio.to_thread(build_daily_ladder_payload, None)
+            sys_content = _ladder_json_for_system_prompt(ladder_payload, _LADDER_INJECT_MAX_CHARS)
+            messages.append({"role": "system", "content": sys_content})
+        except Exception as e:  # noqa: BLE001
+            _log.exception("Hermes BFF ladder prefetch failed: %s", e)
+            messages.append(
+                {
+                    "role": "system",
+                    "content": (
+                        "【连板天梯数据】服务端暂时无法加载数据。请勿编造涨停梯队或股票列表；可说明暂时不可用。"
+                    ),
+                }
+            )
+    messages.append({"role": "user", "content": text})
 
     payload = {
         "model": _HERMES_MODEL,

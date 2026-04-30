@@ -16,14 +16,28 @@ version: 1.0.0
 
 The gateway container has `QUANT_API_URL` and `HERMES_QUANT_INTERNAL_KEY` (same value as on `quant-api`).
 
-Run:
+**Prefer Python** — the official `nousresearch/hermes-agent` image usually has `python3` but may **not** ship `curl` (same as the compose healthcheck).
+
+```bash
+python3 -c "
+import os, urllib.request
+base = os.environ.get('QUANT_API_URL', '').rstrip('/')
+key = os.environ.get('HERMES_QUANT_INTERNAL_KEY', '')
+url = f'{base}/api/hermes-tools/ladder/daily'
+req = urllib.request.Request(url, headers={'X-Hermes-Quant-Key': key})
+with urllib.request.urlopen(req, timeout=30) as r:
+    print(r.read().decode())
+"
+```
+
+Optional query: append `?date=YYYYMMDD` to the URL string (e.g. `20260130`). Omit for “today”.
+
+If `curl` exists on the host, you may use:
 
 ```bash
 curl -sS -H "X-Hermes-Quant-Key: ${HERMES_QUANT_INTERNAL_KEY}" \
   "${QUANT_API_URL}/api/hermes-tools/ladder/daily"
 ```
-
-Optional query: `?date=YYYYMMDD` (e.g. `20260130`). Omit for “today”.
 
 ## Answering
 
