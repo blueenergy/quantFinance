@@ -28,7 +28,8 @@ services:
       - HERMES_API_SERVER_KEY=${HERMES_API_SERVER_KEY:-dev-hermes-api-key-change-me}
       - HERMES_OPENAI_MODEL=${HERMES_OPENAI_MODEL:-hermes-agent}
       - HERMES_CHAT_TEMPERATURE=${HERMES_CHAT_TEMPERATURE:-0.7}
-    extra_hosts:
+      # Hermes -> quant-api internal tools (连板天梯等); must match hermes service
+      - HERMES_QUANT_INTERNAL_KEY=${HERMES_QUANT_INTERNAL_KEY:-}
       - "host.docker.internal:host-gateway"
     networks:
       - quant-network
@@ -328,6 +329,8 @@ services:
       - MONGO_URI=${MONGO_URI:-mongodb://host.docker.internal:27017/}
       # 内部 API 访问
       - QUANT_API_URL=http://quant-api:3001
+      # Must match quant-api HERMES_QUANT_INTERNAL_KEY for /api/hermes-tools/*
+      - HERMES_QUANT_INTERNAL_KEY=${HERMES_QUANT_INTERNAL_KEY:-}
       # 宿主机与其它容器访问网关 OpenAI 兼容 API 时需 0.0.0.0 + 密钥（见 nousresearch 文档 environment-variables）
       - API_SERVER_ENABLED=${HERMES_API_SERVER_ENABLED:-true}
       - API_SERVER_HOST=0.0.0.0

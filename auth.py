@@ -5,7 +5,7 @@
 
 from datetime import datetime, timedelta
 from typing import Optional
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, HTTPException, status, Header
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, EmailStr
 from passlib.context import CryptContext
@@ -353,6 +353,25 @@ def log_admin_action(admin_user: dict, action: str, target_user_id: Optional[str
     }
     
     admin_logs_collection.insert_one(admin_action)
+
+
+def require_hermes_quant_internal_key(
+    x_hermes_quant_key: Optional[str] = Header(None, alias="X-Hermes-Quant-Key"),
+) -> bool:
+    """Shared secret for Hermes -> quant-api internal tools (no end-user JWT)."""
+    expected = os.getenv("HERMES_QUANT_INTERNAL_KEY", "").strip()
+    if not expected:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="HERMES_QUANT_INTERNAL_KEY is not configured",
+        )
+    if not x_hermes_quant_key or x_hermes_quant_key.strip() != expected:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or missing X-Hermes-Quant-Key",
+        )
+    return True
+
 
 async def get_current_admin_user(current_user: dict = Depends(get_current_active_user)):
     """获取当前管理员用户（验证管理员权限）"""
