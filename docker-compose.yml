@@ -175,10 +175,10 @@ services:
       - OPENAI_API_KEY=${QWEN_API_KEY:-sk-xxx}
       - OPENAI_BASE_URL=${QWEN_BASE_URL:-https://dashscope.aliyuncs.com/compatible-mode/v1}
       - OPENAI_MODEL=${DEFAULT_MODEL:-qwen-plus}
-      # Embeddings
+      # Embeddings（模型名/维度以环境为准；Mongo 命中时 base_url 与 chat 同源，见 quant-assistant llm/request_context）
       - EMBEDDINGS_BASE_URL=${QWEN_BASE_URL:-https://dashscope.aliyuncs.com/compatible-mode/v1}
-      - EMBEDDINGS_MODEL=text-embedding-v3
-      - EMBEDDINGS_DIMENSIONS=1024
+      - EMBEDDINGS_MODEL=${EMBEDDINGS_MODEL:-text-embedding-v3}
+      - EMBEDDINGS_DIMENSIONS=${EMBEDDINGS_DIMENSIONS:-1024}
       # MongoDB for assistant logic
       - MONGO_URI=${MONGO_URI:-mongodb://host.docker.internal:27017/}
       - MONGO_DB=assistant
