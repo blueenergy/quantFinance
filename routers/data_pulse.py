@@ -50,8 +50,12 @@ def _freshness_dict_from_rows(freshness_rows: list) -> Dict[str, Any]:
         else:
             base = s[:32]
         pct = row.get("coverage_pct")
-        if pct is not None and row.get("coverage_denominator"):
-            out[label] = f"{base} · 覆盖 {pct:.1f}%"
+        num = row.get("coverage_numerator")
+        den = row.get("coverage_denominator")
+        if num is not None and den is not None and int(den) > 0:
+            out[label] = f"{base} · {int(num)}/{int(den)}"
+        elif pct is not None and den is not None and int(den) > 0:
+            out[label] = f"{base} · 覆盖 {float(pct):.1f}%"
         else:
             out[label] = base
     return out
