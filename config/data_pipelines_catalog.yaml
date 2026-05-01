@@ -67,12 +67,17 @@ pipelines:
     label: 财务数据
     job_status_key: financial_sync
     schedule_hint: "Supercronic 工作日 18:15 → daily_market_sync.sh financial（同上）"
+    # 仍为一条入库任务；新鲜度在 services/data_monitoring 中按 freshness_sheets 展开为 4 行
     freshness:
       database: quant_data
-      collection: financial_indicator
       field: end_date
       field_kind: date_string
-      # 全库 max(end_date) 下，有多少比例的股票（universe）已有该 end_date 的指标行
+      freshness_sheets:
+        - { label: 利润表, collection: financial_income }
+        - { label: 资产负债表, collection: financial_balance }
+        - { label: 现金流量表, collection: financial_cashflow }
+        - { label: 财务指标, collection: financial_indicator }
+      # 各表分别：全库 max(end_date) 为 L 时，stock_info 宇宙内已有该期数据的 ts_code 占比
       coverage:
         universe_database: quant_data
         universe_collection: stock_info

@@ -211,6 +211,70 @@ def _coverage_latest_ratio(
     }
 
 
+def _append_freshness_row_for_collection(
+    out: List[Dict[str, Any]],
+    p: Dict[str, Any],
+    fr: Dict[str, Any],
+    *,
+    database: str,
+    collection: str,
+    display_label: str,
+) -> None:
+    """Append one freshness row (max field + optional coverage) for a Mongo collection."""
+    field = fr.get("field")
+    if not field:
+        return
+    field_kind = fr.get("field_kind", "date_string")
+    doc_id = fr.get("document_id")
+    try:
+        raw = _max_freshness_value(
+            database,
+            collection,
+            field,
+            field_kind,
+            document_id=doc_id,
+        )
+    except Exception as e:
+        raw = None
+        err = str(e)
+    else:
+        err = None
+    iso = None
+    if raw is not None:
+        if hasattr(raw, "isoformat"):
+            iso = raw.isoformat()
+        else:
+            iso = str(raw)
+    row: Dict[str, Any] = {
+        "pipeline_id": p.get("id"),
+        "label": display_label,
+        "database": database,
+        "collection": collection,
+        "field": field,
+        "latest_value": iso,
+        "raw_value": raw,
+        "error": err,
+    }
+    cov_cfg = fr.get("coverage") or {}
+    if raw is not None and not err and cov_cfg.get("universe_collection") and cov_cfg.get("match_key"):
+        try:
+            u_db = cov_cfg.get("universe_database") or database
+            data_coll = _get_collection(database, collection)
+            universe_coll = _get_collection(u_db, cov_cfg["universe_collection"])
+            cov = _coverage_latest_ratio(
+                data_coll,
+                field,
+                raw,
+                universe_coll,
+                str(cov_cfg["match_key"]),
+            )
+            if cov:
+                row.update(cov)
+        except Exception as cov_err:
+            row["coverage_error"] = str(cov_err)
+    out.append(row)
+
+
 def _max_freshness_value(
     database: str,
     collection: str,
@@ -294,58 +358,36 @@ def build_freshness_rows() -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     for p in load_pipelines_catalog():
         fr = p.get("freshness") or {}
-        if not fr.get("collection") or not fr.get("field"):
+        if not fr.get("field"):
             continue
         database = fr.get("database", "quant_data")
-        field_kind = fr.get("field_kind", "date_string")
-        doc_id = fr.get("document_id")
-        try:
-            raw = _max_freshness_value(
-                database,
-                fr["collection"],
-                fr["field"],
-                field_kind,
-                document_id=doc_id,
-            )
-        except Exception as e:
-            raw = None
-            err = str(e)
-        else:
-            err = None
-        iso = None
-        if raw is not None:
-            if hasattr(raw, "isoformat"):
-                iso = raw.isoformat()
-            else:
-                iso = str(raw)
-        row: Dict[str, Any] = {
-            "pipeline_id": p.get("id"),
-            "label": p.get("label"),
-            "database": database,
-            "collection": fr.get("collection"),
-            "field": fr.get("field"),
-            "latest_value": iso,
-            "raw_value": raw,
-            "error": err,
-        }
-        cov_cfg = fr.get("coverage") or {}
-        if raw is not None and not err and cov_cfg.get("universe_collection") and cov_cfg.get("match_key"):
-            try:
-                u_db = cov_cfg.get("universe_database") or database
-                data_coll = _get_collection(database, fr["collection"])
-                universe_coll = _get_collection(u_db, cov_cfg["universe_collection"])
-                cov = _coverage_latest_ratio(
-                    data_coll,
-                    fr["field"],
-                    raw,
-                    universe_coll,
-                    str(cov_cfg["match_key"]),
+        sheets = fr.get("freshness_sheets")
+        if isinstance(sheets, list) and len(sheets) > 0:
+            for sheet in sheets:
+                coll = sheet.get("collection")
+                if not coll:
+                    continue
+                label = sheet.get("label") or str(coll)
+                _append_freshness_row_for_collection(
+                    out,
+                    p,
+                    fr,
+                    database=database,
+                    collection=str(coll),
+                    display_label=str(label),
                 )
-                if cov:
-                    row.update(cov)
-            except Exception as cov_err:
-                row["coverage_error"] = str(cov_err)
-        out.append(row)
+            continue
+        coll = fr.get("collection")
+        if not coll:
+            continue
+        _append_freshness_row_for_collection(
+            out,
+            p,
+            fr,
+            database=database,
+            collection=str(coll),
+            display_label=str(p.get("label") or p.get("id") or coll),
+        )
     return out
 
 
