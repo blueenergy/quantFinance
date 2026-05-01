@@ -26,6 +26,19 @@ def _theme_lag_trade_date_compact(trade_date: str) -> str:
     return digits
 
 
+def _theme_lag_json_float(value: Any) -> Optional[float]:
+    """Mongo / BSON 数值转为 JSON 安全 float；无效或 NaN 为 None。"""
+    if value is None:
+        return None
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return None
+    if f != f:  # NaN
+        return None
+    return f
+
+
 # GlobalMarketBrief 仪表盘实际用到的标的（与 Vue 模板一致）；默认裁剪以减小序列化与传输耗时。
 _DASHBOARD_MARKET_SYMBOLS: Dict[str, List[str]] = {
     "indices": ["^IXIC", "^GSPC", "^DJI", "^RUT", "^VIX"],
@@ -671,8 +684,9 @@ def get_theme_lag_panel(
     current_user: dict = Depends(get_current_active_user),
 ):
     """
-    登录可读：``quant_data.theme_lag_candidates`` 与 ``finance.analysis_tasks`` 中
-    ``theme_lag_narrative`` 最新一条（按更新时间），不校验任务属主。
+    登录可读：``quant_data.theme_lag_candidates``、同锚定日下的
+    ``quant_data.theme_lag_candidate_validation``（按 symbol 合并 P₀、退出日/价、已实现收益率），以及
+    ``finance.analysis_tasks`` 中 ``theme_lag_narrative`` 最新一条（按更新时间），不校验任务属主。
     """
     _ = current_user
     td = _theme_lag_trade_date_compact(trade_date)
@@ -695,6 +709,41 @@ def get_theme_lag_panel(
             if isinstance(v, datetime):
                 row[k] = v.isoformat()
         candidates.append(row)
+
+    exit_by_symbol: Dict[str, Dict[str, Any]] = {}
+    val_col = data_db.get("theme_lag_candidate_validation")
+    if val_col is not None:
+        vdoc = val_col.find_one({"anchor_trade_date": td, "index_store_key": sk})
+        if vdoc and isinstance(vdoc.get("per_symbol"), list):
+            for p in vdoc["per_symbol"]:
+                if not isinstance(p, dict):
+                    continue
+                sym = str(p.get("symbol") or "").strip()
+                if not sym:
+                    continue
+                exit_by_symbol[sym] = {
+                    "p0": _theme_lag_json_float(p.get("p0")),
+                    "return_pct": _theme_lag_json_float(p.get("return_pct")),
+                    "exit_trade_date": p.get("exit_trade_date"),
+                    "exit_price": _theme_lag_json_float(p.get("exit_price")),
+                    "outcome": p.get("outcome"),
+                }
+
+    for row in candidates:
+        sym = str(row.get("symbol") or "").strip()
+        v = exit_by_symbol.get(sym)
+        if v:
+            row["validation_p0"] = v.get("p0")
+            row["validation_return_pct"] = v.get("return_pct")
+            row["validation_exit_trade_date"] = v.get("exit_trade_date")
+            row["validation_exit_price"] = v.get("exit_price")
+            row["validation_outcome"] = v.get("outcome")
+        else:
+            row["validation_p0"] = None
+            row["validation_return_pct"] = None
+            row["validation_exit_trade_date"] = None
+            row["validation_exit_price"] = None
+            row["validation_outcome"] = None
 
     tasks_col = get_db_collections()["analysis_tasks"]
     cur = tasks_col.find(
