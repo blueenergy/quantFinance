@@ -362,16 +362,16 @@ def hot_stock_poll_task(source: str):
         log.error(f"[HotStock Poll] {source.upper()} scheduling failed: {e}", exc_info=True)
 
 
-# Map of configurable tasks to logic
+# Map of configurable tasks to logic（启用/停用请用 Admin 与 DB 中的 is_active，勿在此注释注册项）
 TASK_MAP = {
     'check_worker_timeouts': check_worker_timeouts_task,
     'send_daily_reports': send_daily_reports_task,
-    # 'market_analysis_1000': generate_market_analysis_task,  # Disabled for token optimization
+    'market_analysis_1000': generate_market_analysis_task,
     'market_analysis_1130': generate_market_analysis_task,
     'market_analysis_1630': generate_market_analysis_task,
     'global_analysis_0830': generate_global_analysis_task,
-    # 'hot_stock_poll_ths': lambda: hot_stock_poll_task('ths'),  # Disabled: manual trigger only
-    # 'hot_stock_poll_dc': lambda: hot_stock_poll_task('dc'),    # Disabled: manual trigger only
+    'hot_stock_poll_ths': lambda: hot_stock_poll_task('ths'),
+    'hot_stock_poll_dc': lambda: hot_stock_poll_task('dc'),
 }
 
 # Default trigger configurations
@@ -392,7 +392,8 @@ DEFAULT_SCHEDULES = {
         'type': "cron",
         'hour': 10,
         'minute': 0,
-        'day_of_week': 'mon-fri'
+        'day_of_week': 'mon-fri',
+        'is_active': False,  # 默认关闭省 token；可在管理后台开启
     },
     'market_analysis_1130': {
         'name': "午盘市场分析 (11:30)",
@@ -419,13 +420,13 @@ DEFAULT_SCHEDULES = {
         'name': "同花顺热股轮询",
         'type': "interval",
         'seconds': 3600,
-        'is_active': False,  # Disabled: use manual trigger from dashboard instead
+        'is_active': False,  # 默认关闭；需要时在管理后台启用
     },
     'hot_stock_poll_dc': {
         'name': "东方财富热股轮询",
         'type': "interval",
         'seconds': 1800,
-        'is_active': False,  # Disabled: use manual trigger from dashboard instead
+        'is_active': False,  # 默认关闭；需要时在管理后台启用
     },
 }
 
@@ -446,8 +447,12 @@ def sync_job(job_id, config_data):
     """Sync a single job to the scheduler based on config."""
     task_func = TASK_MAP.get(job_id)
     if not task_func:
-        return False
-        
+        # DEFAULT_SCHEDULES 与 TASK_MAP 应保持一致；若仅有配置无执行函数，清掉陈旧 job 并视为已持久化。
+        if scheduler.get_job(job_id):
+            scheduler.remove_job(job_id)
+            log.warning(f"No TASK_MAP entry for {job_id}; removed stale scheduler job if any.")
+        return True
+
     trigger = get_trigger_from_config(config_data)
     if not trigger:
         return False
@@ -501,12 +506,13 @@ def apply_schedule_config():
             merged_config = {**default_config, **db_config}
             sync_job(job_id, merged_config)
         else:
-            # First time: Save default to DB and use it
-            default_config['job_id'] = job_id
-            default_config.setdefault('is_active', True)
-            default_config['updated_at'] = datetime.now()
-            config_coll.insert_one(default_config)
-            sync_job(job_id, default_config)
+            # First time: Save default to DB and use it（copy 避免修改模块内 DEFAULT_SCHEDULES）
+            row = default_config.copy()
+            row["job_id"] = job_id
+            row.setdefault("is_active", True)
+            row["updated_at"] = datetime.now()
+            config_coll.insert_one(row)
+            sync_job(job_id, row)
             
     return True
 

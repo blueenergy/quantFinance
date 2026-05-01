@@ -19,13 +19,14 @@ def get_scheduler_jobs(admin_user: dict = Depends(get_current_admin_user)):
         
         jobs = []
         for job_id, default_config in DEFAULT_SCHEDULES.items():
-            # Merge with default if exists
-            config = stored_configs.get(job_id)
-            if not config:
+            stored = stored_configs.get(job_id)
+            if stored:
+                config = {**default_config, **stored, "job_id": job_id}
+                config.pop("_id", None)
+            else:
                 config = default_config.copy()
-                config['job_id'] = job_id
-                config['is_active'] = True
-            
+                config["job_id"] = job_id
+
             # Check actual APScheduler status
             aps_job = scheduler.get_job(job_id)
             is_running = aps_job is not None
@@ -45,7 +46,7 @@ def get_scheduler_jobs(admin_user: dict = Depends(get_current_admin_user)):
                     "minute": config.get("minute"),
                     "day_of_week": config.get("day_of_week")
                 },
-                "is_active": config.get("is_active", True),
+                "is_active": config.get("is_active", default_config.get("is_active", True)),
                 "is_running": is_running,
                 "next_run_time": next_run_time,
                 "updated_at": config.get("updated_at", "").isoformat() if isinstance(config.get("updated_at"), datetime) else None
@@ -72,12 +73,14 @@ def update_scheduler_job(
         collections = get_db_collections()
         config_coll = collections.get("schedule_config")
         
-        # Prepare merged config
-        current_config = config_coll.find_one({"job_id": job_id})
-        if not current_config:
-            current_config = DEFAULT_SCHEDULES[job_id].copy()
-            current_config['job_id'] = job_id
-            
+        # Prepare merged config（与 apply_schedule_config 一致：先合并默认值，避免 DB 文档缺字段导致 trigger 构建失败）
+        base = DEFAULT_SCHEDULES[job_id].copy()
+        stored = config_coll.find_one({"job_id": job_id})
+        current_config = {**base, **(stored or {}), "job_id": job_id}
+        current_config.pop("_id", None)
+        if current_config.get("type") not in ("interval", "cron"):
+            current_config["type"] = base["type"]
+
         # Update fields from payload
         if "is_active" in payload:
             current_config["is_active"] = payload["is_active"]
