@@ -5,17 +5,19 @@
   1. /data-pulse/news: 国际新闻摘要
   2. /data-pulse/status: 各管线 job_status（目录驱动）
   3. /data-pulse/overview: 新闻 + 同步健康度 + 集合新鲜度
+  4. /data-pulse/coverage-gaps: 指定集合在报告期上相对 stock_info 的缺数股票列表
 """
 
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, HTTPException, Query
 
 from db import db, get_data_db
 from services.data_monitoring import (
     build_data_monitoring_overview,
     build_pipelines_status_rows,
+    query_coverage_gaps,
 )
 
 router = APIRouter(prefix="/data-pulse", tags=["data-pulse"])
@@ -59,6 +61,44 @@ def _freshness_dict_from_rows(freshness_rows: list) -> Dict[str, Any]:
         else:
             out[label] = base
     return out
+
+
+@router.get("/coverage-gaps")
+async def get_coverage_gaps(
+    collection: str = Query(..., max_length=80, description="quant_data 集合名，须出现在目录 coverage 配置中"),
+    database: str = Query("quant_data", max_length=32),
+    period: Optional[str] = Query(
+        None,
+        max_length=16,
+        description="报告期 YYYYMMDD；省略则使用该集合 freshness 字段的全库最大值",
+    ),
+    skip: int = Query(0, ge=0, le=500000),
+    limit: int = Query(200, ge=1, le=2000),
+):
+    """
+    在指定报告期上，相对 ``stock_info`` 宇宙缺少数据行的股票列表（与覆盖率分子/分母同口径）。
+
+    仅允许访问 ``data_pipelines_catalog.yaml`` 中带 ``coverage`` 的 freshness 集合，避免任意集合扫描。
+    """
+    try:
+        payload = query_coverage_gaps(
+            database=database,
+            collection=collection,
+            period=period,
+            skip=skip,
+            limit=limit,
+        )
+    except ValueError as e:
+        code = str(e)
+        if code == "unknown_coverage_target":
+            raise HTTPException(
+                status_code=404,
+                detail="该 database/collection 未配置覆盖率或不在允许列表中",
+            ) from e
+        if code in ("invalid_or_missing_period", "coverage_unavailable"):
+            raise HTTPException(status_code=400, detail="无法解析报告期或无法计算覆盖") from e
+        raise HTTPException(status_code=400, detail=code) from e
+    return {"success": True, **payload}
 
 
 @router.get("/news")
