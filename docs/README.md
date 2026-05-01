@@ -61,8 +61,11 @@ pip install -r requirements.txt
 cp .env.example .env
 # 编辑.env文件设置MongoDB连接等
 
-# 启动后端
-uvicorn main:app --reload --port 3001
+# 启动后端（推荐：`--reload` 只监视 routers/services/…，不扫 hermes-data，避免无权限目录报错）
+./scripts/uvicorn-dev.sh
+
+# 若坚持手写 uvicorn：勿单独 `--reload` 在仓库根（会递归 hermes-data）。可仿照脚本使用多个 `--reload-dir`。
+# 修改根目录 main.py / auth.py / db.py 等后需手动重启进程。
 ```
 
 3. **前端设置**
@@ -129,8 +132,9 @@ sudo systemctl start mongod
 
 2. **启动后端API**
 ```bash
-uvicorn main:app --reload --host 0.0.0.0 --port 3001
+./scripts/uvicorn-dev.sh
 ```
+（`--reload` 仅监视 `routers/`、`services/` 等子目录，不遍历 `hermes-data/`。根目录 `main.py` 等变更后请重启该进程。）
 
 3. **启动前端**
 ```bash
