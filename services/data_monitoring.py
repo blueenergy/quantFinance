@@ -354,6 +354,195 @@ def build_sync_health_from_catalog() -> Dict[str, Any]:
     }
 
 
+def _iter_coverage_targets() -> List[Dict[str, Any]]:
+    """Catalog entries that define freshness + coverage (per data collection)."""
+    out: List[Dict[str, Any]] = []
+    for p in load_pipelines_catalog():
+        fr = p.get("freshness") or {}
+        cov = fr.get("coverage") or {}
+        if not cov.get("universe_collection") or not cov.get("match_key"):
+            continue
+        field = fr.get("field")
+        if not field:
+            continue
+        database = fr.get("database", "quant_data")
+        u_db = cov.get("universe_database") or database
+        match_key = str(cov["match_key"])
+        universe_collection = str(cov["universe_collection"])
+        field_kind = fr.get("field_kind", "date_string")
+        sheets = fr.get("freshness_sheets")
+        if isinstance(sheets, list) and len(sheets) > 0:
+            for sheet in sheets:
+                c = sheet.get("collection")
+                if not c:
+                    continue
+                out.append(
+                    {
+                        "database": database,
+                        "collection": str(c),
+                        "field": field,
+                        "field_kind": field_kind,
+                        "universe_database": u_db,
+                        "universe_collection": universe_collection,
+                        "match_key": match_key,
+                    }
+                )
+        elif fr.get("collection"):
+            out.append(
+                {
+                    "database": database,
+                    "collection": str(fr["collection"]),
+                    "field": field,
+                    "field_kind": field_kind,
+                    "universe_database": u_db,
+                    "universe_collection": universe_collection,
+                    "match_key": match_key,
+                }
+            )
+    return out
+
+
+def resolve_coverage_gap_config(database: str, collection: str) -> Optional[Dict[str, Any]]:
+    dbn, coln = (database or "").strip(), (collection or "").strip()
+    for t in _iter_coverage_targets():
+        if t["database"] == dbn and t["collection"] == coln:
+            return t
+    return None
+
+
+def _expr_date_equals_field(field: str, norm: str) -> Dict[str, Any]:
+    """Mongo $expr fragment: field matches norm (string or int YYYYMMDD)."""
+    try:
+        as_int = int(norm)
+    except ValueError:
+        return {"$eq": [f"${field}", norm]}
+    return {"$or": [{"$eq": [f"${field}", norm]}, {"$eq": [f"${field}", as_int]}]}
+
+
+def query_coverage_gaps(
+    *,
+    database: str,
+    collection: str,
+    period: Optional[str] = None,
+    skip: int = 0,
+    limit: int = 200,
+) -> Dict[str, Any]:
+    """
+    List universe stocks that have no row in ``collection`` at report period ``norm``.
+
+    ``database`` / ``collection`` must appear in the pipelines catalog with a ``coverage``
+    block (same allowlist as freshness coverage). ``period`` is optional YYYYMMDD; if
+    omitted, uses global max of the freshness ``field`` in that collection.
+    """
+    cfg = resolve_coverage_gap_config(database, collection)
+    if not cfg:
+        raise ValueError("unknown_coverage_target")
+
+    limit = max(1, min(int(limit), 2000))
+    skip = max(0, int(skip))
+
+    field = cfg["field"]
+    field_kind = cfg.get("field_kind", "date_string")
+    match_key = cfg["match_key"]
+    u_db = cfg["universe_database"]
+    u_coll_name = cfg["universe_collection"]
+
+    data_coll = _get_collection(cfg["database"], cfg["collection"])
+    universe_coll = _get_collection(u_db, u_coll_name)
+
+    if period and str(period).strip():
+        raw_for_cov: Any = str(period).strip().replace("-", "")[:8]
+        norm = _normalize_yyyymmdd(raw_for_cov)
+    else:
+        raw_for_cov = _max_freshness_value(
+            cfg["database"],
+            cfg["collection"],
+            field,
+            field_kind,
+            document_id=None,
+        )
+        norm = _normalize_yyyymmdd(raw_for_cov)
+
+    if not norm:
+        raise ValueError("invalid_or_missing_period")
+
+    cov = _coverage_latest_ratio(
+        data_coll,
+        field,
+        raw_for_cov,
+        universe_coll,
+        match_key,
+    )
+    if not cov:
+        raise ValueError("coverage_unavailable")
+
+    date_expr = _expr_date_equals_field(field, norm)
+    mk = match_key
+    lookup_pipeline: List[Dict[str, Any]] = [
+        {
+            "$match": {
+                "$expr": {
+                    "$and": [
+                        {"$eq": [f"${mk}", "$$mkv"]},
+                        date_expr,
+                    ]
+                }
+            }
+        },
+        {"$limit": 1},
+    ]
+
+    pipeline: List[Dict[str, Any]] = [
+        {"$match": {mk: {"$exists": True, "$nin": [None, ""]}}},
+        {
+            "$lookup": {
+                "from": cfg["collection"],
+                "let": {"mkv": f"${mk}"},
+                "pipeline": lookup_pipeline,
+                "as": "hit",
+            }
+        },
+        {"$match": {"hit": {"$eq": []}}},
+        {
+            "$facet": {
+                "items": [
+                    {"$skip": skip},
+                    {"$limit": limit},
+                    {"$project": {"_id": 0, mk: 1, "name": 1}},
+                ],
+                "cnt": [{"$count": "n"}],
+            }
+        },
+    ]
+
+    agg = list(universe_coll.aggregate(pipeline))
+    block = agg[0] if agg else {}
+    raw_items = block.get("items") or []
+    cnt_list = block.get("cnt") or []
+    missing_total = int(cnt_list[0]["n"]) if cnt_list else 0
+
+    items: List[Dict[str, Any]] = []
+    for doc in raw_items:
+        code = doc.get(mk)
+        if code is None:
+            continue
+        items.append({"ts_code": str(code), "name": doc.get("name")})
+
+    out: Dict[str, Any] = {
+        "database": cfg["database"],
+        "collection": cfg["collection"],
+        "field": field,
+        "period": norm,
+        "universe_collection": u_coll_name,
+        "missing_total": missing_total,
+        "items": items,
+        "skip": skip,
+        "limit": limit,
+    }
+    out.update(cov)
+    return out
+
+
 def build_freshness_rows() -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     for p in load_pipelines_catalog():
@@ -422,4 +611,6 @@ __all__ = [
     "build_freshness_rows",
     "build_data_monitoring_overview",
     "expected_latest_trade_date_hint",
+    "query_coverage_gaps",
+    "resolve_coverage_gap_config",
 ]
