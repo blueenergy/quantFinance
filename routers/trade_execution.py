@@ -176,29 +176,68 @@ def get_trade_signals(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"查询交易信号失败: {str(e)}")
 
+
+def _merge_stock_info_symbol_keys(docs: List[Dict[str, Any]]) -> Dict[str, str]:
+    """把 ``stock_info`` 文档的 ``symbol`` / 规范化形式都映射到 ``name``，便于与无后缀成交代码对齐。"""
+    symbol_to_name: Dict[str, str] = {}
+    for doc in docs:
+        raw_name = doc.get("name")
+        name = raw_name if isinstance(raw_name, str) else (str(raw_name) if raw_name is not None else "")
+        sym = str(doc.get("symbol", "")).strip()
+        if not sym:
+            continue
+        symbol_to_name[sym] = name
+        symbol_to_name[normalize_symbol(sym)] = name
+        bare = strip_exchange_suffix(sym)
+        if bare:
+            symbol_to_name[bare] = name
+    return symbol_to_name
+
+
+def _resolve_stock_name_from_map(symbol: Any, symbol_to_name: Dict[str, str]) -> str:
+    if symbol is None:
+        return ""
+    s = str(symbol).strip()
+    if not s:
+        return ""
+    for key in (s, normalize_symbol(s), strip_exchange_suffix(s)):
+        val = symbol_to_name.get(key, "")
+        if val:
+            return val
+    return ""
+
+
 def enrich_trades_with_stock_names(trades: List[Dict], stock_info_collection) -> List[Dict]:
-    """为交易记录添加股票名称"""
+    """为交易记录添加股票名称（兼容 ``stock_info.symbol`` 带后缀与成交里仅 6 位代码）。"""
     if not trades:
         return trades
-    
-    # 收集所有唯一的股票代码
-    symbols = list(set(trade.get("symbol") for trade in trades if trade.get("symbol")))
-    
-    # 批量查询股票信息（symbol现在包含交易所后缀）
-    stock_info_docs = list(stock_info_collection.find(
-        {"symbol": {"$in": symbols}},
-        {"symbol": 1, "name": 1}
-    ))
-    
-    # 创建代码到名称的映射
-    symbol_to_name = {doc["symbol"]: doc.get("name", "") for doc in stock_info_docs}
-    
-    # 为每条交易记录添加股票名称
+
+    variants: set[str] = set()
     for trade in trades:
-        symbol = trade.get("symbol")
-        if symbol:
-            trade["stock_name"] = symbol_to_name.get(symbol, "")
-    
+        sym = trade.get("symbol")
+        if not sym:
+            continue
+        s = str(sym).strip()
+        for cand in (s, normalize_symbol(s), strip_exchange_suffix(s)):
+            if cand:
+                variants.add(cand)
+
+    if not variants:
+        for trade in trades:
+            trade.setdefault("stock_name", "")
+        return trades
+
+    stock_info_docs = list(
+        stock_info_collection.find(
+            {"symbol": {"$in": list(variants)}},
+            {"symbol": 1, "name": 1},
+        )
+    )
+    symbol_to_name = _merge_stock_info_symbol_keys(stock_info_docs)
+
+    for trade in trades:
+        trade["stock_name"] = _resolve_stock_name_from_map(trade.get("symbol"), symbol_to_name)
+
     return trades
 
 
@@ -681,14 +720,20 @@ def get_trade_pnl_summary(
                 }
             )
 
-        # 批量补全股票名称
+        # 批量补全股票名称（与 enrich_trades_with_stock_names 同口径：兼容无后缀 symbol）
         symbols = list({row["symbol"] for row in summary_rows if row.get("symbol")})
+        variants: set[str] = set()
+        for sym in symbols:
+            s = str(sym).strip()
+            for cand in (s, normalize_symbol(s), strip_exchange_suffix(s)):
+                if cand:
+                    variants.add(cand)
         stock_docs = list(
-            stock_info_coll.find({"symbol": {"$in": symbols}}, {"symbol": 1, "name": 1})
+            stock_info_coll.find({"symbol": {"$in": list(variants)}}, {"symbol": 1, "name": 1})
         )
-        symbol_to_name = {doc["symbol"]: doc.get("name", "") for doc in stock_docs}
+        symbol_to_name = _merge_stock_info_symbol_keys(stock_docs)
         for row in summary_rows:
-            row["stock_name"] = symbol_to_name.get(row["symbol"], "")
+            row["stock_name"] = _resolve_stock_name_from_map(row.get("symbol"), symbol_to_name)
 
         total_realized_pnl = round(sum(r["realized_pnl"] for r in summary_rows), 2)
         total_unrealized_pnl = round(total_unrealized_pnl, 2)
