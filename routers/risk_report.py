@@ -24,7 +24,7 @@ router = APIRouter(prefix="/risk-reports", tags=["市场风险预警"])
 
 # 已知行业 key（与 quant-data-engine SECTOR_PROFILES 对应）
 VALID_SECTORS = {
-    "semicon", "finance", "consumer", "healthcare", "nev", "robot", "tourism",
+    "semicon", "semicon_eq", "finance", "consumer", "healthcare", "nev", "robot", "tourism",
     "aerospace",
     # 美股（阶段 3 后启用）
     "us_semicon", "us_tech", "us_macro",
