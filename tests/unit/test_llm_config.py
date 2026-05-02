@@ -59,9 +59,20 @@ class FakeUsersCollection:
                         # Handle nested updates like "llm_configs.$.field"
                         for key, value in update["$set"].items():
                             if "." in key:
-                                # Handle array positional updates (e.g., "llm_configs.$.name")
+                                # Handle array positional updates (e.g., "llm_configs.0.name")
                                 parts = key.split(".")
-                                if parts[1] == "$" and "llm_configs._id" in flt:
+                                if (
+                                    len(parts) == 3
+                                    and parts[0] == "llm_configs"
+                                    and parts[1].isdigit()
+                                ):
+                                    idx = int(parts[1])
+                                    field = parts[2]
+                                    cfgs = d.get("llm_configs") or []
+                                    if 0 <= idx < len(cfgs):
+                                        cfgs[idx][field] = value
+                                        modified_count = 1
+                                elif parts[1] == "$" and "llm_configs._id" in flt:
                                     # Update specific item in array
                                     config_id = flt["llm_configs._id"]
                                     if isinstance(config_id, ObjectId):

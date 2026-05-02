@@ -430,13 +430,16 @@ class TestGetPositionsEndpoint:
         
         fake_collections = {
             "trader_positions": self.positions_coll,
-            "stock_info": self.stock_info_coll
         }
-        
+
         def mock_get_db_collections():
             return fake_collections
-        
+
+        def mock_get_data_db():
+            return {"stock_info": self.stock_info_coll}
+
         monkeypatch.setattr(trader, "get_db_collections", mock_get_db_collections)
+        monkeypatch.setattr(trader, "get_data_db", mock_get_data_db)
         
         # Override dependency
         app.dependency_overrides[get_current_active_user] = lambda: {"id": "user_123"}
