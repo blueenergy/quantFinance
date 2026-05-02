@@ -120,25 +120,17 @@ EXPOSE 3001
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "3001", "--workers", "4"]
 ```
 
-### 2. 前端Dockerfile
-```dockerfile
-# Dockerfile.frontend
-FROM node:18-alpine AS builder
+### 2. 前端 Docker 镜像（`quantFinance-dashboard`）
 
-WORKDIR /app
-COPY dashboard/package*.json ./
-RUN npm ci
+前端为独立仓库 **`quantFinance-dashboard`**。与本仓库 `docker-compose.yml` 对齐时，`quant-web` 服务使用：
 
-COPY dashboard/ .
-RUN npm run build
-
-# 生产环境镜像
-FROM nginx:alpine
-COPY --from=builder /app/dist /usr/share/nginx/html
-COPY nginx.conf /etc/nginx/nginx.conf
-EXPOSE 80
-CMD ["nginx", "-g", "daemon off;"]
+```yaml
+build:
+  context: ../quantFinance-dashboard
+  dockerfile: Dockerfile.fast
 ```
+
+多阶段构建（Node 20 + nginx）、国内镜像与 `VITE_*` 构建参数等，均以该仓库内 **`Dockerfile.fast`** 为准，此处不重复粘贴。
 
 ### 3. docker-compose.yml
 ```yaml
@@ -165,11 +157,11 @@ services:
       timeout: 10s
       retries: 3
 
-  # 前端Web服务
+  # 前端 Web（与 quantFinance/docker-compose.yml 一致：dashboard 仓库 + Dockerfile.fast）
   web:
     build:
-      context: .
-      dockerfile: Dockerfile.frontend
+      context: ../quantFinance-dashboard
+      dockerfile: Dockerfile.fast
     ports:
       - "80:80"
     depends_on:
