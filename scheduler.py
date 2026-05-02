@@ -321,6 +321,13 @@ def generate_global_analysis_task(job_id: str):
         log.error(f"[Global Analysis] Scheduling failed: {e}", exc_info=True)
 
 
+def theme_lag_validation_subscription_scan_task(job_id: str):
+    """按订阅扫描 theme_lag_candidate_validation，写入 notifications；邮件见用户通知设置。"""
+    from services.theme_lag_validation_subscription_task import run_theme_lag_validation_subscription_scan
+
+    run_theme_lag_validation_subscription_scan(job_id)
+
+
 def hot_stock_poll_task(source: str):
     """热股轮询任务 - 每30分钟检查 THS / DC 热榜是否有新数据。"""
     from db import get_db_collections, get_analyzer_db
@@ -372,6 +379,12 @@ TASK_MAP = {
     'global_analysis_0830': generate_global_analysis_task,
     'hot_stock_poll_ths': lambda: hot_stock_poll_task('ths'),
     'hot_stock_poll_dc': lambda: hot_stock_poll_task('dc'),
+    'theme_lag_validation_subscribe_1530': lambda: theme_lag_validation_subscription_scan_task(
+        'theme_lag_validation_subscribe_1530'
+    ),
+    'theme_lag_validation_subscribe_1630': lambda: theme_lag_validation_subscription_scan_task(
+        'theme_lag_validation_subscribe_1630'
+    ),
 }
 
 # Default trigger configurations
@@ -427,6 +440,22 @@ DEFAULT_SCHEDULES = {
         'type': "interval",
         'seconds': 1800,
         'is_active': False,  # 默认关闭；需要时在管理后台启用
+    },
+    'theme_lag_validation_subscribe_1530': {
+        'name': "主题补涨验证订阅扫描 (15:30)",
+        'type': "cron",
+        'hour': 15,
+        'minute': 30,
+        'day_of_week': 'mon-fri',
+        'is_active': False,  # 默认关闭；避免首次落库即跑扫描导致意外通知/邮件，在管理后台再启用
+    },
+    'theme_lag_validation_subscribe_1630': {
+        'name': "主题补涨验证订阅扫描 (16:30)",
+        'type': "cron",
+        'hour': 16,
+        'minute': 30,
+        'day_of_week': 'mon-fri',
+        'is_active': False,  # 同上
     },
 }
 
