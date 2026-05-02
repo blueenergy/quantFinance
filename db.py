@@ -101,6 +101,8 @@ def get_analyzer_db():
         "sector_concept_analysis": analyzer_db["sector_concept_analysis"],
         "portfolio_analysis": analyzer_db["portfolio_analysis"],
         "market_analysis_cache": analyzer_db["market_analysis_cache"],
+        # LLM interpretations of risk scan reports (written by quantAnalyzer)
+        "risk_report_analysis": analyzer_db["risk_report_analysis"],
     }
 
 def get_data_db():
@@ -158,6 +160,8 @@ def get_data_db():
         "international_news_cache": data_db["international_news_cache"],
         # Global quotes (yfinance sync from quant-data-engine)
         "global_market_quotes": data_db["global_market_quotes"],
+        # Market risk scan results (written by quant-data-engine risk_scanner task)
+        "risk_reports": data_db["risk_reports"],
     }
 
 def close_db():
