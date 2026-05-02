@@ -29,6 +29,7 @@ def get_notifications(
     - worker_timeout: Worker heartbeat timeout
     - signal_generated: New trading signal
     - daily_report: Daily report ready
+    - theme_lag_validation: 主题补涨验证 quant_data 结果更新（站内必达；邮件随通知设置）
     - system_alert: System alerts
     """
     try:
@@ -257,7 +258,7 @@ def create_notification(
     """Create a notification (internal use).
     
     Payload:
-    - type: worker_timeout/signal_generated/daily_report/system_alert
+    - type: worker_timeout/signal_generated/daily_report/theme_lag_validation/system_alert
     - title: Notification title
     - message: Notification message
     - data: Additional data (optional)

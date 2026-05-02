@@ -106,6 +106,12 @@ class WatchlistStrategyResponse(BaseModel):
     strategy: str
     params: dict
 
+
+class ThemeLagValidationSubscriptionUpsert(BaseModel):
+    """订阅 quant_data 主题补涨验证结果更新（站内通知 + 可选邮件）。"""
+    index_store_key: str
+    enabled: bool = True
+
 # --- Securities accounts ---
 class SecuritiesAccountBase(BaseModel):
     broker: str
