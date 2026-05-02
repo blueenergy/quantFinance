@@ -223,27 +223,26 @@ async def trigger_analysis(
 
 
 # ---------------------------------------------------------------------------
-# 5. 触发全市场日报 LLM 分析
+# 5. 触发全市场日报 LLM 分析（A股）
 # ---------------------------------------------------------------------------
 
-@router.post("/analyze/market-daily", summary="触发全市场日报 LLM 解读")
+@router.post("/analyze/market-daily", summary="触发A股市场日报 LLM 解读")
 async def trigger_market_daily_analysis(
     date: str = Query(None, description="日期 YYYYMMDD，默认今天"),
     current_user: dict = Depends(get_current_active_user),
 ):
     """
-    将当日所有行业的扫描结果合并，投递一个 market_risk_daily 任务。
-    quantAnalyzer 生成全市场风险日报（scope=market_daily），前端 dashboard 顶部展示。
+    将当日 A 股行业（非 us_ 前缀）扫描结果合并，投递 market_daily 任务。
     """
     scan_date = date or datetime.today().strftime("%Y%m%d")
     coll = get_data_db()["risk_reports"]
     docs = list(coll.find({"scan_date": scan_date}, {"_id": 0}))
+    # 只保留 A 股板块
+    docs = [d for d in docs if not (d.get("sector") or "").startswith("us_")]
     if not docs:
-        raise HTTPException(404, f"{scan_date} 暂无任何行业的扫描数据")
+        raise HTTPException(404, f"{scan_date} 暂无 A 股行业扫描数据")
 
-    # 序列化
     docs = _serialize_list(docs)
-    # 按得分降序排列，便于 LLM 直接引用
     docs.sort(key=lambda x: x.get("overall_risk_score") or 0, reverse=True)
 
     task_doc = build_task_doc(
@@ -268,22 +267,87 @@ async def trigger_market_daily_analysis(
 
 
 # ---------------------------------------------------------------------------
-# 6. 获取全市场日报 LLM 解读结果
+# 5b. 触发美股市场日报 LLM 分析
 # ---------------------------------------------------------------------------
 
-@router.get("/market-daily-analysis", summary="获取全市场日报 LLM 解读结果")
+@router.post("/analyze/us-market-daily", summary="触发美股市场日报 LLM 解读")
+async def trigger_us_market_daily_analysis(
+    date: str = Query(None, description="日期 YYYYMMDD，默认今天"),
+    current_user: dict = Depends(get_current_active_user),
+):
+    """
+    将当日美股板块（us_ 前缀）扫描结果合并，投递 us_market_daily 任务。
+    """
+    scan_date = date or datetime.today().strftime("%Y%m%d")
+    coll = get_data_db()["risk_reports"]
+    docs = list(coll.find({"scan_date": scan_date}, {"_id": 0}))
+    # 只保留美股板块
+    docs = [d for d in docs if (d.get("sector") or "").startswith("us_")]
+    if not docs:
+        raise HTTPException(404, f"{scan_date} 暂无美股板块扫描数据")
+
+    docs = _serialize_list(docs)
+    docs.sort(key=lambda x: x.get("overall_risk_score") or 0, reverse=True)
+
+    task_doc = build_task_doc(
+        current_user=current_user,
+        task_type="risk_report_analysis",
+        priority=4,
+        params={
+            "scan_date": scan_date,
+            "sector": None,
+            "scope": "us_market_daily",
+            "reports": docs,
+        },
+        source="manual_trigger",
+    )
+    result = _app_db.db["analysis_tasks"].insert_one(task_doc)
+    return {
+        "task_id": str(result.inserted_id),
+        "status": "pending",
+        "scan_date": scan_date,
+        "sector_count": len(docs),
+    }
+
+
+# ---------------------------------------------------------------------------
+# 6. 获取全市场日报 LLM 解读结果（A股）
+# ---------------------------------------------------------------------------
+
+@router.get("/market-daily-analysis", summary="获取A股市场日报 LLM 解读结果")
 async def get_market_daily_analysis(
     date: str = Query(None, description="日期 YYYYMMDD，默认今天"),
     current_user: dict = Depends(get_current_active_user),
 ):
     """
-    返回指定日期的全市场风险日报 LLM 解读结果（scope=market_daily）。
-    若当日尚未生成，analysis 字段为 null。
+    返回指定日期的 A 股市场风险日报 LLM 解读结果（scope=market_daily）。
     """
     scan_date = date or datetime.today().strftime("%Y%m%d")
     analysis_coll = get_analyzer_db()["risk_report_analysis"]
     doc = analysis_coll.find_one(
         {"scope": "market_daily", "scan_date": scan_date},
+        {"_id": 0},
+        sort=[("created_at", -1)],
+    )
+    return {"scan_date": scan_date, "analysis": _serialize(doc)}
+
+
+# ---------------------------------------------------------------------------
+# 6b. 获取美股市场日报 LLM 解读结果
+# ---------------------------------------------------------------------------
+
+@router.get("/us-market-daily-analysis", summary="获取美股市场日报 LLM 解读结果")
+async def get_us_market_daily_analysis(
+    date: str = Query(None, description="日期 YYYYMMDD，默认今天"),
+    current_user: dict = Depends(get_current_active_user),
+):
+    """
+    返回指定日期的美股市场风险日报 LLM 解读结果（scope=us_market_daily）。
+    """
+    scan_date = date or datetime.today().strftime("%Y%m%d")
+    analysis_coll = get_analyzer_db()["risk_report_analysis"]
+    doc = analysis_coll.find_one(
+        {"scope": "us_market_daily", "scan_date": scan_date},
         {"_id": 0},
         sort=[("created_at", -1)],
     )
