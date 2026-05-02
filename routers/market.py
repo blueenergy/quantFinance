@@ -513,6 +513,138 @@ async def get_global_market_dashboard(current_user: dict = Depends(get_current_a
     return {"success": False, "error": payload.get("error", "unknown")}
 
 
+# ---------------------------------------------------------------------------
+# 全球市场日线 K 线接口（global_market_daily 集合）
+# ---------------------------------------------------------------------------
+
+# 已在 global_market_daily 中同步历史日线的品种白名单
+_KLINE_AVAILABLE_SYMBOLS = {
+    "SOXX", "SMH", "^SOX", "QQQ", "XLK", "^IXIC",
+    "SPY", "^GSPC", "^VIX", "^TNX", "NVDA", "AMD",
+}
+
+
+def _resample_global_ohlcv(rows: List[Dict[str, Any]], rule: str) -> List[Dict[str, Any]]:
+    """将日线 rows（升序）聚合为周线(1w)或月线(1m)，返回降序结果。"""
+    import pandas as pd
+    import math as _math
+    if not rows:
+        return []
+    df = pd.DataFrame(rows)
+    for col in ("open", "high", "low", "close"):
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    df["volume"] = pd.to_numeric(df.get("volume", 0), errors="coerce").fillna(0)
+    df["_td"] = pd.to_datetime(df["trade_date"].astype(str), format="%Y%m%d", errors="coerce")
+    df = df.dropna(subset=["_td"]).set_index("_td").sort_index()
+    rule_s = "W-FRI" if rule == "1w" else "ME"
+    rs_kw = {"label": "right", "closed": "right"}
+    agg = df.resample(rule_s, **rs_kw).agg(
+        {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}
+    ).dropna(subset=["close"])
+    out = []
+    for dt_idx, row in agg.iterrows():
+        def _f(v):
+            return None if v is None or (isinstance(v, float) and _math.isnan(v)) else round(float(v), 4)
+        out.append({
+            "trade_date": dt_idx.strftime("%Y%m%d"),
+            "open": _f(row.get("open")),
+            "high": _f(row.get("high")),
+            "low":  _f(row.get("low")),
+            "close": _f(row.get("close")),
+            "volume": int(row.get("volume", 0)),
+        })
+    return list(reversed(out))
+
+
+# NOTE: this route must be declared BEFORE the parameterised /{symbol}/kline
+# route so FastAPI does not match "kline-symbols" as a symbol value.
+@router.get("/global-market/kline-symbols")
+async def get_kline_available_symbols(current_user: dict = Depends(get_current_active_user)):
+    """返回 global_market_daily 中有历史 K 线数据的品种列表。"""
+    _ = current_user
+    return {"success": True, "symbols": sorted(_KLINE_AVAILABLE_SYMBOLS)}
+
+
+@router.get("/global-market/{symbol}/kline")
+async def get_global_market_kline(
+    symbol: str,
+    start_date: Optional[str] = Query(None, description="起始日期 YYYYMMDD"),
+    end_date: Optional[str] = Query(None, description="结束日期 YYYYMMDD"),
+    limit: int = Query(500, ge=1, le=2000, description="返回最大根数"),
+    tf: str = Query("1d", description="时间周期：1d 日线 | 1w 周线 | 1m 月线"),
+    current_user: dict = Depends(get_current_active_user),
+):
+    """从 quant_data.global_market_daily 返回指定品种 OHLCV K 线。
+
+    支持日/周/月三个周期；周月线由日线聚合得到。
+    数据字段与 ETF kline 接口保持一致：trade_date / open / high / low / close / volume。
+    """
+    _ = current_user
+    import math as _math
+
+    tfc = tf.strip().lower()
+    # normalise shorthand
+    tfc = {"d": "1d", "w": "1w", "m": "1m"}.get(tfc.lstrip("1"), tfc)
+    if tfc not in ("1d", "1w", "1m"):
+        raise HTTPException(400, "tf must be 1d, 1w, or 1m")
+
+    query: Dict[str, Any] = {"symbol": symbol}
+    date_f: Dict[str, str] = {}
+    if start_date:
+        date_f["$gte"] = start_date.replace("-", "")
+    if end_date:
+        date_f["$lte"] = end_date.replace("-", "")
+    if date_f:
+        query["date"] = date_f
+
+    # For weekly/monthly resampling we need more raw daily points
+    fetch_limit = limit if tfc == "1d" else min(limit * 7, 2000)
+
+    raw = list(
+        get_data_db()["global_market_daily"]
+        .find(query, {"_id": 0, "symbol": 0, "updated_at": 0})
+        .sort("date", -1)
+        .limit(fetch_limit)
+    )
+
+    if not raw:
+        return {"success": True, "symbol": symbol, "tf": tfc, "count": 0, "data": []}
+
+    # Normalise: rename date → trade_date, cast numerics
+    rows = []
+    for doc in raw:
+        def _safe(v):
+            if v is None:
+                return None
+            try:
+                f = float(v)
+                return None if _math.isnan(f) else round(f, 4)
+            except (TypeError, ValueError):
+                return None
+
+        rows.append({
+            "trade_date": doc.get("date", ""),
+            "open":   _safe(doc.get("open")),
+            "high":   _safe(doc.get("high")),
+            "low":    _safe(doc.get("low")),
+            "close":  _safe(doc.get("close")),
+            "volume": int(doc["volume"]) if doc.get("volume") is not None else 0,
+        })
+
+    if tfc in ("1w", "1m"):
+        rows = _resample_global_ohlcv(list(reversed(rows)), tfc)
+        rows = rows[:limit]
+
+    return {
+        "success": True,
+        "symbol": symbol,
+        "tf": tfc,
+        "count": len(rows),
+        "data": rows,
+    }
+
+
 def fetch_market_data() -> Optional[Dict[str, Any]]:
     """获取用于市场分析的数据 - 优先使用外部数据源"""
     try:
