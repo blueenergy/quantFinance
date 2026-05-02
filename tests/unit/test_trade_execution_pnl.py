@@ -173,11 +173,14 @@ def test_trade_pnl_summary_unrealized_zero_when_no_minute_price(monkeypatch):
 
     fake_collections = {
         "trade_executions": FakeExecCollection(exec_docs),
+    }
+    fake_data_db = {
         "minute_bars": FakeMinuteBarsCollection(minute_docs),
         "stock_info": FakeStockInfoCollection(stock_docs),
     }
 
     monkeypatch.setattr(te, "get_db_collections", lambda: fake_collections)
+    monkeypatch.setattr(te, "get_data_db", lambda: fake_data_db)
 
     result = te.get_trade_pnl_summary(current_user={"id": user_id})
 
@@ -249,11 +252,14 @@ def test_trade_pnl_summary_unrealized_zero_when_net_quantity_zero(monkeypatch):
 
     fake_collections = {
         "trade_executions": FakeExecCollection2(exec_docs),
+    }
+    fake_data_db = {
         "minute_bars": FakeMinuteBarsCollection2(minute_docs),
         "stock_info": FakeStockInfoCollection2(stock_docs),
     }
 
     monkeypatch.setattr(te, "get_db_collections", lambda: fake_collections)
+    monkeypatch.setattr(te, "get_data_db", lambda: fake_data_db)
 
     result = te.get_trade_pnl_summary(current_user={"id": user_id})
 
@@ -356,11 +362,14 @@ def test_trade_pnl_summary_multiple_symbols_total_unrealized_matches_sum(monkeyp
 
     fake_collections = {
         "trade_executions": FakeExecCollection3(exec_docs),
+    }
+    fake_data_db = {
         "minute_bars": FakeMinuteBarsCollection3(minute_docs),
         "stock_info": FakeStockInfoCollection3(stock_docs),
     }
 
     monkeypatch.setattr(te, "get_db_collections", lambda: fake_collections)
+    monkeypatch.setattr(te, "get_data_db", lambda: fake_data_db)
 
     result = te.get_trade_pnl_summary(current_user={"id": user_id})
 
