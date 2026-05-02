@@ -160,6 +160,8 @@ def get_data_db():
         "international_news_cache": data_db["international_news_cache"],
         # Global quotes (yfinance sync from quant-data-engine)
         "global_market_quotes": data_db["global_market_quotes"],
+        # Global market daily OHLCV history (synced by run_global_market_daily_sync)
+        "global_market_daily": data_db["global_market_daily"],
         # Market risk scan results (written by quant-data-engine risk_scanner task)
         "risk_reports": data_db["risk_reports"],
     }
