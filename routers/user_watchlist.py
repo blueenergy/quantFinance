@@ -3,6 +3,7 @@
 处理自选股列表、策略、实时数据等功能
 """
 
+from collections import defaultdict
 from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Depends, HTTPException
 from models.all_models import (
@@ -419,32 +420,128 @@ def _etf_daily_intraday_pack(
     return {"row": row, "prev": prev}
 
 
-def _pick_intraday_volume_price(
-    volume_price_col, variants: List[str], today: str
-) -> Optional[Dict[str, Any]]:
-    """当日 ``volume_price``：优先东财 ``eastmoney_snapshot``；兼容 ``symbol``/``ts_code`` 与多种 ``trade_date`` 存法。"""
-    td_key = _trade_date_match_today(today)
-    sym_f = _volume_price_symbol_filter(variants)
-    cands = list(volume_price_col.find({**sym_f, "trade_date": td_key}))
+def _norm_keys_from_vp_doc(doc: Dict[str, Any]) -> List[str]:
+    out: List[str] = []
+    for k in ("symbol", "ts_code"):
+        v = doc.get(k)
+        if not v:
+            continue
+        n = remove_exchange_suffix(str(v).strip())
+        if n and n not in out:
+            out.append(n)
+    return out
+
+
+def _vp_docs_index_by_norm(docs: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
+    """按去掉后缀后的代码聚合；同一文档只出现一次。"""
+    by_norm: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+
+    def _did(d: Dict[str, Any]) -> Any:
+        return d.get("_id") if d.get("_id") is not None else id(d)
+
+    for doc in docs:
+        did = _did(doc)
+        for nid in _norm_keys_from_vp_doc(doc):
+            lst = by_norm[nid]
+            if any(_did(x) == did for x in lst):
+                continue
+            lst.append(doc)
+    return dict(by_norm)
+
+
+def _pick_best_intraday_from_today_docs(cands: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """同一标的当日多条：优先 eastmoney_snapshot。"""
     for c in cands:
         if c.get("source") == "eastmoney_snapshot":
             return c
-    if cands:
-        return cands[0]
-    row = volume_price_col.find_one(
-        {**sym_f, "source": "eastmoney_snapshot"},
-        sort=[("trade_date", -1)],
-    )
-    if not row:
+    return cands[0] if cands else None
+
+
+def _pick_fallback_eastmoney_doc(
+    docs: List[Dict[str, Any]], today: str
+) -> Optional[Dict[str, Any]]:
+    """仅东财快照；按 trade_date 降序取第一条满足当日或 lookback 的文档。"""
+    if not docs:
         return None
-    doc_td = _norm_trade_date_to_yyyymmdd(row.get("trade_date"))
-    if doc_td is None:
-        return None
-    if doc_td == today:
-        return row
-    if _eastmoney_trade_date_within_lookback(doc_td, today):
-        return row
+
+    def _td_sort_key(d: Dict[str, Any]) -> str:
+        t = _norm_trade_date_to_yyyymmdd(d.get("trade_date"))
+        return t or ""
+
+    for d in sorted(docs, key=_td_sort_key, reverse=True):
+        doc_td = _norm_trade_date_to_yyyymmdd(d.get("trade_date"))
+        if doc_td is None:
+            continue
+        if doc_td == today or _eastmoney_trade_date_within_lookback(doc_td, today):
+            return d
     return None
+
+
+def _format_vp_update_time(vp: Optional[Dict[str, Any]]) -> Optional[str]:
+    """volume_price 常见 ``update_time`` 为 ``%Y%m%d %H:%M:%S`` 字符串。"""
+    if not vp:
+        return None
+    raw = vp.get("update_time")
+    if raw is None:
+        raw = vp.get("synced_at")
+    if raw is None:
+        return None
+    if hasattr(raw, "strftime"):
+        try:
+            return raw.strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            return None
+    s = str(raw).strip()
+    if len(s) >= 15 and s[:8].isdigit() and s[8] in (" ", "T"):
+        d = s[:8]
+        rest = s[8:].strip()
+        return f"{d[0:4]}-{d[4:6]}-{d[6:8]} {rest}"
+    return s
+
+
+def _batch_intraday_volume_price_map(
+    volume_price_col,
+    symbols: List[str],
+    sym_ctx: Dict[str, Dict[str, Any]],
+    today: str,
+) -> Dict[str, Optional[Dict[str, Any]]]:
+    """一次（或两次）查询 Mongo，按自选 ``symbol`` 映射最佳当日 / 近日 ``volume_price`` 文档。"""
+    all_variants: List[str] = []
+    seen: set[str] = set()
+    for s in symbols:
+        for v in sym_ctx[s]["variants"]:
+            if v and v not in seen:
+                seen.add(v)
+                all_variants.append(v)
+    empty = {s: None for s in symbols}
+    if not all_variants:
+        return empty
+
+    td_key = _trade_date_match_today(today)
+    sym_f = _volume_price_symbol_filter(all_variants)
+    today_docs = list(volume_price_col.find({**sym_f, "trade_date": td_key}))
+    by_norm_today = _vp_docs_index_by_norm(today_docs)
+
+    out: Dict[str, Optional[Dict[str, Any]]] = {}
+    for sym in symbols:
+        nid = remove_exchange_suffix(sym)
+        cands = by_norm_today.get(nid, [])
+        out[sym] = _pick_best_intraday_from_today_docs(cands)
+
+    need_fb = [sym for sym in symbols if out.get(sym) is None]
+    if need_fb:
+        limit = min(3000, 200 + 50 * len(all_variants))
+        fb_docs = list(
+            volume_price_col.find(
+                {**sym_f, "source": "eastmoney_snapshot"},
+            ).sort([("trade_date", -1)]).limit(limit)
+        )
+        by_norm_fb = _vp_docs_index_by_norm(fb_docs)
+        for sym in need_fb:
+            nid = remove_exchange_suffix(sym)
+            out[sym] = _pick_fallback_eastmoney_doc(by_norm_fb.get(nid, []), today)
+
+    return out
 
 
 # ==================== 实时数据 ====================
@@ -491,6 +588,7 @@ def get_user_watchlist_realtime(current_user: dict = Depends(get_current_active_
         yesterday_close_map = {}
         volume_price_col = data_collections["volume_price"]
 
+        # Key 与下方主循环的 symbol 一致（user_watchlists 原文）；命中文档靠 variants，避免后缀不一致丢 close。
         for symbol in symbols:
             variants = sym_ctx[symbol]["variants"]
             latest_record = volume_price_col.find_one(
@@ -511,11 +609,9 @@ def get_user_watchlist_realtime(current_user: dict = Depends(get_current_active_
         minute_bars_col = data_collections["minute_bars"]
         today = _cn_calendar_today_yyyymmdd()
 
-        minute_match_symbols: List[str] = []
-        for symbol in symbols:
-            for v in sym_ctx[symbol]["variants"]:
-                if v not in minute_match_symbols:
-                    minute_match_symbols.append(v)
+        minute_match_symbols = list(
+            dict.fromkeys(v for symbol in symbols for v in sym_ctx[symbol]["variants"])
+        )
         
         pipeline = [
             {
@@ -544,7 +640,11 @@ def get_user_watchlist_realtime(current_user: dict = Depends(get_current_active_
             prev = realtime_by_norm.get(nid)
             if prev is None or str(item.get("latest_time") or "") > str(prev.get("latest_time") or ""):
                 realtime_by_norm[nid] = item
-        
+
+        vp_batch = _batch_intraday_volume_price_map(
+            volume_price_col, symbols, sym_ctx, today
+        )
+
         result = []
         stock_info_col = data_collections["stock_info"]
 
@@ -569,7 +669,7 @@ def get_user_watchlist_realtime(current_user: dict = Depends(get_current_active_
             item = realtime_by_norm.get(norm)
             
             if item is not None:
-                vp_snap = _pick_intraday_volume_price(volume_price_col, variants, today)
+                vp_snap = vp_batch.get(symbol)
                 o = (
                     item.get("open")
                     if item.get("open") is not None
@@ -610,10 +710,10 @@ def get_user_watchlist_realtime(current_user: dict = Depends(get_current_active_
                     "update_time": formatted_time,
                 })
                 continue
-            
-            vp = _pick_intraday_volume_price(volume_price_col, variants, today)
+
+            vp = vp_batch.get(symbol)
             if vp and vp.get("close") is not None:
-                close = float(vp["close"])
+                close = float(vp.get("close"))
                 pre = vp.get("pre_close")
                 if pre is not None:
                     pre = float(pre)
@@ -642,7 +742,7 @@ def get_user_watchlist_realtime(current_user: dict = Depends(get_current_active_
                     "volume": _safe_round_price(vol, 2) if vol is not None else None,
                     "change": _safe_round_price(ch, 2),
                     "change_pct": _safe_round_price(pct, 2),
-                    "update_time": None,
+                    "update_time": _format_vp_update_time(vp),
                 })
                 continue
 
