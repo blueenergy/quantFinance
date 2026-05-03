@@ -103,6 +103,8 @@ def get_analyzer_db():
         "market_analysis_cache": analyzer_db["market_analysis_cache"],
         # LLM interpretations of risk scan reports (written by quantAnalyzer)
         "risk_report_analysis": analyzer_db["risk_report_analysis"],
+        # X (Twitter) influencer post LLM analysis
+        "x_influencer_post_analysis": analyzer_db["x_influencer_post_analysis"],
     }
 
 def get_data_db():
@@ -164,6 +166,8 @@ def get_data_db():
         "global_market_daily": data_db["global_market_daily"],
         # Market risk scan results (written by quant-data-engine risk_scanner task)
         "risk_reports": data_db["risk_reports"],
+        # X (Twitter) influencer tweets (written by quant-data-engine run_x_influencer_sync)
+        "x_influencer_posts": data_db["x_influencer_posts"],
     }
 
 def close_db():

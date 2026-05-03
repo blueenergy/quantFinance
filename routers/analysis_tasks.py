@@ -34,6 +34,7 @@ RENDER_TYPE_MAP = {
     "broken_limit_up_feedback": "ladder_feedback",
     "earnings_hunter": "earnings_hunter",
     "risk_report_analysis": "risk_report_analysis",
+    "x_influencer_post_analysis": "x_influencer_post_analysis",
 }
 
 
@@ -47,6 +48,7 @@ PARTIAL_TYPES = {
     "limit_up_feedback",
     "broken_limit_up_feedback",
     "risk_report_analysis",
+    "x_influencer_post_analysis",
 }
 
 

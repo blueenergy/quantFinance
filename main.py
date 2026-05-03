@@ -65,6 +65,7 @@ from routers.strategy_pool import router as strategy_pool_router
 from routers.strategy_workers import router as strategy_workers_router
 from routers.limit_up_ladder import router as ladder_router
 from routers.risk_report import router as risk_report_router
+from routers.x_influencer import router as x_influencer_router
 from routers.scheduler_admin import router as scheduler_admin_router
 from routers.sector_concept import router as sector_concept_router
 from routers.hot_stock import router as hot_stock_router
@@ -143,6 +144,7 @@ app.include_router(strategy_pool_router, prefix="/api/strategy-pool", tags=["策
 app.include_router(strategy_workers_router, prefix="/api/strategy", tags=["策略集群管理"])
 app.include_router(ladder_router, prefix="/api", tags=["连板天梯"])
 app.include_router(risk_report_router, prefix="/api", tags=["市场风险预警"])
+app.include_router(x_influencer_router, prefix="/api", tags=["X大V情报"])
 app.include_router(scheduler_admin_router, prefix="/api/admin/scheduler", tags=["定时任务管理"])
 app.include_router(sector_concept_router, prefix="/api", tags=["板块与概念解析"])
 app.include_router(hot_stock_router, prefix="/api", tags=["盘中热股捕捉"])

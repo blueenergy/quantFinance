@@ -109,6 +109,14 @@ def infer_task_data_date(task: Dict[str, Any]) -> Optional[str]:
     if ttype in {"limit_up_feedback", "broken_limit_up_feedback", "limit_up", "broken_limit_up"}:
         return _norm_iso_date(params.get("date"))
 
+    if ttype == "x_influencer_post_analysis":
+        post = params.get("post") or {}
+        ca = post.get("created_at")
+        if isinstance(ca, str) and len(ca) >= 10:
+            head = ca[:10].replace("/", "-")
+            return _norm_iso_date(head)
+        return _norm_iso_date(ca)
+
     return None
 
 
@@ -214,6 +222,11 @@ def summarize_task_result(task: Dict[str, Any]) -> str:
         return "ETF分析完成"
     if task_type in {"global_analysis", "market_analysis"}:
         return str(result.get("summary") or result.get("conclusion") or "市场分析完成")[:120]
+    if task_type == "x_influencer_post_analysis":
+        analysis = result.get("analysis")
+        if isinstance(analysis, dict):
+            return str(analysis.get("summary_zh") or result.get("summary") or "X推文解读完成")[:120]
+        return str(result.get("summary") or "X推文解读完成")[:120]
 
     analysis = result.get("analysis")
     if isinstance(analysis, dict):

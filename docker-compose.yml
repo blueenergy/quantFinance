@@ -140,6 +140,10 @@ services:
       - DB_NAME=${MONGO_DB}
       - TUSHARE_TOKEN=${TUSHARE_TOKEN}
       - RATE_LIMIT_PER_SEC=${RATE_LIMIT_PER_SEC:-20}
+      # X API v2：大 V 推文；常驻循环需 ENABLE_X_INFLUENCER_SYNC=1（默认关闭免刷失败日志）
+      - TWITTER_BEARER_TOKEN=${TWITTER_BEARER_TOKEN:-}
+      - ENABLE_X_INFLUENCER_SYNC=${ENABLE_X_INFLUENCER_SYNC:-0}
+      - X_INFLUENCER_SYNC_INTERVAL=${X_INFLUENCER_SYNC_INTERVAL:-180}
       - TZ=Asia/Shanghai
       # domestic = Tushare同步+梯子（云服务器）
       # overseas = Yahoo Finance+BBC/CNBC新闻（本地有代理）
