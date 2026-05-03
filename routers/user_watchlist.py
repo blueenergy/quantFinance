@@ -3,7 +3,7 @@
 处理自选股列表、策略、实时数据等功能
 """
 
-from typing import List
+from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Depends, HTTPException
 from models.all_models import (
     WatchlistRequest, WatchlistUpdateRequest, WatchlistStrategySetRequest, 
@@ -12,8 +12,76 @@ from models.all_models import (
 from auth import get_current_active_user
 from db import get_db_collections, get_data_db
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 router = APIRouter()
+
+# 与 quant-data-engine 东财自选轮询一致：按上海日历日匹配 ``trade_date``，避免 API 容器为 UTC 时错位。
+_CN_TZ = ZoneInfo("Asia/Shanghai")
+
+
+def _cn_calendar_today_yyyymmdd() -> str:
+    return datetime.now(_CN_TZ).strftime("%Y%m%d")
+
+
+def _trade_date_match_today(today_yyyymmdd: str) -> Any:
+    """``volume_price`` / ``etf_daily`` 的 ``trade_date`` 在库中可能是 str / int / ``YYYY-MM-DD`` 等。"""
+    vals: List[Any] = [today_yyyymmdd]
+    try:
+        vals.append(int(today_yyyymmdd))
+    except (TypeError, ValueError):
+        pass
+    if len(today_yyyymmdd) == 8 and today_yyyymmdd.isdigit():
+        vals.append(f"{today_yyyymmdd[:4]}-{today_yyyymmdd[4:6]}-{today_yyyymmdd[6:8]}")
+    return {"$in": vals}
+
+
+def _norm_trade_date_to_yyyymmdd(td: Any) -> Optional[str]:
+    """将 Mongo 中的 trade_date 规范为 8 位 YYYYMMDD，便于与「上海今日」比较。"""
+    if td is None:
+        return None
+    if isinstance(td, int):
+        s = str(td)
+        return s[:8] if len(s) >= 8 else None
+    if isinstance(td, str):
+        s = td.replace("-", "").replace("/", "")[:8]
+        return s if len(s) == 8 and s.isdigit() else None
+    if hasattr(td, "strftime"):
+        try:
+            return td.strftime("%Y%m%d")
+        except Exception:
+            return None
+    return None
+
+
+def _eastmoney_trade_date_within_lookback(doc_td: str, today: str, max_days: int = 15) -> bool:
+    """东财快照的 ``trade_date`` 可早于上海日历「今日」（周末/长假），在间隔内仍用于展示 OHLC。"""
+    try:
+        d_doc = datetime.strptime(doc_td, "%Y%m%d").date()
+        d_today = datetime.strptime(today, "%Y%m%d").date()
+    except ValueError:
+        return False
+    delta = (d_today - d_doc).days
+    if delta < 0:
+        return False
+    return delta <= max_days
+
+
+def _volume_price_symbol_filter(variants: List[str]) -> Dict[str, Any]:
+    """``volume_price`` 有的历史数据用 ``ts_code``、有的用 ``symbol``。"""
+    return {"$or": [{"symbol": {"$in": variants}}, {"ts_code": {"$in": variants}}]}
+
+
+def _safe_round_price(val: Any, ndigits: int = 2) -> Optional[float]:
+    if val is None:
+        return None
+    try:
+        x = float(val)
+        if x != x:  # NaN
+            return None
+        return round(x, ndigits)
+    except (TypeError, ValueError):
+        return None
 
 
 # 辅助函数
@@ -157,7 +225,7 @@ def set_watchlist_strategy(req: WatchlistStrategySetRequest, current_user: dict 
 def get_user_watchlist_stocks(current_user: dict = Depends(get_current_active_user)):
     """获取当前用户自选股的详细信息（日K线数据）"""
     try:
-        user_id = current_user["id"]
+        user_id = get_user_id(current_user)
         
         # 获取用户自选股列表
         collections = get_db_collections()
@@ -286,37 +354,115 @@ def remove_exchange_suffix(symbol: str) -> str:
     Returns:
         str: Symbol without suffix (e.g., "600990")
     """
-    return symbol.replace(".SH", "").replace(".SZ", "")
+    return symbol.replace(".SH", "").replace(".SZ", "").replace(".BJ", "")
+
+
+def _symbol_variants(symbol: str) -> List[str]:
+    """同一标的在库中可能出现的 symbol / ts_code 写法（无后缀、.SH/.SZ 等）。"""
+    s = (symbol or "").strip()
+    if not s:
+        return []
+    raw = remove_exchange_suffix(s)
+    suffixed = add_exchange_suffix(raw) if raw else s
+    out: List[str] = []
+    for x in (s, raw, suffixed):
+        if x and x not in out:
+            out.append(x)
+    return out
+
+
+def _resolve_etf_ts_code(etf_basic_col, symbol: str) -> Optional[str]:
+    """若在 ``etf_basic`` 中能识别为场内 ETF，返回规范 ``ts_code``（避免 51 开头被误判为深交所）。"""
+    if etf_basic_col is None:
+        return None
+    s = (symbol or "").strip()
+    if not s:
+        return None
+    base = _symbol_variants(s)
+    doc = etf_basic_col.find_one({"ts_code": {"$in": base}})
+    if doc and doc.get("ts_code"):
+        return str(doc["ts_code"]).strip()
+    raw = remove_exchange_suffix(s)
+    if len(raw) == 6 and raw.isdigit():
+        doc = etf_basic_col.find_one({"ts_code": {"$regex": f"^{raw}\\."}})
+        if doc and doc.get("ts_code"):
+            return str(doc["ts_code"]).strip()
+    return None
+
+
+def _merge_variants(*groups: List[str]) -> List[str]:
+    out: List[str] = []
+    for g in groups:
+        for x in g:
+            if x and x not in out:
+                out.append(x)
+    return out
+
+
+def _etf_daily_intraday_pack(
+    etf_daily_col, ts_code: str, today: str
+) -> Optional[Dict[str, Any]]:
+    """ETF：优先当日 Tushare 日线（盘后或已同步时才有），否则最新一根日线 + 前一交易日用于涨跌。"""
+    td_key = _trade_date_match_today(today)
+    row = etf_daily_col.find_one({"ts_code": ts_code, "trade_date": td_key})
+    if not row:
+        row = etf_daily_col.find_one({"ts_code": ts_code}, sort=[("trade_date", -1)])
+    if not row or row.get("close") is None:
+        return None
+    td = row.get("trade_date")
+    prev = None
+    if td:
+        prev = etf_daily_col.find_one(
+            {"ts_code": ts_code, "trade_date": {"$lt": td}},
+            sort=[("trade_date", -1)],
+        )
+    return {"row": row, "prev": prev}
+
+
+def _pick_intraday_volume_price(
+    volume_price_col, variants: List[str], today: str
+) -> Optional[Dict[str, Any]]:
+    """当日 ``volume_price``：优先东财 ``eastmoney_snapshot``；兼容 ``symbol``/``ts_code`` 与多种 ``trade_date`` 存法。"""
+    td_key = _trade_date_match_today(today)
+    sym_f = _volume_price_symbol_filter(variants)
+    cands = list(volume_price_col.find({**sym_f, "trade_date": td_key}))
+    for c in cands:
+        if c.get("source") == "eastmoney_snapshot":
+            return c
+    if cands:
+        return cands[0]
+    row = volume_price_col.find_one(
+        {**sym_f, "source": "eastmoney_snapshot"},
+        sort=[("trade_date", -1)],
+    )
+    if not row:
+        return None
+    doc_td = _norm_trade_date_to_yyyymmdd(row.get("trade_date"))
+    if doc_td is None:
+        return None
+    if doc_td == today:
+        return row
+    if _eastmoney_trade_date_within_lookback(doc_td, today):
+        return row
+    return None
 
 
 # ==================== 实时数据 ====================
 
 @router.get("/watchlist-stocks/realtime")
 def get_user_watchlist_realtime(current_user: dict = Depends(get_current_active_user)):
-    """获取当前用户自选股的实时数据（基于分钟K线）
-    
-    Returns:
-        {
-            "success": True,
-            "data": [
-                {
-                    "symbol": "600990",
-                    "name": "四创电子",
-                    "price": 29.61,        # 最新价格（最新分钟K线的收盘价）
-                    "open": 27.61,         # 今日开盘价
-                    "high": 31.0,          # 今日最高价
-                    "low": 27.45,          # 今日最低价
-                    "volume": 278479.0,    # 今日累计成交量
-                    "change": 0.50,        # 涨跌额
-                    "change_pct": 1.72,    # 涨跌幅%
-                    "update_time": "2025-12-16 14:30:00"  # 最后更新时间
-                },
-                ...
-            ]
-        }
+    """获取当前用户自选股的实时数据。
+
+    股票：① 当日 ``minute_bars``；② 当日 ``volume_price``（优先东财 ``eastmoney_snapshot``）；
+    ③ 若日历「今日」尚无记录，可用 **最近若干自然日内** 的东财快照（休市/长假/数据仍停在上一交易日，如库中为 ``20260502`` 而上海已为 ``20260503``）。
+    ④ 最近 ``volume_price`` 仅收盘价。``trade_date`` 与「今天」按 **Asia/Shanghai** 对齐，并兼容多种存法。
+
+    ETF：一般无分钟线；东财 ulist 与自选轮询 **仅覆盖带交易所后缀的 ts_code**（裸代码不会进东财任务），
+    故在 ①② 不可用时回退到 **``etf_daily``**（优先当日已同步的 Tushare 日线，否则最新一根日线，
+    涨跌相对前一交易日收盘）。**非交易时段 / 日线未落地时 ETF 仍可能只有昨收级别数据。**
     """
     try:
-        user_id = current_user["id"]
+        user_id = get_user_id(current_user)
         
         # 1. 获取用户自选股列表
         collections = get_db_collections()
@@ -333,135 +479,248 @@ def get_user_watchlist_realtime(current_user: dict = Depends(get_current_active_
         symbols = watchlist_doc["symbols"]  # e.g., ["600990", "300722"]
         
         # 2. 获取昨日收盘价（用于计算涨跌幅）
-        yesterday_close_map = {}  # symbol -> close_price
-        volume_price_col = data_collections["volume_price"]
+        etf_basic_col = data_collections.get("etf_basic")
         etf_daily_col = data_collections.get("etf_daily")
-        
+
+        sym_ctx: Dict[str, Dict[str, Any]] = {}
         for symbol in symbols:
+            etf_ts = _resolve_etf_ts_code(etf_basic_col, symbol)
+            eff_variants = _merge_variants(_symbol_variants(symbol), [etf_ts] if etf_ts else [])
+            sym_ctx[symbol] = {"variants": eff_variants, "etf_ts": etf_ts}
+
+        yesterday_close_map = {}
+        volume_price_col = data_collections["volume_price"]
+
+        for symbol in symbols:
+            variants = sym_ctx[symbol]["variants"]
             latest_record = volume_price_col.find_one(
-                {"symbol": symbol},
-                sort=[("trade_date", -1)]
+                _volume_price_symbol_filter(variants),
+                sort=[("trade_date", -1)],
             )
             if latest_record:
                 yesterday_close_map[symbol] = latest_record.get("close")
             elif etf_daily_col is not None:
-                # Fallback to ETF daily
-                etf_record = etf_daily_col.find_one(
-                    {"ts_code": symbol},
-                    sort=[("trade_date", -1)]
-                )
+                etf_ts = sym_ctx[symbol]["etf_ts"]
+                q = {"ts_code": {"$in": variants}}
+                if etf_ts:
+                    q = {"ts_code": etf_ts}
+                etf_record = etf_daily_col.find_one(q, sort=[("trade_date", -1)])
                 if etf_record:
                     yesterday_close_map[symbol] = etf_record.get("close")
-        
-        # 3. 准备查询条件（minute_bars 中 symbol 没有交易所后缀）
-        # symbols 已经是不带后缀的格式，如 ["600990", "300722"]
-        
-        # 4. 聚合今日分钟K线数据
+
         minute_bars_col = data_collections["minute_bars"]
-        today = datetime.now().strftime("%Y%m%d")  # e.g., "20251216"
+        today = _cn_calendar_today_yyyymmdd()
+
+        minute_match_symbols: List[str] = []
+        for symbol in symbols:
+            for v in sym_ctx[symbol]["variants"]:
+                if v not in minute_match_symbols:
+                    minute_match_symbols.append(v)
         
-        # minute_bars 的 trade_date 格式是 YYYYMMDDHHmm，需要按日期前缀匹配
         pipeline = [
             {
                 "$match": {
-                    "symbol": {"$in": symbols},  # 不需要后缀
-                    "trade_date": {"$regex": f"^{today}"}  # 匹配今天的所有分钟数据
+                    "symbol": {"$in": minute_match_symbols},
+                    "trade_date": {"$regex": f"^{today}"},
                 }
             },
-            {"$sort": {"trade_date": 1}},  # 按时间排序
+            {"$sort": {"trade_date": 1}},
             {
                 "$group": {
                     "_id": "$symbol",
-                    "open": {"$first": "$open"},      # 第一根K线的开盘价
-                    "close": {"$last": "$close"},     # 最新K线的收盘价
-                    "high": {"$max": "$high"},        # 最高价
-                    "low": {"$min": "$low"},          # 最低价
-                    "volume": {"$sum": "$volume"},    # 累计成交量
-                    "latest_time": {"$last": "$trade_date"}  # 最后更新时间
+                    "open": {"$first": "$open"},
+                    "close": {"$last": "$close"},
+                    "high": {"$max": "$high"},
+                    "low": {"$min": "$low"},
+                    "volume": {"$sum": "$volume"},
+                    "latest_time": {"$last": "$trade_date"},
                 }
-            }
+            },
         ]
-        
         realtime_data = list(minute_bars_col.aggregate(pipeline))
+        realtime_by_norm: Dict[str, Dict[str, Any]] = {}
+        for item in realtime_data:
+            nid = remove_exchange_suffix(str(item["_id"]))
+            prev = realtime_by_norm.get(nid)
+            if prev is None or str(item.get("latest_time") or "") > str(prev.get("latest_time") or ""):
+                realtime_by_norm[nid] = item
         
-        # 5. 构建结果并计算涨跌幅
         result = []
-        realtime_map = {item["_id"]: item for item in realtime_data}  # symbol -> data
-        
         stock_info_col = data_collections["stock_info"]
-        etf_basic_col = data_collections.get("etf_basic")
-        
+
         for symbol in symbols:
-            # 获取股票/ETF名称
-            stock_info = stock_info_col.find_one({"symbol": symbol})
+            variants = sym_ctx[symbol]["variants"]
+            etf_ts = sym_ctx[symbol]["etf_ts"]
+            stock_info = stock_info_col.find_one({"symbol": {"$in": variants}})
             if stock_info:
                 name = stock_info["name"] if "name" in stock_info else symbol
             else:
-                etf_info = etf_basic_col.find_one({"ts_code": symbol}) if etf_basic_col is not None else None
+                etf_info = (
+                    etf_basic_col.find_one({"ts_code": {"$in": variants}})
+                    if etf_basic_col is not None
+                    else None
+                )
                 if etf_info:
                     name = etf_info["name"] if "name" in etf_info else symbol
                 else:
                     name = symbol
             
-            if symbol in realtime_map:
-                # 有今日实时数据
-                item = realtime_map[symbol]
+            norm = remove_exchange_suffix(symbol)
+            item = realtime_by_norm.get(norm)
+            
+            if item is not None:
+                vp_snap = _pick_intraday_volume_price(volume_price_col, variants, today)
+                o = (
+                    item.get("open")
+                    if item.get("open") is not None
+                    else (vp_snap.get("open") if vp_snap else None)
+                )
+                h = (
+                    item.get("high")
+                    if item.get("high") is not None
+                    else (vp_snap.get("high") if vp_snap else None)
+                )
+                lo = (
+                    item.get("low")
+                    if item.get("low") is not None
+                    else (vp_snap.get("low") if vp_snap else None)
+                )
                 current_price = item["close"]
-                yesterday_close = yesterday_close_map.get(symbol, item["open"])  # 如果没有昨日数据，用今日开盘价
-                
-                # 计算涨跌额和涨跌幅
+                yesterday_close = yesterday_close_map.get(symbol, item.get("open"))
                 change = current_price - yesterday_close if yesterday_close else 0
                 change_pct = (change / yesterday_close * 100) if yesterday_close else 0
-                
-                # 格式化更新时间（YYYYMMDDHHmm -> YYYY-MM-DD HH:MM:SS）
                 latest_time_str = item["latest_time"]
-                if latest_time_str and len(latest_time_str) >= 12:
-                    formatted_time = f"{latest_time_str[0:4]}-{latest_time_str[4:6]}-{latest_time_str[6:8]} {latest_time_str[8:10]}:{latest_time_str[10:12]}:00"
+                if latest_time_str and len(str(latest_time_str)) >= 12:
+                    lts = str(latest_time_str)
+                    formatted_time = (
+                        f"{lts[0:4]}-{lts[4:6]}-{lts[6:8]} {lts[8:10]}:{lts[10:12]}:00"
+                    )
                 else:
                     formatted_time = str(latest_time_str)
-                
                 result.append({
                     "symbol": symbol,
                     "name": name,
-                    "price": round(current_price, 2),
-                    "open": round(item["open"], 2),
-                    "high": round(item["high"], 2),
-                    "low": round(item["low"], 2),
-                    "volume": round(item["volume"], 2),
-                    "change": round(change, 2),
-                    "change_pct": round(change_pct, 2),
-                    "update_time": formatted_time
+                    "price": _safe_round_price(current_price),
+                    "open": _safe_round_price(o),
+                    "high": _safe_round_price(h),
+                    "low": _safe_round_price(lo),
+                    "volume": _safe_round_price(item.get("volume"), 2),
+                    "change": _safe_round_price(change, 2),
+                    "change_pct": _safe_round_price(change_pct, 2),
+                    "update_time": formatted_time,
+                })
+                continue
+            
+            vp = _pick_intraday_volume_price(volume_price_col, variants, today)
+            if vp and vp.get("close") is not None:
+                close = float(vp["close"])
+                pre = vp.get("pre_close")
+                if pre is not None:
+                    pre = float(pre)
+                ch = vp.get("change")
+                if ch is not None:
+                    ch = float(ch)
+                elif pre is not None:
+                    ch = close - pre
+                else:
+                    ch = 0.0
+                pct = vp.get("pct_chg")
+                if pct is not None:
+                    pct = float(pct)
+                elif pre:
+                    pct = (ch / pre * 100.0) if pre else 0.0
+                else:
+                    pct = 0.0
+                vol = vp.get("volume")
+                result.append({
+                    "symbol": symbol,
+                    "name": name,
+                    "price": _safe_round_price(close),
+                    "open": _safe_round_price(vp.get("open")),
+                    "high": _safe_round_price(vp.get("high")),
+                    "low": _safe_round_price(vp.get("low")),
+                    "volume": _safe_round_price(vol, 2) if vol is not None else None,
+                    "change": _safe_round_price(ch, 2),
+                    "change_pct": _safe_round_price(pct, 2),
+                    "update_time": None,
+                })
+                continue
+
+            if etf_ts and etf_daily_col is not None:
+                pack = _etf_daily_intraday_pack(etf_daily_col, etf_ts, today)
+                if pack:
+                    row = pack["row"]
+                    prev = pack.get("prev")
+                    close = row.get("close")
+                    if close is not None:
+                        close = float(close)
+                        prev_c = prev.get("close") if prev else None
+                        if prev_c is not None:
+                            prev_c = float(prev_c)
+                        ch = (
+                            (close - prev_c)
+                            if prev_c is not None
+                            else 0.0
+                        )
+                        pct = (
+                            (ch / prev_c * 100.0)
+                            if prev_c not in (None, 0)
+                            else 0.0
+                        )
+                        vol = row.get("vol")
+                        if vol is None:
+                            vol = row.get("volume")
+                        result.append(
+                            {
+                                "symbol": symbol,
+                                "name": name,
+                                "price": round(close, 2),
+                                "open": round(row["open"], 2)
+                                if row.get("open") is not None
+                                else None,
+                                "high": round(row["high"], 2)
+                                if row.get("high") is not None
+                                else None,
+                                "low": round(row["low"], 2)
+                                if row.get("low") is not None
+                                else None,
+                                "volume": round(float(vol), 2)
+                                if vol is not None
+                                else None,
+                                "change": round(ch, 2),
+                                "change_pct": round(pct, 2),
+                                "update_time": None,
+                            }
+                        )
+                        continue
+
+            yesterday_close = yesterday_close_map.get(symbol)
+            if yesterday_close:
+                result.append({
+                    "symbol": symbol,
+                    "name": name,
+                    "price": round(yesterday_close, 2),
+                    "open": None,
+                    "high": None,
+                    "low": None,
+                    "volume": None,
+                    "change": 0.0,
+                    "change_pct": 0.0,
+                    "update_time": None,
                 })
             else:
-                # 无今日实时数据，返回昨日数据或空值
-                yesterday_close = yesterday_close_map.get(symbol)
-                
-                if yesterday_close:
-                    result.append({
-                        "symbol": symbol,
-                        "name": name,
-                        "price": round(yesterday_close, 2),
-                        "open": None,
-                        "high": None,
-                        "low": None,
-                        "volume": None,
-                        "change": 0.0,
-                        "change_pct": 0.0,
-                        "update_time": None
-                    })
-                else:
-                    result.append({
-                        "symbol": symbol,
-                        "name": name,
-                        "price": None,
-                        "open": None,
-                        "high": None,
-                        "low": None,
-                        "volume": None,
-                        "change": None,
-                        "change_pct": None,
-                        "update_time": None
-                    })
+                result.append({
+                    "symbol": symbol,
+                    "name": name,
+                    "price": None,
+                    "open": None,
+                    "high": None,
+                    "low": None,
+                    "volume": None,
+                    "change": None,
+                    "change_pct": None,
+                    "update_time": None,
+                })
         
         return {
             "success": True,
