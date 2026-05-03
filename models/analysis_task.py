@@ -17,6 +17,10 @@ class AnalysisTaskCreate(BaseModel):
     model: Optional[str] = None
     feedback: Optional[str] = None
     revision_of: Optional[str] = None
+    skip_review: bool = Field(
+        default=False,
+        description="为 True 时跳过「评审→修订」流水线，仅执行单次深度分析（节省耗时）",
+    )
 
 class AnalysisTask(BaseModel):
     id: Optional[str] = Field(default=None, alias="_id", description="MongoDB ObjectId")

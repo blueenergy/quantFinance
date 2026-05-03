@@ -60,6 +60,9 @@ def build_user_analysis_history_payload(
             analysis_obj = h.get("analysis")
         if isinstance(analysis_obj, dict) and "analysis" in analysis_obj:
             core = analysis_obj.get("analysis")
+            # 深度分析正文常用顶层字段；若与顶层 keys 无任何交集，则把 legacy 的「仅包一层 analysis」剥开。
+            # 必须包含流水线相关键：否则顶层仅有 { analysis: {...}, deep_review_pipeline: {...} } 时
+            # 交集为空会误剥壳，导致前端拿不到 reviewer comments。
             known_keys = {
                 "technical_analysis",
                 "investment_advice",
@@ -74,6 +77,14 @@ def build_user_analysis_history_payload(
                 "confidence_score",
                 "stock_name",
                 "symbol",
+                "deep_review_pipeline",
+                "revision_log",
+                "thought_process_raw",
+                "quant_score_snapshot_tag",
+                "quant_score_cross_check",
+                "chip_analysis",
+                "institutional_deep_meta",
+                "institutional_deep_user_visible",
             }
             if not (known_keys & set(analysis_obj.keys())) and core is not None:
                 analysis_obj = core

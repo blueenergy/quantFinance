@@ -694,12 +694,18 @@ async def create_deep_analysis_task(
     )
 
     # 3. 创建任务
+    params: Dict[str, Any] = {}
+    if request.feedback:
+        params["feedback"] = request.feedback
+    if request.skip_review:
+        params["skip_review"] = True
+
     task_doc = build_task_doc(
         current_user=current_user,
         task_type="deep_analysis",
         priority=request.priority,
         symbol=request.symbol,
-        params={"feedback": request.feedback} if request.feedback else {},
+        params=params if params else {},
         provider=request.provider,
         model=request.model,
         source="manual_trigger",
