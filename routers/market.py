@@ -46,7 +46,7 @@ _DASHBOARD_MARKET_SYMBOLS: Dict[str, List[str]] = {
     "china_concepts": ["FXI", "2823.HK", "PGJ", "BABA", "PDD", "JD", "NIO"],
     "tech_giants": ["NVDA", "TSLA", "AAPL", "MSFT", "GOOG", "META", "AMZN", "AMD", "INTC"],
     "commodities": ["GC=F", "SI=F", "CL=F"],
-    "forex": ["CNH=X", "DX-Y.NYB"],
+    "forex": ["USDCNH=X", "DX-Y.NYB"],
     "bonds": ["^TNX"],
     "crypto": ["BTC-USD", "ETH-USD"],
 }
@@ -87,7 +87,7 @@ _DASHBOARD_SYMBOL_NAMES: Dict[str, Dict[str, str]] = {
         "AMZN": "Amazon",
     },
     "commodities": {"GC=F": "Gold", "SI=F": "Silver", "CL=F": "Crude Oil"},
-    "forex": {"DX-Y.NYB": "USD Index", "CNH=X": "USD/CNH (Offshore)"},
+    "forex": {"DX-Y.NYB": "USD Index", "USDCNH=X": "USD/CNH (Offshore)"},
     "bonds": {"^TNX": "US 10Y Treasury Yield"},
     "crypto": {"BTC-USD": "Bitcoin", "ETH-USD": "Ethereum"},
 }
@@ -519,8 +519,34 @@ async def get_global_market_dashboard(current_user: dict = Depends(get_current_a
 
 # 已在 global_market_daily 中同步历史日线的品种白名单
 _KLINE_AVAILABLE_SYMBOLS = {
-    "SOXX", "SMH", "^SOX", "QQQ", "XLK", "^IXIC",
-    "SPY", "^GSPC", "^VIX", "^TNX", "NVDA", "AMD",
+    # US broad market
+    "SPY", "^GSPC", "^DJI", "^RUT",
+    # Nasdaq / tech
+    "QQQ", "XLK", "^IXIC",
+    # Semiconductor
+    "SOXX", "SMH", "^SOX",
+    # Sector ETFs
+    "XLE", "XLF", "XLV", "XLI", "XLU", "XLRE",
+    # Innovation
+    "ARKK",
+    # Volatility + rates
+    "^VIX", "^TNX", "^TYX",
+    # USD index
+    "DX-Y.NYB",
+    # Global indices
+    "^N225", "^HSI", "000001.SS", "FXI", "EWJ", "EWG", "EWY",
+    # Commodities
+    "GC=F", "CL=F", "SI=F",
+    # Crypto
+    "BTC-USD", "ETH-USD",
+    # US index futures
+    "ES=F", "NQ=F",
+    # Tech giants
+    "NVDA", "AMD", "AAPL", "MSFT", "TSLA", "GOOG", "META", "AMZN", "INTC",
+    # China concepts
+    "BABA", "PDD", "JD", "NIO", "2823.HK", "PGJ",
+    # US index futures (additional)
+    "YM=F", "RTY=F",
 }
 
 
