@@ -369,12 +369,21 @@ def fetch_market_analysis_result(analysis_date: Optional[str] = None) -> Dict[st
         "user_tip": f"系统会在交易日 {schedule_text} 自动更新，请稍后刷新查看。"
     }
 
+@router.get("/market-analysis")
+async def get_market_analysis(
+    date: Optional[str] = Query(default=None, description="分析日期，格式 YYYY-MM-DD"),
+    current_user: dict = Depends(get_current_active_user)
+):
+    """Canonical read endpoint for cached market analysis results."""
+    return fetch_market_analysis_result(date)
+
+
 @router.post("/analyze-market")
 async def analyze_market(request: MarketAnalysisRequest, current_user: dict = Depends(get_current_active_user)):
-    """Frontend endpoint: only fetch cached market analysis result.
+    """Legacy compatibility endpoint for reading cached market analysis.
 
     实际分析工作由后台 Celery 定时任务完成，这里不再触发 LLM 调用。
-    支持可选的 date 参数。
+    新调用方应改用 GET /market-analysis；此路由仅为兼容旧前端保留。
     """
     return fetch_market_analysis_result(request.date)
 
