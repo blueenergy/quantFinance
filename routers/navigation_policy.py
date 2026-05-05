@@ -18,6 +18,8 @@ from routers.entitlements_matrix import get_merged_matrix_cells, user_tier_for_m
 KNOWN_MAIN_TABS: List[tuple] = [
     ("limit-up-ladder", False),
     ("market-risk", False),
+    ("china-macro", False),
+    ("us-rates", False),
     ("x-influencer-voices", False),
     ("theme-lag-recommend", False),
     ("sector-concept", True),
