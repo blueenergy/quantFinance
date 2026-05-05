@@ -15,6 +15,217 @@ from services.analysis_tasks import build_task_doc
 router = APIRouter()
 
 
+def _compact_summary_text(value: Any, fallback: str, max_len: int = 48) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return fallback
+    return f"{text[:max_len].strip()}..." if len(text) > max_len else text
+
+
+def _summary_signals(values: Any, fallback: List[str]) -> List[str]:
+    out: List[str] = []
+    seq = values if isinstance(values, list) else []
+    for value in seq:
+        if not value:
+            continue
+        if isinstance(value, str):
+            item = value.strip()
+        elif isinstance(value, Mapping):
+            item = str(value.get("name") or value.get("label") or value.get("title") or value.get("sector") or "").strip()
+        else:
+            item = str(value).strip()
+        if item:
+            out.append(item)
+        if len(out) >= 2:
+            break
+    return out or fallback
+
+
+def _build_market_home_summary(result: Mapping[str, Any]) -> Dict[str, Any]:
+    raw_existing = result.get("home_summary")
+    existing: Mapping[str, Any] = raw_existing if isinstance(raw_existing, Mapping) else {}
+    return {
+        "summary_line": _compact_summary_text(
+            existing.get("summary_line") or result.get("summary"),
+            "今日暂无 AI 大盘分析摘要。",
+        ),
+        "signals": _summary_signals(
+            existing.get("signals") or [
+                result.get("riskLevel") and f"风险 {result.get('riskLevel')}",
+                result.get("mainlineAnalysis") or result.get("macroDrivers") or result.get("mood"),
+            ],
+            ["风险等级", "主题主线"],
+        ),
+        "tone": str(existing.get("tone") or result.get("mood") or "中性").strip(),
+        "risk_tag": str(existing.get("risk_tag") or result.get("riskLevel") or "medium").strip(),
+    }
+
+
+def _build_global_home_summary(doc: Mapping[str, Any]) -> Dict[str, Any]:
+    raw_analysis = doc.get("analysis")
+    analysis: Mapping[str, Any] = raw_analysis if isinstance(raw_analysis, Mapping) else {}
+    raw_existing = analysis.get("home_summary")
+    existing: Mapping[str, Any] = raw_existing if isinstance(raw_existing, Mapping) else {}
+    mood = str(existing.get("tone") or analysis.get("sentiment_mood") or "中性").strip()
+    net_impact = analysis.get("net_impact_score")
+    if net_impact is not None and str(net_impact).strip() != "":
+        try:
+            summary_line = f"{mood} | 净影响分 {float(net_impact):+0.1f}"
+        except Exception:
+            summary_line = _compact_summary_text(
+                existing.get("summary_line") or analysis.get("net_impact") or analysis.get("foreign_impact"),
+                "今日暂无全球市场简报。",
+            )
+    else:
+        summary_line = _compact_summary_text(
+            existing.get("summary_line") or analysis.get("net_impact") or analysis.get("foreign_impact"),
+            "今日暂无全球市场简报。",
+        )
+    return {
+        "summary_line": summary_line,
+        "signals": _summary_signals(
+            existing.get("signals") or [*(analysis.get("risk_factors") or []), *(analysis.get("key_sectors") or [])],
+            ["全球联动", "风险观察"],
+        ),
+        "tone": mood,
+        "risk_tag": str(existing.get("risk_tag") or mood or "中性").strip(),
+    }
+
+
+def _build_data_pulse_home_summary(overview: Mapping[str, Any]) -> Dict[str, Any]:
+    raw_sync_health = overview.get("sync_health")
+    sync_health: Mapping[str, Any] = raw_sync_health if isinstance(raw_sync_health, Mapping) else {}
+    freshness_detail = overview.get("freshness_detail") if isinstance(overview.get("freshness_detail"), list) else []
+    raw_news = overview.get("news")
+    news: Mapping[str, Any] = raw_news if isinstance(raw_news, Mapping) else {}
+
+    health_pct = float(sync_health.get("health_pct") or 0)
+    healthy = int(sync_health.get("healthy") or 0)
+    total = int(sync_health.get("total_pipelines") or 0)
+    latest_freshness = None
+    if freshness_detail:
+        latest_values = sorted(
+            [str(row.get("latest_value") or "").strip() for row in freshness_detail if row.get("latest_value")],
+        )
+        latest_freshness = latest_values[-1] if latest_values else None
+
+    if health_pct >= 80:
+        status = "正常"
+    elif health_pct >= 50:
+        status = "部分延迟"
+    else:
+        status = "异常"
+
+    headline_count = 0
+    headlines = news.get("headlines")
+    if isinstance(headlines, Mapping):
+        headline_count = len([value for value in headlines.values() if value])
+
+    return {
+        "status": status if total > 0 else "暂无摘要",
+        "summary_line": (
+            f"{healthy}/{total} 条管线正常，当前健康度 {health_pct:.0f}%"
+            if total > 0
+            else "已获取数据脉搏概览，请进入模块查看细项。"
+        ),
+        "signals": _summary_signals(
+            [
+                headline_count > 0 and f"新闻 {headline_count} 条",
+                "同步正常" if health_pct >= 80 else "存在延迟" if health_pct >= 50 else "需排障",
+            ],
+            ["同步状态", "新闻摘要"],
+        ),
+        "tone": status if total > 0 else "中性",
+        "risk_tag": status if total > 0 else "暂无摘要",
+        "updated_at": (
+            f"最新数据 {str(latest_freshness)[4:6]}-{str(latest_freshness)[6:8]}"
+            if latest_freshness and len(str(latest_freshness)) >= 8
+            else "已更新概览"
+        ),
+    }
+
+
+def _get_data_pulse_overview_for_home() -> Dict[str, Any]:
+    from routers.data_pulse import _get_international_news_doc
+    from services.data_monitoring import build_data_monitoring_overview
+
+    from datetime import timezone
+
+    dm = build_data_monitoring_overview()
+    freshness_rows = dm.get("freshness") or []
+    overview: Dict[str, Any] = {
+        "news": None,
+        "sync_health": dm.get("sync_health"),
+        "freshness_detail": freshness_rows,
+        "pipelines_detail": dm.get("pipelines"),
+    }
+
+    news_doc = _get_international_news_doc()
+    if news_doc:
+        fetched_at = news_doc.get("fetched_at")
+        age_minutes = None
+        if fetched_at:
+            if fetched_at.tzinfo is None:
+                fetched_at = fetched_at.replace(tzinfo=timezone.utc)
+            age_minutes = int((datetime.now(timezone.utc) - fetched_at).total_seconds() / 60)
+
+        categories = news_doc.get("categories", {})
+        headlines = {}
+        for cat, items in categories.items():
+            if items:
+                headlines[cat] = items[0].get("title", "")
+
+        overview["news"] = {
+            "total": news_doc.get("total", 0),
+            "age_minutes": age_minutes,
+            "is_fresh": age_minutes is not None and age_minutes < 120,
+            "headlines": headlines,
+        }
+
+    return overview
+
+
+def _collect_home_summary_cards(analysis_date: Optional[str] = None) -> Dict[str, Any]:
+    market_result = fetch_market_analysis_result(analysis_date)
+
+    global_doc = get_analyzer_db()["global_analysis"].find_one(sort=[("_id", -1)])
+    global_payload = serialize_doc(dict(global_doc)) if global_doc else {}
+    global_summary = _build_global_home_summary(global_payload if isinstance(global_payload, dict) else {})
+
+    data_pulse_overview = _get_data_pulse_overview_for_home()
+    data_pulse_summary = _build_data_pulse_home_summary(data_pulse_overview)
+
+    return {
+        "global-market-brief": {
+            "status": "已生成" if global_doc else "未生成",
+            "summary_line": global_summary["summary_line"] if global_doc else "今日暂无全球市场简报，进入模块后可查看是否已生成新报告。",
+            "signals": global_summary["signals"] if global_doc else ["等待生成", "无轮询"],
+            "tone": global_summary["tone"] if global_doc else "中性",
+            "risk_tag": global_summary["risk_tag"] if global_doc else "中性",
+            "updated_at": global_payload.get("analyzed_at") if isinstance(global_payload, dict) else None,
+            "success": bool(global_doc),
+            "error": None if global_doc else "今日尚无全球市场分析数据",
+        },
+        "data-pulse": {
+            **data_pulse_summary,
+            "success": True,
+            "error": None,
+        },
+        "market-analysis": {
+            "status": market_result.get("analysisType") or ("已生成" if market_result.get("success") else "等待生成"),
+            "summary_line": _build_market_home_summary(market_result)["summary_line"],
+            "signals": _build_market_home_summary(market_result)["signals"],
+            "tone": _build_market_home_summary(market_result)["tone"],
+            "risk_tag": _build_market_home_summary(market_result)["risk_tag"],
+            "updated_at": (market_result.get("cache_info") or {}).get("created_at") or market_result.get("analysis_date"),
+            "analysis_date": market_result.get("analysis_date"),
+            "success": bool(market_result.get("success")),
+            "error": market_result.get("error"),
+            "user_tip": market_result.get("user_tip"),
+        },
+    }
+
+
 def _theme_lag_trade_date_compact(trade_date: str) -> str:
     """Normalize to YYYYMMDD."""
     raw = (trade_date or "").strip()
@@ -320,6 +531,7 @@ def fetch_market_analysis_result(analysis_date: Optional[str] = None) -> Dict[st
     
     if cached:
         result = dict(cached.get('analysis_result', {}))
+        result['home_summary'] = _build_market_home_summary(result)
         result['analysis_date'] = cached.get('analysis_date', today_str)
         result['cache_info'] = {
             'from_cache': True,
@@ -337,6 +549,7 @@ def fetch_market_analysis_result(analysis_date: Optional[str] = None) -> Dict[st
         latest_analysis = market_analysis_cache.get_latest_trading_day_analysis()
         if latest_analysis:
             result = dict(latest_analysis.get('analysis_result', {}))
+            result['home_summary'] = _build_market_home_summary(result)
             result['analysis_date'] = latest_analysis['analysis_date']
             result['cache_info'] = {
                 'from_cache': True,
@@ -376,6 +589,48 @@ async def get_market_analysis(
 ):
     """Canonical read endpoint for cached market analysis results."""
     return fetch_market_analysis_result(date)
+
+
+@router.get("/market-analysis/summary")
+async def get_market_analysis_summary(
+    date: Optional[str] = Query(default=None, description="分析日期，格式 YYYY-MM-DD"),
+    current_user: dict = Depends(get_current_active_user)
+):
+    _ = current_user
+    result = fetch_market_analysis_result(date)
+    summary = _build_market_home_summary(result)
+    return {
+        "success": bool(result.get("success")),
+        "data": {
+            "status": result.get("analysisType") or ("已生成" if result.get("success") else "等待生成"),
+            "summary_line": summary["summary_line"],
+            "signals": summary["signals"],
+            "tone": summary["tone"],
+            "risk_tag": summary["risk_tag"],
+            "updated_at": (result.get("cache_info") or {}).get("created_at") or result.get("analysis_date"),
+            "analysis_date": result.get("analysis_date"),
+        },
+        "error": result.get("error"),
+        "user_tip": result.get("user_tip"),
+    }
+
+
+@router.get("/home-summaries")
+async def get_home_summaries(
+    date: Optional[str] = Query(default=None, description="大盘分析日期，格式 YYYY-MM-DD"),
+    current_user: dict = Depends(get_current_active_user)
+):
+    _ = current_user
+    try:
+        return {
+            "success": True,
+            "data": _collect_home_summary_cards(date),
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": f"系统错误: {str(e)}",
+        }
 
 
 @router.post("/analyze-market")
@@ -500,6 +755,8 @@ async def get_global_analysis(
                 payload["market_data"] = _prune_market_data_for_dashboard(md)
 
         result = serialize_doc(payload)
+        if isinstance(result, dict):
+            result["home_summary"] = _build_global_home_summary(result)
         return {
             "success": True,
             "data": result
@@ -509,6 +766,53 @@ async def get_global_analysis(
         return {
             "success": False,
             "error": f"系统错误: {str(e)}"
+        }
+
+
+@router.get("/global-analysis/summary")
+async def get_global_analysis_summary(current_user: dict = Depends(get_current_active_user)):
+    _ = current_user
+    try:
+        doc = get_analyzer_db()["global_analysis"].find_one(sort=[("_id", -1)])
+        if not doc:
+            return {
+                "success": False,
+                "data": {
+                    "status": "未生成",
+                    "summary_line": "今日暂无全球市场简报，进入模块后可查看是否已生成新报告。",
+                    "signals": ["等待生成", "无轮询"],
+                    "tone": "中性",
+                    "risk_tag": "中性",
+                    "updated_at": None,
+                },
+                "error": "今日尚无全球市场分析数据",
+            }
+        payload = serialize_doc(dict(doc))
+        payload_dict: Dict[str, Any] = payload if isinstance(payload, dict) else {}
+        summary = _build_global_home_summary(payload_dict)
+        return {
+            "success": True,
+            "data": {
+                "status": "已生成",
+                "summary_line": summary["summary_line"],
+                "signals": summary["signals"],
+                "tone": summary["tone"],
+                "risk_tag": summary["risk_tag"],
+                "updated_at": payload_dict.get("analyzed_at") or payload_dict.get("created_at") or payload_dict.get("timestamp"),
+            },
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "data": {
+                "status": "读取失败",
+                "summary_line": "全球市场简报摘要暂时不可用，可直接进入模块查看详情。",
+                "signals": ["手动进入模块", "稍后重试"],
+                "tone": "中性",
+                "risk_tag": "中性",
+                "updated_at": None,
+            },
+            "error": f"系统错误: {str(e)}",
         }
 
 

@@ -165,6 +165,107 @@ class TestFetchMarketAnalysisResult:
 
 
 @pytest.mark.unit
+class TestHomeSummaryBuilders:
+    def test_market_home_summary_falls_back_to_result_fields(self):
+        from routers import market
+
+        summary = market._build_market_home_summary({
+            "summary": "市场整体呈现震荡偏强格局，主线仍在科技与高股息之间轮动。",
+            "riskLevel": "medium",
+            "mainlineAnalysis": "科技分化，高股息承接",
+            "mood": "谨慎乐观",
+        })
+
+        assert summary["summary_line"].startswith("市场整体呈现震荡偏强格局")
+        assert summary["signals"] == ["风险 medium", "科技分化，高股息承接"]
+        assert summary["tone"] == "谨慎乐观"
+
+    def test_global_home_summary_prefers_embedded_home_summary(self):
+        from routers import market
+
+        summary = market._build_global_home_summary({
+            "analysis": {
+                "sentiment_mood": "谨慎",
+                "net_impact_score": 43,
+                "risk_factors": ["VIX抬升"],
+                "home_summary": {
+                    "summary_line": "外盘承压，A股开盘情绪偏谨慎",
+                    "signals": ["VIX抬升", "黄金走强"],
+                    "tone": "谨慎",
+                    "risk_tag": "中性偏谨慎",
+                },
+            }
+        })
+
+        assert summary["summary_line"] == "谨慎 | 净影响分 +43.0"
+        assert summary["signals"] == ["VIX抬升", "黄金走强"]
+        assert summary["risk_tag"] == "中性偏谨慎"
+
+    def test_data_pulse_home_summary_from_overview(self):
+        from routers import market
+
+        summary = market._build_data_pulse_home_summary({
+            "sync_health": {
+                "health_pct": 84,
+                "healthy": 21,
+                "total_pipelines": 25,
+            },
+            "freshness_detail": [
+                {"latest_value": "20251222"},
+                {"latest_value": "20251221"},
+            ],
+            "news": {
+                "headlines": {
+                    "macro": "headline-a",
+                    "equity": "headline-b",
+                }
+            },
+        })
+
+        assert summary["status"] == "正常"
+        assert summary["summary_line"] == "21/25 条管线正常，当前健康度 84%"
+        assert summary["signals"] == ["新闻 2 条", "同步正常"]
+        assert summary["updated_at"] == "最新数据 12-22"
+
+    def test_collect_home_summary_cards_aggregates_three_modules(self, monkeypatch):
+        from routers import market
+
+        monkeypatch.setattr(market, "fetch_market_analysis_result", lambda analysis_date=None: {
+            "success": True,
+            "analysisType": "已生成",
+            "summary": "市场延续修复，主线集中在科技。",
+            "riskLevel": "medium",
+            "mainlineAnalysis": "科技修复",
+            "mood": "谨慎乐观",
+            "analysis_date": "2025-12-22",
+            "cache_info": {"created_at": "2025-12-22T15:30:00"},
+        })
+
+        fake_global_collection = MagicMock()
+        fake_global_collection.find_one.return_value = {
+            "analysis": {
+                "sentiment_mood": "谨慎",
+                "net_impact_score": 43,
+                "risk_factors": ["VIX抬升"],
+            },
+            "analyzed_at": "2025-12-22T08:00:00",
+        }
+        monkeypatch.setattr(market, "get_analyzer_db", lambda: {"global_analysis": fake_global_collection})
+        monkeypatch.setattr(market, "_get_data_pulse_overview_for_home", lambda: {
+            "sync_health": {"health_pct": 80, "healthy": 8, "total_pipelines": 10},
+            "freshness_detail": [{"latest_value": "20251222"}],
+            "news": {"headlines": {"macro": "headline-a"}},
+        })
+
+        data = market._collect_home_summary_cards("2025-12-22")
+
+        assert set(data.keys()) == {"global-market-brief", "data-pulse", "market-analysis"}
+        assert data["market-analysis"]["success"] is True
+        assert data["global-market-brief"]["success"] is True
+        assert data["data-pulse"]["success"] is True
+
+
+@pytest.mark.unit
 class TestGenerateMarketAnalysisTask:
     """scheduler.generate_market_analysis_task — enqueue to analysis_tasks (no celery_app)."""
 
