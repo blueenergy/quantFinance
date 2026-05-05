@@ -42,6 +42,9 @@ class ActionCell(BaseModel):
 
 # --- 主导航 Tab（顺序即模块排序）---
 _NAV_ROWS: List[Tuple[str, str, int]] = [
+    ("global-market-brief", "🌍 全球市场简报", 5),
+    ("data-pulse", "🛰️ 数据脉搏", 8),
+    ("market-analysis", "🤖 AI大盘分析", 9),
     ("limit-up-ladder", "📊 连板天梯", 10),
     ("x-influencer-voices", "🐦 X大V情报", 12),
     ("theme-lag-recommend", "📌 主题补涨", 15),
@@ -70,6 +73,12 @@ _NAV_ROWS: List[Tuple[str, str, int]] = [
 
 # 某主导航 Tab 下的页内操作 (action_key, 展示名)
 _CHILD_ACTIONS_BY_NAV_SUFFIX: Dict[str, List[Tuple[str, str]]] = {
+    "global-market-brief": [
+        ("action.global_brief.refresh", "刷新全球市场简报"),
+    ],
+    "market-analysis": [
+        ("action.market_bulletin.trigger", "触发大盘 AI 分析"),
+    ],
     "limit-up-ladder": [
         ("action.ladder.feedback", "涨停归因 · 提交反馈并重算"),
     ],
@@ -86,21 +95,7 @@ _CHILD_ACTIONS_BY_NAV_SUFFIX: Dict[str, List[Tuple[str, str]]] = {
 FEATURE_WATCHLIST_DEEP_ANALYSIS = "action.watchlist.deep_analysis"
 FEATURE_WATCHLIST_OPPORTUNITIES = "action.watchlist.opportunities_analysis"
 
-# 顶部区域：无对应主导航 Tab，单独成段
-_TOP_SECTIONS: List[Tuple[str, str, str, List[Tuple[str, str]]]] = [
-    (
-        "sec_global_brief",
-        "全球市场简报",
-        "页面顶部「隔夜全球市场联动分析」卡片（非独立 Tab）。",
-        [("action.global_brief.refresh", "刷新隔夜全球分析")],
-    ),
-    (
-        "sec_market_bulletin",
-        "AI 公告栏",
-        "页面顶部「大盘分析公告栏」（非独立 Tab）。",
-        [("action.market_bulletin.trigger", "触发大盘 AI 分析")],
-    ),
-]
+_TOP_SECTIONS: List[Tuple[str, str, str, List[Tuple[str, str]]]] = []
 
 
 def _row_dict(

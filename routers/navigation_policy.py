@@ -16,6 +16,9 @@ from routers.entitlements_matrix import get_merged_matrix_cells, user_tier_for_m
 
 # (tab_id, requires_vip_or_premium) — keep in sync with dashboard App.vue baseTabs
 KNOWN_MAIN_TABS: List[tuple] = [
+    ("global-market-brief", False),
+    ("data-pulse", False),
+    ("market-analysis", False),
     ("limit-up-ladder", False),
     ("market-risk", False),
     ("china-macro", False),

@@ -19,6 +19,9 @@ def test_compute_visible_tab_ids_admin_sees_all():
     ids = navp.compute_visible_tab_ids(user, _all_inherit_cells())
     assert len(ids) == len(navp.KNOWN_MAIN_TABS)
     assert "etf" in ids
+    assert "global-market-brief" in ids
+    assert "data-pulse" in ids
+    assert "market-analysis" in ids
     assert "limit-up-ladder" in ids
 
 
@@ -28,6 +31,9 @@ def test_compute_visible_tab_ids_free_inherit_excludes_req_vip_tabs():
     ids = navp.compute_visible_tab_ids(user, _all_inherit_cells())
     assert "etf" not in ids
     assert "sector-concept" not in ids
+    assert ids.index("global-market-brief") < ids.index("limit-up-ladder")
+    assert "data-pulse" in ids
+    assert "market-analysis" in ids
     assert "limit-up-ladder" in ids
 
 
