@@ -7,6 +7,7 @@ the action is ineffective for that user (documented in API + UI).
 
 Phase 1: persistence + admin UI; runtime not yet wired.
 """
+import time
 from datetime import datetime
 from typing import Any, Dict, List, Literal, Optional, Tuple
 
@@ -448,14 +449,36 @@ def admin_put_entitlements_matrix(
         action="UPDATE_ENTITLEMENTS_MATRIX",
         details=f"keys={len(normalized)}",
     )
+    # Invalidate in-process cache so the new matrix takes effect immediately.
+    _invalidate_matrix_cache()
     return {"success": True, "data": {"cells": normalized, "updated_at": now.isoformat()}}
 
 
+# ---------------------------------------------------------------------------
+# In-process cache for entitlements matrix (read on every authenticated request)
+# ---------------------------------------------------------------------------
+_MATRIX_CACHE_TTL = 60  # seconds
+_matrix_cache: Optional[Dict[str, Dict[str, Any]]] = None
+_matrix_cache_ts: float = 0.0
+
+
+def _invalidate_matrix_cache() -> None:
+    global _matrix_cache, _matrix_cache_ts
+    _matrix_cache = None
+    _matrix_cache_ts = 0.0
+
+
 def get_merged_matrix_cells() -> Dict[str, Dict[str, Any]]:
-    """For future runtime use: read merged cells from DB."""
+    """Read merged cells from DB, with a 60-second in-process TTL cache."""
+    global _matrix_cache, _matrix_cache_ts
+    now = time.monotonic()
+    if _matrix_cache is not None and now - _matrix_cache_ts < _MATRIX_CACHE_TTL:
+        return _matrix_cache
     coll = _settings_coll()
     doc = coll.find_one({"_id": MATRIX_DOC_ID})
-    return _merge_cells(doc.get("cells") if doc else None)
+    _matrix_cache = _merge_cells(doc.get("cells") if doc else None)
+    _matrix_cache_ts = now
+    return _matrix_cache
 
 
 def user_tier_for_matrix(user: Dict[str, Any]) -> str:
