@@ -105,6 +105,8 @@ def get_analyzer_db():
         "risk_report_analysis": analyzer_db["risk_report_analysis"],
         # X (Twitter) influencer post LLM analysis
         "x_influencer_post_analysis": analyzer_db["x_influencer_post_analysis"],
+        # Macro deep-dive analysis (china_macro / us_macro)
+        "macro_analysis": analyzer_db["macro_analysis"],
     }
 
 def get_data_db():
@@ -168,6 +170,12 @@ def get_data_db():
         "risk_reports": data_db["risk_reports"],
         # X (Twitter) influencer tweets (written by quant-data-engine run_x_influencer_sync)
         "x_influencer_posts": data_db["x_influencer_posts"],
+        # China macro rates/monthly/quarterly (written by run_cn_macro_sync)
+        "cn_macro_rates": data_db["cn_macro_rates"],
+        "cn_macro_monthly": data_db["cn_macro_monthly"],
+        "cn_macro_quarterly": data_db["cn_macro_quarterly"],
+        # US Treasury rates (written by run_us_rates_sync)
+        "us_rates_daily": data_db["us_rates_daily"],
     }
 
 def close_db():
