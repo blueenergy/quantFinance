@@ -2,6 +2,7 @@ import os
 import logging
 from typing import Optional, Dict, Any, List
 from fastapi import APIRouter, Depends, Query, HTTPException
+from pydantic import BaseModel
 from auth import get_current_active_user
 from db import get_db_collections, get_analyzer_db, get_data_db
 from datetime import datetime
@@ -746,6 +747,71 @@ async def get_unread_count(current_user: dict = Depends(get_current_active_user)
         "source": "async_task" # Only count async tasks? Or all? Let's count all unread.
     })
     return {"count": count}
+
+# ---------------------------------------------------------------------------
+# Analysis Quality Evaluation
+# ---------------------------------------------------------------------------
+
+class EvaluationRequest(BaseModel):
+    history_id: str
+
+
+@router.post("/analysis/evaluate", summary="提交分析质量评估任务")
+async def submit_evaluation(
+    body: EvaluationRequest,
+    current_user: dict = Depends(get_current_active_user),
+):
+    history_id = body.history_id.strip()
+    if not history_id:
+        raise HTTPException(status_code=400, detail="history_id 不能为空")
+
+    # Verify history record exists
+    from bson import ObjectId as _ObjId
+    try:
+        oid = _ObjId(history_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="history_id 格式无效")
+
+    history_doc = get_analyzer_db()["analysis_history"].find_one({"_id": oid})
+    if not history_doc:
+        raise HTTPException(status_code=404, detail="分析记录不存在")
+
+    # 409 if evaluation document already exists for this history_id
+    eval_col = get_analyzer_db()["analysis_evaluations"]
+    existing = eval_col.find_one(
+        {"history_id": history_id}, {"_id": 0, "evaluation_status": 1}
+    )
+    if existing:
+        raise HTTPException(
+            status_code=409,
+            detail=f"该记录已有评估结果（status={existing.get('evaluation_status')}）",
+        )
+
+    collections = get_db_collections()
+    task_doc = build_task_doc(
+        current_user=current_user,
+        task_type="analysis_quality_evaluation",
+        priority=1,
+        params={"history_id": history_id},
+        source="manual_trigger",
+    )
+    result = collections["analysis_tasks"].insert_one(task_doc)
+    return {"success": True, "task_id": str(result.inserted_id), "status": "pending"}
+
+
+@router.get("/analysis/evaluations/{history_id}", summary="获取分析质量评估结果")
+async def get_evaluation(
+    history_id: str,
+    current_user: dict = Depends(get_current_active_user),
+):
+    doc = get_analyzer_db()["analysis_evaluations"].find_one(
+        {"history_id": history_id}
+    )
+    if not doc:
+        raise HTTPException(status_code=404, detail="评估结果不存在")
+    doc["_id"] = str(doc["_id"])
+    return doc
+
 
 @router.post("/analyze/mark-read", summary="标记分析为已读")
 async def mark_analysis_read(ids: List[str], current_user: dict = Depends(get_current_active_user)):

@@ -107,6 +107,8 @@ def get_analyzer_db():
         "x_influencer_post_analysis": analyzer_db["x_influencer_post_analysis"],
         # Macro deep-dive analysis (china_macro / us_macro)
         "macro_analysis": analyzer_db["macro_analysis"],
+        # Retrospective analysis quality evaluations
+        "analysis_evaluations": analyzer_db["analysis_evaluations"],
     }
 
 def get_data_db():
