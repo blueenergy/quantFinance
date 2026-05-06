@@ -817,6 +817,40 @@ async def get_evaluation(
     return doc
 
 
+@router.post("/analysis/evaluations/batch", summary="批量获取评估摘要（用于列表徽章）")
+async def get_evaluations_batch(
+    history_ids: List[str],
+    current_user: dict = Depends(get_current_active_user),
+):
+    """
+    Given a list of history_ids, return a map of
+    { history_id -> { evaluation_status, outcome_accuracy, reasoning_quality } }
+    for records that have been evaluated. Un-evaluated ids are omitted.
+    """
+    if not history_ids:
+        return {}
+    cursor = get_analyzer_db()["analysis_evaluations"].find(
+        {"history_id": {"$in": history_ids}},
+        {
+            "_id": 0,
+            "history_id": 1,
+            "evaluation_status": 1,
+            "llm_review.outcome_accuracy": 1,
+            "llm_review.reasoning_quality": 1,
+        },
+    )
+    result = {}
+    for doc in cursor:
+        hid = doc.get("history_id")
+        if hid:
+            result[hid] = {
+                "evaluation_status": doc.get("evaluation_status"),
+                "outcome_accuracy": (doc.get("llm_review") or {}).get("outcome_accuracy"),
+                "reasoning_quality": (doc.get("llm_review") or {}).get("reasoning_quality"),
+            }
+    return result
+
+
 @router.post("/analyze/mark-read", summary="标记分析为已读")
 async def mark_analysis_read(ids: List[str], current_user: dict = Depends(get_current_active_user)):
     collections = get_db_collections()
