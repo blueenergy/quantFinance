@@ -365,6 +365,7 @@ async def get_analysis_task_status(
         "task_id": task_id,
         "status": _normalize_task_status(task.get("status", "unknown")),
         "type": task.get("params", {}).get("analysis_type", "combined"),
+        "analysis_mode": task.get("params", {}).get("analysis_mode", "classic"),
         "created_at": task.get("created_at").isoformat() if task.get("created_at") else None
     }
     
@@ -695,6 +696,7 @@ async def create_deep_analysis_task(
 
     # 3. 创建任务
     params: Dict[str, Any] = {}
+    params["analysis_mode"] = str(request.analysis_mode.value if hasattr(request.analysis_mode, "value") else request.analysis_mode)
     if request.feedback:
         params["feedback"] = request.feedback
     if request.skip_review:
@@ -728,6 +730,7 @@ async def create_deep_analysis_task(
             "success": True,
             "task_id": task_id,
             "status": "pending",
+            "analysis_mode": params.get("analysis_mode", "classic"),
             "message": "深度分析任务已提交",
             "quota_remaining": remaining,
             "position_in_queue": collections["analysis_tasks"].count_documents({"status": "pending"})

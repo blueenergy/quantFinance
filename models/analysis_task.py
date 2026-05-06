@@ -3,6 +3,11 @@ from typing import Optional, Dict, Any
 from datetime import datetime
 from enum import Enum
 
+
+class AnalysisMode(str, Enum):
+    CLASSIC = "classic"
+    MULTI_EXPERT_V1 = "multi_expert_v1"
+
 class TaskStatus(str, Enum):
     PENDING = "pending"
     PROCESSING = "processing"
@@ -13,6 +18,10 @@ class TaskStatus(str, Enum):
 class AnalysisTaskCreate(BaseModel):
     symbol: str
     priority: int = Field(default=1, description="1=User, 0=Batch")
+    analysis_mode: AnalysisMode = Field(
+        default=AnalysisMode.CLASSIC,
+        description="深度分析执行模式：classic 为现有单专家，multi_expert_v1 为固定三专家会审。",
+    )
     provider: Optional[str] = None
     model: Optional[str] = None
     feedback: Optional[str] = None

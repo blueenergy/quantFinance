@@ -98,12 +98,19 @@ def build_user_analysis_history_payload(
             stock_name = analysis_obj.get("stock_name")
 
         created_at = h.get("created_at") or h.get("timestamp") or None
+        analysis_mode = (
+            h.get("analysis_mode")
+            or (analysis_result.get("analysis_mode") if analysis_result else None)
+            or (analysis_obj.get("analysis_mode") if isinstance(analysis_obj, dict) else None)
+            or "classic"
+        )
 
         normalized.append(
             {
                 "id": h_id,
                 "stock_name": stock_name,
                 "symbol": symbol_val,
+                "analysis_mode": analysis_mode,
                 "analysis": analysis_obj,
                 "analysis_result": analysis_result,
                 "provider": h.get("provider")
