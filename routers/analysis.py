@@ -754,6 +754,7 @@ async def get_unread_count(current_user: dict = Depends(get_current_active_user)
 
 class EvaluationRequest(BaseModel):
     history_id: str
+    force: bool = False
 
 
 @router.post("/analysis/evaluate", summary="提交分析质量评估任务")
@@ -776,16 +777,19 @@ async def submit_evaluation(
     if not history_doc:
         raise HTTPException(status_code=404, detail="分析记录不存在")
 
-    # 409 if evaluation document already exists for this history_id
+    # 409 if evaluation document already exists for this history_id (unless force=True)
     eval_col = get_analyzer_db()["analysis_evaluations"]
     existing = eval_col.find_one(
         {"history_id": history_id}, {"_id": 0, "evaluation_status": 1}
     )
     if existing:
-        raise HTTPException(
-            status_code=409,
-            detail=f"该记录已有评估结果（status={existing.get('evaluation_status')}）",
-        )
+        if not body.force:
+            raise HTTPException(
+                status_code=409,
+                detail=f"该记录已有评估结果（status={existing.get('evaluation_status')}）",
+            )
+        # force=True: remove old result so the new run can upsert cleanly
+        eval_col.delete_one({"history_id": history_id})
 
     collections = get_db_collections()
     task_doc = build_task_doc(
