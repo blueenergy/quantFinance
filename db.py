@@ -109,6 +109,8 @@ def get_analyzer_db():
         "macro_analysis": analyzer_db["macro_analysis"],
         # Retrospective analysis quality evaluations
         "analysis_evaluations": analyzer_db["analysis_evaluations"],
+        # Daily limit-up panorama narrative (written by quantAnalyzer)
+        "limit_up_daily_narrative": analyzer_db["limit_up_daily_narrative"],
     }
 
 def get_data_db():

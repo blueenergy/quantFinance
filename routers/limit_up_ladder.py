@@ -384,3 +384,65 @@ async def submit_reasoning_feedback(
         "message": "反馈已提交，正在重新分析",
         "task_id": str(result.inserted_id)
     }
+
+
+@router.get("/narrative", summary="涨停全景市场动向总结")
+async def get_limit_up_narrative(
+    date: str = Query(None, description="日期 YYYYMMDD，默认最新有数据的交易日"),
+    current_user: dict = Depends(get_current_active_user),
+):
+    """获取由 LLM 生成的涨停全景市场动向总结。
+
+    包含今日涨停全貌（含炸板）、主线格局、天梯健康度、与昨日的关键变化，以及市场方向解读。
+    数据来源：``quant_analyzer.limit_up_daily_narrative``，由
+    ``run_limit_up_narrative`` 任务入队、quantAnalyzer 消费后写入。
+    """
+    _analyzer_cols = get_analyzer_db()
+    data_db = get_data_db()
+    narrative_col = _analyzer_cols["limit_up_daily_narrative"]
+
+    # Resolve date
+    if not date:
+        latest_doc = narrative_col.find_one(sort=[("trade_date", -1)])
+        if latest_doc:
+            date = latest_doc["trade_date"]
+        else:
+            # Fall back to latest daily_limit_up date
+            latest_stock = data_db["daily_limit_up"].find_one(sort=[("date", -1)])
+            date = (latest_stock or {}).get("date") or datetime.now().strftime("%Y%m%d")
+
+    doc = narrative_col.find_one({"trade_date": date})
+
+    if not doc:
+        # Check if a pending task exists
+        task_col = get_db_collections()["analysis_tasks"]
+        pending = task_col.find_one(
+            {
+                "type": "limit_up_daily_narrative",
+                "params.trade_date": date,
+                "status": {"$in": ["pending", "processing"]},
+            }
+        )
+        if pending:
+            return {
+                "success": False,
+                "trade_date": date,
+                "status": "pending",
+                "message": "分析正在生成中，请稍后刷新",
+            }
+        return {
+            "success": False,
+            "trade_date": date,
+            "status": "not_found",
+            "message": f"{date} 暂无涨停全景总结，请先运行 run_limit_up_narrative 任务",
+        }
+
+    return {
+        "success": True,
+        "trade_date": doc["trade_date"],
+        "headline": doc.get("headline", ""),
+        "sentiment_signal": doc.get("sentiment_signal", ""),
+        "narrative_markdown": doc.get("narrative_markdown", ""),
+        "model": doc.get("model"),
+        "created_at": doc["created_at"].isoformat() if isinstance(doc.get("created_at"), datetime) else None,
+    }
