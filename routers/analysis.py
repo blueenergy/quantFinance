@@ -873,3 +873,28 @@ async def mark_analysis_read(ids: List[str], current_user: dict = Depends(get_cu
         {"$set": {"is_read": True}}
     )
     return {"success": True, "modified_count": result.modified_count}
+
+
+@router.delete("/analysis/history/{history_id}", summary="删除历史分析记录")
+async def delete_analysis_history(
+    history_id: str,
+    current_user: dict = Depends(get_current_active_user),
+):
+    try:
+        oid = ObjectId(history_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="history_id 格式无效")
+
+    doc = get_analyzer_db()["analysis_history"].find_one(
+        {"_id": oid}, {"user_id": 1}
+    )
+    if not doc:
+        raise HTTPException(status_code=404, detail="记录不存在")
+    if doc.get("user_id") != current_user["id"]:
+        raise HTTPException(status_code=403, detail="无权删除他人的分析记录")
+
+    get_analyzer_db()["analysis_history"].delete_one({"_id": oid})
+    # Also remove any associated evaluation result
+    get_analyzer_db()["analysis_evaluations"].delete_one({"history_id": history_id})
+
+    return {"success": True}
