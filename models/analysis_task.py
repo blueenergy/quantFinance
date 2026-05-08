@@ -17,7 +17,7 @@ class TaskStatus(str, Enum):
 
 class AnalysisTaskCreate(BaseModel):
     symbol: str
-    priority: int = Field(default=1, description="1=User, 0=Batch")
+    priority: int = Field(default=30, description="30=User manual, 0=Batch")
     analysis_mode: AnalysisMode = Field(
         default=AnalysisMode.CLASSIC,
         description="深度分析执行模式：classic 为现有单专家，multi_expert_v1 为固定三专家会审。",
@@ -39,7 +39,7 @@ class AnalysisTask(BaseModel):
     created_by_user_id: Optional[str] = None
     created_by_username: Optional[str] = None
     status: TaskStatus = TaskStatus.PENDING
-    priority: int = 1
+    priority: int = 30
     created_at: datetime
     updated_at: datetime
     result: Optional[Dict[str, Any]] = None

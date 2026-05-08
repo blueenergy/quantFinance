@@ -367,7 +367,7 @@ async def submit_reasoning_feedback(
     task_doc = build_task_doc(
         current_user=current_user,
         task_type=task_type,
-        priority=100,
+        priority=25,
         symbol=symbol,
         params={
             "date": target_date,

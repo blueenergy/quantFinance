@@ -77,7 +77,7 @@ async def submit_sector_analysis(
     task_doc = build_task_doc(
         current_user=current_user,
         task_type="sector_concept_analysis",
-        priority=50,
+        priority=20,
         params={
             "date": trade_date,
             "source": source,
