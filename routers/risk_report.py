@@ -352,3 +352,133 @@ async def get_us_market_daily_analysis(
         sort=[("created_at", -1)],
     )
     return {"scan_date": scan_date, "analysis": _serialize(doc)}
+
+
+# ---------------------------------------------------------------------------
+# 7. A股波动率快照 — 独立卡片数据 + LLM 解读
+# ---------------------------------------------------------------------------
+
+@router.get("/iv-snapshot", summary="获取A股最新四指数波动率快照")
+async def get_iv_snapshot(
+    current_user: dict = Depends(get_current_active_user),
+):
+    """
+    从 MongoDB 读取最近一条 market_daily 解读中内嵌的 iv_snapshot，
+    同时携带缓存的 LLM 解读文本（若已生成）。
+    返回格式：{iv_snapshot: {...}, interpretation: str|null, interpreted_at: str|null}
+    """
+    analysis_coll = get_analyzer_db()["risk_report_analysis"]
+    # 从最新 market_daily 中取 iv_snapshot（不限日期，取最新有效）
+    doc = analysis_coll.find_one(
+        {"scope": "market_daily", "analysis.iv_snapshot.available": True},
+        {"_id": 0, "analysis.iv_snapshot": 1, "scan_date": 1},
+        sort=[("created_at", -1)],
+    )
+    iv_snap = (doc or {}).get("analysis", {}).get("iv_snapshot") if doc else None
+    scan_date = (doc or {}).get("scan_date") if doc else None
+
+    # 读取最近的 LLM 解读缓存
+    interp_doc = analysis_coll.find_one(
+        {"scope": "iv_interpretation"},
+        {"_id": 0, "interpretation": 1, "created_at": 1, "scan_date": 1},
+        sort=[("created_at", -1)],
+    )
+    return {
+        "iv_snapshot": iv_snap,
+        "snapshot_date": scan_date,
+        "interpretation": (interp_doc or {}).get("interpretation"),
+        "interpreted_at": (
+            interp_doc["created_at"].isoformat()
+            if interp_doc and isinstance(interp_doc.get("created_at"), datetime)
+            else (interp_doc or {}).get("created_at")
+        ),
+    }
+
+
+@router.post("/iv-snapshot/interpret", summary="触发A股波动率LLM专业解读（同步）")
+async def interpret_iv_snapshot(
+    current_user: dict = Depends(get_current_active_user),
+):
+    """
+    读取当前 iv_snapshot，构造专业提示词，调用 Hermes LLM 同步返回解读文本。
+    结果同时写入 MongoDB（scope=iv_interpretation）供下次快速读取。
+    """
+    import os
+    import httpx
+
+    # 1. 获取 iv_snapshot
+    analysis_coll = get_analyzer_db()["risk_report_analysis"]
+    doc = analysis_coll.find_one(
+        {"scope": "market_daily", "analysis.iv_snapshot.available": True},
+        {"_id": 0, "analysis.iv_snapshot": 1, "scan_date": 1},
+        sort=[("created_at", -1)],
+    )
+    iv_snap = (doc or {}).get("analysis", {}).get("iv_snapshot") if doc else None
+    if not iv_snap or not iv_snap.get("available"):
+        raise HTTPException(503, "暂无可用的 iv_snapshot，请先触发 A股日报解读")
+
+    indices = iv_snap.get("indices") or {}
+    idx_lines = "\n".join(
+        f"  {v['name']}（{v.get('label','')}）: IV={v['iv_30']}%  {v['level_zh']}"
+        f"{'  认沽偏度+'+str(v['skew_pp'])+'pp' if v.get('skew_pp') else ''}"
+        for v in indices.values()
+    ) if indices else f"  {iv_snap.get('underlying','')}: IV={iv_snap['iv_30']}%  {iv_snap['level_zh']}"
+
+    prompt = f"""你是专业的A股量化波动率分析师。请根据以下当日隐含波动率（IV）数据，给出一段专业、精炼的市场解读（300字以内，中文）。
+
+【当日A股指数期权IV快照】
+{idx_lines}
+
+主要参考指数：{iv_snap.get('underlying','沪深300')}  IV={iv_snap['iv_30']}%（{iv_snap['level_zh']}）
+
+解读要求：
+1. 说明当前整体波动率水位处于什么区间（历史分位参考：<15% 极低，15-20% 正常，20-25% 偏高，>25% 高位警示）
+2. 对比各指数IV差异，解读风格轮动或资金偏好信号（大盘/小盘/成长）
+3. 认沽偏度（skew）含义：>3pp 表示市场对下行对冲需求旺盛，投资者情绪偏谨慎
+4. 给出对短期仓位管理的具体参考建议（如仓位比例、止损策略、是否适合追涨等）
+
+请直接输出解读正文，无需重复列出原始数据。"""
+
+    # 2. 调用 Hermes LLM（非流式）
+    hermes_base = os.getenv("HERMES_OPENAI_BASE_URL", "http://hermes:8642").rstrip("/")
+    hermes_key  = os.getenv("HERMES_API_SERVER_KEY", "")
+    hermes_model = os.getenv("HERMES_OPENAI_MODEL", "hermes-agent").strip()
+
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            resp = await client.post(
+                f"{hermes_base}/v1/chat/completions",
+                headers={"Authorization": f"Bearer {hermes_key}", "Content-Type": "application/json"},
+                json={
+                    "model": hermes_model,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": 0.3,
+                    "stream": False,
+                },
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            interpretation = data["choices"][0]["message"]["content"].strip()
+    except Exception as e:
+        raise HTTPException(502, f"LLM 调用失败: {e}")
+
+    # 3. 写入 MongoDB 缓存
+    now = datetime.utcnow()
+    analysis_coll.update_one(
+        {"scope": "iv_interpretation"},
+        {"$set": {
+            "scope": "iv_interpretation",
+            "interpretation": interpretation,
+            "iv_snapshot": iv_snap,
+            "scan_date": (doc or {}).get("scan_date"),
+            "created_at": now,
+            "generated_by": hermes_model,
+        }},
+        upsert=True,
+    )
+
+    return {
+        "interpretation": interpretation,
+        "interpreted_at": now.isoformat(),
+        "iv_snapshot": iv_snap,
+    }
