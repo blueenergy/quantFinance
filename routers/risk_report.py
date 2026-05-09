@@ -375,6 +375,7 @@ async def get_iv_snapshot(
     scan_date: Optional[str] = None
     interpretation: Optional[str] = None
     interpreted_at: Optional[str] = None
+    alert: Optional[Dict[str, Any]] = None
     snapshot_source = "db_cache"
 
     # ── 1. quant_analyzer.iv_analysis（主数据源）─────────────────────────
@@ -388,6 +389,7 @@ async def get_iv_snapshot(
         scan_date = doc.get("analysis_date")
         interpretation = doc.get("interpretation")
         interpreted_at = doc.get("interpreted_at")
+        alert = doc.get("alert")
 
     # ── 2. 旧 risk_report_analysis.market_daily 兜底（向后兼容）──────────
     if not iv_snap:
@@ -407,6 +409,7 @@ async def get_iv_snapshot(
         "snapshot_source": snapshot_source,
         "interpretation":  interpretation,
         "interpreted_at":  interpreted_at,
+        "alert":           alert,
     }
 
 
