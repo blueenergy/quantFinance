@@ -111,6 +111,8 @@ def get_analyzer_db():
         "analysis_evaluations": analyzer_db["analysis_evaluations"],
         # Daily limit-up panorama narrative (written by quantAnalyzer)
         "limit_up_daily_narrative": analyzer_db["limit_up_daily_narrative"],
+        # A-share multi-index IV snapshot + LLM interpretation (written by quantAnalyzer)
+        "iv_analysis": analyzer_db["iv_analysis"],
     }
 
 def get_data_db():
