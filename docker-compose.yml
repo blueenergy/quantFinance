@@ -39,12 +39,13 @@ services:
         max-size: "50m"
         max-file: "3"
 
-  # Multi-worker setup for parallel task processing
-  quant-analyzer-1:
+  # Analysis workers — scale with: docker compose up --scale quant-analyzer=N
+  # No container_name: required for --scale to work.
+  # WORKER_ID defaults to the container hostname (unique per replica).
+  quant-analyzer:
     build:
       context: ../quantAnalyzer
       dockerfile: Dockerfile
-    container_name: quant-analyzer-1
     environment:
       - MONGO_URI=${MONGO_URI:-mongodb://host.docker.internal:27017/}
       - MONGO_URL=${MONGO_URI:-mongodb://host.docker.internal:27017/}
@@ -67,7 +68,7 @@ services:
       - LIMIT_UP_TRIGGER_MODE=${LIMIT_UP_TRIGGER_MODE:-scheduled}
       - ANALYSIS_INTERVAL=300
       - DISABLE_AUTO_ANALYSIS=${DISABLE_AUTO_ANALYSIS:-false}
-      - WORKER_ID=analyzer-1
+      - WORKER_ID=${HOSTNAME}
       - TZ=Asia/Shanghai
     extra_hosts:
       - "host.docker.internal:host-gateway"
@@ -75,49 +76,8 @@ services:
     # networks:
     #   - quant-network
     volumes:
-      - ../quantAnalyzer/logs:/app/logs
-      - ../quant-data-engine/src/quant_data_engine:/app/src/quant_data_engine
-      - ../quantAnalyzer/src:/app/src
-    logging:
-      driver: json-file
-      options:
-        max-size: "50m"
-        max-file: "3"
-
-  quant-analyzer-2:
-    build:
-      context: ../quantAnalyzer
-      dockerfile: Dockerfile
-    container_name: quant-analyzer-2
-    environment:
-      - MONGO_URI=${MONGO_URI:-mongodb://host.docker.internal:27017/}
-      - MONGO_URL=${MONGO_URI:-mongodb://host.docker.internal:27017/}
-      - DB_NAME=${MONGO_DB}
-      - ANALYZER_DB_NAME=${ANALYZER_DB_NAME:-quant_analyzer}
-      - TUSHARE_TOKEN=${TUSHARE_TOKEN}
-      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
-      - DEEPSEEK_BASE_URL=${DEEPSEEK_BASE_URL}
-      - QWEN_API_KEY=${QWEN_API_KEY}
-      - QWEN_BASE_URL=${QWEN_BASE_URL}
-      - OPENAI_API_KEY=${OPENAI_API_KEY}
-      - OPENAI_BASE_URL=${OPENAI_BASE_URL}
-      - CUSTOM_API_KEY=${CUSTOM_API_KEY}
-      - CUSTOM_BASE_URL=${CUSTOM_BASE_URL}  
-      - DEFAULT_LLM_PROVIDER=${DEFAULT_LLM_PROVIDER:-qwen}
-      - DEFAULT_MODEL=${DEFAULT_MODEL:-qwen-plus}
-      - ETF_ANALYSIS_RESPONSE_FORMAT=${ETF_ANALYSIS_RESPONSE_FORMAT:-auto}
-      - LIMIT_UP_ATTRIBUTION_MODE=${LIMIT_UP_ATTRIBUTION_MODE:-legacy_daily}
-      - LIMIT_UP_TRIGGER_MODE=${LIMIT_UP_TRIGGER_MODE:-scheduled}
-      - ANALYSIS_INTERVAL=300
-      - DISABLE_AUTO_ANALYSIS=${DISABLE_AUTO_ANALYSIS:-false}
-      - WORKER_ID=analyzer-2
-      - TZ=Asia/Shanghai
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-    restart: unless-stopped
-    # networks:
-    #   - quant-network
-    volumes:
+      # Each replica writes to logs/analyzer-<WORKER_ID>.log, so multiple
+      # replicas on the same host each get their own file — no conflicts.
       - ../quantAnalyzer/logs:/app/logs
       - ../quant-data-engine/src/quant_data_engine:/app/src/quant_data_engine
       - ../quantAnalyzer/src:/app/src
