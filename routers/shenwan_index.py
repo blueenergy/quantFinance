@@ -485,3 +485,40 @@ async def get_kline(
         "data": ohlc_list,
         "count": len(ohlc_list),
     }
+
+
+_MEMBER = data_db["sw_index_member"]
+
+_MEMBER_LEVEL_KEYS = ("l1_code", "l2_code", "l3_code")
+_MEMBER_PROJ = {"_id": 0, "con_code": 1, "name": 1, "is_new": 1, "l1_name": 1, "l2_name": 1, "l3_name": 1}
+
+
+@router.get("/members")
+async def get_members(
+    current_user: Dict = Depends(get_current_active_user),  # noqa: ARG001
+    index_code: str = Query(..., min_length=4, description="行业指数 index_code，如 801010.SI"),
+    src: str = Query("SW2021"),
+    current_only: bool = Query(True, description="True 仅返回当前成分 is_new=Y"),
+):
+    """返回某行业指数（L1/L2/L3 均可）的成分股列表。"""
+    code = index_code.strip()
+    if not code:
+        raise HTTPException(400, "index_code required")
+
+    # 按三个层级字段 OR 查，兼容 L1/L2/L3
+    flt: Dict[str, Any] = {
+        "src": src,
+        "$or": [{k: code} for k in _MEMBER_LEVEL_KEYS],
+    }
+    if current_only:
+        flt["is_new"] = "Y"
+
+    cur = _MEMBER.find(flt, _MEMBER_PROJ).sort("con_code", ASCENDING)
+    members = list(cur)
+
+    return {
+        "success": True,
+        "index_code": code,
+        "count": len(members),
+        "data": members,
+    }
