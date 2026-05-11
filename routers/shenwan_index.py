@@ -12,8 +12,10 @@ import pandas as pd
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from pymongo import ASCENDING, DESCENDING
 
+from pydantic import BaseModel
 from auth import get_current_active_user
-from db import data_db
+from db import data_db, get_db_collections
+from services.analysis_tasks import build_task_doc
 
 router = APIRouter()
 
@@ -575,4 +577,75 @@ async def get_stock_industry(
         "l3_code": doc.get("l3_code", ""),
         "l3_name": doc.get("l3_name", ""),
         "src": src,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Industry analysis task — POST to submit, GET latest for auto-restore
+# ---------------------------------------------------------------------------
+
+class IndustryAnalysisRequest(BaseModel):
+    index_code: str
+    model: Optional[str] = None
+    src: str = "SW2021"
+
+
+@router.post("/industry-analysis")
+async def submit_industry_analysis(
+    body: IndustryAnalysisRequest,
+    current_user: Dict = Depends(get_current_active_user),
+):
+    """提交行业分析任务（异步队列）。"""
+    index_code = (body.index_code or "").strip().upper()
+    if not index_code:
+        raise HTTPException(400, "index_code required")
+
+    task_doc = build_task_doc(
+        current_user=current_user,
+        task_type="industry_analysis",
+        priority=20,
+        params={
+            "index_code": index_code,
+            "src": body.src,
+            **({"model": body.model} if body.model else {}),
+        },
+        source="manual_trigger",
+    )
+    # store index_code at top level for easy querying
+    task_doc["index_code"] = index_code
+
+    try:
+        result = get_db_collections()["analysis_tasks"].insert_one(task_doc)
+        return {
+            "success": True,
+            "task_id": str(result.inserted_id),
+            "status": "pending",
+            "index_code": index_code,
+        }
+    except Exception as e:
+        raise HTTPException(500, f"任务创建失败: {e}")
+
+
+@router.get("/industry-analysis/latest")
+async def get_latest_industry_analysis(
+    current_user: Dict = Depends(get_current_active_user),  # noqa: ARG001
+    index_code: str = Query(..., min_length=1),
+):
+    """查询该行业最近一次已完成的分析结果（供页面打开时自动回显）。"""
+    ic = (index_code or "").strip().upper()
+    doc = get_db_collections()["analysis_tasks"].find_one(
+        {"type": "industry_analysis", "index_code": ic, "status": "completed"},
+        sort=[("created_at", -1)],
+        projection={"_id": 1, "result": 1, "created_at": 1, "updated_at": 1},
+    )
+    if not doc:
+        return {"success": False, "message": "暂无该行业的分析记录"}
+
+    analysis = (doc.get("result") or {}).get("analysis") or {}
+    return {
+        "success": True,
+        "task_id": str(doc["_id"]),
+        "index_code": ic,
+        "analysis": analysis,
+        "created_at": doc.get("created_at"),
     }
