@@ -120,8 +120,8 @@ def test_prune_market_data_for_dashboard_categories_shape():
 def test_prune_market_data_for_dashboard_flat_shape():
     md = {
         "indices": {"^IXIC": {"p": 1}, "ZZ": {}},
-        "forex": {"CNH=X": {"p": 7}, "OTHER": {}},
+        "forex": {"USDCNH=X": {"p": 7}, "OTHER": {}},
     }
     out = market._prune_market_data_for_dashboard(md)
     assert "^IXIC" in out["indices"] and "ZZ" not in out["indices"]
-    assert "CNH=X" in out["forex"] and "OTHER" not in out["forex"]
+    assert "USDCNH=X" in out["forex"] and "OTHER" not in out["forex"]

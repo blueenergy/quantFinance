@@ -490,6 +490,7 @@ async def get_kline(
 
 
 _MEMBER = data_db["sw_index_member"]
+_DAILY_BASIC = data_db["financial_daily_basic"]
 
 _MEMBER_LEVEL_KEYS = ("l1_code", "l2_code", "l3_code")
 _MEMBER_PROJ = {"_id": 0, "con_code": 1, "name": 1, "is_new": 1, "l1_name": 1, "l2_name": 1, "l3_name": 1}
@@ -502,12 +503,11 @@ async def get_members(
     src: str = Query("SW2021"),
     current_only: bool = Query(True, description="True 仅返回当前成分 is_new=Y"),
 ):
-    """返回某行业指数（L1/L2/L3 均可）的成分股列表。"""
+    """返回某行业指数（L1/L2/L3 均可）的成分股列表，含最新市值和涨跌幅。"""
     code = index_code.strip()
     if not code:
         raise HTTPException(400, "index_code required")
 
-    # 按三个层级字段 OR 查，兼容 L1/L2/L3
     flt: Dict[str, Any] = {
         "src": src,
         "$or": [{k: code} for k in _MEMBER_LEVEL_KEYS],
@@ -517,6 +517,24 @@ async def get_members(
 
     cur = _MEMBER.find(flt, _MEMBER_PROJ).sort("con_code", ASCENDING)
     members = list(cur)
+
+    # 补充最新行情：total_mv（万元）、pct_chg（%）
+    # con_code 已带交易所后缀（如 600519.SH），可直接作为 ts_code 查询
+    if members:
+        latest = _DAILY_BASIC.find_one({}, {"trade_date": 1}, sort=[("trade_date", -1)])
+        if latest:
+            trade_date = latest["trade_date"]
+            ts_codes = [m["con_code"] for m in members]
+            rows = _DAILY_BASIC.find(
+                {"trade_date": trade_date, "ts_code": {"$in": ts_codes}},
+                {"_id": 0, "ts_code": 1, "total_mv": 1, "pe_ttm": 1, "pb": 1},
+            )
+            mkt: Dict[str, Any] = {r["ts_code"]: r for r in rows}
+            for m in members:
+                row = mkt.get(m["con_code"], {})
+                m["total_mv"] = row.get("total_mv")   # 万元
+                m["pe_ttm"]   = row.get("pe_ttm")
+                m["pb"]       = row.get("pb")
 
     return {
         "success": True,
