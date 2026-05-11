@@ -522,3 +522,57 @@ async def get_members(
         "count": len(members),
         "data": members,
     }
+
+
+_STOCK_INDUSTRY_PROJ = {
+    "_id": 0, "con_code": 1, "name": 1,
+    "l1_code": 1, "l1_name": 1,
+    "l2_code": 1, "l2_name": 1,
+    "l3_code": 1, "l3_name": 1,
+}
+
+
+@router.get("/stock-industry")
+async def get_stock_industry(
+    current_user: Dict = Depends(get_current_active_user),  # noqa: ARG001
+    symbol: str = Query(..., min_length=1, description="股票代码，如 600519 或 600519.SH"),
+    src: str = Query("SW2021"),
+):
+    """查询某股票所属申万行业 L1/L2/L3。"""
+    sym = symbol.strip()
+    cands: List[str] = [sym]
+    if "." not in sym:
+        cands += [f"{sym}.SH", f"{sym}.SZ", f"{sym}.BJ"]
+    else:
+        cands.append(sym.split(".")[0])
+
+    doc = None
+    for c in cands:
+        doc = _MEMBER.find_one({"con_code": c, "src": src, "is_new": "Y"}, _STOCK_INDUSTRY_PROJ)
+        if doc:
+            break
+    if not doc:
+        for c in cands:
+            doc = _MEMBER.find_one(
+                {"con_code": c, "src": src},
+                _STOCK_INDUSTRY_PROJ,
+                sort=[("in_date", -1)],
+            )
+            if doc:
+                break
+
+    if not doc:
+        return {"success": False, "message": f"未找到 {symbol} 的申万行业归属"}
+
+    return {
+        "success": True,
+        "symbol": doc.get("con_code", sym),
+        "name": doc.get("name", ""),
+        "l1_code": doc.get("l1_code", ""),
+        "l1_name": doc.get("l1_name", ""),
+        "l2_code": doc.get("l2_code", ""),
+        "l2_name": doc.get("l2_name", ""),
+        "l3_code": doc.get("l3_code", ""),
+        "l3_name": doc.get("l3_name", ""),
+        "src": src,
+    }
