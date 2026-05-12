@@ -1,12 +1,40 @@
 # Authoritative list of quant-data-engine ingestion pipelines for monitoring UI.
 # job_status_key must match JobStatusRepository job_type and pipeline_tasks.task_type (domain=data_collection).
 # Scheduling matches quant-data-engine/start.sh + crontab*.txt (see repo).
+#
+# DAG dependency fields (for pipeline orchestration and visualization):
+#   group:               layer0 (independent) | layer1 (depends on L0) | layer2 (depends on L1) | layer3 (analysis)
+#   depends_on:          list of pipeline ids that must be complete before this one can start
+#   trigger_on_complete: false = keep existing cron schedule unchanged (safe default, backward compatible)
+#                        true  = dispatcher will auto-trigger when all depends_on are complete
+#   run_mode:            cron | loop | on_demand  (informational only, does not affect execution)
 
 pipelines:
+
+  # ── Layer 0: Independent data collection (direct from Tushare / external) ─────
+
+  - id: stock_info
+    label: 股票基础信息
+    job_status_key: stock_info
+    group: layer0
+    depends_on: []
+    trigger_on_complete: false
+    run_mode: cron
+    schedule_hint: "Supercronic 工作日 17:20 → daily_market_sync.sh stockinfo"
+    freshness:
+      database: quant_data
+      collection: stock_info
+      field: list_date
+      field_kind: date_string
+
   - id: stock_daily
     label: 股票日线
     job_status_key: stock_daily
-    schedule_hint: "Supercronic 工作日 17:30 → /app/daily_market_sync.sh stock（full 用 crontab.txt，domestic 用 crontab_domestic.txt）"
+    group: layer0
+    depends_on: []
+    trigger_on_complete: false
+    run_mode: cron
+    schedule_hint: "Supercronic 工作日 17:30 → daily_market_sync.sh stock（full 用 crontab.txt，domestic 用 crontab_domestic.txt）"
     freshness:
       database: quant_data
       collection: volume_price
@@ -16,6 +44,10 @@ pipelines:
   - id: stock_weekly
     label: 股票周线
     job_status_key: stock_weekly
+    group: layer0
+    depends_on: []
+    trigger_on_complete: false
+    run_mode: cron
     schedule_hint: "Supercronic 周六 02:30 → daily_market_sync.sh stock_weekly（Tushare weekly）"
     freshness:
       database: quant_data
@@ -26,6 +58,10 @@ pipelines:
   - id: stock_monthly
     label: 股票月线
     job_status_key: stock_monthly
+    group: layer0
+    depends_on: []
+    trigger_on_complete: false
+    run_mode: cron
     schedule_hint: "Supercronic 每月 1 日 03:30 → daily_market_sync.sh stock_monthly（Tushare monthly）"
     freshness:
       database: quant_data
@@ -36,6 +72,10 @@ pipelines:
   - id: index_daily
     label: 指数日线
     job_status_key: index_daily
+    group: layer0
+    depends_on: []
+    trigger_on_complete: false
+    run_mode: cron
     schedule_hint: "Supercronic 工作日 17:45 → daily_market_sync.sh index（同上 crontab 文件）"
     freshness:
       database: quant_data
@@ -43,9 +83,27 @@ pipelines:
       field: trade_date
       field_kind: date_string
 
+  - id: index_constituents
+    label: 指数成分股
+    job_status_key: index_constituents
+    group: layer0
+    depends_on: []
+    trigger_on_complete: false
+    run_mode: cron
+    schedule_hint: "Supercronic 工作日 17:50 → daily_market_sync.sh index_constituents"
+    freshness:
+      database: quant_data
+      collection: index_constituents
+      field: trade_date
+      field_kind: date_string
+
   - id: etf_daily
     label: ETF日线
     job_status_key: etf_daily
+    group: layer0
+    depends_on: []
+    trigger_on_complete: false
+    run_mode: cron
     schedule_hint: "Supercronic 工作日 18:00 → daily_market_sync.sh etf（同上）"
     freshness:
       database: quant_data
@@ -56,6 +114,10 @@ pipelines:
   - id: etf_share_size
     label: ETF份额规模
     job_status_key: etf_share_size
+    group: layer0
+    depends_on: []
+    trigger_on_complete: false
+    run_mode: cron
     schedule_hint: "Supercronic 工作日 19:05 → daily_market_sync.sh etf_share_size（Tushare etf_share_size，建议 19 点后）"
     freshness:
       database: quant_data
@@ -66,6 +128,10 @@ pipelines:
   - id: financial_sync
     label: 财务数据
     job_status_key: financial_sync
+    group: layer0
+    depends_on: []
+    trigger_on_complete: false
+    run_mode: cron
     schedule_hint: "Supercronic 工作日 18:15 → daily_market_sync.sh financial（同上）"
     # 仍为一条入库任务；新鲜度在 services/data_monitoring 中按 freshness_sheets 展开为 4 行
     freshness:
@@ -86,6 +152,10 @@ pipelines:
   - id: moneyflow
     label: 资金流向
     job_status_key: moneyflow
+    group: layer0
+    depends_on: []
+    trigger_on_complete: false
+    run_mode: cron
     schedule_hint: "Supercronic 工作日 18:30 → daily_market_sync.sh moneyflow（同上）"
     freshness:
       database: quant_data
@@ -93,9 +163,41 @@ pipelines:
       field: trade_date
       field_kind: date_string
 
+  - id: earnings_sync
+    label: 业绩数据
+    job_status_key: earnings_sync
+    group: layer0
+    depends_on: []
+    trigger_on_complete: false
+    run_mode: cron
+    schedule_hint: "Supercronic 工作日 18:30 → daily_market_sync.sh earnings"
+    freshness:
+      database: quant_data
+      collection: earnings
+      field: trade_date
+      field_kind: date_string
+
+  - id: cn_macro_sync
+    label: 国内宏观数据
+    job_status_key: cn_macro_sync
+    group: layer0
+    depends_on: []
+    trigger_on_complete: false
+    run_mode: cron
+    schedule_hint: "Supercronic 工作日 19:40 → daily_market_sync.sh cn_macro_sync（shibor/LPR/PMI/CPI/PPI/M2/社融/GDP）"
+    freshness:
+      database: quant_data
+      collection: cn_macro
+      field: date
+      field_kind: date_string
+
   - id: ladder_sync
     label: 连板天梯
     job_status_key: ladder_sync
+    group: layer0
+    depends_on: []
+    trigger_on_complete: false
+    run_mode: loop
     schedule_hint: "start.sh：DEPLOY_MODE=domestic 或 full 时常驻 run_ladder_sync --loop（LADDER_SYNC_INTERVAL，默认 60s）；不在 crontab 中"
     freshness:
       database: quant_data
@@ -106,6 +208,10 @@ pipelines:
   - id: industry_sync
     label: 行业与ETF聚合
     job_status_key: industry_sync
+    group: layer0
+    depends_on: []
+    trigger_on_complete: false
+    run_mode: loop
     schedule_hint: "start.sh：DEPLOY_MODE=domestic 或 full 时常驻 run_industry_sync --loop（INDUSTRY_SYNC_INTERVAL，默认 3600s）；盘后 15:30+ 才跑同步；不在 crontab 中"
     freshness:
       database: quant_data
@@ -113,19 +219,13 @@ pipelines:
       field: date
       field_kind: date_string
 
-  - id: market_sentiment
-    label: 市场情绪阴阳谱
-    job_status_key: market_sentiment
-    schedule_hint: "Supercronic 工作日 18:45 → daily_market_sync.sh sentiment（同上 crontab）"
-    freshness:
-      database: quant_data
-      collection: market_spectrum
-      field: trade_date
-      field_kind: date_string
-
   - id: hot_stock_sync
     label: 热股同步
     job_status_key: hot_stock_sync
+    group: layer0
+    depends_on: []
+    trigger_on_complete: false
+    run_mode: cron
     schedule_hint: "仅 full：Supercronic crontab.txt 工作日 22:35 → daily_market_sync.sh hotstock；domestic 的 crontab_domestic.txt 当前未包含此项"
     freshness:
       database: quant_data
@@ -133,19 +233,13 @@ pipelines:
       field: trade_date
       field_kind: date_string
 
-  - id: stock_composite_scoring
-    label: 综合评分
-    job_status_key: stock_composite_scoring
-    schedule_hint: "日终/收盘后：本机或 cron 调 stock-scoring score_util --action core（沪深300+中证A500+中证500+中证1000+科创50 成分并集；全市场可用 --action all；与交易日检查一致时）；写入 job_status 与 data_collection pipeline_tasks"
-    freshness:
-      database: finance
-      collection: stock_scores
-      field: score_date
-      field_kind: date_string
-
   - id: international_news
     label: 国际新闻缓存
     job_status_key: international_news
+    group: layer0
+    depends_on: []
+    trigger_on_complete: false
+    run_mode: loop
     schedule_hint: "start.sh：DEPLOY_MODE=overseas 或 full 时常驻 run_international_news_sync --loop（INTL_NEWS_SYNC_INTERVAL，默认 1800s）；可选 SECONDARY_MONGO_URI → --sync-uri；domestic 不启动"
     freshness:
       database: quant_data
@@ -153,3 +247,93 @@ pipelines:
       field: fetched_at
       field_kind: datetime
       document_id: "latest"
+
+  # ── Layer 1: Depends on Layer 0 ───────────────────────────────────────────────
+
+  - id: market_sentiment
+    label: 市场情绪阴阳谱
+    job_status_key: market_sentiment
+    group: layer1
+    depends_on: [stock_daily]
+    trigger_on_complete: false   # 改为 true 后 dispatcher 可在 stock_daily 完成后立即触发
+    run_mode: cron
+    schedule_hint: "Supercronic 工作日 18:45 → daily_market_sync.sh sentiment（依赖 volume_price MA5）"
+    freshness:
+      database: quant_data
+      collection: market_spectrum
+      field: trade_date
+      field_kind: date_string
+
+  - id: theme_lag_candidates
+    label: 主题补涨候选
+    job_status_key: theme_lag_candidates
+    group: layer1
+    depends_on: [stock_daily, ladder_sync, index_constituents]
+    trigger_on_complete: false
+    run_mode: cron
+    schedule_hint: "Supercronic 工作日（ladder_sync 盘后稳定后）→ daily_market_sync.sh theme_lag；成功后串联 theme_lag_candidate_validation"
+    freshness:
+      database: quant_data
+      collection: theme_lag_candidates
+      field: trade_date
+      field_kind: date_string
+
+  - id: risk_scan_a
+    label: A股风险扫描
+    job_status_key: risk_scan_a
+    group: layer1
+    depends_on: [stock_daily, index_daily]
+    trigger_on_complete: false
+    run_mode: cron
+    schedule_hint: "Supercronic 工作日 19:30 → daily_market_sync.sh risk_scan_a（9个A股板块）"
+    freshness:
+      database: quant_data
+      collection: risk_scan
+      field: trade_date
+      field_kind: date_string
+
+  # ── Layer 2: Depends on Layer 1 ───────────────────────────────────────────────
+
+  - id: theme_lag_candidate_validation
+    label: 主题补涨验证
+    job_status_key: theme_lag_candidate_validation
+    group: layer2
+    depends_on: [theme_lag_candidates, stock_daily]
+    trigger_on_complete: false   # 目前由 daily_market_sync.sh 串联调用；改 true 后由 dispatcher 接管
+    run_mode: cron
+    schedule_hint: "daily_market_sync.sh theme_lag 中在 theme_lag_candidates 成功后串联调用"
+    freshness:
+      database: quant_data
+      collection: theme_lag_candidate_validation
+      field: trade_date
+      field_kind: date_string
+
+  - id: stock_composite_scoring
+    label: 综合评分
+    job_status_key: stock_composite_scoring
+    group: layer2
+    depends_on: [stock_daily, financial_sync, moneyflow]
+    trigger_on_complete: false   # 由 stock-scoring-system 独立调度，暂不纳入 dispatcher
+    run_mode: on_demand
+    schedule_hint: "日终/收盘后：本机或 cron 调 stock-scoring score_util --action core（沪深300+中证A500+中证500+中证1000+科创50 成分并集；全市场可用 --action all；与交易日检查一致时）；写入 job_status 与 data_collection pipeline_tasks"
+    freshness:
+      database: finance
+      collection: stock_scores
+      field: score_date
+      field_kind: date_string
+
+  # ── Layer 3: Analysis layer (quantAnalyzer, depends on L2) ────────────────────
+
+  - id: limit_up_sector_batch
+    label: 涨停板板块分析
+    job_status_key: limit_up_sector_batch
+    group: layer3
+    depends_on: [ladder_sync, stock_composite_scoring]
+    trigger_on_complete: false   # 由 quantAnalyzer 自身 polling 驱动
+    run_mode: loop
+    schedule_hint: "quantAnalyzer 常驻服务，polling analysis_tasks 集合；sector_queue 模式下实时触发"
+    freshness:
+      database: finance
+      collection: analysis_history
+      field: created_at
+      field_kind: datetime
