@@ -3,13 +3,29 @@
 # Scheduling matches quant-data-engine/start.sh + crontab*.txt (see repo).
 #
 # DAG dependency fields (for pipeline orchestration and visualization):
-#   group:               layer0 (independent) | layer1 (depends on L0) | layer2 (depends on L1) | layer3 (analysis)
+#   group:               probe (Tushare gate) | layer0 (independent) | layer1 (depends on L0) | layer2 (depends on L1) | layer3 (analysis)
 #   depends_on:          list of pipeline ids that must be complete before this one can start
 #   trigger_on_complete: false = keep existing cron schedule unchanged (safe default, backward compatible)
 #                        true  = dispatcher will auto-trigger when all depends_on are complete
 #   run_mode:            cron | loop | on_demand  (informational only, does not affect execution)
 
 pipelines:
+
+  # ── Probe: Tushare data-availability gate ────────────────────────────────────
+
+  - id: tushare_daily_ready
+    label: Tushare日线就绪探测
+    job_status_key: tushare_daily_ready
+    group: probe
+    depends_on: []
+    trigger_on_complete: false   # probe 本身由 cron 15:10 直接启动，不由 dispatcher 触发
+    run_mode: cron
+    schedule_hint: "Supercronic 工作日 15:10 启动 run_tushare_probe.py；轮询探测直到 Tushare 日线数据可用，写入 pipeline_tasks(complete)；超时 6h 则 failed"
+    freshness:
+      database: finance
+      collection: pipeline_tasks
+      field: updated_at
+      field_kind: datetime
 
   # ── Layer 0: Independent data collection (direct from Tushare / external) ─────
 
@@ -18,7 +34,7 @@ pipelines:
     job_status_key: stock_info
     group: layer0
     depends_on: []
-    trigger_on_complete: false
+    trigger_on_complete: false   # 偶发更新（上市/退市），保持 cron 独立调度
     run_mode: cron
     schedule_hint: "Supercronic 工作日 17:20 → daily_market_sync.sh stockinfo"
     freshness:
@@ -31,10 +47,10 @@ pipelines:
     label: 股票日线
     job_status_key: stock_daily
     group: layer0
-    depends_on: []
-    trigger_on_complete: false
+    depends_on: [tushare_daily_ready]
+    trigger_on_complete: true    # dispatcher-triggered（删除 cron 17:30）
     run_mode: cron
-    schedule_hint: "Supercronic 工作日 17:30 → daily_market_sync.sh stock（full 用 crontab.txt，domestic 用 crontab_domestic.txt）"
+    schedule_hint: "dispatcher-triggered after tushare_daily_ready（原 cron 17:30 已禁用）"
     freshness:
       database: quant_data
       collection: volume_price
@@ -73,10 +89,10 @@ pipelines:
     label: 指数日线
     job_status_key: index_daily
     group: layer0
-    depends_on: []
-    trigger_on_complete: false
+    depends_on: [tushare_daily_ready]
+    trigger_on_complete: true    # dispatcher-triggered（删除 cron 17:45）
     run_mode: cron
-    schedule_hint: "Supercronic 工作日 17:45 → daily_market_sync.sh index（同上 crontab 文件）"
+    schedule_hint: "dispatcher-triggered after tushare_daily_ready（原 cron 17:45 已禁用）"
     freshness:
       database: quant_data
       collection: index_prices
@@ -88,7 +104,7 @@ pipelines:
     job_status_key: index_constituents
     group: layer0
     depends_on: []
-    trigger_on_complete: false
+    trigger_on_complete: false   # 月末调仓，保持 cron 独立调度
     run_mode: cron
     schedule_hint: "Supercronic 工作日 17:50 → daily_market_sync.sh index_constituents"
     freshness:
@@ -101,10 +117,10 @@ pipelines:
     label: ETF日线
     job_status_key: etf_daily
     group: layer0
-    depends_on: []
-    trigger_on_complete: false
+    depends_on: [tushare_daily_ready]
+    trigger_on_complete: true    # dispatcher-triggered（删除 cron 18:00）
     run_mode: cron
-    schedule_hint: "Supercronic 工作日 18:00 → daily_market_sync.sh etf（同上）"
+    schedule_hint: "dispatcher-triggered after tushare_daily_ready（原 cron 18:00 已禁用）"
     freshness:
       database: quant_data
       collection: etf_daily
@@ -130,9 +146,9 @@ pipelines:
     job_status_key: financial_sync
     group: layer0
     depends_on: []
-    trigger_on_complete: false
+    trigger_on_complete: false   # 季报周期数据，保持 cron 独立调度
     run_mode: cron
-    schedule_hint: "Supercronic 工作日 18:15 → daily_market_sync.sh financial（同上）"
+    schedule_hint: "Supercronic 工作日 18:15 → daily_market_sync.sh financial（季报期外大多空跑，保持 cron 独立）"
     # 仍为一条入库任务；新鲜度在 services/data_monitoring 中按 freshness_sheets 展开为 4 行
     freshness:
       database: quant_data
@@ -153,10 +169,10 @@ pipelines:
     label: 资金流向
     job_status_key: moneyflow
     group: layer0
-    depends_on: []
-    trigger_on_complete: false
+    depends_on: [tushare_daily_ready]
+    trigger_on_complete: true    # dispatcher-triggered（删除 cron 18:30）
     run_mode: cron
-    schedule_hint: "Supercronic 工作日 18:30 → daily_market_sync.sh moneyflow（同上）"
+    schedule_hint: "dispatcher-triggered after tushare_daily_ready（原 cron 18:30 已禁用）"
     freshness:
       database: quant_data
       collection: money_flow
@@ -168,9 +184,9 @@ pipelines:
     job_status_key: earnings_sync
     group: layer0
     depends_on: []
-    trigger_on_complete: false
+    trigger_on_complete: false   # 季报周期数据，保持 cron 独立调度
     run_mode: cron
-    schedule_hint: "Supercronic 工作日 18:30 → daily_market_sync.sh earnings"
+    schedule_hint: "Supercronic 工作日 18:30 → daily_market_sync.sh earnings（季报期外大多空跑，保持 cron 独立）"
     freshness:
       database: quant_data
       collection: earnings
@@ -255,9 +271,9 @@ pipelines:
     job_status_key: market_sentiment
     group: layer1
     depends_on: [stock_daily]
-    trigger_on_complete: false   # 改为 true 后 dispatcher 可在 stock_daily 完成后立即触发
+    trigger_on_complete: true    # dispatcher-triggered after stock_daily（原 cron 18:45 已禁用）
     run_mode: cron
-    schedule_hint: "Supercronic 工作日 18:45 → daily_market_sync.sh sentiment（依赖 volume_price MA5）"
+    schedule_hint: "dispatcher-triggered after stock_daily（原 cron 18:45 已禁用）"
     freshness:
       database: quant_data
       collection: market_spectrum
