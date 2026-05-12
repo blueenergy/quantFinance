@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Optional
 import yaml
 
 # finance DB (main) and quant_data handle
+from datetime import timedelta
 from db import data_db, db
 
 _CATALOG_PATH = Path(__file__).resolve().parent.parent / "config" / "data_pipelines_catalog.yaml"
@@ -25,6 +26,103 @@ def load_pipelines_catalog() -> List[Dict[str, Any]]:
     with open(p, "r", encoding="utf-8") as f:
         data = yaml.safe_load(f) or {}
     return list(data.get("pipelines") or [])
+
+
+def build_pipeline_dag(date: Optional[str] = None) -> Dict[str, Any]:
+    """Return DAG graph structure with today's run status for each node.
+
+    Response shape::
+
+        {
+          "nodes": [
+            {
+              "id": "stock_daily",
+              "label": "股票日线",
+              "group": "layer0",
+              "run_mode": "cron",
+              "trigger_on_complete": false,
+              "schedule_hint": "...",
+              "status": "complete" | "failed" | "no_record" | "skipped" | ...,
+              "date": "20260512",
+              "completed_at": "2026-05-12T17:45:00+08:00",
+              "records_changed": 5200,
+              "error": null
+            },
+            ...
+          ],
+          "edges": [
+            {"source": "stock_daily", "target": "market_sentiment"},
+            ...
+          ],
+          "query_date": "20260512"
+        }
+    """
+    from datetime import timezone as _tz
+
+    BEIJING = _tz(timedelta(hours=8))
+
+    def _to_bj_iso(dt: Optional[datetime]) -> Optional[str]:
+        if not isinstance(dt, datetime):
+            return None
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(BEIJING).isoformat()
+
+    catalog = load_pipelines_catalog()
+    query_date = date or datetime.now(BEIJING).strftime("%Y%m%d")
+
+    nodes: List[Dict[str, Any]] = []
+    edges: List[Dict[str, str]] = []
+
+    for entry in catalog:
+        pid = entry.get("id", "")
+        key = entry.get("job_status_key") or pid
+
+        # Fetch latest run doc for this pipeline
+        raw = _latest_ingestion_doc_for_catalog_key(key)
+        run = normalize_ingestion_monitor_doc(raw)
+
+        # Determine if the latest run matches the query date
+        run_date_int = _ingestion_date_ymd_int(raw.get("date") if raw else None)
+        query_date_int = _ingestion_date_ymd_int(query_date)
+        if run_date_int != query_date_int:
+            # No record for the queried date
+            status = "no_record"
+            run_date_str = None
+            completed_at = None
+            records_changed = None
+            error = None
+        else:
+            status = run.get("status") or "no_record"
+            run_date_str = str(raw.get("date")) if raw else None
+            completed_at = _to_bj_iso(run.get("completed_at"))
+            records_changed = run.get("records_changed")
+            error = run.get("error")
+
+        nodes.append({
+            "id": pid,
+            "label": entry.get("label", pid),
+            "group": entry.get("group", "layer0"),
+            "run_mode": entry.get("run_mode", "cron"),
+            "trigger_on_complete": bool(entry.get("trigger_on_complete", False)),
+            "depends_on": list(entry.get("depends_on") or []),
+            "schedule_hint": entry.get("schedule_hint"),
+            "status": status,
+            "date": run_date_str,
+            "completed_at": completed_at,
+            "records_changed": records_changed,
+            "error": error,
+        })
+
+        # Build edges from depends_on
+        for dep in (entry.get("depends_on") or []):
+            edges.append({"source": dep, "target": pid})
+
+    return {
+        "nodes": nodes,
+        "edges": edges,
+        "query_date": query_date,
+    }
 
 
 def _ingestion_date_ymd_int(value: Any) -> int:

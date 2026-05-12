@@ -16,6 +16,7 @@ from fastapi import APIRouter, HTTPException, Query
 from db import db, get_data_db
 from services.data_monitoring import (
     build_data_monitoring_overview,
+    build_pipeline_dag,
     build_pipelines_status_rows,
     query_coverage_gaps,
 )
@@ -181,3 +182,19 @@ async def get_data_pulse_overview():
         }
 
     return {"success": True, "overview": overview}
+
+
+@router.get("/dag")
+async def get_pipeline_dag(
+    date: Optional[str] = Query(
+        None,
+        max_length=8,
+        description="查询日期 YYYYMMDD；省略则用今日北京时间",
+    ),
+):
+    """Return pipeline DAG graph: nodes with today's run status + dependency edges.
+
+    Used by the admin dashboard to render a Blue-Ocean-style pipeline flow view.
+    """
+    dag = build_pipeline_dag(date=date)
+    return {"success": True, **dag}
