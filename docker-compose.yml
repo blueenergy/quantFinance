@@ -181,6 +181,7 @@ services:
       - MONGO_URI=${MONGO_URI:-mongodb://host.docker.internal:27017/}
       - MONGO_URL=${MONGO_URI:-mongodb://host.docker.internal:27017/}
       - DB_NAME=${MONGO_DB}
+      - MONGO_DB=${DATA_DB_NAME:-quant_data}
       - API_BASE_URL=${BACKTEST_API_BASE_URL:-http://quant-api:3001/api}
       - API_TOKEN=${BACKTEST_API_TOKEN}
       - WORKER_ID=${BACKTEST_WORKER_ID:-}
