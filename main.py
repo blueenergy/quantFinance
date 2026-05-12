@@ -77,6 +77,7 @@ from routers.shenwan_index import router as shenwan_index_router
 from routers.assistant_bff import router as assistant_bff_router
 from routers.hermes_quant_tools import router as hermes_quant_tools_router
 from routers.macro import router as macro_router
+from routers.kline_series import router as kline_series_router
 from routers.navigation_policy import user_router as navigation_user_router
 from routers.entitlements_matrix import router as entitlements_matrix_router
 from production_config import configure_production_app
@@ -157,3 +158,4 @@ app.include_router(shenwan_index_router, prefix="/api/shenwan-index", tags=["申
 app.include_router(assistant_bff_router, prefix="/api/assistant", tags=["助手BFF"])
 app.include_router(hermes_quant_tools_router, prefix="/api", tags=["Hermes quant tools"])
 app.include_router(macro_router, prefix="/api", tags=["宏观分析"])
+app.include_router(kline_series_router, prefix="/api", tags=["K线对比"])
