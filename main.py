@@ -159,3 +159,26 @@ app.include_router(assistant_bff_router, prefix="/api/assistant", tags=["助手B
 app.include_router(hermes_quant_tools_router, prefix="/api", tags=["Hermes quant tools"])
 app.include_router(macro_router, prefix="/api", tags=["宏观分析"])
 app.include_router(kline_series_router, prefix="/api", tags=["K线对比"])
+
+# ---------------------------------------------------------------------------
+# MCP 服务器：暴露 quant-api 工具给 Hermes 等多智能体框架
+# 端点：POST/GET/DELETE /mcp  (Streamable HTTP, MCP spec 2025-03-26)
+# 鉴权：复用现有 HERMES_QUANT_INTERNAL_KEY (X-Hermes-Quant-Key header)
+# 工具范围：仅 tag="Hermes quant tools" 的路由（hermes_quant_tools.py）
+# 扩展：往 routers/hermes_quant_tools.py 加路由即可自动出现在 MCP 工具列表
+# ---------------------------------------------------------------------------
+from fastapi import Depends
+from fastapi_mcp import FastApiMCP, AuthConfig
+from auth import require_hermes_quant_internal_key
+
+_mcp = FastApiMCP(
+    app,
+    name="wukong-quant",
+    description="A-share quantitative finance tools (ladder, market data, ETF, macro)",
+    include_tags=["Hermes quant tools"],
+    auth_config=AuthConfig(
+        dependencies=[Depends(require_hermes_quant_internal_key)],
+    ),
+    headers=["x-hermes-quant-key"],  # 将此 header 转发给底层路由的 Depends 校验
+)
+_mcp.mount_http()  # 挂载在 /mcp

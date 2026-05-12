@@ -34,3 +34,6 @@ python-multipart>=0.0.6         # 文件上传支持
 # 监控和日志
 structlog>=23.2.0               # 结构化日志
 sentry-sdk[fastapi]>=1.38.0     # 错误监控
+
+# MCP 服务器（暴露 quant-api 工具给 Hermes 等多智能体框架）
+fastapi-mcp>=0.3.4
