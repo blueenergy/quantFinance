@@ -573,12 +573,17 @@ async def stock_ranking(
     stock_scores = db["stock_scores"]
     stock_info = db["stock_info"]
 
-    # 取每只股票最新评分，按 index_codes 过滤
+    # Step 1: get index member symbols from historical index_codes records
+    hs_symbols = list(stock_scores.distinct("symbol", {"index_codes": ic}))
+    if not hs_symbols:
+        return {"success": False, "error": f"未找到 {ic} 成分股数据，index_codes 可能尚未回填"}
+
+    # Step 2: get latest score for each member symbol
     pipeline = [
+        {"$match": {"symbol": {"$in": hs_symbols}}},
         {"$sort": {"score_date": -1}},
         {"$group": {"_id": "$symbol", "doc": {"$first": "$$ROOT"}}},
         {"$replaceRoot": {"newRoot": "$doc"}},
-        {"$match": {"index_codes": ic}},
         {"$project": {
             "_id": 0, "symbol": 1, "score_date": 1,
             "composite_score": 1, "cycle_score": 1, "value_score": 1,
