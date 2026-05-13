@@ -12,6 +12,8 @@ Hermes 容器内可调用的只读 quant-api 端点（共享密钥，无用户 J
   GET  /hermes-tools/macro/analysis          — 宏观 AI 分析（中国/美国）
   GET  /hermes-tools/sector/latest           — 最新板块/概念 AI 分析
   GET  /hermes-tools/earnings/signals        — 财报猎手异动信号
+  GET  /hermes-tools/stock/ranking            — 股票评分排行榜 Top N（按指数）
+  GET  /hermes-tools/stock/score-detail       — 单股六维评分详情
   POST /hermes-tools/analysis/deep         — 提交深度分析任务
   POST /hermes-tools/analysis/deep-and-wait — 提交并等待完成（推荐）
   GET  /hermes-tools/analysis/task/{id}    — 轮询任务状态
@@ -539,3 +541,130 @@ async def hermes_earnings_signals(
 
     signals.sort(key=lambda x: x["date"] or "", reverse=True)
     return {"success": True, "days": days, "count": len(signals), "signals": signals}
+
+
+# ---------------------------------------------------------------------------
+# 股票评分排行榜
+# ---------------------------------------------------------------------------
+
+_RANKING_INDEX_CODES = ("hs300", "a500", "csi500", "csi1000", "star50")
+
+
+@router.get("/stock/ranking", operation_id="stock_ranking")
+async def stock_ranking(
+    index_code: str = Query("hs300", description="指数: hs300/a500/csi500/csi1000/star50"),
+    top: int = Query(20, ge=1, le=100, description="返回前 N 名，默认 20"),
+    strategy: str = Query("balanced", description="策略: balanced/aggressive/conservative"),
+    _: bool = Depends(require_hermes_quant_internal_key),
+):
+    """
+    获取 A 股量化评分排行榜 Top N（按指数成分筛选）。
+
+    - index_code: hs300（沪深300）、a500、csi500（中证500）、csi1000、star50（科创50）
+    - strategy: balanced（均衡，默认）、aggressive（进取）、conservative（保守）
+    - 返回每只股票的综合评分及六维子评分（周期/价值/基本面/成长/技术/资金流）
+    """
+    ic = index_code.strip().lower()
+    if ic not in _RANKING_INDEX_CODES:
+        return {"success": False, "error": f"不支持的 index_code: {ic}，可选: {', '.join(_RANKING_INDEX_CODES)}"}
+
+    from utils.score_utils import extract_strategy_score, safe_round
+    db = get_db_collections()
+    stock_scores = db["stock_scores"]
+    stock_info = db["stock_info"]
+
+    # 取每只股票最新评分，按 index_codes 过滤
+    pipeline = [
+        {"$sort": {"score_date": -1}},
+        {"$group": {"_id": "$symbol", "doc": {"$first": "$$ROOT"}}},
+        {"$replaceRoot": {"newRoot": "$doc"}},
+        {"$match": {"index_codes": ic}},
+        {"$project": {
+            "_id": 0, "symbol": 1, "score_date": 1,
+            "composite_score": 1, "cycle_score": 1, "value_score": 1,
+            "fundamental_score": 1, "growth_score": 1, "technical_score": 1,
+            "money_flow_score": 1,
+        }},
+    ]
+    raw = list(stock_scores.aggregate(pipeline))
+    raw.sort(key=lambda d: extract_strategy_score(d.get("composite_score", 0), strategy), reverse=True)
+    raw = raw[:top]
+
+    symbols = [d["symbol"] for d in raw if d.get("symbol")]
+    info_map = {
+        info["symbol"]: info
+        for info in stock_info.find({"symbol": {"$in": symbols}}, {"symbol": 1, "name": 1, "industry": 1})
+        if info.get("symbol")
+    }
+
+    result = []
+    for i, d in enumerate(raw, 1):
+        sym = d.get("symbol", "")
+        inf = info_map.get(sym, {})
+        cs = d.get("composite_score", 0)
+        score_val = extract_strategy_score(cs, strategy)
+        result.append({
+            "rank": i,
+            "symbol": sym,
+            "name": inf.get("name", ""),
+            "industry": inf.get("industry", ""),
+            "score": safe_round(score_val, 2),
+            "score_date": d.get("score_date", ""),
+            "cycle_score": safe_round(d.get("cycle_score", 0), 2),
+            "value_score": safe_round(d.get("value_score", 0), 2),
+            "fundamental_score": safe_round(d.get("fundamental_score", 0), 2),
+            "growth_score": safe_round(d.get("growth_score", 0), 2),
+            "technical_score": safe_round(d.get("technical_score", 0), 2),
+            "money_flow_score": safe_round(d.get("money_flow_score", 0), 2),
+        })
+
+    return {
+        "success": True,
+        "index_code": ic,
+        "strategy": strategy,
+        "top": top,
+        "count": len(result),
+        "ranking": result,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 单股量化评分详情
+# ---------------------------------------------------------------------------
+
+@router.get("/stock/score-detail", operation_id="stock_score_detail")
+async def stock_score_detail(
+    symbol: str = Query(..., description="股票代码，如 600519"),
+    _: bool = Depends(require_hermes_quant_internal_key),
+):
+    """
+    获取单只股票最新量化评分的六维详细拆解。
+
+    返回字段：综合评分（balanced/aggressive/conservative 三策略）及
+    cycle/value/fundamental/growth/technical/money_flow 六维子评分。
+    """
+    from utils.score_utils import safe_round
+    db = get_db_collections()
+    doc = db["stock_scores"].find_one({"symbol": symbol}, sort=[("score_date", -1)])
+    if not doc:
+        return {"success": False, "error": f"未找到 {symbol} 的评分数据"}
+
+    info = db["stock_info"].find_one({"symbol": symbol}, {"name": 1, "industry": 1}) or {}
+    cs = doc.get("composite_score", 0)
+    if not isinstance(cs, dict):
+        cs = {"balanced": cs}
+
+    return {
+        "success": True,
+        "symbol": symbol,
+        "name": info.get("name", ""),
+        "industry": info.get("industry", ""),
+        "score_date": doc.get("score_date", ""),
+        "composite_score": {k: safe_round(v, 2) for k, v in cs.items() if isinstance(v, (int, float))},
+        "cycle_score": safe_round(doc.get("cycle_score", 0), 2),
+        "value_score": safe_round(doc.get("value_score", 0), 2),
+        "fundamental_score": safe_round(doc.get("fundamental_score", 0), 2),
+        "growth_score": safe_round(doc.get("growth_score", 0), 2),
+        "technical_score": safe_round(doc.get("technical_score", 0), 2),
+        "money_flow_score": safe_round(doc.get("money_flow_score", 0), 2),
+    }
