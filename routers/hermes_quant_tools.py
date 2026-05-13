@@ -9,6 +9,9 @@ Hermes 容器内可调用的只读 quant-api 端点（共享密钥，无用户 J
   GET  /hermes-tools/market/summary        — AI 大盘分析（市场总结）
   GET  /hermes-tools/market/global         — 全球市场简报
   GET  /hermes-tools/market/hot-stock       — 热股分析（THS/DC 最新）
+  GET  /hermes-tools/macro/analysis          — 宏观 AI 分析（中国/美国）
+  GET  /hermes-tools/sector/latest           — 最新板块/概念 AI 分析
+  GET  /hermes-tools/earnings/signals        — 财报猎手异动信号
   POST /hermes-tools/analysis/deep         — 提交深度分析任务
   POST /hermes-tools/analysis/deep-and-wait — 提交并等待完成（推荐）
   GET  /hermes-tools/analysis/task/{id}    — 轮询任务状态
@@ -16,6 +19,7 @@ Hermes 容器内可调用的只读 quant-api 端点（共享密钥，无用户 J
 """
 
 import asyncio
+from datetime import datetime
 from typing import Any, Dict, Optional
 
 from bson import ObjectId
@@ -390,3 +394,148 @@ async def hermes_global_market(
         "analyzed_at": str(doc["analyzed_at"]) if hasattr(doc.get("analyzed_at"), "isoformat") else doc.get("analyzed_at"),
     }
     return result
+
+
+# ---------------------------------------------------------------------------
+# 宏观 AI 分析
+# ---------------------------------------------------------------------------
+
+@router.get("/macro/analysis", operation_id="hermes_macro_analysis")
+async def hermes_macro_analysis(
+    scope: str = Query("china_macro", description="china_macro（中国宏观）或 us_macro（美国利率）"),
+    _: bool = Depends(require_hermes_quant_internal_key),
+):
+    """
+    获取最新宏观 AI 分析结果，读取缓存，不触发 LLM。
+
+    - scope=china_macro — 中国宏观深度分析（PMI/CPI/PPI/M2/LPR/GDP等）
+    - scope=us_macro    — 美国利率市场深度分析（联储政策/局形/收益率曲线）
+    """
+    if scope not in ("china_macro", "us_macro"):
+        return {"success": False, "error": "scope 须为 china_macro 或 us_macro"}
+
+    doc = get_analyzer_db()["macro_analysis"].find_one(
+        {"scope": scope}, {"_id": 0}, sort=[("analysis_date", -1)]
+    )
+    if not doc:
+        return {"success": False, "error": f"暂无 {scope} 分析数据"}
+
+    result = dict(doc)
+    for k, v in result.items():
+        if hasattr(v, "isoformat"):
+            result[k] = v.isoformat()
+    result["success"] = True
+    return result
+
+
+# ---------------------------------------------------------------------------
+# 板块/概念 AI 分析
+# ---------------------------------------------------------------------------
+
+@router.get("/sector/latest", operation_id="hermes_sector_latest")
+async def hermes_sector_latest(
+    source: str = Query("dc", description="数据源: dc（东方财富，默认）或 ths（同花顺）"),
+    _: bool = Depends(require_hermes_quant_internal_key),
+):
+    """
+    获取最新板块/概念 AI 分析结果，读取缓存，不触发 LLM。
+
+    返回当日热门板块/概念的消内容要和 AI 点评。
+    """
+    source = source.lower()
+    if source not in ("dc", "ths"):
+        return {"success": False, "error": "source 须为 dc 或 ths"}
+
+    doc = get_analyzer_db()["sector_concept_analysis"].find_one(
+        {"source": source}, sort=[("created_at", -1)]
+    )
+    if not doc:
+        return {"success": False, "error": f"暂无 {source.upper()} 板块分析数据"}
+
+    return {
+        "success": True,
+        "source": source,
+        "trade_date": doc.get("trade_date"),
+        "analysis": doc.get("analysis"),
+        "data_summary": doc.get("data_summary"),
+        "model": doc.get("model"),
+        "created_at": doc["created_at"].isoformat() if doc.get("created_at") else None,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 财报猎手异动信号
+# ---------------------------------------------------------------------------
+
+@router.get("/earnings/signals", operation_id="hermes_earnings_signals")
+async def hermes_earnings_signals(
+    days: int = Query(7, ge=1, le=30, description="扫描最近 N 天的异动信号，默认 7 天"),
+    _: bool = Depends(require_hermes_quant_internal_key),
+):
+    """
+    财报猎手：扫描最近 N 天的业绩预告、快报和券商评级上调，
+    寻找可能发生“戴维斯双击”（盈利上修 + 估值扩张）的拠点公司。
+
+    返回信号列表，每条包括：股票代码、公司名、信号类型、核心指标、日期。
+    """
+    from datetime import timedelta
+    from db import get_data_db
+
+    data_db = get_data_db()
+    cutoff = (datetime.utcnow() - timedelta(days=days)).strftime("%Y%m%d")
+    signals = []
+
+    # 1. 业绩预告：扫描扭亏/大幅预增
+    for f in data_db["earnings_forecast"].find(
+        {"ann_date": {"$gte": cutoff}, "type": {"$in": ["预增", "扭亏"]}},
+        sort=[("ann_date", -1)],
+    ):
+        p_min = f.get("p_change_min")
+        p_max = f.get("p_change_max")
+        growth = ((p_min or 0) + (p_max or 0)) / 2 if p_min is not None else 0
+        signals.append({
+            "ts_code": f.get("ts_code"),
+            "signal_type": "业绩预告",
+            "subtype": f.get("type"),
+            "date": f.get("ann_date"),
+            "core_metric": f"净利润增速约 {growth:.1f}%" if growth else "增速未知",
+            "reason": f.get("change_reason", ""),
+        })
+
+    # 2. 业绩快报：净利润同比 > 30%
+    for e in data_db["earnings_express"].find(
+        {"ann_date": {"$gte": cutoff}}, sort=[("ann_date", -1)]
+    ):
+        n = e.get("n_income")
+        last = e.get("yoy_net_profit")
+        if n is None or not last:
+            continue
+        yoy = (n - last) / abs(last) * 100
+        if yoy < 30:
+            continue
+        revenue = e.get("revenue")
+        signals.append({
+            "ts_code": e.get("ts_code"),
+            "signal_type": "业绩快报",
+            "subtype": "实际高增",
+            "date": e.get("ann_date"),
+            "core_metric": f"净利润同比 {yoy:.1f}%" + (f"，营收 {revenue/1e8:.1f}亿" if revenue else ""),
+            "reason": "",
+        })
+
+    # 3. 券商评级上调
+    for r in data_db["earnings_report_rc"].find(
+        {"report_date": {"$gte": cutoff}, "op_rt": {"$in": ["首次", "调高"]}},
+        sort=[("report_date", -1)],
+    ):
+        signals.append({
+            "ts_code": r.get("ts_code"),
+            "signal_type": "卖方研报",
+            "subtype": "评级" + r.get("op_rt", ""),
+            "date": r.get("report_date"),
+            "core_metric": f"[{r.get('org_name')}] {r.get('rating_name')}",
+            "reason": r.get("title", ""),
+        })
+
+    signals.sort(key=lambda x: x["date"] or "", reverse=True)
+    return {"success": True, "days": days, "count": len(signals), "signals": signals}
