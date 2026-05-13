@@ -18,6 +18,14 @@ Hermes 容器内可调用的只读 quant-api 端点（共享密钥，无用户 J
   POST /hermes-tools/analysis/deep-and-wait — 提交并等待完成（推荐）
   GET  /hermes-tools/analysis/task/{id}    — 轮询任务状态
   GET  /hermes-tools/analysis/history      — 查某股历史分析
+
+  — 个人化端点（需先 user_login 获取 token 并设置 X-User-Token header）—
+  POST /hermes-tools/user/login            — 用户登录，返回 JWT token
+  GET  /hermes-tools/user/profile          — 当前用户账户信息
+  GET  /hermes-tools/user/watchlist        — 自选股列表 + 最新量化评分排行
+  POST /hermes-tools/user/watchlist/add    — 添加股票到自选股
+  DEL  /hermes-tools/user/watchlist/remove/{symbol} — 从自选股删除
+  GET  /hermes-tools/user/watchlist/history — 自选股历史深度分析记录
 """
 
 import asyncio
@@ -28,7 +36,7 @@ from bson import ObjectId
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 
-from auth import require_hermes_quant_internal_key
+from auth import get_user_from_header_token, require_hermes_quant_internal_key
 from db import db, get_analyzer_db, get_db_collections
 from models.analysis_task import AnalysisMode
 from routers.market import fetch_market_analysis_result
@@ -673,3 +681,223 @@ async def stock_score_detail(
         "technical_score": safe_round(doc.get("technical_score", 0), 2),
         "money_flow_score": safe_round(doc.get("money_flow_score", 0), 2),
     }
+
+
+# ---------------------------------------------------------------------------
+# 用户登录
+# ---------------------------------------------------------------------------
+
+class _UserLoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+@router.post("/user/login", operation_id="user_login")
+async def user_login(
+    req: _UserLoginRequest,
+    _: bool = Depends(require_hermes_quant_internal_key),
+):
+    """
+    用户登录，返回 JWT token（有效期 8 小时）。
+
+    登录成功后，将返回的 token 配置到 MCP headers 的 X-User-Token 字段，
+    之后即可使用 user_profile / user_watchlist_stocks 等个人化工具。
+
+    配置步骤：
+    1. 打开 .vscode/mcp.json（或 ~/.hermes/config.yaml）
+    2. 在 wukong-quant 的 headers 下添加 "X-User-Token": "<返回的 token>"
+    3. 重新加载 VS Code 窗口（Ctrl+Shift+P → Developer: Reload Window）
+    """
+    from auth import authenticate_user, create_access_token
+    user = authenticate_user(req.username, req.password)
+    if not user:
+        return {"success": False, "error": "用户名或密码错误"}
+    token = create_access_token(data={"sub": user["username"]})
+    return {
+        "success": True,
+        "username": user["username"],
+        "token": token,
+        "expires_in": "8h",
+        "next_step": (
+            "请将上面的 token 添加到 .vscode/mcp.json 的 wukong-quant.headers 中："
+            ' "X-User-Token": "<token>"，然后重载 VS Code 窗口。'
+            "之后即可调用 user_profile、user_watchlist_stocks、user_watchlist_add 等个人化工具。"
+        ),
+    }
+
+
+# ---------------------------------------------------------------------------
+# 用户账户信息
+# ---------------------------------------------------------------------------
+
+@router.get("/user/profile", operation_id="user_profile")
+async def user_profile(
+    user: dict = Depends(get_user_from_header_token),
+    _: bool = Depends(require_hermes_quant_internal_key),
+):
+    """
+    获取当前登录用户的账户基本信息（用户名、邮箱、服务等级、注册时间等）。
+
+    需要在 MCP headers 中设置 X-User-Token（通过 user_login 工具获取）。
+    """
+    return {
+        "success": True,
+        "username": user.get("username"),
+        "email": user.get("email"),
+        "full_name": user.get("full_name"),
+        "is_active": user.get("is_active", True),
+        "is_admin": user.get("is_admin", False),
+        "service_level": user.get("service_level", "free"),
+        "created_at": str(user.get("created_at", "")),
+        "last_login": str(user.get("last_login", "")),
+    }
+
+
+# ---------------------------------------------------------------------------
+# 用户自选股评分列表
+# ---------------------------------------------------------------------------
+
+@router.get("/user/watchlist", operation_id="user_watchlist_stocks")
+async def user_watchlist_stocks(
+    strategy: str = Query("balanced", description="评分策略：balanced / aggressive / conservative"),
+    user: dict = Depends(get_user_from_header_token),
+    _: bool = Depends(require_hermes_quant_internal_key),
+):
+    """
+    获取当前用户自选股列表，并附带每只股票最新量化评分（六维子分），按综合分降序排列。
+
+    需要在 MCP headers 中设置 X-User-Token（通过 user_login 工具获取）。
+    """
+    from utils.score_utils import safe_round
+    user_id = user["id"]
+    colls = get_db_collections()
+
+    doc = colls["user_watchlists"].find_one({"user_id": user_id})
+    symbols = doc.get("symbols", []) if doc else []
+    if not symbols:
+        return {
+            "success": True,
+            "username": user.get("username"),
+            "count": 0,
+            "watchlist": [],
+            "note": "自选股为空，可使用 user_watchlist_add 工具添加股票",
+        }
+
+    strat_map = {"aggressive": "aggressive", "conservative": "conservative"}
+    strat = strat_map.get(strategy, "balanced")
+
+    pipeline = [
+        {"$match": {"symbol": {"$in": symbols}}},
+        {"$sort": {"score_date": -1}},
+        {"$group": {"_id": "$symbol", "doc": {"$first": "$$ROOT"}}},
+        {"$replaceRoot": {"newRoot": "$doc"}},
+    ]
+    score_docs = list(colls["stock_scores"].aggregate(pipeline))
+    scores_by_symbol = {d["symbol"]: d for d in score_docs}
+
+    info_docs = list(colls["stock_info"].find(
+        {"symbol": {"$in": symbols}}, {"symbol": 1, "name": 1, "industry": 1}
+    ))
+    info_by_symbol = {d["symbol"]: d for d in info_docs}
+
+    result = []
+    for sym in symbols:
+        d = scores_by_symbol.get(sym, {})
+        info = info_by_symbol.get(sym, {})
+        cs = d.get("composite_score", 0)
+        score_val = cs.get(strat, cs.get("balanced", 0)) if isinstance(cs, dict) else cs
+        result.append({
+            "symbol": sym,
+            "name": info.get("name", ""),
+            "industry": info.get("industry", ""),
+            "score": safe_round(score_val, 2),
+            "score_date": d.get("score_date", ""),
+            "cycle_score": safe_round(d.get("cycle_score", 0), 2),
+            "value_score": safe_round(d.get("value_score", 0), 2),
+            "fundamental_score": safe_round(d.get("fundamental_score", 0), 2),
+            "growth_score": safe_round(d.get("growth_score", 0), 2),
+            "technical_score": safe_round(d.get("technical_score", 0), 2),
+            "money_flow_score": safe_round(d.get("money_flow_score", 0), 2),
+        })
+    result.sort(key=lambda x: x["score"] or 0, reverse=True)
+
+    return {
+        "success": True,
+        "username": user.get("username"),
+        "strategy": strat,
+        "count": len(result),
+        "watchlist": result,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 自选股添加 / 删除
+# ---------------------------------------------------------------------------
+
+class _WatchlistSymbolRequest(BaseModel):
+    symbol: str
+
+
+@router.post("/user/watchlist/add", operation_id="user_watchlist_add")
+async def user_watchlist_add(
+    req: _WatchlistSymbolRequest,
+    user: dict = Depends(get_user_from_header_token),
+    _: bool = Depends(require_hermes_quant_internal_key),
+):
+    """
+    将股票代码添加到当前用户自选股列表（幂等，重复添加不报错）。
+
+    需要在 MCP headers 中设置 X-User-Token（通过 user_login 工具获取）。
+    """
+    colls = get_db_collections()
+    colls["user_watchlists"].update_one(
+        {"user_id": user["id"]},
+        {"$addToSet": {"symbols": req.symbol}},
+        upsert=True,
+    )
+    return {"success": True, "symbol": req.symbol, "action": "added"}
+
+
+@router.delete("/user/watchlist/remove/{symbol}", operation_id="user_watchlist_remove")
+async def user_watchlist_remove(
+    symbol: str,
+    user: dict = Depends(get_user_from_header_token),
+    _: bool = Depends(require_hermes_quant_internal_key),
+):
+    """
+    从当前用户自选股列表中删除指定股票代码。
+
+    需要在 MCP headers 中设置 X-User-Token（通过 user_login 工具获取）。
+    """
+    colls = get_db_collections()
+    colls["user_watchlists"].update_one(
+        {"user_id": user["id"]},
+        {"$pull": {"symbols": symbol}},
+    )
+    return {"success": True, "symbol": symbol, "action": "removed"}
+
+
+# ---------------------------------------------------------------------------
+# 自选股历史分析记录
+# ---------------------------------------------------------------------------
+
+@router.get("/user/watchlist/history", operation_id="user_watchlist_history")
+async def user_watchlist_history(
+    symbol: Optional[str] = Query(None, description="可选：筛选指定股票的历史分析，不填则返回所有自选股历史"),
+    limit: int = Query(10, description="最多返回条数，默认 10，最大 50"),
+    user: dict = Depends(get_user_from_header_token),
+    _: bool = Depends(require_hermes_quant_internal_key),
+):
+    """
+    查询当前用户的历史深度分析记录（自选股分析历史）。
+
+    可通过 symbol 参数筛选单只股票，不指定则按时间倒序返回最近的分析记录。
+    需要在 MCP headers 中设置 X-User-Token（通过 user_login 工具获取）。
+    """
+    payload = build_user_analysis_history_payload(
+        user_id=user["id"],
+        symbol=symbol,
+        limit=min(limit, 50),
+    )
+    payload["username"] = user.get("username")
+    return payload

@@ -373,6 +373,41 @@ def require_hermes_quant_internal_key(
     return True
 
 
+def get_user_from_header_token(
+    x_user_token: Optional[str] = Header(None, alias="X-User-Token"),
+) -> dict:
+    """从 X-User-Token header 解码 JWT，返回用户 dict。
+
+    用于 hermes-tools 个人化端点（user_profile / user_watchlist 等）。
+    调用方需先通过 user_login 工具获取 token，并将其写入 MCP headers。
+    """
+    if not x_user_token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="需要登录。请先调用 user_login 工具获取 token，然后将 X-User-Token 添加到 MCP headers 中",
+        )
+    try:
+        payload = jwt.decode(x_user_token, SECRET_KEY, algorithms=[ALGORITHM])
+        username: str = payload.get("sub")
+        if not username:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Token 内容无效",
+            )
+    except jwt.PyJWTError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token 已过期或无效，请重新调用 user_login 工具登录",
+        )
+    user = get_user(username=username)
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="用户不存在",
+        )
+    return user
+
+
 async def get_current_admin_user(current_user: dict = Depends(get_current_active_user)):
     """获取当前管理员用户（验证管理员权限）"""
     if not current_user.get("is_admin", False):
