@@ -65,7 +65,7 @@ def _norm_task_status(raw: Any) -> str:
 # 连板天梯
 # ---------------------------------------------------------------------------
 
-@router.get("/ladder/daily", operation_id="hermes_ladder_daily")
+@router.get("/ladder/daily", operation_id="ladder_daily")
 async def hermes_ladder_daily(
     date: Optional[str] = Query(None, description="YYYYMMDD，默认今天"),
     _: bool = Depends(require_hermes_quant_internal_key),
@@ -86,7 +86,7 @@ class DeepAnalysisRequest(BaseModel):
     model: Optional[str] = None
 
 
-@router.post("/analysis/deep", operation_id="hermes_submit_deep_analysis")
+@router.post("/analysis/deep", operation_id="submit_deep")
 async def hermes_submit_deep_analysis(
     body: DeepAnalysisRequest,
     _: bool = Depends(require_hermes_quant_internal_key),
@@ -126,7 +126,7 @@ async def hermes_submit_deep_analysis(
     }
 
 
-@router.post("/analysis/deep-and-wait", operation_id="hermes_deep_analysis_wait")
+@router.post("/analysis/deep-and-wait", operation_id="deep_analysis")
 async def hermes_deep_analysis_wait(
     body: DeepAnalysisRequest,
     timeout: int = Query(180, ge=30, le=300, description="最长等待秒数，默认 180"),
@@ -203,7 +203,7 @@ async def hermes_deep_analysis_wait(
         }
 
 
-@router.get("/analysis/task/{task_id}", operation_id="hermes_get_task_status")
+@router.get("/analysis/task/{task_id}", operation_id="task_status")
 async def hermes_get_task_status(
     task_id: str,
     _: bool = Depends(require_hermes_quant_internal_key),
@@ -244,7 +244,7 @@ async def hermes_get_task_status(
     return resp
 
 
-@router.get("/analysis/history", operation_id="hermes_get_analysis_history")
+@router.get("/analysis/history", operation_id="analysis_history")
 async def hermes_get_analysis_history(
     symbol: str = Query(..., description="股票代码，例如 600519 或 600519.SH"),
     username: Optional[str] = Query(None, description="归属用户；留空则查 hermes-system"),
@@ -270,7 +270,7 @@ async def hermes_get_analysis_history(
 # 涨停全景叙事
 # ---------------------------------------------------------------------------
 
-@router.get("/ladder/narrative", operation_id="hermes_ladder_narrative")
+@router.get("/ladder/narrative", operation_id="ladder_narrative")
 async def hermes_ladder_narrative(
     date: Optional[str] = Query(None, description="交易日 YYYYMMDD，默认最新有数据的交易日"),
     _: bool = Depends(require_hermes_quant_internal_key),
@@ -310,7 +310,7 @@ async def hermes_ladder_narrative(
 # AI 大盘分析（市场总结）
 # ---------------------------------------------------------------------------
 
-@router.get("/market/summary", operation_id="hermes_market_summary")
+@router.get("/market/summary", operation_id="market_summary")
 async def hermes_market_summary(
     date: Optional[str] = Query(None, description="日期 YYYY-MM-DD，默认最新交易日"),
     _: bool = Depends(require_hermes_quant_internal_key),
@@ -336,7 +336,7 @@ async def hermes_market_summary(
 # 热股分析
 # ---------------------------------------------------------------------------
 
-@router.get("/market/hot-stock", operation_id="hermes_hot_stock")
+@router.get("/market/hot-stock", operation_id="hot_stock")
 async def hermes_hot_stock(
     source: str = Query("ths", description="数据源: ths（同花顺）或 dc（东方财富）"),
     _: bool = Depends(require_hermes_quant_internal_key),
@@ -374,7 +374,7 @@ async def hermes_hot_stock(
 # 全球市场简报
 # ---------------------------------------------------------------------------
 
-@router.get("/market/global", operation_id="hermes_global_market")
+@router.get("/market/global", operation_id="global_market")
 async def hermes_global_market(
     _: bool = Depends(require_hermes_quant_internal_key),
 ):
@@ -400,7 +400,7 @@ async def hermes_global_market(
 # 宏观 AI 分析
 # ---------------------------------------------------------------------------
 
-@router.get("/macro/analysis", operation_id="hermes_macro_analysis")
+@router.get("/macro/analysis", operation_id="macro_analysis")
 async def hermes_macro_analysis(
     scope: str = Query("china_macro", description="china_macro（中国宏观）或 us_macro（美国利率）"),
     _: bool = Depends(require_hermes_quant_internal_key),
@@ -432,7 +432,7 @@ async def hermes_macro_analysis(
 # 板块/概念 AI 分析
 # ---------------------------------------------------------------------------
 
-@router.get("/sector/latest", operation_id="hermes_sector_latest")
+@router.get("/sector/latest", operation_id="sector_latest")
 async def hermes_sector_latest(
     source: str = Query("dc", description="数据源: dc（东方财富，默认）或 ths（同花顺）"),
     _: bool = Depends(require_hermes_quant_internal_key),
@@ -467,7 +467,7 @@ async def hermes_sector_latest(
 # 财报猎手异动信号
 # ---------------------------------------------------------------------------
 
-@router.get("/earnings/signals", operation_id="hermes_earnings_signals")
+@router.get("/earnings/signals", operation_id="earnings_signals")
 async def hermes_earnings_signals(
     days: int = Query(7, ge=1, le=30, description="扫描最近 N 天的异动信号，默认 7 天"),
     _: bool = Depends(require_hermes_quant_internal_key),
