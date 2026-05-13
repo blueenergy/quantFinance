@@ -8,6 +8,7 @@ Hermes 容器内可调用的只读 quant-api 端点（共享密钥，无用户 J
   GET  /hermes-tools/ladder/narrative      — 涨停分析（LLM 叙事，盘后可用）
   GET  /hermes-tools/market/summary        — AI 大盘分析（市场总结）
   GET  /hermes-tools/market/global         — 全球市场简报
+  GET  /hermes-tools/market/hot-stock       — 热股分析（THS/DC 最新）
   POST /hermes-tools/analysis/deep         — 提交深度分析任务
   POST /hermes-tools/analysis/deep-and-wait — 提交并等待完成（推荐）
   GET  /hermes-tools/analysis/task/{id}    — 轮询任务状态
@@ -325,6 +326,44 @@ async def hermes_market_summary(
         "overall_trend", "key_stocks", "market_overview",
     ]
     return {k: result[k] for k in keys if k in result}
+
+
+# ---------------------------------------------------------------------------
+# 热股分析
+# ---------------------------------------------------------------------------
+
+@router.get("/market/hot-stock", operation_id="hermes_hot_stock")
+async def hermes_hot_stock(
+    source: str = Query("ths", description="数据源: ths（同花顺）或 dc（东方财富）"),
+    _: bool = Depends(require_hermes_quant_internal_key),
+):
+    """
+    获取最新热股分析结果（同花顺或东方财富热股榜 + AI 点评）。
+
+    数据由系统盘中自动更新，读取缓存，不触发 LLM。
+    参数 source: ths（默认）或 dc。
+    """
+    source = source.lower()
+    if source not in ("ths", "dc"):
+        return {"success": False, "error": "source 须为 ths 或 dc"}
+
+    doc = get_analyzer_db()["hot_stock_analysis"].find_one(
+        {"source": source}, sort=[("created_at", -1)]
+    )
+    if not doc:
+        return {"success": False, "error": f"暂无 {source.upper()} 热股分析数据"}
+
+    return {
+        "success": True,
+        "source": source,
+        "source_name": doc.get("source_name"),
+        "rank_time": doc.get("rank_time"),
+        "trade_date": doc.get("trade_date"),
+        "stock_count": doc.get("stock_count"),
+        "analysis": doc.get("analysis"),
+        "model": doc.get("model"),
+        "created_at": doc["created_at"].isoformat() if doc.get("created_at") else None,
+    }
 
 
 # ---------------------------------------------------------------------------
