@@ -18,6 +18,7 @@ Hermes 容器内可调用的只读 quant-api 端点（共享密钥，无用户 J
   POST /hermes-tools/analysis/deep-and-wait — 提交并等待完成（推荐）
   GET  /hermes-tools/analysis/task/{id}    — 轮询任务状态
   GET  /hermes-tools/analysis/history      — 查某股历史分析
+  GET  /hermes-tools/shenwan/pe-pb           — 申万行业指数月度 PE/PB 历史分位
 
   — 个人化端点（需先 user_login 获取 token 并设置 X-User-Token header）—
   POST /hermes-tools/user/login            — 用户登录，返回 JWT token
@@ -37,7 +38,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 
 from auth import get_user_from_header_token, require_hermes_quant_internal_key
-from db import db, get_analyzer_db, get_db_collections
+from db import data_db, db, get_analyzer_db, get_db_collections
 from models.analysis_task import AnalysisMode
 from routers.market import fetch_market_analysis_result
 from services.analysis_history import build_user_analysis_history_payload
@@ -901,3 +902,108 @@ async def user_watchlist_history(
     )
     payload["username"] = user.get("username")
     return payload
+
+
+# ---------------------------------------------------------------------------
+# 申万行业指数 PE/PB 历史分位
+# ---------------------------------------------------------------------------
+
+@router.get("/shenwan/pe-pb", operation_id="shenwan_index")
+async def shenwan_pe_pb(
+    ts_code: str = Query(..., description="申万行业指数 ts_code，如 801012.SI（采掘）、801010.SI（农林牧渔）"),
+    _: bool = Depends(require_hermes_quant_internal_key),
+):
+    """
+    查询申万行业指数月度 PE/PB 历史分位数，用于行业估值定价与安全边际判断。
+
+    - 返回最新月末 PE、PB 及其在 5 年 / 10 年 / 全历史区间内的百分位
+    - 百分位越低代表估值处于历史底部（越便宜），越高代表估值偏贵
+    - 数据来自 sw_monthly 预计算月线集合（需先回补申万行业月线数据）
+    - ts_code 示例：801012.SI（采掘）、801010.SI（农林牧渔）、801050.SI（有色金属）等
+    """
+    monthly_col = data_db["sw_monthly"]
+
+    rows = list(
+        monthly_col.find(
+            {"ts_code": ts_code.strip()},
+            {"_id": 0, "trade_date": 1, "pe": 1, "pb": 1},
+        ).sort("trade_date", 1)
+    )
+
+    if not rows:
+        return {
+            "success": False,
+            "ts_code": ts_code,
+            "error": (
+                f"未找到 {ts_code} 的月线数据，请检查 ts_code 是否正确（格式如 801012.SI），"
+                "或先执行申万行业月线回补任务"
+            ),
+        }
+
+    def _pct_rank(series: list, value: Optional[float]) -> Optional[float]:
+        if value is None:
+            return None
+        valid = [v for v in series if isinstance(v, (int, float)) and v == v]
+        if not valid:
+            return None
+        below = sum(1 for v in valid if v < value)
+        return round(below / len(valid) * 100, 1)
+
+    def _stats(series: list) -> dict:
+        valid = [v for v in series if isinstance(v, (int, float)) and v == v]
+        if not valid:
+            return {"min": None, "max": None, "mean": None, "count": 0}
+        mean_val = sum(valid) / len(valid)
+        return {
+            "min": round(min(valid), 2),
+            "max": round(max(valid), 2),
+            "mean": round(mean_val, 2),
+            "count": len(valid),
+        }
+
+    latest = rows[-1]
+    cur_pe = latest.get("pe")
+    cur_pb = latest.get("pb")
+    cur_date = str(latest.get("trade_date", ""))[:8]
+
+    all_pe = [r.get("pe") for r in rows]
+    all_pb = [r.get("pb") for r in rows]
+
+    # 5-year window: last 60 months
+    win5 = rows[-60:] if len(rows) >= 60 else rows
+    pe_5y = [r.get("pe") for r in win5]
+    pb_5y = [r.get("pb") for r in win5]
+
+    # 10-year window: last 120 months
+    win10 = rows[-120:] if len(rows) >= 120 else rows
+    pe_10y = [r.get("pe") for r in win10]
+    pb_10y = [r.get("pb") for r in win10]
+
+    return {
+        "success": True,
+        "ts_code": ts_code,
+        "latest_month": cur_date,
+        "current": {
+            "pe": round(cur_pe, 2) if isinstance(cur_pe, (int, float)) else None,
+            "pb": round(cur_pb, 2) if isinstance(cur_pb, (int, float)) else None,
+        },
+        "pe_percentile": {
+            "5y": _pct_rank(pe_5y, cur_pe),
+            "10y": _pct_rank(pe_10y, cur_pe),
+            "all": _pct_rank(all_pe, cur_pe),
+        },
+        "pb_percentile": {
+            "5y": _pct_rank(pb_5y, cur_pb),
+            "10y": _pct_rank(pb_10y, cur_pb),
+            "all": _pct_rank(all_pb, cur_pb),
+        },
+        "pe_stats": {
+            "5y": _stats(pe_5y),
+            "10y": _stats(pe_10y),
+        },
+        "pb_stats": {
+            "5y": _stats(pb_5y),
+            "10y": _stats(pb_10y),
+        },
+        "sample_months": len(rows),
+    }
