@@ -181,4 +181,4 @@ _mcp = FastApiMCP(
     ),
     headers=["x-hermes-quant-key"],  # 将此 header 转发给底层路由的 Depends 校验
 )
-_mcp.mount_http()  # 挂载在 /mcp
+_mcp.mount_http(mount_path="/api/mcp")  # 挂载在 /api/mcp
