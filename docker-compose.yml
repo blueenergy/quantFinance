@@ -30,6 +30,7 @@ services:
       - HERMES_CHAT_TEMPERATURE=${HERMES_CHAT_TEMPERATURE:-0.7}
       # Hermes -> quant-api internal tools (连板天梯等); must match hermes service
       - HERMES_QUANT_INTERNAL_KEY=${HERMES_QUANT_INTERNAL_KEY:-}
+    extra_hosts:
       - "host.docker.internal:host-gateway"
     networks:
       - quant-network

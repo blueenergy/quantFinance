@@ -38,16 +38,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends curl && \
 COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
 COPY --from=builder /usr/local/bin /usr/local/bin
 
-# Non-root user (must exist before COPY --chown)
-RUN groupadd -r appuser && useradd -r -g appuser appuser && \
-    mkdir -p /app/logs
+RUN mkdir -p /app/logs
 
 # Copy source code (this layer changes most often)
-COPY --chown=appuser:appuser . .
-
-RUN chown -R appuser:appuser /app
-
-USER appuser
+COPY . .
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD curl -f http://localhost:3001/health || exit 1

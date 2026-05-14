@@ -68,6 +68,10 @@ jobs:
                --restart unless-stopped \
                --add-host=host.docker.internal:host-gateway \
                -p 3001:3001 \
+               -e TZ=Asia/Shanghai \
+               --log-driver json-file \
+               --log-opt max-size=50m \
+               --log-opt max-file=3 \
                -v /home/deployuser/quantFinance/.env:/app/.env:ro \
                -v /home/deployuser/quantFinance/logs:/app/logs \
                crpi-gv3f6mfcrw75qane.cn-hangzhou.personal.cr.aliyuncs.com/wukongquant/quant-api:latest && \
