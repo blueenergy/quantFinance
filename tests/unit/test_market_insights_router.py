@@ -100,7 +100,7 @@ def test_focus_passes_trade_date_and_limit_to_engine(monkeypatch):
 
     assert res.status_code == 200
     assert res.json()["count"] == 1
-    assert captured == {"trade_date": "2026-05-15", "limit": 3}
+    assert captured == {"trade_date": "2026-05-15", "limit": 3, "user_id": "u1"}
 
 
 @pytest.mark.unit

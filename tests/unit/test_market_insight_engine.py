@@ -172,6 +172,62 @@ def test_get_market_insight_focus_prioritizes_high_value_events(monkeypatch):
 
 
 @pytest.mark.unit
+def test_get_market_insight_focus_boosts_user_relevant_sectors(monkeypatch):
+    finance = {
+        "market_insight_events": FakeCollection(
+            [
+                {
+                    "_id": "a",
+                    "trade_date": "20260515",
+                    "snapshot_time": "202605151030",
+                    "event_type": "SECTOR_DIFFUSION",
+                    "severity": "medium",
+                    "confidence": 76.0,
+                    "subject_type": "sector",
+                    "subject_code": "801011.SI",
+                    "subject_name": "银行",
+                    "title": "银行扩散",
+                    "summary": "银行上涨家数扩散。",
+                },
+                {
+                    "_id": "b",
+                    "trade_date": "20260515",
+                    "snapshot_time": "202605151030",
+                    "event_type": "SECTOR_DIFFUSION",
+                    "severity": "medium",
+                    "confidence": 78.0,
+                    "subject_type": "sector",
+                    "subject_code": "801012.SI",
+                    "subject_name": "地产",
+                    "title": "地产扩散",
+                    "summary": "地产上涨家数扩散。",
+                },
+            ]
+        ),
+        "trader_positions": FakeCollection(
+            [
+                {
+                    "user_id": "u1",
+                    "symbol": "600000.SH",
+                    "quantity": 100,
+                    "sw_l2_code": "801011.SI",
+                }
+            ]
+        ),
+        "intraday_t0_mock_positions": FakeCollection([]),
+        "user_watchlists": FakeCollection([]),
+    }
+    monkeypatch.setattr(engine, "get_db_collections", lambda: finance)
+
+    result = engine.get_market_insight_focus("2026-05-15", limit=2, user_id="u1")
+
+    assert result["data"][0]["subject_name"] == "银行"
+    assert result["data"][0]["relevance"]["matched"] is True
+    assert "命中真实持仓" in result["data"][0]["relevance"]["labels"]
+    assert result["data"][0]["score_breakdown"]["user_relevance_weight"] == 18.0
+
+
+@pytest.mark.unit
 def test_generate_market_insight_events_detects_breadth_and_sector_diffusion(monkeypatch):
     realtime = {
         "market_spectrum_realtime_daily": FakeCollection(

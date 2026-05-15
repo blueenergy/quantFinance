@@ -52,9 +52,9 @@ def event_types(
 def focus(
     trade_date: Optional[str] = Query(None, description="YYYYMMDD or YYYY-MM-DD"),
     limit: int = Query(5, ge=1, le=10),
-    current_user: dict = Depends(get_current_active_user),  # noqa: ARG001
+    current_user: dict = Depends(get_current_active_user),
 ):
-    return get_market_insight_focus(trade_date=trade_date, limit=limit)
+    return get_market_insight_focus(trade_date=trade_date, limit=limit, user_id=str(current_user["id"]))
 
 
 @router.get("/events")

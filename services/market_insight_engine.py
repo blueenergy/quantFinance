@@ -8,6 +8,7 @@ from pymongo import ASCENDING, DESCENDING
 
 from db import get_data_db, get_db_collections
 from utils.stock_utils import serialize_doc
+from utils.symbol_utils import normalize_symbol
 
 
 EVENT_TYPES = {
@@ -108,6 +109,12 @@ EVENT_ATTENTION_WEIGHTS = {
 }
 
 SEVERITY_ATTENTION_WEIGHTS = {"high": 12.0, "medium": 6.0, "low": 2.0}
+RELEVANCE_SOURCE_WEIGHTS = {"real_position": 18.0, "mock_position": 14.0, "watchlist": 10.0}
+RELEVANCE_SOURCE_LABELS = {
+    "real_position": "命中真实持仓",
+    "mock_position": "命中T+0模拟仓",
+    "watchlist": "命中自选股",
+}
 
 
 def get_event_type_metadata() -> Dict[str, Dict[str, Any]]:
@@ -650,16 +657,21 @@ def list_market_insight_events(
     return [serialize_doc(doc) for doc in cursor]
 
 
-def get_market_insight_focus(trade_date: Optional[str] = None, limit: int = 5) -> Dict[str, Any]:
+def get_market_insight_focus(
+    trade_date: Optional[str] = None,
+    limit: int = 5,
+    user_id: Optional[str] = None,
+) -> Dict[str, Any]:
     td = _compact_trade_date(trade_date)
     rows = list_market_insight_events(trade_date=td, limit=200)
     if not rows:
         return {"success": True, "trade_date": td, "count": 0, "data": []}
 
     latest_snapshot = max(str(row.get("snapshot_time") or "") for row in rows)
+    relevance_context = _build_user_relevance_context(user_id)
     by_subject: Dict[str, Dict[str, Any]] = {}
     for row in rows:
-        focus = _build_focus_item(row, latest_snapshot)
+        focus = _build_focus_item(row, latest_snapshot, relevance_context)
         key = _focus_subject_key(row)
         current = by_subject.get(key)
         if not current or focus["attention_score"] > current["attention_score"]:
@@ -686,7 +698,11 @@ def _focus_subject_key(event: Dict[str, Any]) -> str:
     return f"{subject_type}:{subject_code}"
 
 
-def _build_focus_item(event: Dict[str, Any], latest_snapshot: str) -> Dict[str, Any]:
+def _build_focus_item(
+    event: Dict[str, Any],
+    latest_snapshot: str,
+    relevance_context: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     event_type = str(event.get("event_type") or "")
     confidence = _num(event.get("confidence"), 0.0) or 0.0
     severity = str(event.get("severity") or "")
@@ -694,7 +710,12 @@ def _build_focus_item(event: Dict[str, Any], latest_snapshot: str) -> Dict[str, 
     severity_weight = SEVERITY_ATTENTION_WEIGHTS.get(severity, 0.0)
     recency_weight = _recency_attention_weight(str(event.get("snapshot_time") or ""), latest_snapshot)
     subject_weight = 4.0 if event.get("subject_type") == "sector" else 2.0
-    attention_score = min(100.0, confidence * 0.55 + type_weight + severity_weight + recency_weight + subject_weight)
+    relevance = _event_user_relevance(event, relevance_context or {})
+    relevance_weight = _num(relevance.get("score"), 0.0) or 0.0
+    attention_score = min(
+        100.0,
+        confidence * 0.55 + type_weight + severity_weight + recency_weight + subject_weight + relevance_weight,
+    )
     metadata = EVENT_TYPE_METADATA.get(event_type, {})
     return {
         "attention_score": round(attention_score, 1),
@@ -711,7 +732,9 @@ def _build_focus_item(event: Dict[str, Any], latest_snapshot: str) -> Dict[str, 
             "severity_weight": severity_weight,
             "recency_weight": recency_weight,
             "subject_weight": subject_weight,
+            "user_relevance_weight": relevance_weight,
         },
+        "relevance": relevance,
         "related_event_count": 1,
         "related_event_types": [event_type],
         "primary_event": event,
@@ -744,6 +767,84 @@ def _focus_next_action(event: Dict[str, Any], metadata: Dict[str, Any]) -> str:
     if watch:
         return str(watch[0])
     return "点开证据链，确认支持证据和反向证据是否匹配。"
+
+
+def _build_user_relevance_context(user_id: Optional[str]) -> Dict[str, Any]:
+    if not user_id:
+        return {"symbol_sources": {}, "sector_sources": {}}
+    collections = get_db_collections()
+    context: Dict[str, Any] = {"symbol_sources": {}, "sector_sources": {}}
+    for doc in collections["trader_positions"].find({"user_id": user_id}):
+        quantity = _num(doc.get("quantity", doc.get("qty", doc.get("volume", 0))), 0.0) or 0.0
+        if quantity <= 0:
+            continue
+        _register_relevance_doc(context, doc, "real_position")
+    for doc in collections["intraday_t0_mock_positions"].find({"user_id": user_id}):
+        if doc.get("enabled", True) is False:
+            continue
+        _register_relevance_doc(context, doc, "mock_position")
+    watch_doc = collections["user_watchlists"].find_one({"user_id": user_id}) or {}
+    for symbol in watch_doc.get("symbols", []):
+        _register_relevance_doc(context, {"symbol": symbol}, "watchlist")
+    return context
+
+
+def _register_relevance_doc(context: Dict[str, Any], doc: Dict[str, Any], source: str) -> None:
+    symbol = normalize_symbol(str(doc.get("symbol") or doc.get("ts_code") or ""))
+    industry = _industry_from_doc(doc)
+    if symbol:
+        context["symbol_sources"].setdefault(symbol, set()).add(source)
+        if not any(industry.values()):
+            industry = _lookup_sw_industry(symbol)
+    for code in industry.values():
+        if code:
+            context["sector_sources"].setdefault(code, set()).add(source)
+
+
+def _industry_from_doc(doc: Dict[str, Any]) -> Dict[str, str]:
+    return {
+        "L1": str(doc.get("sw_l1_code") or doc.get("l1_code") or ""),
+        "L2": str(doc.get("sw_l2_code") or doc.get("l2_code") or ""),
+        "L3": str(doc.get("sw_l3_code") or doc.get("l3_code") or ""),
+    }
+
+
+def _lookup_sw_industry(symbol: str) -> Dict[str, str]:
+    member = get_data_db()["sw_index_member"]
+    projection = {"_id": 0, "l1_code": 1, "l2_code": 1, "l3_code": 1}
+    for candidate in _symbol_candidates(symbol):
+        doc = member.find_one({"con_code": candidate, "src": "SW2021", "is_new": "Y"}, projection)
+        if doc:
+            return {
+                "L1": str(doc.get("l1_code") or ""),
+                "L2": str(doc.get("l2_code") or ""),
+                "L3": str(doc.get("l3_code") or ""),
+            }
+    return {}
+
+
+def _symbol_candidates(symbol: str) -> List[str]:
+    normalized = normalize_symbol(symbol)
+    bare = normalized.split(".")[0] if normalized else str(symbol or "").strip()
+    candidates = [normalized, bare, str(symbol or "").strip().upper()]
+    return list(dict.fromkeys([candidate for candidate in candidates if candidate]))
+
+
+def _event_user_relevance(event: Dict[str, Any], context: Dict[str, Any]) -> Dict[str, Any]:
+    subject_type = str(event.get("subject_type") or "")
+    subject_code = str(event.get("subject_code") or "")
+    sources = set()
+    if subject_type == "sector" and subject_code:
+        sources.update(context.get("sector_sources", {}).get(subject_code, set()))
+    elif subject_type == "stock" and subject_code:
+        sources.update(context.get("symbol_sources", {}).get(normalize_symbol(subject_code), set()))
+    score = max([RELEVANCE_SOURCE_WEIGHTS.get(source, 0.0) for source in sources] or [0.0])
+    labels = [RELEVANCE_SOURCE_LABELS[source] for source in sorted(sources) if source in RELEVANCE_SOURCE_LABELS]
+    return {
+        "score": score,
+        "labels": labels,
+        "matched": bool(labels),
+    }
 
 
 def get_sector_strength(level: str = "L2", trade_date: Optional[str] = None, window: int = 30, limit: int = 50) -> Dict[str, Any]:
