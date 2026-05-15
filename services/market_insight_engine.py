@@ -115,6 +115,13 @@ RELEVANCE_SOURCE_LABELS = {
     "mock_position": "命中T+0模拟仓",
     "watchlist": "命中自选股",
 }
+FOCUS_FEEDBACK_ACTIONS = {"valuable", "ignore", "false_positive"}
+FOCUS_FEEDBACK_LABELS = {
+    "valuable": "有价值",
+    "ignore": "忽略",
+    "false_positive": "误报",
+}
+FOCUS_FEEDBACK_WEIGHTS = {"valuable": 8.0, "ignore": -12.0, "false_positive": -18.0}
 
 
 def get_event_type_metadata() -> Dict[str, Dict[str, Any]]:
@@ -669,9 +676,10 @@ def get_market_insight_focus(
 
     latest_snapshot = max(str(row.get("snapshot_time") or "") for row in rows)
     relevance_context = _build_user_relevance_context(user_id)
+    feedback_context = _build_focus_feedback_context(user_id, td)
     by_subject: Dict[str, Dict[str, Any]] = {}
     for row in rows:
-        focus = _build_focus_item(row, latest_snapshot, relevance_context)
+        focus = _build_focus_item(row, latest_snapshot, relevance_context, feedback_context)
         key = _focus_subject_key(row)
         current = by_subject.get(key)
         if not current or focus["attention_score"] > current["attention_score"]:
@@ -702,6 +710,7 @@ def _build_focus_item(
     event: Dict[str, Any],
     latest_snapshot: str,
     relevance_context: Optional[Dict[str, Any]] = None,
+    feedback_context: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     event_type = str(event.get("event_type") or "")
     confidence = _num(event.get("confidence"), 0.0) or 0.0
@@ -712,12 +721,25 @@ def _build_focus_item(
     subject_weight = 4.0 if event.get("subject_type") == "sector" else 2.0
     relevance = _event_user_relevance(event, relevance_context or {})
     relevance_weight = _num(relevance.get("score"), 0.0) or 0.0
+    focus_key = _focus_event_key(event)
+    feedback = _focus_feedback_for_key(focus_key, feedback_context or {})
+    feedback_weight = FOCUS_FEEDBACK_WEIGHTS.get(str(feedback.get("action") or ""), 0.0)
     attention_score = min(
         100.0,
-        confidence * 0.55 + type_weight + severity_weight + recency_weight + subject_weight + relevance_weight,
+        max(
+            0.0,
+            confidence * 0.55
+            + type_weight
+            + severity_weight
+            + recency_weight
+            + subject_weight
+            + relevance_weight
+            + feedback_weight,
+        ),
     )
     metadata = EVENT_TYPE_METADATA.get(event_type, {})
     return {
+        "focus_key": focus_key,
         "attention_score": round(attention_score, 1),
         "subject_name": event.get("subject_name") or "全市场",
         "event_label": metadata.get("label") or event_type,
@@ -733,8 +755,10 @@ def _build_focus_item(
             "recency_weight": recency_weight,
             "subject_weight": subject_weight,
             "user_relevance_weight": relevance_weight,
+            "feedback_weight": feedback_weight,
         },
         "relevance": relevance,
+        "feedback": feedback,
         "related_event_count": 1,
         "related_event_types": [event_type],
         "primary_event": event,
@@ -767,6 +791,73 @@ def _focus_next_action(event: Dict[str, Any], metadata: Dict[str, Any]) -> str:
     if watch:
         return str(watch[0])
     return "点开证据链，确认支持证据和反向证据是否匹配。"
+
+
+def _focus_event_key(event: Dict[str, Any]) -> str:
+    return "|".join(
+        [
+            str(event.get("trade_date") or ""),
+            str(event.get("snapshot_time") or ""),
+            str(event.get("event_type") or ""),
+            str(event.get("subject_type") or ""),
+            str(event.get("subject_code") or event.get("subject_name") or ""),
+        ]
+    )
+
+
+def _build_focus_feedback_context(user_id: Optional[str], trade_date: str) -> Dict[str, Dict[str, Any]]:
+    if not user_id:
+        return {}
+    cursor = get_db_collections()["market_insight_focus_feedback"].find({"user_id": user_id, "trade_date": trade_date})
+    return {str(doc.get("focus_key") or ""): _serialize_focus_feedback(doc) for doc in cursor if doc.get("focus_key")}
+
+
+def _focus_feedback_for_key(focus_key: str, feedback_context: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+    feedback = feedback_context.get(focus_key) or {}
+    if not feedback:
+        return {"action": None, "label": "", "note": "", "updated_at": None}
+    return feedback
+
+
+def _serialize_focus_feedback(doc: Dict[str, Any]) -> Dict[str, Any]:
+    action = str(doc.get("action") or "")
+    return {
+        "action": action,
+        "label": FOCUS_FEEDBACK_LABELS.get(action, ""),
+        "note": doc.get("note") or "",
+        "updated_at": doc.get("updated_at"),
+    }
+
+
+def save_market_insight_focus_feedback(
+    *,
+    user_id: str,
+    focus_key: str,
+    action: str,
+    trade_date: Optional[str] = None,
+    note: Optional[str] = None,
+) -> Dict[str, Any]:
+    if action not in FOCUS_FEEDBACK_ACTIONS:
+        raise ValueError("unsupported feedback action")
+    td = _compact_trade_date(trade_date) if trade_date else str(focus_key).split("|", 1)[0]
+    now = time.time()
+    doc = {
+        "user_id": user_id,
+        "trade_date": td,
+        "focus_key": focus_key,
+        "action": action,
+        "note": note or "",
+        "updated_at": now,
+    }
+    coll = get_db_collections()["market_insight_focus_feedback"]
+    coll.update_one(
+        {"user_id": user_id, "focus_key": focus_key},
+        {"$set": doc, "$setOnInsert": {"created_at": now}},
+        upsert=True,
+    )
+    coll.create_index([("user_id", ASCENDING), ("trade_date", DESCENDING)], name="user_trade_date_idx", background=True)
+    coll.create_index([("user_id", ASCENDING), ("focus_key", ASCENDING)], unique=True, name="user_focus_unique", background=True)
+    return {"success": True, "data": _serialize_focus_feedback(doc)}
 
 
 def _build_user_relevance_context(user_id: Optional[str]) -> Dict[str, Any]:

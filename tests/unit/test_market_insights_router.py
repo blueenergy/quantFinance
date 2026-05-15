@@ -104,6 +104,53 @@ def test_focus_passes_trade_date_and_limit_to_engine(monkeypatch):
 
 
 @pytest.mark.unit
+def test_focus_feedback_passes_payload_to_engine(monkeypatch):
+    captured = {}
+
+    def fake_save(**kwargs):
+        captured.update(kwargs)
+        return {"success": True, "data": {"action": kwargs["action"], "label": "有价值"}}
+
+    monkeypatch.setattr(market_insights, "save_market_insight_focus_feedback", fake_save)
+
+    res = _client().post(
+        "/api/market-insights/focus/feedback",
+        json={
+            "focus_key": "20260515|202605151030|SECTOR_DIFFUSION|sector|801011.SI",
+            "trade_date": "20260515",
+            "action": "valuable",
+            "note": "值得看",
+        },
+    )
+
+    assert res.status_code == 200
+    assert res.json()["data"]["label"] == "有价值"
+    assert captured == {
+        "user_id": "u1",
+        "focus_key": "20260515|202605151030|SECTOR_DIFFUSION|sector|801011.SI",
+        "trade_date": "20260515",
+        "action": "valuable",
+        "note": "值得看",
+    }
+
+
+@pytest.mark.unit
+def test_focus_feedback_rejects_unknown_action(monkeypatch):
+    def fake_save(**kwargs):
+        raise ValueError("unsupported feedback action")
+
+    monkeypatch.setattr(market_insights, "save_market_insight_focus_feedback", fake_save)
+
+    res = _client().post(
+        "/api/market-insights/focus/feedback",
+        json={"focus_key": "key", "action": "bad"},
+    )
+
+    assert res.status_code == 400
+    assert res.json()["detail"] == "unsupported feedback action"
+
+
+@pytest.mark.unit
 def test_events_passes_filter_params_to_engine(monkeypatch):
     captured = {}
 

@@ -216,6 +216,7 @@ def test_get_market_insight_focus_boosts_user_relevant_sectors(monkeypatch):
         ),
         "intraday_t0_mock_positions": FakeCollection([]),
         "user_watchlists": FakeCollection([]),
+        "market_insight_focus_feedback": FakeCollection([]),
     }
     monkeypatch.setattr(engine, "get_db_collections", lambda: finance)
 
@@ -225,6 +226,76 @@ def test_get_market_insight_focus_boosts_user_relevant_sectors(monkeypatch):
     assert result["data"][0]["relevance"]["matched"] is True
     assert "命中真实持仓" in result["data"][0]["relevance"]["labels"]
     assert result["data"][0]["score_breakdown"]["user_relevance_weight"] == 18.0
+
+
+@pytest.mark.unit
+def test_get_market_insight_focus_includes_existing_feedback(monkeypatch):
+    focus_key = "20260515|202605151030|SECTOR_DIFFUSION|sector|801011.SI"
+    finance = {
+        "market_insight_events": FakeCollection(
+            [
+                {
+                    "_id": "a",
+                    "trade_date": "20260515",
+                    "snapshot_time": "202605151030",
+                    "event_type": "SECTOR_DIFFUSION",
+                    "severity": "medium",
+                    "confidence": 76.0,
+                    "subject_type": "sector",
+                    "subject_code": "801011.SI",
+                    "subject_name": "银行",
+                    "title": "银行扩散",
+                    "summary": "银行上涨家数扩散。",
+                },
+            ]
+        ),
+        "trader_positions": FakeCollection([]),
+        "intraday_t0_mock_positions": FakeCollection([]),
+        "user_watchlists": FakeCollection([]),
+        "market_insight_focus_feedback": FakeCollection(
+            [
+                {
+                    "user_id": "u1",
+                    "trade_date": "20260515",
+                    "focus_key": focus_key,
+                    "action": "ignore",
+                    "note": "暂不关注",
+                    "updated_at": 123.0,
+                }
+            ]
+        ),
+    }
+    monkeypatch.setattr(engine, "get_db_collections", lambda: finance)
+
+    result = engine.get_market_insight_focus("2026-05-15", limit=1, user_id="u1")
+
+    assert result["data"][0]["focus_key"] == focus_key
+    assert result["data"][0]["feedback"]["action"] == "ignore"
+    assert result["data"][0]["feedback"]["label"] == "忽略"
+    assert result["data"][0]["score_breakdown"]["feedback_weight"] == -12.0
+
+
+@pytest.mark.unit
+def test_save_market_insight_focus_feedback_upserts(monkeypatch):
+    feedback = FakeCollection([])
+    finance = {"market_insight_focus_feedback": feedback}
+    monkeypatch.setattr(engine, "get_db_collections", lambda: finance)
+
+    result = engine.save_market_insight_focus_feedback(
+        user_id="u1",
+        focus_key="20260515|202605151030|SECTOR_DIFFUSION|sector|801011.SI",
+        action="valuable",
+        note="值得复盘",
+    )
+
+    assert result["success"] is True
+    assert result["data"]["action"] == "valuable"
+    assert result["data"]["label"] == "有价值"
+    query, update, upsert = feedback.upserts[0]
+    assert query["user_id"] == "u1"
+    assert update["$set"]["trade_date"] == "20260515"
+    assert update["$set"]["note"] == "值得复盘"
+    assert upsert is True
 
 
 @pytest.mark.unit

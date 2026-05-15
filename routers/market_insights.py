@@ -18,6 +18,7 @@ from services.market_insight_engine import (
     get_sector_strength,
     get_sector_strength_series,
     list_market_insight_events,
+    save_market_insight_focus_feedback,
 )
 from utils.stock_utils import serialize_doc
 
@@ -30,6 +31,13 @@ class GenerateInsightPayload(BaseModel):
     snapshot_time: Optional[str] = None
     source: str = "auto"
     sync_status: Optional[str] = None
+
+
+class FocusFeedbackPayload(BaseModel):
+    focus_key: str
+    action: str
+    trade_date: Optional[str] = None
+    note: Optional[str] = None
 
 
 @router.get("/overview")
@@ -55,6 +63,23 @@ def focus(
     current_user: dict = Depends(get_current_active_user),
 ):
     return get_market_insight_focus(trade_date=trade_date, limit=limit, user_id=str(current_user["id"]))
+
+
+@router.post("/focus/feedback")
+def focus_feedback(
+    payload: FocusFeedbackPayload,
+    current_user: dict = Depends(get_current_active_user),
+):
+    try:
+        return save_market_insight_focus_feedback(
+            user_id=str(current_user["id"]),
+            focus_key=payload.focus_key,
+            action=payload.action,
+            trade_date=payload.trade_date,
+            note=payload.note,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
 
 @router.get("/events")
