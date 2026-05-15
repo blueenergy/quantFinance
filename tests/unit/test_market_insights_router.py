@@ -151,6 +151,26 @@ def test_focus_feedback_rejects_unknown_action(monkeypatch):
 
 
 @pytest.mark.unit
+def test_focus_review_passes_params_to_engine(monkeypatch):
+    captured = {}
+
+    def fake_review(**kwargs):
+        captured.update(kwargs)
+        return {"success": True, "trade_date": kwargs["trade_date"], "written": 2, "data": []}
+
+    monkeypatch.setattr(market_insights, "review_market_insight_focus", fake_review)
+
+    res = _client().post(
+        "/api/market-insights/focus/review",
+        params={"trade_date": "2026-05-15", "horizon_minutes": 60},
+    )
+
+    assert res.status_code == 200
+    assert res.json()["written"] == 2
+    assert captured == {"trade_date": "2026-05-15", "horizon_minutes": 60}
+
+
+@pytest.mark.unit
 def test_events_passes_filter_params_to_engine(monkeypatch):
     captured = {}
 

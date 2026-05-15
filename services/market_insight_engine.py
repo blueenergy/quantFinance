@@ -122,6 +122,12 @@ FOCUS_FEEDBACK_LABELS = {
     "false_positive": "误报",
 }
 FOCUS_FEEDBACK_WEIGHTS = {"valuable": 8.0, "ignore": -12.0, "false_positive": -18.0}
+FOCUS_REVIEW_LABELS = {
+    "confirmed": "已验证",
+    "faded": "反证",
+    "unconfirmed": "未验证",
+    "insufficient_data": "待观察",
+}
 
 
 def get_event_type_metadata() -> Dict[str, Dict[str, Any]]:
@@ -163,6 +169,14 @@ def _snapshot_minus(snapshot_time: str, minutes: int) -> str:
     except ValueError:
         return str(snapshot_time)
     return (dt - timedelta(minutes=minutes)).strftime("%Y%m%d%H%M")
+
+
+def _snapshot_plus(snapshot_time: str, minutes: int) -> str:
+    try:
+        dt = datetime.strptime(str(snapshot_time), "%Y%m%d%H%M")
+    except ValueError:
+        return str(snapshot_time)
+    return (dt + timedelta(minutes=minutes)).strftime("%Y%m%d%H%M")
 
 
 def _latest_spectrum(trade_date: str) -> Dict[str, Any]:
@@ -677,9 +691,10 @@ def get_market_insight_focus(
     latest_snapshot = max(str(row.get("snapshot_time") or "") for row in rows)
     relevance_context = _build_user_relevance_context(user_id)
     feedback_context = _build_focus_feedback_context(user_id, td)
+    review_context = _build_focus_review_context(td)
     by_subject: Dict[str, Dict[str, Any]] = {}
     for row in rows:
-        focus = _build_focus_item(row, latest_snapshot, relevance_context, feedback_context)
+        focus = _build_focus_item(row, latest_snapshot, relevance_context, feedback_context, review_context)
         key = _focus_subject_key(row)
         current = by_subject.get(key)
         if not current or focus["attention_score"] > current["attention_score"]:
@@ -711,6 +726,7 @@ def _build_focus_item(
     latest_snapshot: str,
     relevance_context: Optional[Dict[str, Any]] = None,
     feedback_context: Optional[Dict[str, Any]] = None,
+    review_context: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     event_type = str(event.get("event_type") or "")
     confidence = _num(event.get("confidence"), 0.0) or 0.0
@@ -723,6 +739,7 @@ def _build_focus_item(
     relevance_weight = _num(relevance.get("score"), 0.0) or 0.0
     focus_key = _focus_event_key(event)
     feedback = _focus_feedback_for_key(focus_key, feedback_context or {})
+    review = _focus_review_for_key(focus_key, review_context or {})
     feedback_weight = FOCUS_FEEDBACK_WEIGHTS.get(str(feedback.get("action") or ""), 0.0)
     attention_score = min(
         100.0,
@@ -759,6 +776,7 @@ def _build_focus_item(
         },
         "relevance": relevance,
         "feedback": feedback,
+        "review": review,
         "related_event_count": 1,
         "related_event_types": [event_type],
         "primary_event": event,
@@ -808,8 +826,19 @@ def _focus_event_key(event: Dict[str, Any]) -> str:
 def _build_focus_feedback_context(user_id: Optional[str], trade_date: str) -> Dict[str, Dict[str, Any]]:
     if not user_id:
         return {}
-    cursor = get_db_collections()["market_insight_focus_feedback"].find({"user_id": user_id, "trade_date": trade_date})
+    coll = get_db_collections().get("market_insight_focus_feedback")
+    if coll is None:
+        return {}
+    cursor = coll.find({"user_id": user_id, "trade_date": trade_date})
     return {str(doc.get("focus_key") or ""): _serialize_focus_feedback(doc) for doc in cursor if doc.get("focus_key")}
+
+
+def _build_focus_review_context(trade_date: str) -> Dict[str, Dict[str, Any]]:
+    coll = get_db_collections().get("market_insight_focus_reviews")
+    if coll is None:
+        return {}
+    cursor = coll.find({"trade_date": trade_date})
+    return {str(doc.get("focus_key") or ""): _serialize_focus_review(doc) for doc in cursor if doc.get("focus_key")}
 
 
 def _focus_feedback_for_key(focus_key: str, feedback_context: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
@@ -819,6 +848,13 @@ def _focus_feedback_for_key(focus_key: str, feedback_context: Dict[str, Dict[str
     return feedback
 
 
+def _focus_review_for_key(focus_key: str, review_context: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+    review = review_context.get(focus_key) or {}
+    if not review:
+        return {"status": None, "label": "", "summary": "", "checked_at": None}
+    return review
+
+
 def _serialize_focus_feedback(doc: Dict[str, Any]) -> Dict[str, Any]:
     action = str(doc.get("action") or "")
     return {
@@ -826,6 +862,17 @@ def _serialize_focus_feedback(doc: Dict[str, Any]) -> Dict[str, Any]:
         "label": FOCUS_FEEDBACK_LABELS.get(action, ""),
         "note": doc.get("note") or "",
         "updated_at": doc.get("updated_at"),
+    }
+
+
+def _serialize_focus_review(doc: Dict[str, Any]) -> Dict[str, Any]:
+    status = str(doc.get("status") or "")
+    return {
+        "status": status,
+        "label": FOCUS_REVIEW_LABELS.get(status, ""),
+        "summary": doc.get("summary") or "",
+        "metrics": doc.get("metrics") or {},
+        "checked_at": doc.get("checked_at"),
     }
 
 
@@ -858,6 +905,136 @@ def save_market_insight_focus_feedback(
     coll.create_index([("user_id", ASCENDING), ("trade_date", DESCENDING)], name="user_trade_date_idx", background=True)
     coll.create_index([("user_id", ASCENDING), ("focus_key", ASCENDING)], unique=True, name="user_focus_unique", background=True)
     return {"success": True, "data": _serialize_focus_feedback(doc)}
+
+
+def review_market_insight_focus(trade_date: Optional[str] = None, horizon_minutes: int = 60) -> Dict[str, Any]:
+    td = _compact_trade_date(trade_date)
+    rows = list_market_insight_events(trade_date=td, limit=500)
+    reviews = []
+    for event in rows:
+        if event.get("subject_type") != "sector":
+            continue
+        review = _review_sector_focus_event(event, horizon_minutes)
+        reviews.append(review)
+    written = _upsert_focus_reviews(reviews)
+    return {"success": True, "trade_date": td, "horizon_minutes": horizon_minutes, "written": written, "data": reviews}
+
+
+def _review_sector_focus_event(event: Dict[str, Any], horizon_minutes: int) -> Dict[str, Any]:
+    focus_key = _focus_event_key(event)
+    trade_date = str(event.get("trade_date") or "")
+    snapshot_time = str(event.get("snapshot_time") or "")
+    level = str(event.get("level") or "")
+    sector_code = str(event.get("subject_code") or "")
+    baseline = _num((event.get("evidence") or {}).get("positive_ratio_now"))
+    if not all([trade_date, snapshot_time, level, sector_code]) or baseline is None:
+        return _focus_review_doc(
+            event,
+            focus_key,
+            "insufficient_data",
+            "缺少板块级别、代码或基准上涨比例，暂无法验证。",
+            horizon_minutes,
+            {},
+        )
+
+    end_time = _snapshot_plus(snapshot_time, horizon_minutes)
+    rows = list(
+        get_data_db()["realtime_sector_strength"]
+        .find(
+            {
+                "trade_date": trade_date,
+                "level": level,
+                "sector_code": sector_code,
+                "snapshot_time": {"$gt": snapshot_time, "$lte": end_time},
+            },
+            {"_id": 0},
+        )
+        .sort("snapshot_time", ASCENDING)
+    )
+    if not rows:
+        return _focus_review_doc(
+            event,
+            focus_key,
+            "insufficient_data",
+            "后续窗口内没有足够的板块快照，暂不判断。",
+            horizon_minutes,
+            {"baseline_positive_ratio": baseline, "sample_count": 0},
+        )
+
+    values = [_num(row.get("positive_ratio")) for row in rows]
+    values = [value for value in values if value is not None]
+    if not values:
+        return _focus_review_doc(
+            event,
+            focus_key,
+            "insufficient_data",
+            "后续快照缺少上涨比例，暂不判断。",
+            horizon_minutes,
+            {"baseline_positive_ratio": baseline, "sample_count": len(rows)},
+        )
+    latest = values[-1]
+    peak = max(values)
+    trough = min(values)
+    delta_latest = latest - baseline
+    delta_peak = peak - baseline
+    metrics = {
+        "baseline_positive_ratio": baseline,
+        "latest_positive_ratio": latest,
+        "peak_positive_ratio": peak,
+        "trough_positive_ratio": trough,
+        "delta_latest": delta_latest,
+        "delta_peak": delta_peak,
+        "sample_count": len(values),
+        "first_snapshot_time": rows[0].get("snapshot_time"),
+        "last_snapshot_time": rows[-1].get("snapshot_time"),
+    }
+    if delta_peak >= 0.08 or delta_latest >= 0.05:
+        status = "confirmed"
+        summary = f"后续 {horizon_minutes} 分钟内上涨比例最高提升至 {peak:.1%}，焦点得到验证。"
+    elif delta_latest <= -0.08 or trough <= baseline - 0.10:
+        status = "faded"
+        summary = f"后续 {horizon_minutes} 分钟内上涨比例回落至 {latest:.1%}，焦点被反证。"
+    else:
+        status = "unconfirmed"
+        summary = f"后续 {horizon_minutes} 分钟内上涨比例变化有限，暂未验证。"
+    return _focus_review_doc(event, focus_key, status, summary, horizon_minutes, metrics)
+
+
+def _focus_review_doc(
+    event: Dict[str, Any],
+    focus_key: str,
+    status: str,
+    summary: str,
+    horizon_minutes: int,
+    metrics: Dict[str, Any],
+) -> Dict[str, Any]:
+    now = time.time()
+    return {
+        "focus_key": focus_key,
+        "trade_date": event.get("trade_date"),
+        "snapshot_time": event.get("snapshot_time"),
+        "event_type": event.get("event_type"),
+        "subject_type": event.get("subject_type"),
+        "subject_code": event.get("subject_code"),
+        "subject_name": event.get("subject_name"),
+        "status": status,
+        "label": FOCUS_REVIEW_LABELS.get(status, ""),
+        "summary": summary,
+        "horizon_minutes": horizon_minutes,
+        "metrics": metrics,
+        "checked_at": now,
+    }
+
+
+def _upsert_focus_reviews(reviews: List[Dict[str, Any]]) -> int:
+    if not reviews:
+        return 0
+    coll = get_db_collections()["market_insight_focus_reviews"]
+    for review in reviews:
+        coll.update_one({"focus_key": review["focus_key"]}, {"$set": review}, upsert=True)
+    coll.create_index([("trade_date", DESCENDING), ("status", ASCENDING)], name="trade_status_idx", background=True)
+    coll.create_index([("focus_key", ASCENDING)], unique=True, name="focus_key_unique", background=True)
+    return len(reviews)
 
 
 def _build_user_relevance_context(user_id: Optional[str]) -> Dict[str, Any]:

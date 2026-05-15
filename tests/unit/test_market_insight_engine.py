@@ -50,6 +50,8 @@ class FakeCollection:
         for key, value in query.items():
             current = row.get(key)
             if isinstance(value, dict):
+                if "$gt" in value and not (current > value["$gt"]):
+                    return False
                 if "$lte" in value and not (current <= value["$lte"]):
                     return False
                 if "$gte" in value and not (current >= value["$gte"]):
@@ -296,6 +298,108 @@ def test_save_market_insight_focus_feedback_upserts(monkeypatch):
     assert update["$set"]["trade_date"] == "20260515"
     assert update["$set"]["note"] == "值得复盘"
     assert upsert is True
+
+
+@pytest.mark.unit
+def test_review_market_insight_focus_confirms_sector_diffusion(monkeypatch):
+    reviews = FakeCollection([])
+    finance = {
+        "market_insight_events": FakeCollection(
+            [
+                {
+                    "_id": "a",
+                    "trade_date": "20260515",
+                    "snapshot_time": "202605151030",
+                    "event_type": "SECTOR_DIFFUSION",
+                    "severity": "medium",
+                    "confidence": 80.0,
+                    "subject_type": "sector",
+                    "subject_code": "801011.SI",
+                    "subject_name": "银行",
+                    "level": "L2",
+                    "evidence": {"positive_ratio_now": 0.55},
+                }
+            ]
+        ),
+        "market_insight_focus_reviews": reviews,
+    }
+    realtime = {
+        "realtime_sector_strength": FakeCollection(
+            [
+                {
+                    "trade_date": "20260515",
+                    "snapshot_time": "202605151045",
+                    "level": "L2",
+                    "sector_code": "801011.SI",
+                    "positive_ratio": 0.64,
+                },
+                {
+                    "trade_date": "20260515",
+                    "snapshot_time": "202605151100",
+                    "level": "L2",
+                    "sector_code": "801011.SI",
+                    "positive_ratio": 0.62,
+                },
+            ]
+        )
+    }
+    monkeypatch.setattr(engine, "get_db_collections", lambda: finance)
+    monkeypatch.setattr(engine, "get_data_db", lambda: realtime)
+
+    result = engine.review_market_insight_focus("2026-05-15", horizon_minutes=60)
+
+    assert result["success"] is True
+    assert result["written"] == 1
+    assert result["data"][0]["status"] == "confirmed"
+    assert result["data"][0]["label"] == "已验证"
+    assert result["data"][0]["metrics"]["delta_peak"] == pytest.approx(0.09)
+    assert reviews.upserts[0][1]["$set"]["status"] == "confirmed"
+
+
+@pytest.mark.unit
+def test_get_market_insight_focus_includes_existing_review(monkeypatch):
+    focus_key = "20260515|202605151030|SECTOR_DIFFUSION|sector|801011.SI"
+    finance = {
+        "market_insight_events": FakeCollection(
+            [
+                {
+                    "_id": "a",
+                    "trade_date": "20260515",
+                    "snapshot_time": "202605151030",
+                    "event_type": "SECTOR_DIFFUSION",
+                    "severity": "medium",
+                    "confidence": 76.0,
+                    "subject_type": "sector",
+                    "subject_code": "801011.SI",
+                    "subject_name": "银行",
+                    "title": "银行扩散",
+                    "summary": "银行上涨家数扩散。",
+                },
+            ]
+        ),
+        "trader_positions": FakeCollection([]),
+        "intraday_t0_mock_positions": FakeCollection([]),
+        "user_watchlists": FakeCollection([]),
+        "market_insight_focus_feedback": FakeCollection([]),
+        "market_insight_focus_reviews": FakeCollection(
+            [
+                {
+                    "trade_date": "20260515",
+                    "focus_key": focus_key,
+                    "status": "confirmed",
+                    "summary": "已延续",
+                    "checked_at": 123.0,
+                }
+            ]
+        ),
+    }
+    monkeypatch.setattr(engine, "get_db_collections", lambda: finance)
+
+    result = engine.get_market_insight_focus("2026-05-15", limit=1, user_id="u1")
+
+    assert result["data"][0]["review"]["status"] == "confirmed"
+    assert result["data"][0]["review"]["label"] == "已验证"
+    assert result["data"][0]["review"]["summary"] == "已延续"
 
 
 @pytest.mark.unit

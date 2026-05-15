@@ -18,6 +18,7 @@ from services.market_insight_engine import (
     get_sector_strength,
     get_sector_strength_series,
     list_market_insight_events,
+    review_market_insight_focus,
     save_market_insight_focus_feedback,
 )
 from utils.stock_utils import serialize_doc
@@ -80,6 +81,15 @@ def focus_feedback(
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+
+
+@router.post("/focus/review")
+def focus_review(
+    trade_date: Optional[str] = Query(None, description="YYYYMMDD or YYYY-MM-DD"),
+    horizon_minutes: int = Query(60, ge=15, le=240),
+    current_user: dict = Depends(get_current_active_user),  # noqa: ARG001
+):
+    return review_market_insight_focus(trade_date=trade_date, horizon_minutes=horizon_minutes)
 
 
 @router.get("/events")
