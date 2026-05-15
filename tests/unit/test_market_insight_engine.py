@@ -197,6 +197,55 @@ def test_generate_market_insight_events_detects_early_l3_diffusion(monkeypatch):
 
 
 @pytest.mark.unit
+def test_generate_market_insight_events_detects_sector_false_strength(monkeypatch):
+    realtime = {
+        "market_spectrum_realtime_daily": FakeCollection(
+            [
+                {"snapshot_trade_date": "20260515", "snapshot_time": "202605151020", "yang_spectrum": 0.32},
+            ]
+        ),
+        "realtime_sector_strength": FakeCollection(
+            [
+                {
+                    "trade_date": "20260515",
+                    "snapshot_time": "202605151000",
+                    "level": "L2",
+                    "sector_code": "801011.SI",
+                    "sector_name": "国有大型银行",
+                    "positive_ratio": 0.36,
+                    "relative_positive_ratio": 0.05,
+                },
+                {
+                    "trade_date": "20260515",
+                    "snapshot_time": "202605151020",
+                    "level": "L2",
+                    "sector_code": "801011.SI",
+                    "sector_name": "国有大型银行",
+                    "positive_ratio": 0.44,
+                    "relative_positive_ratio": 0.12,
+                    "avg_pct_chg": 1.1,
+                    "avg_trade_size_yuan": 18000,
+                    "stock_count": 20,
+                    "market_positive_ratio": 0.32,
+                },
+            ]
+        ),
+        "sw_index_member": FakeCollection([]),
+    }
+    finance = {"market_insight_events": FakeCollection()}
+    monkeypatch.setattr(engine, "get_data_db", lambda: realtime)
+    monkeypatch.setattr(engine, "get_db_collections", lambda: finance)
+
+    result = engine.generate_market_insight_events("20260515")
+
+    false_strength_events = [event for event in result["events"] if event["event_type"] == "SECTOR_FALSE_STRENGTH"]
+    assert len(false_strength_events) == 1
+    assert false_strength_events[0]["subject_name"] == "国有大型银行"
+    assert false_strength_events[0]["evidence"]["positive_ratio_now"] == pytest.approx(0.44)
+    assert false_strength_events[0]["evidence"]["avg_pct_chg"] == pytest.approx(1.1)
+
+
+@pytest.mark.unit
 def test_get_sector_strength_series_returns_chronological_rows(monkeypatch):
     realtime = {
         "realtime_sector_strength": FakeCollection(

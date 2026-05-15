@@ -15,6 +15,7 @@ EVENT_TYPES = {
     "MARKET_BREADTH_DIVERGENCE",
     "EARLY_SECTOR_DIFFUSION",
     "SECTOR_DIFFUSION",
+    "SECTOR_FALSE_STRENGTH",
     "SECTOR_FADE",
     "VOLUME_QUALITY_SHIFT",
 }
@@ -235,6 +236,7 @@ def generate_market_insight_events(trade_date: Optional[str] = None) -> Dict[str
             ratio_prev = _num(prev.get("positive_ratio"))
             rel_now = _num(doc.get("relative_positive_ratio"), 0.0) or 0.0
             avg_trade = _num(doc.get("avg_trade_size_yuan"))
+            avg_pct_chg = _num(doc.get("avg_pct_chg"))
             if ratio_now is None or ratio_prev is None:
                 continue
             delta = ratio_now - ratio_prev
@@ -252,6 +254,7 @@ def generate_market_insight_events(trade_date: Optional[str] = None) -> Dict[str
                     "delta_positive_ratio_15m": delta,
                     "relative_positive_ratio": rel_now,
                     "avg_trade_size_yuan": avg_trade,
+                    "avg_pct_chg": avg_pct_chg,
                     "stock_count": doc.get("stock_count"),
                     "market_positive_ratio": doc.get("market_positive_ratio"),
                 },
@@ -294,6 +297,32 @@ def generate_market_insight_events(trade_date: Optional[str] = None) -> Dict[str
                         "watch_conditions": ["观察板块是否继续低于全市场广度"],
                     }
                 )
+            elif _is_false_strength(
+                ratio_now=ratio_now,
+                rel_now=rel_now,
+                avg_pct_chg=avg_pct_chg,
+                avg_trade=avg_trade,
+                stock_count=int(doc.get("stock_count") or 0),
+            ):
+                events.append(
+                    {
+                        **base,
+                        "event_type": "SECTOR_FALSE_STRENGTH",
+                        "severity": "medium",
+                        "confidence": min(90.0, 58.0 + max(rel_now, 0) * 120 + max(avg_pct_chg or 0, 0) * 4),
+                        "title": f"{subject}可能存在假强",
+                        "summary": (
+                            f"{subject}相对全市场强度为 {rel_now:.1%}，但内部上涨比例仅 {ratio_now:.1%}，"
+                            "需警惕少数个股带动的表面强势。"
+                        ),
+                        "supporting_points": ["板块相对强度为正", "内部上涨家数比例不足", "强势可能集中在少数成分股"],
+                        "counter_points": ["如果后续上涨家数扩散，假强信号可能被解除"],
+                        "watch_conditions": [
+                            "观察 positive_ratio 是否补升至 50% 以上",
+                            "观察 median_pct_chg 是否跟随 avg_pct_chg 改善",
+                        ],
+                    }
+                )
             elif avg_trade is not None and avg_trade >= 30000 and abs(delta) < 0.08 and ratio_now >= 0.45:
                 events.append(
                     {
@@ -311,6 +340,25 @@ def generate_market_insight_events(trade_date: Optional[str] = None) -> Dict[str
 
     written = _upsert_events(events)
     return {"success": True, "trade_date": td, "snapshot_time": str(snapshot_time), "written": written, "events": events}
+
+
+def _is_false_strength(
+    *,
+    ratio_now: float,
+    rel_now: float,
+    avg_pct_chg: Optional[float],
+    avg_trade: Optional[float],
+    stock_count: int,
+) -> bool:
+    """Detect relative strength that lacks enough internal participation."""
+    if stock_count < 5:
+        return False
+    if ratio_now >= 0.50:
+        return False
+    has_relative_strength = rel_now >= 0.10
+    has_price_strength = avg_pct_chg is not None and avg_pct_chg >= 0.8
+    has_trade_quality = avg_trade is not None and avg_trade >= 25000
+    return has_relative_strength and (has_price_strength or has_trade_quality)
 
 
 def _build_early_sector_diffusion_event(
