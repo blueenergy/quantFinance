@@ -105,3 +105,55 @@ def test_generate_market_insight_events_detects_breadth_and_sector_diffusion(mon
     assert "MARKET_BREADTH_RECOVERY" in event_types
     assert "SECTOR_DIFFUSION" in event_types
     assert len(finance["market_insight_events"].upserts) == len(result["events"])
+
+
+@pytest.mark.unit
+def test_get_sector_strength_series_returns_chronological_rows(monkeypatch):
+    realtime = {
+        "realtime_sector_strength": FakeCollection(
+            [
+                {
+                    "trade_date": "20260515",
+                    "snapshot_time": "202605151020",
+                    "level": "L2",
+                    "sector_code": "801011.SI",
+                    "sector_name": "国有大型银行",
+                    "positive_ratio": 0.65,
+                },
+                {
+                    "trade_date": "20260515",
+                    "snapshot_time": "202605151000",
+                    "level": "L2",
+                    "sector_code": "801011.SI",
+                    "sector_name": "国有大型银行",
+                    "positive_ratio": 0.35,
+                },
+                {
+                    "trade_date": "20260515",
+                    "snapshot_time": "202605151010",
+                    "level": "L2",
+                    "sector_code": "801011.SI",
+                    "sector_name": "国有大型银行",
+                    "positive_ratio": 0.50,
+                },
+            ]
+        )
+    }
+    monkeypatch.setattr(engine, "get_data_db", lambda: realtime)
+
+    result = engine.get_sector_strength_series(
+        level="L2",
+        sector_code="801011.SI",
+        trade_date="20260515",
+        limit=10,
+    )
+
+    assert result["success"] is True
+    assert [row["snapshot_time"] for row in result["data"]] == [
+        "202605151000",
+        "202605151010",
+        "202605151020",
+    ]
+    assert result["data"][0]["delta_from_previous"] is None
+    assert result["data"][1]["delta_from_previous"] == pytest.approx(0.15)
+    assert result["data"][2]["delta_from_previous"] == pytest.approx(0.15)

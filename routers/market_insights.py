@@ -13,6 +13,7 @@ from services.market_insight_engine import (
     generate_market_insight_events,
     get_market_insight_overview,
     get_sector_strength,
+    get_sector_strength_series,
     list_market_insight_events,
 )
 from utils.stock_utils import serialize_doc
@@ -74,6 +75,22 @@ def sector_strength(
     current_user: dict = Depends(get_current_active_user),  # noqa: ARG001
 ):
     return get_sector_strength(level=level, trade_date=trade_date, window=window, limit=limit)
+
+
+@router.get("/sector-strength/series")
+def sector_strength_series(
+    sector_code: str = Query(..., min_length=1),
+    trade_date: Optional[str] = Query(None, description="YYYYMMDD or YYYY-MM-DD"),
+    level: str = Query("L2", pattern="^L[123]$"),
+    limit: int = Query(120, ge=1, le=500),
+    current_user: dict = Depends(get_current_active_user),  # noqa: ARG001
+):
+    return get_sector_strength_series(
+        level=level,
+        sector_code=sector_code,
+        trade_date=trade_date,
+        limit=limit,
+    )
 
 
 @router.post("/generate")

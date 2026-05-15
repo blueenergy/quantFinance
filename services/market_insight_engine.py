@@ -340,3 +340,36 @@ def get_sector_strength(level: str = "L2", trade_date: Optional[str] = None, win
         row["delta_positive_ratio"] = now_ratio - prev_ratio if now_ratio is not None and prev_ratio is not None else None
         row["window_minutes"] = window
     return {"success": True, "trade_date": td, "snapshot_time": latest_time, "data": current_rows}
+
+
+def get_sector_strength_series(
+    *,
+    level: str,
+    sector_code: str,
+    trade_date: Optional[str] = None,
+    limit: int = 120,
+) -> Dict[str, Any]:
+    """Return intraday sector strength snapshots for a single sector."""
+    td = _compact_trade_date(trade_date)
+    query = {"trade_date": td, "level": level, "sector_code": sector_code}
+    cursor = (
+        get_data_db()["realtime_sector_strength"]
+        .find(query, {"_id": 0})
+        .sort("snapshot_time", DESCENDING)
+        .limit(limit)
+    )
+    rows = list(reversed([serialize_doc(doc) for doc in cursor]))
+    previous = None
+    for row in rows:
+        current = _num(row.get("positive_ratio"))
+        row["delta_from_previous"] = current - previous if current is not None and previous is not None else None
+        if current is not None:
+            previous = current
+    return {
+        "success": True,
+        "trade_date": td,
+        "level": level,
+        "sector_code": sector_code,
+        "count": len(rows),
+        "data": rows,
+    }
