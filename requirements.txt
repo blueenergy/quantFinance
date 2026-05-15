@@ -1,6 +1,5 @@
 tqdm
 pandas
-numpy
 pymongo
 apscheduler
 tushare
@@ -16,24 +15,16 @@ bcrypt<4.0
 python-multipart
 email-validator
 pytest>=7.0
-yfinance
+requests
 
 # 生产环境额外依赖
 motor>=3.3.2                    # MongoDB异步驱动
 slowapi>=0.1.8                  # FastAPI限流
 prometheus-fastapi-instrumentator>=6.1.0  # Prometheus监控
-gunicorn>=21.2.0                # WSGI服务器
-redis>=5.0.1                    # Redis缓存
-aioredis>=2.0.1                 # Redis异步客户端
 
 # 安全和性能
 cryptography>=41.0.7            # 加密库
 python-jose[cryptography]>=3.3.0  # JWT处理
-python-multipart>=0.0.6         # 文件上传支持
-
-# 监控和日志
-structlog>=23.2.0               # 结构化日志
-sentry-sdk[fastapi]>=1.38.0     # 错误监控
 
 # MCP 服务器（暴露 quant-api 工具给 Hermes 等多智能体框架）
 fastapi-mcp>=0.3.4

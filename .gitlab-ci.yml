@@ -7,7 +7,7 @@ variables:
 cache:
   key:
     files:
-      - requirements-ci.txt
+      - requirements.txt
   paths:
     - .cache/pip
 
@@ -22,7 +22,7 @@ backend-unit-tests:
     - python -m venv .venv
     - source .venv/bin/activate
     - pip install --upgrade pip
-    - pip install --cache-dir "$PIP_CACHE_DIR" -r requirements-ci.txt
+    - pip install --cache-dir "$PIP_CACHE_DIR" -r requirements.txt
   script:
     - source .venv/bin/activate
     - |
@@ -50,7 +50,7 @@ backend-integration-tests:
     - python -m venv .venv
     - source .venv/bin/activate
     - pip install --upgrade pip
-    - pip install --cache-dir "$PIP_CACHE_DIR" -r requirements-ci.txt
+    - pip install --cache-dir "$PIP_CACHE_DIR" -r requirements.txt
   script:
     - source .venv/bin/activate
     - |
