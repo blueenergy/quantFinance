@@ -147,7 +147,8 @@ def get_data_db():
         # Market sentiment
         "market_spectrum": data_db["market_spectrum"],
         "market_spectrum_minute": data_db["market_spectrum_minute"],
-        "market_spectrum_realtime_daily": data_db["market_spectrum_realtime_daily"],
+        "market_spectrum_realtime_daily": realtime_db["market_spectrum_realtime_daily"],
+        "realtime_sector_strength": realtime_db["realtime_sector_strength"],
         # ETF data
         "etf_prices": data_db["etf_prices"],
         "etf_basic": data_db["etf_basic"],
