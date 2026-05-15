@@ -11,6 +11,7 @@ from db import get_db_collections
 from services.market_insight_engine import (
     EVENT_TYPES,
     generate_market_insight_events,
+    get_event_type_metadata,
     get_market_insight_overview,
     get_sector_strength,
     get_sector_strength_series,
@@ -35,6 +36,14 @@ def overview(
     current_user: dict = Depends(get_current_active_user),  # noqa: ARG001
 ):
     return get_market_insight_overview(trade_date)
+
+
+@router.get("/event-types")
+def event_types(
+    current_user: dict = Depends(get_current_active_user),  # noqa: ARG001
+):
+    metadata = get_event_type_metadata()
+    return {"success": True, "count": len(metadata), "data": metadata}
 
 
 @router.get("/events")

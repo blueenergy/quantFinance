@@ -3,11 +3,13 @@ from fastapi.testclient import TestClient
 import pytest
 
 from routers import market_insights
+from auth import get_current_active_user
 
 
 def _client() -> TestClient:
     app = FastAPI()
     app.include_router(market_insights.router, prefix="/api")
+    app.dependency_overrides[get_current_active_user] = lambda: {"id": "u1", "is_active": True}
     return TestClient(app)
 
 
@@ -70,3 +72,15 @@ def test_generate_internal_accepts_empty_payload(monkeypatch):
     assert res.status_code == 200
     assert res.json() == {"success": True, "trade_date": None, "written": 0}
     assert captured["trade_date"] is None
+
+
+@pytest.mark.unit
+def test_event_types_returns_usage_metadata():
+    res = _client().get("/api/market-insights/event-types")
+
+    assert res.status_code == 200
+    data = res.json()["data"]
+    assert "EARLY_SECTOR_DIFFUSION" in data
+    assert data["EARLY_SECTOR_DIFFUSION"]["label"] == "早期扩散"
+    assert data["SECTOR_FALSE_STRENGTH"]["category"] == "去妄存真类"
+    assert data["COUNTER_TREND_SECTOR_STRENGTH"]["meaning"]

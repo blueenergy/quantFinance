@@ -21,6 +21,85 @@ EVENT_TYPES = {
     "VOLUME_QUALITY_SHIFT",
 }
 
+EVENT_TYPE_METADATA: Dict[str, Dict[str, Any]] = {
+    "MARKET_BREADTH_RECOVERY": {
+        "label": "广度修复",
+        "category": "市场状态类",
+        "meaning": "全市场阳谱在短时间内回升，说明上涨家数正在从低位修复。",
+        "why_it_matters": "它反映的是市场内部参与度改善，而不只是指数价格上涨。",
+        "evidence_guide": ["重点看 yang_spectrum_now", "比较 delta_yang_spectrum_15m 是否持续为正"],
+        "false_positive": "如果修复只持续一两个快照，可能只是盘中反抽。",
+        "next_watch": ["观察未来 15 分钟阳谱是否继续维持或上行", "结合板块扩散事件判断修复来源"],
+    },
+    "MARKET_BREADTH_DIVERGENCE": {
+        "label": "广度走弱",
+        "category": "市场状态类",
+        "meaning": "全市场阳谱短时间下降，市场内部上涨家数减少。",
+        "why_it_matters": "它可以提醒用户指数表面稳定时，内部结构可能已经变弱。",
+        "evidence_guide": ["重点看 yang_spectrum_now 是否低于中性区", "看 delta_yang_spectrum_15m 是否明显为负"],
+        "false_positive": "午间或尾盘流动性变化可能放大短时波动。",
+        "next_watch": ["观察指数是否与阳谱背离", "观察是否有逆势扩散板块出现"],
+    },
+    "SECTOR_DIFFUSION": {
+        "label": "板块扩散",
+        "category": "板块扩散类",
+        "meaning": "某个板块内部上涨家数快速增加，并且强于全市场。",
+        "why_it_matters": "扩散说明资金不只集中在少数个股，板块内部共振更真实。",
+        "evidence_guide": ["看 positive_ratio_now", "看 delta_positive_ratio_15m", "看 relative_positive_ratio"],
+        "false_positive": "如果成交质量没有同步增强，可能只是短线轮动。",
+        "next_watch": ["观察 positive_ratio 是否维持在 55% 以上", "观察 L1/L2/L3 是否相互确认"],
+    },
+    "SECTOR_FADE": {
+        "label": "板块退潮",
+        "category": "板块扩散类",
+        "meaning": "板块内部上涨家数快速下降，扩散状态开始收缩。",
+        "why_it_matters": "它提示板块热度或承接开始减弱，避免只看少数仍上涨个股。",
+        "evidence_guide": ["看 positive_ratio_now 是否跌破中性区", "看 delta_positive_ratio_15m 是否明显为负"],
+        "false_positive": "强势板块盘中洗盘也可能造成短时退潮。",
+        "next_watch": ["观察是否重新扩散", "观察相对全市场强度是否继续下滑"],
+    },
+    "EARLY_SECTOR_DIFFUSION": {
+        "label": "早期扩散",
+        "category": "板块扩散类",
+        "meaning": "L3 细分行业已经开始扩散，但所属 L2/L1 大行业还没有同步确认。",
+        "why_it_matters": "这可能是结构变化的早期信号，说明资金先在更细分方向试探。",
+        "evidence_guide": ["看 L3 positive_ratio", "看 parent_l2_positive_ratio", "看 parent_confirmed 是否为 false"],
+        "false_positive": "如果父级行业迟迟不扩散，可能只是细分方向的短线脉冲。",
+        "next_watch": ["观察父级 L2 上涨比例是否突破 55%", "观察 L3 是否继续维持强度"],
+    },
+    "COUNTER_TREND_SECTOR_STRENGTH": {
+        "label": "逆势扩散",
+        "category": "板块扩散类",
+        "meaning": "全市场广度偏弱时，某个局部板块仍然逆势扩散。",
+        "why_it_matters": "它帮助用户发现弱市中仍有资金聚集的方向，可能是真强候选。",
+        "evidence_guide": ["看 market_weak", "看 market_yang_spectrum", "看板块 positive_ratio 和 relative_positive_ratio"],
+        "false_positive": "逆势扩散可能是短线避险轮动，不一定能持续。",
+        "next_watch": ["观察全市场弱势是否持续", "观察该板块能否继续扩散"],
+    },
+    "SECTOR_FALSE_STRENGTH": {
+        "label": "板块假强",
+        "category": "去妄存真类",
+        "meaning": "板块看起来强，但内部上涨家数不足，可能只是少数权重股或核心股撑起来。",
+        "why_it_matters": "它帮助用户识别表面强势和真实扩散之间的差异。",
+        "evidence_guide": ["看 positive_ratio_now 是否低于 50%", "比较 avg_pct_chg 和 median_pct_chg", "看 relative_positive_ratio"],
+        "false_positive": "强势初期也可能先由龙头带动，后续扩散后会转为真强。",
+        "next_watch": ["观察上涨家数是否补升到 50% 以上", "观察中位涨幅是否改善"],
+    },
+    "VOLUME_QUALITY_SHIFT": {
+        "label": "成交质量变化",
+        "category": "质量识别类",
+        "meaning": "板块均笔成交额等质量指标出现变化，但方向尚未完全确认。",
+        "why_it_matters": "它提示资金行为可能正在变化，适合作为后续扩散的观察线索。",
+        "evidence_guide": ["看 avg_trade_size_yuan", "结合 positive_ratio 判断是否转化为扩散"],
+        "false_positive": "大单成交可能来自个别股票，不能单独作为方向信号。",
+        "next_watch": ["观察成交质量是否转化为板块扩散", "观察价格和上涨家数是否跟随"],
+    },
+}
+
+
+def get_event_type_metadata() -> Dict[str, Dict[str, Any]]:
+    return EVENT_TYPE_METADATA
+
 
 def _compact_trade_date(raw: Optional[str] = None) -> str:
     if raw:
