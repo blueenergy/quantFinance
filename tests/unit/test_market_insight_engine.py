@@ -246,6 +246,55 @@ def test_generate_market_insight_events_detects_sector_false_strength(monkeypatc
 
 
 @pytest.mark.unit
+def test_generate_market_insight_events_detects_counter_trend_sector_strength(monkeypatch):
+    realtime = {
+        "market_spectrum_realtime_daily": FakeCollection(
+            [
+                {"snapshot_trade_date": "20260515", "snapshot_time": "202605151000", "yang_spectrum": 0.46},
+                {"snapshot_trade_date": "20260515", "snapshot_time": "202605151020", "yang_spectrum": 0.38},
+            ]
+        ),
+        "realtime_sector_strength": FakeCollection(
+            [
+                {
+                    "trade_date": "20260515",
+                    "snapshot_time": "202605151000",
+                    "level": "L2",
+                    "sector_code": "801011.SI",
+                    "sector_name": "国有大型银行",
+                    "positive_ratio": 0.42,
+                    "relative_positive_ratio": -0.04,
+                },
+                {
+                    "trade_date": "20260515",
+                    "snapshot_time": "202605151020",
+                    "level": "L2",
+                    "sector_code": "801011.SI",
+                    "sector_name": "国有大型银行",
+                    "positive_ratio": 0.62,
+                    "relative_positive_ratio": 0.24,
+                    "avg_trade_size_yuan": 18000,
+                    "stock_count": 20,
+                    "market_positive_ratio": 0.38,
+                },
+            ]
+        ),
+        "sw_index_member": FakeCollection([]),
+    }
+    finance = {"market_insight_events": FakeCollection()}
+    monkeypatch.setattr(engine, "get_data_db", lambda: realtime)
+    monkeypatch.setattr(engine, "get_db_collections", lambda: finance)
+
+    result = engine.generate_market_insight_events("20260515")
+
+    counter_events = [event for event in result["events"] if event["event_type"] == "COUNTER_TREND_SECTOR_STRENGTH"]
+    assert len(counter_events) == 1
+    assert counter_events[0]["subject_name"] == "国有大型银行"
+    assert counter_events[0]["evidence"]["market_weak"] is True
+    assert counter_events[0]["evidence"]["market_yang_spectrum"] == pytest.approx(0.38)
+
+
+@pytest.mark.unit
 def test_get_sector_strength_series_returns_chronological_rows(monkeypatch):
     realtime = {
         "realtime_sector_strength": FakeCollection(

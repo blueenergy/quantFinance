@@ -13,6 +13,7 @@ from utils.stock_utils import serialize_doc
 EVENT_TYPES = {
     "MARKET_BREADTH_RECOVERY",
     "MARKET_BREADTH_DIVERGENCE",
+    "COUNTER_TREND_SECTOR_STRENGTH",
     "EARLY_SECTOR_DIFFUSION",
     "SECTOR_DIFFUSION",
     "SECTOR_FALSE_STRENGTH",
@@ -175,8 +176,16 @@ def generate_market_insight_events(trade_date: Optional[str] = None) -> Dict[str
     yang_now = _num(spectrum.get("yang_spectrum"))
     prev_spectrum = _previous_spectrum(td, str(snapshot_time), 15) if spectrum else {}
     yang_prev = _num(prev_spectrum.get("yang_spectrum"))
+    market_delta = yang_now - yang_prev if yang_now is not None and yang_prev is not None else None
+    market_weak = (
+        yang_now is not None
+        and (
+            yang_now < 0.45
+            or (market_delta is not None and market_delta <= -0.03)
+        )
+    )
     if yang_now is not None and yang_prev is not None:
-        delta = yang_now - yang_prev
+        delta = market_delta
         if delta >= 0.05:
             events.append(
                 {
@@ -269,6 +278,37 @@ def generate_market_insight_events(trade_date: Optional[str] = None) -> Dict[str
             )
             if early_event:
                 events.append(early_event)
+            elif _is_counter_trend_sector_strength(
+                market_weak=market_weak,
+                ratio_now=ratio_now,
+                delta=delta,
+                rel_now=rel_now,
+            ):
+                events.append(
+                    {
+                        **base,
+                        "event_type": "COUNTER_TREND_SECTOR_STRENGTH",
+                        "severity": "high",
+                        "confidence": min(94.0, 62.0 + delta * 100 + max(rel_now, 0) * 80),
+                        "title": f"{subject}出现逆势扩散",
+                        "summary": (
+                            f"全市场广度偏弱时，{subject}上涨比例 15 分钟内从 {ratio_prev:.1%} "
+                            f"升至 {ratio_now:.1%}，相对全市场强度为 {rel_now:.1%}。"
+                        ),
+                        "evidence": {
+                            **base["evidence"],
+                            "market_yang_spectrum": yang_now,
+                            "market_delta_yang_spectrum_15m": market_delta,
+                            "market_weak": market_weak,
+                        },
+                        "supporting_points": ["全市场广度偏弱", "局部板块仍在扩散", "板块强度明显高于全市场"],
+                        "counter_points": ["逆势扩散也可能是短线避险轮动，需要后续确认"],
+                        "watch_conditions": [
+                            "观察全市场弱势是否持续",
+                            "观察该板块 positive_ratio 是否继续维持在 58% 以上",
+                        ],
+                    }
+                )
             elif delta >= 0.20 and ratio_now >= 0.55 and rel_now >= 0.08:
                 events.append(
                     {
@@ -340,6 +380,16 @@ def generate_market_insight_events(trade_date: Optional[str] = None) -> Dict[str
 
     written = _upsert_events(events)
     return {"success": True, "trade_date": td, "snapshot_time": str(snapshot_time), "written": written, "events": events}
+
+
+def _is_counter_trend_sector_strength(
+    *,
+    market_weak: bool,
+    ratio_now: float,
+    delta: float,
+    rel_now: float,
+) -> bool:
+    return market_weak and ratio_now >= 0.58 and delta >= 0.15 and rel_now >= 0.15
 
 
 def _is_false_strength(
