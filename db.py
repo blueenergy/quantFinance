@@ -10,6 +10,7 @@ mongo_url = os.getenv("MONGO_URI", os.getenv("MONGO_URL", "mongodb://localhost:2
 DB_NAME = os.getenv("MONGO_DB", "finance")
 ANALYZER_DB_NAME = os.getenv("ANALYZER_DB_NAME", "quant_analyzer")
 data_db_name = os.getenv("DATA_DB_NAME", "quant_data")
+realtime_db_name = os.getenv("REALTIME_DB_NAME", "quant_realtime")
 
 # Singleton client (reuse across app)
 client = MongoClient(mongo_url)
@@ -18,11 +19,13 @@ db = client[DB_NAME]
 analyzer_db = client[ANALYZER_DB_NAME]
 # Separate DB for raw external data (hot stocks, news, etc.)
 data_db = client[data_db_name]
+# Separate DB for high-frequency hot snapshots.
+realtime_db = client[realtime_db_name]
 
 import logging as _logging
 _logging.getLogger(__name__).info(
-    "MongoDB connected: main=%s, analyzer=%s, data=%s",
-    DB_NAME, ANALYZER_DB_NAME, data_db_name
+    "MongoDB connected: main=%s, analyzer=%s, data=%s, realtime=%s",
+    DB_NAME, ANALYZER_DB_NAME, data_db_name, realtime_db_name
 )
 
 def get_db_collections() -> Dict[str, Collection]:
@@ -48,6 +51,11 @@ def get_db_collections() -> Dict[str, Collection]:
         "trader_positions": db["trader_positions"],  # 实时持仓快照
         "trader_accounts": db["trader_accounts"],  # 账户资金信息
         "position_snapshots": db["position_snapshots"],  # 历史持仓快照（每日）
+        # Intraday T+0 opportunity discovery
+        "intraday_t0_mock_positions": db["intraday_t0_mock_positions"],
+        "intraday_t0_signals": db["intraday_t0_signals"],
+        "intraday_t0_position_snapshots": db["intraday_t0_position_snapshots"],
+        "intraday_t0_signal_evaluations": db["intraday_t0_signal_evaluations"],
         # Strategy
         "strategy_template": db["strategy_template"],  # 策略参数模板
         "strategy_metadata": db["strategy_metadata"],  # 策略元数据（key和name）
@@ -123,6 +131,7 @@ def get_data_db():
         "hot_stock_raw": data_db["hot_stock_raw"],
         # Market data
         "volume_price": data_db["volume_price"],
+        "volume_price_realtime_latest": realtime_db["volume_price_realtime_latest"],
         "stock_weekly": data_db["stock_weekly"],
         "stock_monthly": data_db["stock_monthly"],
         "money_flow": data_db["money_flow"],
