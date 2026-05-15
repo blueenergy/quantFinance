@@ -13,6 +13,7 @@ from services.market_insight_engine import (
     generate_market_insight_events,
     get_event_categories,
     get_event_type_metadata,
+    get_market_insight_focus,
     get_market_insight_overview,
     get_sector_strength,
     get_sector_strength_series,
@@ -45,6 +46,15 @@ def event_types(
 ):
     metadata = get_event_type_metadata()
     return {"success": True, "count": len(metadata), "data": metadata}
+
+
+@router.get("/focus")
+def focus(
+    trade_date: Optional[str] = Query(None, description="YYYYMMDD or YYYY-MM-DD"),
+    limit: int = Query(5, ge=1, le=10),
+    current_user: dict = Depends(get_current_active_user),  # noqa: ARG001
+):
+    return get_market_insight_focus(trade_date=trade_date, limit=limit)
 
 
 @router.get("/events")

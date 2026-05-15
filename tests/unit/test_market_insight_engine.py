@@ -111,6 +111,67 @@ def test_list_market_insight_events_filters_by_category_and_confidence(monkeypat
 
 
 @pytest.mark.unit
+def test_get_market_insight_focus_prioritizes_high_value_events(monkeypatch):
+    finance = {
+        "market_insight_events": FakeCollection(
+            [
+                {
+                    "_id": "a",
+                    "trade_date": "20260515",
+                    "snapshot_time": "202605151030",
+                    "event_type": "SECTOR_DIFFUSION",
+                    "severity": "medium",
+                    "confidence": 88.0,
+                    "subject_type": "sector",
+                    "subject_code": "801011.SI",
+                    "subject_name": "银行",
+                    "title": "银行扩散",
+                    "summary": "银行上涨家数扩散。",
+                    "watch_conditions": ["观察银行是否维持扩散"],
+                },
+                {
+                    "_id": "b",
+                    "trade_date": "20260515",
+                    "snapshot_time": "202605151035",
+                    "event_type": "COUNTER_TREND_SECTOR_STRENGTH",
+                    "severity": "high",
+                    "confidence": 84.0,
+                    "subject_type": "sector",
+                    "subject_code": "801012.SI",
+                    "subject_name": "机器人",
+                    "title": "机器人逆势扩散",
+                    "summary": "机器人弱市逆势扩散。",
+                    "watch_conditions": ["观察机器人能否继续扩散"],
+                },
+                {
+                    "_id": "c",
+                    "trade_date": "20260515",
+                    "snapshot_time": "202605151036",
+                    "event_type": "MARKET_BREADTH_RECOVERY",
+                    "severity": "medium",
+                    "confidence": 90.0,
+                    "subject_type": "market",
+                    "subject_code": "all",
+                    "subject_name": "全市场",
+                    "title": "广度修复",
+                    "summary": "全市场阳谱修复。",
+                },
+            ]
+        )
+    }
+    monkeypatch.setattr(engine, "get_db_collections", lambda: finance)
+
+    result = engine.get_market_insight_focus("2026-05-15", limit=2)
+
+    assert result["success"] is True
+    assert result["count"] == 2
+    assert result["data"][0]["primary_event"]["event_type"] == "COUNTER_TREND_SECTOR_STRENGTH"
+    assert result["data"][0]["attention_score"] > result["data"][1]["attention_score"]
+    assert "为什么先看" not in result["data"][0]["why_focus"]
+    assert result["data"][0]["next_action"] == "观察机器人能否继续扩散"
+
+
+@pytest.mark.unit
 def test_generate_market_insight_events_detects_breadth_and_sector_diffusion(monkeypatch):
     realtime = {
         "market_spectrum_realtime_daily": FakeCollection(

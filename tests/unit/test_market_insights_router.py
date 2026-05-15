@@ -87,6 +87,23 @@ def test_event_types_returns_usage_metadata():
 
 
 @pytest.mark.unit
+def test_focus_passes_trade_date_and_limit_to_engine(monkeypatch):
+    captured = {}
+
+    def fake_focus(**kwargs):
+        captured.update(kwargs)
+        return {"success": True, "trade_date": kwargs["trade_date"], "count": 1, "data": [{"title": "焦点"}]}
+
+    monkeypatch.setattr(market_insights, "get_market_insight_focus", fake_focus)
+
+    res = _client().get("/api/market-insights/focus", params={"trade_date": "2026-05-15", "limit": 3})
+
+    assert res.status_code == 200
+    assert res.json()["count"] == 1
+    assert captured == {"trade_date": "2026-05-15", "limit": 3}
+
+
+@pytest.mark.unit
 def test_events_passes_filter_params_to_engine(monkeypatch):
     captured = {}
 

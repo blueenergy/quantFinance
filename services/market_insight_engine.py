@@ -96,6 +96,19 @@ EVENT_TYPE_METADATA: Dict[str, Dict[str, Any]] = {
     },
 }
 
+EVENT_ATTENTION_WEIGHTS = {
+    "COUNTER_TREND_SECTOR_STRENGTH": 18.0,
+    "EARLY_SECTOR_DIFFUSION": 16.0,
+    "SECTOR_FALSE_STRENGTH": 14.0,
+    "MARKET_BREADTH_DIVERGENCE": 12.0,
+    "SECTOR_DIFFUSION": 10.0,
+    "MARKET_BREADTH_RECOVERY": 8.0,
+    "SECTOR_FADE": 8.0,
+    "VOLUME_QUALITY_SHIFT": 4.0,
+}
+
+SEVERITY_ATTENTION_WEIGHTS = {"high": 12.0, "medium": 6.0, "low": 2.0}
+
 
 def get_event_type_metadata() -> Dict[str, Dict[str, Any]]:
     return EVENT_TYPE_METADATA
@@ -635,6 +648,102 @@ def list_market_insight_events(
         .limit(limit)
     )
     return [serialize_doc(doc) for doc in cursor]
+
+
+def get_market_insight_focus(trade_date: Optional[str] = None, limit: int = 5) -> Dict[str, Any]:
+    td = _compact_trade_date(trade_date)
+    rows = list_market_insight_events(trade_date=td, limit=200)
+    if not rows:
+        return {"success": True, "trade_date": td, "count": 0, "data": []}
+
+    latest_snapshot = max(str(row.get("snapshot_time") or "") for row in rows)
+    by_subject: Dict[str, Dict[str, Any]] = {}
+    for row in rows:
+        focus = _build_focus_item(row, latest_snapshot)
+        key = _focus_subject_key(row)
+        current = by_subject.get(key)
+        if not current or focus["attention_score"] > current["attention_score"]:
+            by_subject[key] = focus
+        else:
+            current["related_event_count"] += 1
+            current["related_event_types"] = sorted(
+                set(current["related_event_types"] + [str(row.get("event_type") or "")])
+            )
+
+    focus_items = sorted(
+        by_subject.values(),
+        key=lambda item: (item["attention_score"], item["primary_event"].get("snapshot_time") or ""),
+        reverse=True,
+    )[:limit]
+    return {"success": True, "trade_date": td, "count": len(focus_items), "data": focus_items}
+
+
+def _focus_subject_key(event: Dict[str, Any]) -> str:
+    subject_type = str(event.get("subject_type") or "")
+    subject_code = str(event.get("subject_code") or event.get("subject_name") or "")
+    if subject_type == "market":
+        return "market:all"
+    return f"{subject_type}:{subject_code}"
+
+
+def _build_focus_item(event: Dict[str, Any], latest_snapshot: str) -> Dict[str, Any]:
+    event_type = str(event.get("event_type") or "")
+    confidence = _num(event.get("confidence"), 0.0) or 0.0
+    severity = str(event.get("severity") or "")
+    type_weight = EVENT_ATTENTION_WEIGHTS.get(event_type, 0.0)
+    severity_weight = SEVERITY_ATTENTION_WEIGHTS.get(severity, 0.0)
+    recency_weight = _recency_attention_weight(str(event.get("snapshot_time") or ""), latest_snapshot)
+    subject_weight = 4.0 if event.get("subject_type") == "sector" else 2.0
+    attention_score = min(100.0, confidence * 0.55 + type_weight + severity_weight + recency_weight + subject_weight)
+    metadata = EVENT_TYPE_METADATA.get(event_type, {})
+    return {
+        "attention_score": round(attention_score, 1),
+        "subject_name": event.get("subject_name") or "全市场",
+        "event_label": metadata.get("label") or event_type,
+        "category": metadata.get("category") or "",
+        "title": event.get("title") or metadata.get("label") or event_type,
+        "summary": event.get("summary") or metadata.get("meaning") or "",
+        "why_focus": _focus_reason(event, metadata, attention_score),
+        "next_action": _focus_next_action(event, metadata),
+        "score_breakdown": {
+            "confidence_component": round(confidence * 0.55, 1),
+            "event_type_weight": type_weight,
+            "severity_weight": severity_weight,
+            "recency_weight": recency_weight,
+            "subject_weight": subject_weight,
+        },
+        "related_event_count": 1,
+        "related_event_types": [event_type],
+        "primary_event": event,
+    }
+
+
+def _recency_attention_weight(snapshot_time: str, latest_snapshot: str) -> float:
+    if snapshot_time and latest_snapshot and snapshot_time == latest_snapshot:
+        return 8.0
+    return 3.0
+
+
+def _focus_reason(event: Dict[str, Any], metadata: Dict[str, Any], attention_score: float) -> str:
+    event_type = event.get("event_type")
+    if event_type == "COUNTER_TREND_SECTOR_STRENGTH":
+        return "弱市里仍然逆势扩散，属于稀缺且更值得优先确认的方向。"
+    if event_type == "EARLY_SECTOR_DIFFUSION":
+        return "细分方向先于父级行业启动，可能是结构变化的早期线索。"
+    if event_type == "SECTOR_FALSE_STRENGTH":
+        return "表面强势和内部参与度不一致，适合优先排除假强噪音。"
+    if event_type == "MARKET_BREADTH_DIVERGENCE":
+        return "市场内部走弱会影响其他板块信号的可靠性，需要先校准大环境。"
+    if attention_score >= 80:
+        return "置信度、事件重要性和新鲜度共同靠前，适合作为今日优先观察项。"
+    return metadata.get("why_it_matters") or "该事件对理解当前市场结构有参考价值。"
+
+
+def _focus_next_action(event: Dict[str, Any], metadata: Dict[str, Any]) -> str:
+    watch = event.get("watch_conditions") or metadata.get("next_watch") or []
+    if watch:
+        return str(watch[0])
+    return "点开证据链，确认支持证据和反向证据是否匹配。"
 
 
 def get_sector_strength(level: str = "L2", trade_date: Optional[str] = None, window: int = 30, limit: int = 50) -> Dict[str, Any]:
