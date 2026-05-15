@@ -506,12 +506,17 @@ async def trigger_global_analysis(current_user: dict = Depends(get_current_activ
         return {"success": False, "error": str(e)}
 
 
-def fetch_market_analysis_result(analysis_date: Optional[str] = None) -> Dict[str, Any]:
+def fetch_market_analysis_result(
+    analysis_date: Optional[str] = None,
+    time_slot: Optional[str] = None,
+) -> Dict[str, Any]:
     """Fetch cached market analysis for frontend.
 
     - If analysis_date is provided: return the cached result for that specific date.
     - If not provided: on trading days, return today's cached result; 
       on non-trading days, fall back to the latest available trading day.
+    - If time_slot is provided: return that specific HHMM slot; otherwise the latest slot
+      for the chosen date.
     """
     target_day = date.today()
     is_explicit_date = bool(analysis_date)
@@ -519,16 +524,46 @@ def fetch_market_analysis_result(analysis_date: Optional[str] = None) -> Dict[st
     if analysis_date:
         target_day = date.fromisoformat(analysis_date)
         today_str = analysis_date
-        print(f"[Market Analysis] Explicit date requested: {today_str}")
+        print(f"[Market Analysis] Explicit date requested: {today_str} slot={time_slot or 'latest'}")
     else:
         today_str = target_day.strftime('%Y-%m-%d')
-        print(f"[Market Analysis] No date provided, using default: {today_str}")
+        print(f"[Market Analysis] No date provided, using default: {today_str} slot={time_slot or 'latest'}")
 
     is_trading_day = market_analysis_cache.is_trading_day(target_day)
 
-    # Try to get the analysis for the target date
-    cached = market_analysis_cache.get_cached_analysis(today_str)
-    
+    # Try to get the analysis for the target date / slot
+    cached = market_analysis_cache.get_cached_analysis(today_str, time_slot=time_slot)
+
+    def _attach_comparison(result: Dict[str, Any], cached_doc: Dict[str, Any]) -> None:
+        """Append previous_snapshot diff context to a result dict (mutates in place)."""
+        cur_slot = cached_doc.get("time_slot") or time_slot
+        cur_date = cached_doc.get("analysis_date", today_str)
+        snapshot = cached_doc.get("snapshot")
+        if snapshot:
+            result["snapshot"] = snapshot
+        if cur_slot:
+            result["time_slot"] = cur_slot
+        # Same-day other slots (for tab UI)
+        try:
+            result["available_slots"] = market_analysis_cache.list_slots_for_date(cur_date)
+        except Exception as exc:
+            print(f"[Market Analysis] list_slots_for_date failed: {exc}")
+            result["available_slots"] = []
+        # Nearest previous snapshot (cross-day, same-time-window)
+        if cur_slot:
+            try:
+                prev = market_analysis_cache.get_nearest_previous_snapshot(cur_date, cur_slot)
+            except Exception as exc:
+                print(f"[Market Analysis] get_nearest_previous_snapshot failed: {exc}")
+                prev = None
+            if prev:
+                result["previous_snapshot"] = prev["snapshot"]
+                result["previous_snapshot_meta"] = {
+                    "analysis_date": prev["analysis_date"],
+                    "time_slot": prev["time_slot"],
+                    "lag_minutes": prev["lag_minutes"],
+                }
+
     if cached:
         result = dict(cached.get('analysis_result', {}))
         result['home_summary'] = _build_market_home_summary(result)
@@ -541,6 +576,7 @@ def fetch_market_analysis_result(analysis_date: Optional[str] = None) -> Dict[st
         }
         # Add success flag for frontend
         result['success'] = True
+        _attach_comparison(result, cached)
         return result
 
     # 非交易日：优先回退到最近交易日结果，避免用户误判系统异常
@@ -559,6 +595,7 @@ def fetch_market_analysis_result(analysis_date: Optional[str] = None) -> Dict[st
             }
             result['success'] = True
             result['notice'] = f"{today_str} 为非交易日，已展示最近交易日数据。"
+            _attach_comparison(result, latest_analysis)
             return result
 
         return {
@@ -573,22 +610,45 @@ def fetch_market_analysis_result(analysis_date: Optional[str] = None) -> Dict[st
     schedule_text = "10:00 / 11:30 / 15:30"
     print(f"[Market Analysis] {today_str} trading-day analysis not ready")
     message_date = "今日" if target_day == date.today() and not is_explicit_date else today_str
+    # Surface available slots even when the requested slot is missing, so the UI can
+    # offer a fallback instead of a hard "not ready" state.
+    try:
+        slots_today = market_analysis_cache.list_slots_for_date(today_str)
+    except Exception:
+        slots_today = []
     return {
         "success": False,
         "error": f"{message_date} 的大盘分析尚未生成",
         "is_trading_day": True,
         "is_expected": True,
         "expected_schedule": ["10:00", "11:30", "15:30"],
+        "available_slots": slots_today,
         "user_tip": f"系统会在交易日 {schedule_text} 自动更新，请稍后刷新查看。"
     }
 
 @router.get("/market-analysis")
 async def get_market_analysis(
     date: Optional[str] = Query(default=None, description="分析日期，格式 YYYY-MM-DD"),
+    time_slot: Optional[str] = Query(default=None, description="HHMM 时间槽，缺省返回当日最新槽"),
     current_user: dict = Depends(get_current_active_user)
 ):
     """Canonical read endpoint for cached market analysis results."""
-    return fetch_market_analysis_result(date)
+    return fetch_market_analysis_result(date, time_slot=time_slot)
+
+
+@router.get("/market-analysis/slots")
+async def list_market_analysis_slots(
+    date: Optional[str] = Query(default=None, description="日期 YYYY-MM-DD，默认今日"),
+    current_user: dict = Depends(get_current_active_user),
+):
+    """Return the list of HHMM slots available for a given analysis date."""
+    _ = current_user
+    target = date or datetime.now().strftime('%Y-%m-%d')
+    try:
+        slots = market_analysis_cache.list_slots_for_date(target)
+    except Exception as exc:
+        return {"success": False, "error": str(exc), "analysis_date": target, "slots": []}
+    return {"success": True, "analysis_date": target, "slots": slots}
 
 
 @router.get("/market-analysis/summary")

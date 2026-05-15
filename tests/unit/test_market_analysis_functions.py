@@ -49,7 +49,17 @@ class TestFetchMarketAnalysisResult:
         monkeypatch.setattr(
             market.market_analysis_cache,
             "get_cached_analysis",
-            lambda date_str: cached_data,
+            lambda date_str, time_slot=None: cached_data,
+        )
+        monkeypatch.setattr(
+            market.market_analysis_cache,
+            "list_slots_for_date",
+            lambda d: [],
+        )
+        monkeypatch.setattr(
+            market.market_analysis_cache,
+            "get_nearest_previous_snapshot",
+            lambda d, s, max_lookback_days=7: None,
         )
 
         result = market.fetch_market_analysis_result()
@@ -75,12 +85,17 @@ class TestFetchMarketAnalysisResult:
         monkeypatch.setattr(
             market.market_analysis_cache,
             "get_cached_analysis",
-            lambda date_str: None,
+            lambda date_str, time_slot=None: None,
         )
         monkeypatch.setattr(
             market.market_analysis_cache,
             "get_latest_trading_day_analysis",
             lambda: None,
+        )
+        monkeypatch.setattr(
+            market.market_analysis_cache,
+            "list_slots_for_date",
+            lambda d: [],
         )
 
         result = market.fetch_market_analysis_result()
@@ -116,12 +131,22 @@ class TestFetchMarketAnalysisResult:
         monkeypatch.setattr(
             market.market_analysis_cache,
             "get_cached_analysis",
-            lambda date_str: None,
+            lambda date_str, time_slot=None: None,
         )
         monkeypatch.setattr(
             market.market_analysis_cache,
             "get_latest_trading_day_analysis",
             lambda: latest_data,
+        )
+        monkeypatch.setattr(
+            market.market_analysis_cache,
+            "list_slots_for_date",
+            lambda d: [],
+        )
+        monkeypatch.setattr(
+            market.market_analysis_cache,
+            "get_nearest_previous_snapshot",
+            lambda d, s, max_lookback_days=7: None,
         )
 
         result = market.fetch_market_analysis_result()
@@ -148,7 +173,7 @@ class TestFetchMarketAnalysisResult:
         monkeypatch.setattr(
             market.market_analysis_cache,
             "get_cached_analysis",
-            lambda date_str: None,
+            lambda date_str, time_slot=None: None,
         )
         monkeypatch.setattr(
             market.market_analysis_cache,
@@ -392,7 +417,7 @@ class TestTriggerMarketAnalysis:
         self._patch_collections(monkeypatch, market, fake_tasks_col)
         monkeypatch.setattr(market, "get_latest_trade_date", lambda: "20251219")
         monkeypatch.setattr(market.market_analysis_cache, "is_trading_day", lambda d: False)
-        monkeypatch.setattr(market.market_analysis_cache, "get_cached_analysis", lambda d: None)
+        monkeypatch.setattr(market.market_analysis_cache, "get_cached_analysis", lambda d, time_slot=None: None)
 
         req = MarketAnalysisRequest(date="2025-12-21", force_refresh=False)
         result = asyncio.run(market.trigger_market_analysis(req, current_user={"id": "u1"}))
@@ -419,7 +444,7 @@ class TestTriggerMarketAnalysis:
         monkeypatch.setattr(
             market.market_analysis_cache,
             "get_cached_analysis",
-            lambda d: {"analysis_date": "2025-12-19", "analysis_result": {"summary": "ok"}},
+            lambda d, time_slot=None: {"analysis_date": "2025-12-19", "analysis_result": {"summary": "ok"}},
         )
 
         req = MarketAnalysisRequest(date="2025-12-21", force_refresh=False)

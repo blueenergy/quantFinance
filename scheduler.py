@@ -248,7 +248,11 @@ def generate_market_analysis_task(job_id: str):
         # Determine analysis type based on job_id
         # 16:30 is post-market, others are intraday
         analysis_type = "post_market" if "1630" in job_id else "intraday"
-            
+
+        # Extract HHMM time slot from job_id suffix (e.g. "market_analysis_1130" → "1130").
+        # Falls back to current local HHMM for any non-conformant id (e.g. manual triggers).
+        time_slot = job_id.rsplit("_", 1)[-1] if job_id.rsplit("_", 1)[-1].isdigit() and len(job_id.rsplit("_", 1)[-1]) == 4 else datetime.now().strftime("%H%M")
+
         task_doc = build_task_doc(
             current_user={
                 "id": user_id,
@@ -262,12 +266,13 @@ def generate_market_analysis_task(job_id: str):
                 "date": today_str,
                 "job_id": job_id,
                 "analysis_type": analysis_type,
+                "time_slot": time_slot,
             },
             source="scheduler",
         )
         
         result = tasks_col.insert_one(task_doc)
-        log.info(f"[Market Analysis] Scheduled task {result.inserted_id} for {today_str} (type: {analysis_type})")
+        log.info(f"[Market Analysis] Scheduled task {result.inserted_id} for {today_str} slot={time_slot} (type: {analysis_type})")
         
     except Exception as e:
         log.error(f"[Market Analysis] Scheduling failed: {e}", exc_info=True)
