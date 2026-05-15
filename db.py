@@ -165,6 +165,7 @@ def get_data_db():
         # Stock reference data
         "stock_info": data_db["stock_info"],
         "stock_basic": data_db["stock_basic"],
+        "sw_index_member": data_db["sw_index_member"],
         # Financial statements
         "financial_daily_basic": data_db["financial_daily_basic"],
         "financial_income": data_db["financial_income"],

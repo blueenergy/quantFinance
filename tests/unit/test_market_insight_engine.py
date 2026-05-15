@@ -108,6 +108,95 @@ def test_generate_market_insight_events_detects_breadth_and_sector_diffusion(mon
 
 
 @pytest.mark.unit
+def test_generate_market_insight_events_detects_early_l3_diffusion(monkeypatch):
+    realtime = {
+        "market_spectrum_realtime_daily": FakeCollection(
+            [
+                {"snapshot_trade_date": "20260515", "snapshot_time": "202605151020", "yang_spectrum": 0.48},
+            ]
+        ),
+        "realtime_sector_strength": FakeCollection(
+            [
+                {
+                    "trade_date": "20260515",
+                    "snapshot_time": "202605151000",
+                    "level": "L3",
+                    "sector_code": "851011.SI",
+                    "sector_name": "大型银行",
+                    "positive_ratio": 0.38,
+                    "relative_positive_ratio": -0.02,
+                },
+                {
+                    "trade_date": "20260515",
+                    "snapshot_time": "202605151020",
+                    "level": "L3",
+                    "sector_code": "851011.SI",
+                    "sector_name": "大型银行",
+                    "positive_ratio": 0.68,
+                    "relative_positive_ratio": 0.20,
+                    "avg_trade_size_yuan": 18000,
+                    "stock_count": 8,
+                    "market_positive_ratio": 0.48,
+                },
+                {
+                    "trade_date": "20260515",
+                    "snapshot_time": "202605151000",
+                    "level": "L2",
+                    "sector_code": "801011.SI",
+                    "sector_name": "国有大型银行",
+                    "positive_ratio": 0.43,
+                    "relative_positive_ratio": -0.04,
+                },
+                {
+                    "trade_date": "20260515",
+                    "snapshot_time": "202605151020",
+                    "level": "L2",
+                    "sector_code": "801011.SI",
+                    "sector_name": "国有大型银行",
+                    "positive_ratio": 0.49,
+                    "relative_positive_ratio": 0.01,
+                },
+                {
+                    "trade_date": "20260515",
+                    "snapshot_time": "202605151020",
+                    "level": "L1",
+                    "sector_code": "801010.SI",
+                    "sector_name": "银行",
+                    "positive_ratio": 0.50,
+                    "relative_positive_ratio": 0.02,
+                },
+            ]
+        ),
+        "sw_index_member": FakeCollection(
+            [
+                {
+                    "src": "SW2021",
+                    "is_new": "Y",
+                    "l1_code": "801010.SI",
+                    "l1_name": "银行",
+                    "l2_code": "801011.SI",
+                    "l2_name": "国有大型银行",
+                    "l3_code": "851011.SI",
+                    "l3_name": "大型银行",
+                }
+            ]
+        ),
+    }
+    finance = {"market_insight_events": FakeCollection()}
+    monkeypatch.setattr(engine, "get_data_db", lambda: realtime)
+    monkeypatch.setattr(engine, "get_db_collections", lambda: finance)
+
+    result = engine.generate_market_insight_events("20260515")
+
+    early_events = [event for event in result["events"] if event["event_type"] == "EARLY_SECTOR_DIFFUSION"]
+    assert len(early_events) == 1
+    assert early_events[0]["subject_name"] == "大型银行"
+    assert early_events[0]["evidence"]["parent_l2_code"] == "801011.SI"
+    assert early_events[0]["evidence"]["parent_confirmed"] is False
+    assert len(finance["market_insight_events"].upserts) == len(result["events"])
+
+
+@pytest.mark.unit
 def test_get_sector_strength_series_returns_chronological_rows(monkeypatch):
     realtime = {
         "realtime_sector_strength": FakeCollection(

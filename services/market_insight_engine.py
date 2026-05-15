@@ -13,6 +13,7 @@ from utils.stock_utils import serialize_doc
 EVENT_TYPES = {
     "MARKET_BREADTH_RECOVERY",
     "MARKET_BREADTH_DIVERGENCE",
+    "EARLY_SECTOR_DIFFUSION",
     "SECTOR_DIFFUSION",
     "SECTOR_FADE",
     "VOLUME_QUALITY_SHIFT",
@@ -91,6 +92,43 @@ def _previous_sector_doc(doc: Dict[str, Any], minutes: int = 15) -> Dict[str, An
         )
         or {}
     )
+
+
+def _sector_doc(trade_date: str, snapshot_time: str, level: str, sector_code: str) -> Dict[str, Any]:
+    return (
+        get_data_db()["realtime_sector_strength"].find_one(
+            {
+                "trade_date": trade_date,
+                "snapshot_time": snapshot_time,
+                "level": level,
+                "sector_code": sector_code,
+            },
+            {"_id": 0},
+        )
+        or {}
+    )
+
+
+def _sector_parent_codes(doc: Dict[str, Any]) -> Dict[str, str]:
+    """Resolve SW parent hierarchy for an L3 sector from member mapping."""
+    if doc.get("level") != "L3":
+        return {}
+    data_cols = get_data_db()
+    member_col = data_cols.get("sw_index_member")
+    if member_col is None:
+        return {}
+    member = member_col.find_one(
+        {"src": "SW2021", "is_new": "Y", "l3_code": doc.get("sector_code")},
+        {"_id": 0, "l1_code": 1, "l1_name": 1, "l2_code": 1, "l2_name": 1, "l3_code": 1, "l3_name": 1},
+    )
+    if not member:
+        return {}
+    return {
+        "l1_code": str(member.get("l1_code") or ""),
+        "l1_name": str(member.get("l1_name") or ""),
+        "l2_code": str(member.get("l2_code") or ""),
+        "l2_name": str(member.get("l2_name") or ""),
+    }
 
 
 def _event_id(event: Dict[str, Any]) -> Dict[str, Any]:
@@ -218,7 +256,17 @@ def generate_market_insight_events(trade_date: Optional[str] = None) -> Dict[str
                     "market_positive_ratio": doc.get("market_positive_ratio"),
                 },
             }
-            if delta >= 0.20 and ratio_now >= 0.55 and rel_now >= 0.08:
+            early_event = _build_early_sector_diffusion_event(
+                doc=doc,
+                base=base,
+                ratio_now=ratio_now,
+                ratio_prev=ratio_prev,
+                delta=delta,
+                rel_now=rel_now,
+            )
+            if early_event:
+                events.append(early_event)
+            elif delta >= 0.20 and ratio_now >= 0.55 and rel_now >= 0.08:
                 events.append(
                     {
                         **base,
@@ -263,6 +311,79 @@ def generate_market_insight_events(trade_date: Optional[str] = None) -> Dict[str
 
     written = _upsert_events(events)
     return {"success": True, "trade_date": td, "snapshot_time": str(snapshot_time), "written": written, "events": events}
+
+
+def _build_early_sector_diffusion_event(
+    *,
+    doc: Dict[str, Any],
+    base: Dict[str, Any],
+    ratio_now: float,
+    ratio_prev: float,
+    delta: float,
+    rel_now: float,
+) -> Optional[Dict[str, Any]]:
+    """Identify L3 diffusion before its parent sectors have confirmed."""
+    if doc.get("level") != "L3":
+        return None
+    if not (delta >= 0.18 and ratio_now >= 0.58 and rel_now >= 0.10):
+        return None
+    parents = _sector_parent_codes(doc)
+    l2_code = parents.get("l2_code")
+    l1_code = parents.get("l1_code")
+    if not l2_code:
+        return None
+
+    trade_date = str(doc.get("trade_date") or "")
+    snapshot_time = str(doc.get("snapshot_time") or "")
+    l2_doc = _sector_doc(trade_date, snapshot_time, "L2", l2_code)
+    l1_doc = _sector_doc(trade_date, snapshot_time, "L1", l1_code) if l1_code else {}
+    l2_ratio = _num(l2_doc.get("positive_ratio"))
+    l2_rel = _num(l2_doc.get("relative_positive_ratio"), 0.0) or 0.0
+    l2_prev = _previous_sector_doc(l2_doc, 15) if l2_doc else {}
+    l2_prev_ratio = _num(l2_prev.get("positive_ratio"))
+    l2_delta = l2_ratio - l2_prev_ratio if l2_ratio is not None and l2_prev_ratio is not None else None
+
+    parent_confirmed = (
+        l2_ratio is not None
+        and l2_ratio >= 0.55
+        and l2_rel >= 0.08
+        and (l2_delta is None or l2_delta >= 0.12)
+    )
+    if parent_confirmed:
+        return None
+
+    subject = str(doc.get("sector_name") or doc.get("sector_code"))
+    l2_name = parents.get("l2_name") or str(l2_doc.get("sector_name") or "")
+    evidence = {
+        **base["evidence"],
+        "parent_l2_code": l2_code,
+        "parent_l2_name": l2_name,
+        "parent_l2_positive_ratio": l2_ratio,
+        "parent_l2_relative_positive_ratio": l2_rel,
+        "parent_l2_delta_positive_ratio_15m": l2_delta,
+        "parent_l1_code": l1_code,
+        "parent_l1_name": parents.get("l1_name") or str(l1_doc.get("sector_name") or ""),
+        "parent_l1_positive_ratio": _num(l1_doc.get("positive_ratio")),
+        "parent_confirmed": parent_confirmed,
+    }
+    return {
+        **base,
+        "event_type": "EARLY_SECTOR_DIFFUSION",
+        "severity": "medium",
+        "confidence": min(93.0, 62.0 + delta * 90 + max(rel_now, 0) * 70),
+        "title": f"{subject}出现早期扩散",
+        "summary": (
+            f"{subject}上涨比例 15 分钟内从 {ratio_prev:.1%} 升至 {ratio_now:.1%}，"
+            f"但上级 {l2_name or l2_code} 尚未同步确认。"
+        ),
+        "evidence": evidence,
+        "supporting_points": ["L3 细分行业上涨家数快速扩散", "强度已经明显高于全市场", "上级 L2/L1 尚未充分扩散"],
+        "counter_points": ["早期扩散可能回落，需要父级行业后续确认"],
+        "watch_conditions": [
+            "观察上级 L2 的上涨比例是否跟随突破 55%",
+            "观察该 L3 的 positive_ratio 是否继续维持在 58% 以上",
+        ],
+    }
 
 
 def get_market_insight_overview(trade_date: Optional[str] = None) -> Dict[str, Any]:
