@@ -67,6 +67,7 @@ _NAV_ROWS: List[Tuple[str, str, int]] = [
     ("strategy-execution-analysis", "策略执行分析", 150),
     ("spectrum", "阴阳谱", 160),
     ("intraday-t0", "日内T+0", 165),
+    ("market-insights", "火眼金睛", 168),
     ("securities", "账户工作台", 170),
     ("user-profile", "用户配置", 180),
     ("chat", "🤖 AI助手", 190),

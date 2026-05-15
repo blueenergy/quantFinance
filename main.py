@@ -79,6 +79,7 @@ from routers.hermes_quant_tools import router as hermes_quant_tools_router
 from routers.macro import router as macro_router
 from routers.kline_series import router as kline_series_router
 from routers.intraday_t0 import router as intraday_t0_router
+from routers.market_insights import router as market_insights_router
 from routers.navigation_policy import user_router as navigation_user_router
 from routers.entitlements_matrix import router as entitlements_matrix_router
 from production_config import configure_production_app
@@ -161,6 +162,7 @@ app.include_router(hermes_quant_tools_router, prefix="/api", tags=["Hermes quant
 app.include_router(macro_router, prefix="/api", tags=["宏观分析"])
 app.include_router(kline_series_router, prefix="/api", tags=["K线对比"])
 app.include_router(intraday_t0_router, prefix="/api", tags=["日内T+0"])
+app.include_router(market_insights_router, prefix="/api", tags=["火眼金睛"])
 
 # ---------------------------------------------------------------------------
 # MCP 服务器：暴露 quant-api 工具给 Hermes 等多智能体框架

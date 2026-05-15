@@ -82,6 +82,7 @@ def get_db_collections() -> Dict[str, Collection]:
         "schedule_config": db["schedule_config"], # 定时任务调度配置
         "pipeline_tasks": db["pipeline_tasks"],
         "job_status": db["job_status"],
+        "market_insight_events": db["market_insight_events"],
         # 主题补涨验证订阅（物化/通知水位线；见 theme_lag_validation_subscription_task）
         "theme_lag_validation_subscriptions": db["theme_lag_validation_subscriptions"],
         "app_settings": db["app_settings"],  # 全局可配置项（如主导航按等级可见性）

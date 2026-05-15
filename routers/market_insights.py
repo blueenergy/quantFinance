@@ -1,0 +1,76 @@
+from __future__ import annotations
+
+from typing import Optional
+
+from bson import ObjectId
+from fastapi import APIRouter, Depends, HTTPException, Query
+
+from auth import get_current_active_user
+from db import get_db_collections
+from services.market_insight_engine import (
+    EVENT_TYPES,
+    generate_market_insight_events,
+    get_market_insight_overview,
+    get_sector_strength,
+    list_market_insight_events,
+)
+from utils.stock_utils import serialize_doc
+
+
+router = APIRouter(prefix="/market-insights", tags=["火眼金睛"])
+
+
+@router.get("/overview")
+def overview(
+    trade_date: Optional[str] = Query(None, description="YYYYMMDD or YYYY-MM-DD"),
+    current_user: dict = Depends(get_current_active_user),  # noqa: ARG001
+):
+    return get_market_insight_overview(trade_date)
+
+
+@router.get("/events")
+def events(
+    trade_date: Optional[str] = Query(None, description="YYYYMMDD or YYYY-MM-DD"),
+    event_type: Optional[str] = Query(None),
+    level: Optional[str] = Query(None),
+    limit: int = Query(100, ge=1, le=500),
+    current_user: dict = Depends(get_current_active_user),  # noqa: ARG001
+):
+    if event_type and event_type not in EVENT_TYPES:
+        raise HTTPException(status_code=400, detail="unsupported event_type")
+    rows = list_market_insight_events(trade_date, event_type, level, limit)
+    return {"success": True, "count": len(rows), "data": rows}
+
+
+@router.get("/events/{event_id}")
+def event_detail(
+    event_id: str,
+    current_user: dict = Depends(get_current_active_user),  # noqa: ARG001
+):
+    try:
+        oid = ObjectId(event_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid event_id")
+    doc = get_db_collections()["market_insight_events"].find_one({"_id": oid})
+    if not doc:
+        raise HTTPException(status_code=404, detail="event not found")
+    return {"success": True, "data": serialize_doc(doc)}
+
+
+@router.get("/sector-strength")
+def sector_strength(
+    trade_date: Optional[str] = Query(None, description="YYYYMMDD or YYYY-MM-DD"),
+    level: str = Query("L2", pattern="^L[123]$"),
+    window: int = Query(15, ge=5, le=60),
+    limit: int = Query(50, ge=1, le=200),
+    current_user: dict = Depends(get_current_active_user),  # noqa: ARG001
+):
+    return get_sector_strength(level=level, trade_date=trade_date, window=window, limit=limit)
+
+
+@router.post("/generate")
+def generate(
+    trade_date: Optional[str] = Query(None, description="YYYYMMDD or YYYY-MM-DD"),
+    current_user: dict = Depends(get_current_active_user),  # noqa: ARG001
+):
+    return generate_market_insight_events(trade_date)

@@ -43,6 +43,7 @@ KNOWN_MAIN_TABS: List[tuple] = [
     ("strategy-execution-analysis", False),
     ("spectrum", False),
     ("intraday-t0", False),
+    ("market-insights", False),
     ("securities", False),
     ("user-profile", False),
     ("chat", False),
