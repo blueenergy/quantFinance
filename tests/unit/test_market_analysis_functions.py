@@ -395,6 +395,50 @@ class TestGenerateMarketAnalysisTask:
 
 
 @pytest.mark.unit
+class TestMarketInsightFocusReviewSchedule:
+    def test_task_map_registers_focus_review_job(self):
+        import scheduler as sched_mod
+
+        assert "market_insight_focus_review_1530" in sched_mod.TASK_MAP
+        config = sched_mod.DEFAULT_SCHEDULES["market_insight_focus_review_1530"]
+        assert config["type"] == "cron"
+        assert config["hour"] == 15
+        assert config["minute"] == 30
+        assert config["day_of_week"] == "mon-fri"
+        assert config["is_active"] is True
+
+    def test_market_insight_focus_review_task_calls_engine(self, monkeypatch):
+        import scheduler as sched_mod
+        from services import market_insight_engine
+
+        captured = {}
+
+        def fake_review(**kwargs):
+            captured.update(kwargs)
+            return {"success": True, "trade_date": "20260515", "written": 3}
+
+        monkeypatch.setattr(market_insight_engine, "review_market_insight_focus", fake_review)
+        monkeypatch.setattr(sched_mod, "_acquire_scheduler_job_lock", lambda job_id: True)
+        monkeypatch.setattr(sched_mod, "_release_scheduler_job_lock", lambda job_id: None)
+
+        sched_mod.market_insight_focus_review_task()
+
+        assert captured == {"horizon_minutes": 60}
+
+    def test_market_insight_focus_review_task_skips_without_lock(self, monkeypatch):
+        import scheduler as sched_mod
+        from services import market_insight_engine
+
+        review = MagicMock()
+        monkeypatch.setattr(market_insight_engine, "review_market_insight_focus", review)
+        monkeypatch.setattr(sched_mod, "_acquire_scheduler_job_lock", lambda job_id: False)
+
+        sched_mod.market_insight_focus_review_task()
+
+        review.assert_not_called()
+
+
+@pytest.mark.unit
 class TestTriggerMarketAnalysis:
     """Tests for routers.market.trigger_market_analysis effective date handling."""
 

@@ -3,12 +3,55 @@ from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 from datetime import datetime
 import logging
+import os
 import time
+from pymongo.errors import DuplicateKeyError
 
 log = logging.getLogger(__name__)
 
 # Define global scheduler
 scheduler = BackgroundScheduler(timezone='Asia/Shanghai')
+_SCHEDULER_INSTANCE_ID = f"{os.uname().nodename}:{os.getpid()}"
+
+
+def _acquire_scheduler_job_lock(job_id: str, ttl_seconds: int = 1800) -> bool:
+    """Best-effort Mongo lease so duplicated scheduler instances do not run the same job."""
+    from db import get_db_collections
+
+    now = time.time()
+    lock_id = f"scheduler_lock:{job_id}"
+    try:
+        result = get_db_collections()["job_status"].update_one(
+            {
+                "_id": lock_id,
+                "$or": [
+                    {"locked_until": {"$lte": now}},
+                    {"locked_until": {"$exists": False}},
+                ],
+            },
+            {
+                "$set": {
+                    "job_id": lock_id,
+                    "locked_by": _SCHEDULER_INSTANCE_ID,
+                    "locked_until": now + ttl_seconds,
+                    "updated_at": now,
+                },
+                "$setOnInsert": {"created_at": now},
+            },
+            upsert=True,
+        )
+    except DuplicateKeyError:
+        return False
+    return bool(result.upserted_id or result.modified_count)
+
+
+def _release_scheduler_job_lock(job_id: str) -> None:
+    from db import get_db_collections
+
+    get_db_collections()["job_status"].update_one(
+        {"_id": f"scheduler_lock:{job_id}", "locked_by": _SCHEDULER_INSTANCE_ID},
+        {"$set": {"locked_until": time.time(), "updated_at": time.time()}},
+    )
 
 
 # Default trigger configurations
@@ -333,6 +376,27 @@ def theme_lag_validation_subscription_scan_task(job_id: str):
     run_theme_lag_validation_subscription_scan(job_id)
 
 
+def market_insight_focus_review_task():
+    """Run post-market validation for Fire Eye focus items."""
+    from services.market_insight_engine import review_market_insight_focus
+
+    job_id = "market_insight_focus_review_1530"
+    if not _acquire_scheduler_job_lock(job_id):
+        log.info("[Market Insight Review] Another scheduler instance owns the lock, skipping.")
+        return
+    try:
+        result = review_market_insight_focus(horizon_minutes=60)
+        log.info(
+            "[Market Insight Review] Reviewed %s focus items for %s",
+            result.get("written", 0),
+            result.get("trade_date"),
+        )
+    except Exception as e:
+        log.error(f"[Market Insight Review] Scheduling failed: {e}", exc_info=True)
+    finally:
+        _release_scheduler_job_lock(job_id)
+
+
 def hot_stock_poll_task(source: str):
     """热股轮询任务 - 每30分钟检查 THS / DC 热榜是否有新数据。"""
     from db import get_db_collections, get_analyzer_db
@@ -390,6 +454,7 @@ TASK_MAP = {
     'theme_lag_validation_subscribe_1630': lambda: theme_lag_validation_subscription_scan_task(
         'theme_lag_validation_subscribe_1630'
     ),
+    'market_insight_focus_review_1530': market_insight_focus_review_task,
 }
 
 # Default trigger configurations
@@ -461,6 +526,14 @@ DEFAULT_SCHEDULES = {
         'minute': 30,
         'day_of_week': 'mon-fri',
         'is_active': False,  # 同上
+    },
+    'market_insight_focus_review_1530': {
+        'name': "火眼金睛焦点盘后验证 (15:30)",
+        'type': "cron",
+        'hour': 15,
+        'minute': 30,
+        'day_of_week': 'mon-fri',
+        'is_active': True,
     },
 }
 
