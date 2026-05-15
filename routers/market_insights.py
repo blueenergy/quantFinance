@@ -3,9 +3,10 @@ from __future__ import annotations
 from typing import Optional
 
 from bson import ObjectId
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Body, Depends, HTTPException, Query
+from pydantic import BaseModel
 
-from auth import get_current_active_user
+from auth import get_current_active_user, require_hermes_quant_internal_key
 from db import get_db_collections
 from services.market_insight_engine import (
     EVENT_TYPES,
@@ -18,6 +19,13 @@ from utils.stock_utils import serialize_doc
 
 
 router = APIRouter(prefix="/market-insights", tags=["火眼金睛"])
+
+
+class GenerateInsightPayload(BaseModel):
+    trade_date: Optional[str] = None
+    snapshot_time: Optional[str] = None
+    source: str = "auto"
+    sync_status: Optional[str] = None
 
 
 @router.get("/overview")
@@ -74,3 +82,13 @@ def generate(
     current_user: dict = Depends(get_current_active_user),  # noqa: ARG001
 ):
     return generate_market_insight_events(trade_date)
+
+
+@router.post("/generate-internal")
+def generate_internal(
+    payload: Optional[GenerateInsightPayload] = Body(None),
+    _: bool = Depends(require_hermes_quant_internal_key),
+):
+    """Internal endpoint called after realtime daily K sync materializes snapshots."""
+    payload = payload or GenerateInsightPayload()
+    return generate_market_insight_events(payload.trade_date)

@@ -118,6 +118,9 @@ services:
       # quant-data-engine uses host networking, so call the host-published API port.
       - INTRADAY_T0_TRIGGER_URL=${INTRADAY_T0_TRIGGER_URL:-http://127.0.0.1:3001/api/intraday-t0/signals/generate-all}
       - INTRADAY_T0_TRIGGER_KEY=${INTRADAY_T0_TRIGGER_KEY:-${HERMES_QUANT_INTERNAL_KEY:-}}
+      # Trigger market insight event generation after realtime sector strength is materialized.
+      - MARKET_INSIGHT_TRIGGER_URL=${MARKET_INSIGHT_TRIGGER_URL:-http://127.0.0.1:3001/api/market-insights/generate-internal}
+      - MARKET_INSIGHT_TRIGGER_KEY=${MARKET_INSIGHT_TRIGGER_KEY:-${HERMES_QUANT_INTERNAL_KEY:-}}
       # Optional per-task cron overrides for daily_market_sync.sh jobs
       - CRON_STOCK_DAILY=${CRON_STOCK_DAILY:-}
       - CRON_INDEX_DAILY=${CRON_INDEX_DAILY:-}
