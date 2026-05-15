@@ -72,6 +72,8 @@ def get_db_collections() -> Dict[str, Collection]:
         "analysis_task_revisions": db["analysis_task_revisions"],  # 分析任务版本历史
         "quota_usage": db["quota_usage"],        # 用户配额使用情况
         "schedule_config": db["schedule_config"], # 定时任务调度配置
+        "pipeline_tasks": db["pipeline_tasks"],
+        "job_status": db["job_status"],
         # 主题补涨验证订阅（物化/通知水位线；见 theme_lag_validation_subscription_task）
         "theme_lag_validation_subscriptions": db["theme_lag_validation_subscriptions"],
         "app_settings": db["app_settings"],  # 全局可配置项（如主导航按等级可见性）
@@ -136,6 +138,7 @@ def get_data_db():
         # Market sentiment
         "market_spectrum": data_db["market_spectrum"],
         "market_spectrum_minute": data_db["market_spectrum_minute"],
+        "market_spectrum_realtime_daily": data_db["market_spectrum_realtime_daily"],
         # ETF data
         "etf_prices": data_db["etf_prices"],
         "etf_basic": data_db["etf_basic"],

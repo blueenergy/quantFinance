@@ -57,6 +57,34 @@ pipelines:
       field: trade_date
       field_kind: date_string
 
+  - id: a_daily_realtime_sync
+    label: A股实时日K同步
+    job_status_key: a_daily_realtime_sync
+    group: layer0
+    depends_on: []
+    trigger_on_complete: false
+    run_mode: cron
+    schedule_hint: "盘中可选 → daily_market_sync.sh realtime_daily_k；写 volume_price 快照与 market_spectrum_realtime_daily"
+    freshness:
+      database: finance
+      collection: pipeline_tasks
+      field: updated_at
+      field_kind: datetime
+
+  - id: a_daily_realtime_eod_compare
+    label: 实时日K盘后等价性对比
+    job_status_key: a_daily_realtime_eod_compare
+    group: layer1
+    depends_on: [stock_daily]
+    trigger_on_complete: false
+    run_mode: cron
+    schedule_hint: "盘后 stock_daily 后可选 → daily_market_sync.sh realtime_daily_k_compare；用于 shadow mode 质量验证"
+    freshness:
+      database: finance
+      collection: pipeline_tasks
+      field: updated_at
+      field_kind: datetime
+
   - id: stock_weekly
     label: 股票周线
     job_status_key: stock_weekly

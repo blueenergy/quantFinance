@@ -1167,7 +1167,10 @@ def get_market_spectrum_minute(
 ):
     """获取分钟级市场阴阳谱数据.
 
-    数据来源: market_spectrum_minute 集合, 字段包括:
+    数据来源:
+      - type=daily_realtime: market_spectrum_realtime_daily (实时日K快照阴阳谱)
+      - type=minute: market_spectrum_minute (旧分钟MA阴阳谱)
+    字段包括:
       - trade_date: YYYYMMDDHHMM
       - yang_spectrum / yin_spectrum
       - total_stocks
@@ -1175,10 +1178,13 @@ def get_market_spectrum_minute(
       - ma_period, granularity 字段区分来源
     """
     data_collections = get_data_db()
-    collection = data_collections.get('market_spectrum_minute')  # type: ignore
+    if spectrum_type == 'daily_realtime':
+        collection = data_collections.get('market_spectrum_realtime_daily')  # type: ignore
+    else:
+        collection = data_collections.get('market_spectrum_minute')  # type: ignore
 
     if collection is None:
-        raise HTTPException(status_code=500, detail="market_spectrum_minute collection not configured")
+        raise HTTPException(status_code=500, detail="market spectrum collection not configured")
 
     # Map type -> granularity field stored in DB
     granularity = 'daily_realtime' if spectrum_type == 'daily_realtime' else 'minute'
@@ -1199,10 +1205,49 @@ def get_market_spectrum_minute(
         'distribution': 1,
         'ma_period': 1,
         'granularity': 1,
+        'snapshot_time': 1,
+        'source_mode': 1,
+        'coverage_ratio': 1,
+        'quality_passed': 1,
     }
     cursor = collection.find(query, projection).sort('trade_date', 1)
     data = list(cursor)
     return {"data": data}
+
+
+@router.get('/market-spectrum-realtime-daily/status', summary="获取实时日K阴阳谱同步状态", tags=["Market"])
+def get_market_spectrum_realtime_daily_status(
+    trade_date: str = Query(..., description="交易日期,格式YYYYMMDD"),
+):
+    """Return realtime daily K sync health and fallback decision."""
+    td = trade_date.replace("-", "")[:8]
+    if len(td) != 8:
+        raise HTTPException(status_code=400, detail="trade_date 须为 YYYYMMDD 或 YYYY-MM-DD")
+
+    collections = get_db_collections()
+    pipeline_tasks = collections.get("pipeline_tasks")
+    if pipeline_tasks is None:
+        raise HTTPException(status_code=500, detail="pipeline_tasks collection not configured")
+
+    sync_doc = pipeline_tasks.find_one(
+        {"domain": "data_collection", "task_type": "a_daily_realtime_sync", "date": td},
+        {"_id": 0},
+    )
+    compare_doc = pipeline_tasks.find_one(
+        {"domain": "data_collection", "task_type": "a_daily_realtime_eod_compare", "date": td},
+        {"_id": 0},
+    )
+    latest_spectrum = (
+        get_data_db()["market_spectrum_realtime_daily"]
+        .find_one({"snapshot_trade_date": td}, {"_id": 0}, sort=[("snapshot_time", -1)])
+    )
+    return {
+        "success": True,
+        "trade_date": td,
+        "sync_status": sync_doc,
+        "compare_status": compare_doc,
+        "latest_spectrum": latest_spectrum,
+    }
 
 @router.get(
     "/theme-lag-panel",
