@@ -84,3 +84,46 @@ def test_event_types_returns_usage_metadata():
     assert data["EARLY_SECTOR_DIFFUSION"]["label"] == "早期扩散"
     assert data["SECTOR_FALSE_STRENGTH"]["category"] == "去妄存真类"
     assert data["COUNTER_TREND_SECTOR_STRENGTH"]["meaning"]
+
+
+@pytest.mark.unit
+def test_events_passes_filter_params_to_engine(monkeypatch):
+    captured = {}
+
+    def fake_list(**kwargs):
+        captured.update(kwargs)
+        return [{"event_type": "SECTOR_FALSE_STRENGTH", "confidence": 82.0}]
+
+    monkeypatch.setattr(market_insights, "list_market_insight_events", fake_list)
+
+    res = _client().get(
+        "/api/market-insights/events",
+        params={
+            "trade_date": "2026-05-15",
+            "category": "去妄存真类",
+            "severity": "medium",
+            "min_confidence": 80,
+            "level": "L2",
+            "limit": 20,
+        },
+    )
+
+    assert res.status_code == 200
+    assert res.json()["count"] == 1
+    assert captured == {
+        "trade_date": "2026-05-15",
+        "event_type": None,
+        "category": "去妄存真类",
+        "severity": "medium",
+        "min_confidence": 80.0,
+        "level": "L2",
+        "limit": 20,
+    }
+
+
+@pytest.mark.unit
+def test_events_rejects_unknown_category():
+    res = _client().get("/api/market-insights/events", params={"category": "不存在"})
+
+    assert res.status_code == 400
+    assert res.json()["detail"] == "unsupported category"

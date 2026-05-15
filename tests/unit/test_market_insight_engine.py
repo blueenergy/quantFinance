@@ -52,11 +52,62 @@ class FakeCollection:
             if isinstance(value, dict):
                 if "$lte" in value and not (current <= value["$lte"]):
                     return False
+                if "$gte" in value and not (current >= value["$gte"]):
+                    return False
                 if "$in" in value and current not in value["$in"]:
                     return False
             elif current != value:
                 return False
         return True
+
+
+@pytest.mark.unit
+def test_list_market_insight_events_filters_by_category_and_confidence(monkeypatch):
+    finance = {
+        "market_insight_events": FakeCollection(
+            [
+                {
+                    "_id": "a",
+                    "trade_date": "20260515",
+                    "snapshot_time": "202605151030",
+                    "event_type": "SECTOR_FALSE_STRENGTH",
+                    "severity": "medium",
+                    "confidence": 82.0,
+                    "level": "L2",
+                },
+                {
+                    "_id": "b",
+                    "trade_date": "20260515",
+                    "snapshot_time": "202605151031",
+                    "event_type": "SECTOR_DIFFUSION",
+                    "severity": "high",
+                    "confidence": 92.0,
+                    "level": "L2",
+                },
+                {
+                    "_id": "c",
+                    "trade_date": "20260515",
+                    "snapshot_time": "202605151032",
+                    "event_type": "SECTOR_FALSE_STRENGTH",
+                    "severity": "medium",
+                    "confidence": 60.0,
+                    "level": "L2",
+                },
+            ]
+        )
+    }
+    monkeypatch.setattr(engine, "get_db_collections", lambda: finance)
+
+    rows = engine.list_market_insight_events(
+        trade_date="2026-05-15",
+        category="去妄存真类",
+        severity="medium",
+        min_confidence=80,
+        level="L2",
+    )
+
+    assert [row["event_type"] for row in rows] == ["SECTOR_FALSE_STRENGTH"]
+    assert rows[0]["confidence"] == 82.0
 
 
 @pytest.mark.unit

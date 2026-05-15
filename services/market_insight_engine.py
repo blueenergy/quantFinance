@@ -101,6 +101,18 @@ def get_event_type_metadata() -> Dict[str, Dict[str, Any]]:
     return EVENT_TYPE_METADATA
 
 
+def get_event_categories() -> List[str]:
+    return sorted({str(item.get("category")) for item in EVENT_TYPE_METADATA.values() if item.get("category")})
+
+
+def _event_types_for_category(category: str) -> List[str]:
+    return sorted(
+        event_type
+        for event_type, metadata in EVENT_TYPE_METADATA.items()
+        if metadata.get("category") == category
+    )
+
+
 def _compact_trade_date(raw: Optional[str] = None) -> str:
     if raw:
         td = str(raw).strip().replace("-", "")[:8]
@@ -592,14 +604,28 @@ def get_market_insight_overview(trade_date: Optional[str] = None) -> Dict[str, A
 def list_market_insight_events(
     trade_date: Optional[str] = None,
     event_type: Optional[str] = None,
+    category: Optional[str] = None,
+    severity: Optional[str] = None,
+    min_confidence: Optional[float] = None,
     level: Optional[str] = None,
     limit: int = 100,
 ) -> List[Dict[str, Any]]:
     query: Dict[str, Any] = {}
     if trade_date:
         query["trade_date"] = _compact_trade_date(trade_date)
+    if category:
+        category_event_types = _event_types_for_category(category)
+        if not category_event_types:
+            return []
+        if event_type and event_type not in category_event_types:
+            return []
+        query["event_type"] = event_type or {"$in": category_event_types}
     if event_type:
         query["event_type"] = event_type
+    if severity:
+        query["severity"] = severity
+    if min_confidence is not None:
+        query["confidence"] = {"$gte": min_confidence}
     if level:
         query["level"] = level
     cursor = (

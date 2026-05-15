@@ -11,6 +11,7 @@ from db import get_db_collections
 from services.market_insight_engine import (
     EVENT_TYPES,
     generate_market_insight_events,
+    get_event_categories,
     get_event_type_metadata,
     get_market_insight_overview,
     get_sector_strength,
@@ -50,13 +51,26 @@ def event_types(
 def events(
     trade_date: Optional[str] = Query(None, description="YYYYMMDD or YYYY-MM-DD"),
     event_type: Optional[str] = Query(None),
+    category: Optional[str] = Query(None),
+    severity: Optional[str] = Query(None, pattern="^(low|medium|high)$"),
+    min_confidence: Optional[float] = Query(None, ge=0, le=100),
     level: Optional[str] = Query(None),
     limit: int = Query(100, ge=1, le=500),
     current_user: dict = Depends(get_current_active_user),  # noqa: ARG001
 ):
     if event_type and event_type not in EVENT_TYPES:
         raise HTTPException(status_code=400, detail="unsupported event_type")
-    rows = list_market_insight_events(trade_date, event_type, level, limit)
+    if category and category not in get_event_categories():
+        raise HTTPException(status_code=400, detail="unsupported category")
+    rows = list_market_insight_events(
+        trade_date=trade_date,
+        event_type=event_type,
+        category=category,
+        severity=severity,
+        min_confidence=min_confidence,
+        level=level,
+        limit=limit,
+    )
     return {"success": True, "count": len(rows), "data": rows}
 
 
