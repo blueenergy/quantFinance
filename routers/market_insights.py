@@ -83,6 +83,7 @@ def sector_strength_series(
     trade_date: Optional[str] = Query(None, description="YYYYMMDD or YYYY-MM-DD"),
     level: str = Query("L2", pattern="^L[123]$"),
     limit: int = Query(120, ge=1, le=500),
+    simulate_if_sparse: bool = Query(False),
     current_user: dict = Depends(get_current_active_user),  # noqa: ARG001
 ):
     return get_sector_strength_series(
@@ -90,6 +91,7 @@ def sector_strength_series(
         sector_code=sector_code,
         trade_date=trade_date,
         limit=limit,
+        simulate_if_sparse=simulate_if_sparse,
     )
 
 

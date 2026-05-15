@@ -348,6 +348,7 @@ def get_sector_strength_series(
     sector_code: str,
     trade_date: Optional[str] = None,
     limit: int = 120,
+    simulate_if_sparse: bool = False,
 ) -> Dict[str, Any]:
     """Return intraday sector strength snapshots for a single sector."""
     td = _compact_trade_date(trade_date)
@@ -365,11 +366,46 @@ def get_sector_strength_series(
         row["delta_from_previous"] = current - previous if current is not None and previous is not None else None
         if current is not None:
             previous = current
+    is_simulated = False
+    if simulate_if_sparse and 0 < len(rows) < 2:
+        rows = _simulate_sector_strength_series(rows[0], limit=min(max(limit, 6), 12))
+        is_simulated = True
     return {
         "success": True,
         "trade_date": td,
         "level": level,
         "sector_code": sector_code,
         "count": len(rows),
+        "is_simulated": is_simulated,
         "data": rows,
     }
+
+
+def _simulate_sector_strength_series(seed: Dict[str, Any], limit: int = 8) -> List[Dict[str, Any]]:
+    """Build a non-persistent trend series when weekend/off-hours data is sparse."""
+    snapshot_time = str(seed.get("snapshot_time") or "")
+    try:
+        end_dt = datetime.strptime(snapshot_time, "%Y%m%d%H%M")
+    except ValueError:
+        end_dt = datetime.now()
+    current_ratio = _num(seed.get("positive_ratio"), 0.5) or 0.5
+    relative = _num(seed.get("relative_positive_ratio"), 0.0) or 0.0
+    direction = 1 if relative >= 0 else -1
+    amplitude = min(0.18, max(0.06, abs(relative) * 0.8))
+    points = max(int(limit or 8), 2)
+    rows: List[Dict[str, Any]] = []
+    previous = None
+    for index in range(points):
+        progress = index / (points - 1)
+        ratio = current_ratio - direction * amplitude * (1 - progress)
+        ratio = max(0.0, min(1.0, ratio))
+        row = {
+            **seed,
+            "snapshot_time": (end_dt - timedelta(minutes=(points - 1 - index) * 5)).strftime("%Y%m%d%H%M"),
+            "positive_ratio": ratio,
+            "delta_from_previous": ratio - previous if previous is not None else None,
+            "simulated": True,
+        }
+        previous = ratio
+        rows.append(row)
+    return rows

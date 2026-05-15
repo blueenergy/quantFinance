@@ -157,3 +157,39 @@ def test_get_sector_strength_series_returns_chronological_rows(monkeypatch):
     assert result["data"][0]["delta_from_previous"] is None
     assert result["data"][1]["delta_from_previous"] == pytest.approx(0.15)
     assert result["data"][2]["delta_from_previous"] == pytest.approx(0.15)
+
+
+@pytest.mark.unit
+def test_get_sector_strength_series_can_simulate_sparse_rows(monkeypatch):
+    realtime = {
+        "realtime_sector_strength": FakeCollection(
+            [
+                {
+                    "trade_date": "20260515",
+                    "snapshot_time": "202605151020",
+                    "level": "L2",
+                    "sector_code": "801011.SI",
+                    "sector_name": "国有大型银行",
+                    "positive_ratio": 0.65,
+                    "relative_positive_ratio": 0.12,
+                }
+            ]
+        )
+    }
+    monkeypatch.setattr(engine, "get_data_db", lambda: realtime)
+
+    result = engine.get_sector_strength_series(
+        level="L2",
+        sector_code="801011.SI",
+        trade_date="20260515",
+        limit=8,
+        simulate_if_sparse=True,
+    )
+
+    assert result["success"] is True
+    assert result["is_simulated"] is True
+    assert result["count"] == 8
+    assert len(result["data"]) == 8
+    assert all(row["simulated"] for row in result["data"])
+    assert result["data"][-1]["positive_ratio"] == pytest.approx(0.65)
+    assert result["data"][0]["snapshot_time"] < result["data"][-1]["snapshot_time"]
