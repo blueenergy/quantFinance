@@ -31,10 +31,53 @@ services:
       - HERMES_CHAT_TEMPERATURE=${HERMES_CHAT_TEMPERATURE:-0.7}
       # Hermes -> quant-api internal tools (连板天梯等); must match hermes service
       - HERMES_QUANT_INTERNAL_KEY=${HERMES_QUANT_INTERNAL_KEY:-}
+      - ENABLE_EMBEDDED_SCHEDULER=false
+      - API_WORKERS=${API_WORKERS:-2}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     networks:
       - quant-network
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
+
+  # 独立 APScheduler runner（单副本，不对外暴露端口）
+  quant-scheduler:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    container_name: quant-scheduler
+    command: [ "python", "scheduler_runner.py" ]
+    environment:
+      - MONGO_URI=${MONGO_URI:-mongodb://host.docker.internal:27017/}
+      - MONGO_URL=${MONGO_URI:-mongodb://host.docker.internal:27017/}
+      - DB_NAME=${MONGO_DB}
+      - ANALYZER_DB_NAME=${ANALYZER_DB_NAME:-quant_analyzer}
+      - REALTIME_DB_NAME=${REALTIME_DB_NAME:-quant_realtime}
+      - JWT_SECRET_KEY=${JWT_SECRET_KEY}
+      - TZ=Asia/Shanghai
+      - SMTP_SERVER=${SMTP_SERVER:-}
+      - SMTP_PORT=${SMTP_PORT:-587}
+      - SMTP_USERNAME=${SMTP_USERNAME:-}
+      - SMTP_PASSWORD=${SMTP_PASSWORD:-}
+      - SMTP_FROM_EMAIL=${SMTP_FROM_EMAIL:-}
+      - FROM_NAME=${FROM_NAME:-悟空量化}
+      - SCHEDULER_LOCK_TTL_SECONDS=${SCHEDULER_LOCK_TTL_SECONDS:-90}
+      - SCHEDULER_HEARTBEAT_INTERVAL_SECONDS=${SCHEDULER_HEARTBEAT_INTERVAL_SECONDS:-15}
+      - SCHEDULER_RELOAD_INTERVAL_SECONDS=${SCHEDULER_RELOAD_INTERVAL_SECONDS:-15}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - quant-network
+    restart: unless-stopped
+    healthcheck:
+      test: [ "CMD", "python", "tools/check_scheduler_health.py" ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 45s
     logging:
       driver: json-file
       options:

@@ -1,11 +1,25 @@
+from __future__ import annotations
+
 from fastapi import APIRouter, Depends, HTTPException, Body
-from typing import List, Dict, Any
 from auth import get_current_admin_user, log_admin_action
 from db import get_db_collections
-from scheduler import sync_job, scheduler, DEFAULT_SCHEDULES
+from scheduler import DEFAULT_SCHEDULES
 from datetime import datetime
+import time
 
 router = APIRouter()
+
+
+def _scheduler_status_is_fresh(status_doc: dict | None, max_age_seconds: int = 90) -> bool:
+    if not status_doc:
+        return False
+    heartbeat_ts = status_doc.get("heartbeat_ts")
+    if heartbeat_ts is None:
+        return False
+    try:
+        return time.time() - float(heartbeat_ts) <= max_age_seconds
+    except (TypeError, ValueError):
+        return False
 
 @router.get("/jobs", summary="获取所有定时任务配置")
 def get_scheduler_jobs(admin_user: dict = Depends(get_current_admin_user)):
@@ -13,9 +27,13 @@ def get_scheduler_jobs(admin_user: dict = Depends(get_current_admin_user)):
     try:
         collections = get_db_collections()
         config_coll = collections.get("schedule_config")
+        status_coll = collections.get("scheduler_status")
         
         # Get all stored configs
         stored_configs = {doc['job_id']: doc for doc in config_coll.find({})}
+        status_doc = status_coll.find_one({"_id": "primary"}) if status_coll is not None else None
+        status_fresh = _scheduler_status_is_fresh(status_doc)
+        loaded_jobs = status_doc.get("jobs", {}) if status_fresh and isinstance(status_doc, dict) else {}
         
         jobs = []
         for job_id, default_config in DEFAULT_SCHEDULES.items():
@@ -27,10 +45,9 @@ def get_scheduler_jobs(admin_user: dict = Depends(get_current_admin_user)):
                 config = default_config.copy()
                 config["job_id"] = job_id
 
-            # Check actual APScheduler status
-            aps_job = scheduler.get_job(job_id)
-            is_running = aps_job is not None
-            next_run_time = aps_job.next_run_time.isoformat() if is_running and aps_job.next_run_time else None
+            job_state = loaded_jobs.get(job_id) if isinstance(loaded_jobs, dict) else None
+            is_running = bool(status_fresh and job_state)
+            next_run_time = job_state.get("next_run_time") if isinstance(job_state, dict) else None
             
             # Remove MongoDB _id for JSON serialization
             if "_id" in config:
@@ -49,6 +66,9 @@ def get_scheduler_jobs(admin_user: dict = Depends(get_current_admin_user)):
                 "is_active": config.get("is_active", default_config.get("is_active", True)),
                 "is_running": is_running,
                 "next_run_time": next_run_time,
+                "scheduler_online": status_fresh,
+                "scheduler_instance": status_doc.get("instance_id") if isinstance(status_doc, dict) else None,
+                "scheduler_heartbeat_at": status_doc.get("heartbeat_at").isoformat() if isinstance(status_doc, dict) and isinstance(status_doc.get("heartbeat_at"), datetime) else None,
                 "updated_at": config.get("updated_at", "").isoformat() if isinstance(config.get("updated_at"), datetime) else None
             })
             
@@ -104,21 +124,15 @@ def update_scheduler_job(
             upsert=True
         )
         
-        # Sync immediately to memory
-        sync_success = sync_job(job_id, current_config)
-        
         log_admin_action(
             admin_user=admin_user,
             action="UPDATE_SCHEDULER_JOB",
             details=f"Updated job {job_id} configuration"
         )
-        
-        if not sync_success:
-             raise HTTPException(status_code=500, detail="配置已保存，但同步到内存调度器时失败，可能参数不合法")
              
         return {
             "success": True,
-            "message": "调度规则修改成功并已生效"
+            "message": "调度规则已保存，独立 scheduler runner 将自动加载"
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"更新任务失败: {str(e)}")

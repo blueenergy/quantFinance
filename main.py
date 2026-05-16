@@ -84,6 +84,7 @@ from routers.navigation_policy import user_router as navigation_user_router
 from routers.entitlements_matrix import router as entitlements_matrix_router
 from production_config import configure_production_app
 from contextlib import asynccontextmanager
+import os
 from scheduler import start_scheduler, stop_scheduler
 
 
@@ -102,11 +103,12 @@ async def lifespan(app: FastAPI):
     logging.getLogger("uvicorn.access").addFilter(_NoiseFilter())
     logging.getLogger("apscheduler.executors.default").setLevel(logging.WARNING)
     logging.getLogger("apscheduler.scheduler").setLevel(logging.WARNING)
-    # Startup
-    start_scheduler()
+    embedded_scheduler_enabled = os.getenv("ENABLE_EMBEDDED_SCHEDULER", "false").lower() in {"1", "true", "yes"}
+    if embedded_scheduler_enabled:
+        start_scheduler()
     yield
-    # Shutdown
-    stop_scheduler()
+    if embedded_scheduler_enabled:
+        stop_scheduler()
 
 app = FastAPI(lifespan=lifespan)
 

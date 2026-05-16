@@ -61,6 +61,8 @@ jobs:
             "docker login crpi-gv3f6mfcrw75qane.cn-hangzhou.personal.cr.aliyuncs.com \
                -u ${{ secrets.ALIYUN_USER }} -p ${{ secrets.ALIYUN_TOKEN }} && \
              docker pull crpi-gv3f6mfcrw75qane.cn-hangzhou.personal.cr.aliyuncs.com/wukongquant/quant-api:latest && \
+             docker stop quant-scheduler 2>/dev/null || true && \
+             docker rm   quant-scheduler 2>/dev/null || true && \
              docker stop quant-api 2>/dev/null || true && \
              docker rm   quant-api 2>/dev/null || true && \
              docker run -d \
@@ -69,12 +71,31 @@ jobs:
                --add-host=host.docker.internal:host-gateway \
                -p 3001:3001 \
                -e TZ=Asia/Shanghai \
+               -e ENABLE_EMBEDDED_SCHEDULER=false \
+               -e API_WORKERS=2 \
                --log-driver json-file \
                --log-opt max-size=50m \
                --log-opt max-file=3 \
                -v /home/deployuser/quantFinance/.env:/app/.env:ro \
                -v /home/deployuser/quantFinance/logs:/app/logs \
                crpi-gv3f6mfcrw75qane.cn-hangzhou.personal.cr.aliyuncs.com/wukongquant/quant-api:latest && \
+             docker run -d \
+               --name quant-scheduler \
+               --restart unless-stopped \
+               --add-host=host.docker.internal:host-gateway \
+               -e TZ=Asia/Shanghai \
+               --health-cmd 'python tools/check_scheduler_health.py' \
+               --health-interval 30s \
+               --health-timeout 10s \
+               --health-retries 3 \
+               --health-start-period 45s \
+               --log-driver json-file \
+               --log-opt max-size=50m \
+               --log-opt max-file=3 \
+               -v /home/deployuser/quantFinance/.env:/app/.env:ro \
+               -v /home/deployuser/quantFinance/logs:/app/logs \
+               crpi-gv3f6mfcrw75qane.cn-hangzhou.personal.cr.aliyuncs.com/wukongquant/quant-api:latest \
+               python scheduler_runner.py && \
              docker image prune -f"
 
   docker:

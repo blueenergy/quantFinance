@@ -80,6 +80,7 @@ def get_db_collections() -> Dict[str, Collection]:
         "analysis_task_revisions": db["analysis_task_revisions"],  # 分析任务版本历史
         "quota_usage": db["quota_usage"],        # 用户配额使用情况
         "schedule_config": db["schedule_config"], # 定时任务调度配置
+        "scheduler_status": db["scheduler_status"], # 独立 scheduler runner 状态
         "pipeline_tasks": db["pipeline_tasks"],
         "job_status": db["job_status"],
         "market_insight_events": db["market_insight_events"],

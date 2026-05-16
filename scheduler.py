@@ -1,7 +1,7 @@
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
-from datetime import datetime
+from datetime import datetime, timezone
 import logging
 import os
 import time
@@ -12,6 +12,134 @@ log = logging.getLogger(__name__)
 # Define global scheduler
 scheduler = BackgroundScheduler(timezone='Asia/Shanghai')
 _SCHEDULER_INSTANCE_ID = f"{os.uname().nodename}:{os.getpid()}"
+_SCHEDULER_PRIMARY_LOCK_ID = "scheduler_primary_lock"
+_SCHEDULER_STATUS_ID = "primary"
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _get_scheduler_status_collection():
+    from db import get_db_collections
+
+    return get_db_collections()["scheduler_status"]
+
+
+def acquire_primary_scheduler_lock(ttl_seconds: int = 90) -> bool:
+    """Acquire the single-runner lease for the standalone scheduler process."""
+    now = time.time()
+    try:
+        result = _get_scheduler_status_collection().update_one(
+            {
+                "_id": _SCHEDULER_PRIMARY_LOCK_ID,
+                "$or": [
+                    {"locked_until": {"$lte": now}},
+                    {"locked_until": {"$exists": False}},
+                ],
+            },
+            {
+                "$set": {
+                    "locked_by": _SCHEDULER_INSTANCE_ID,
+                    "locked_until": now + ttl_seconds,
+                    "updated_at": _utc_now(),
+                },
+                "$setOnInsert": {"created_at": _utc_now()},
+            },
+            upsert=True,
+        )
+    except DuplicateKeyError:
+        return False
+    return bool(result.upserted_id or result.modified_count)
+
+
+def renew_primary_scheduler_lock(ttl_seconds: int = 90) -> bool:
+    """Renew the single-runner lease; returns False if another runner owns it."""
+    now = time.time()
+    result = _get_scheduler_status_collection().update_one(
+        {"_id": _SCHEDULER_PRIMARY_LOCK_ID, "locked_by": _SCHEDULER_INSTANCE_ID},
+        {
+            "$set": {
+                "locked_until": now + ttl_seconds,
+                "updated_at": _utc_now(),
+            }
+        },
+    )
+    return bool(result.modified_count)
+
+
+def release_primary_scheduler_lock() -> None:
+    _get_scheduler_status_collection().update_one(
+        {"_id": _SCHEDULER_PRIMARY_LOCK_ID, "locked_by": _SCHEDULER_INSTANCE_ID},
+        {
+            "$set": {
+                "locked_until": time.time(),
+                "updated_at": _utc_now(),
+            }
+        },
+    )
+
+
+def schedule_config_signature() -> str:
+    """Return a compact signature for detecting schedule_config changes."""
+    from db import get_db_collections
+
+    config_coll = get_db_collections()["schedule_config"]
+    parts = []
+    for doc in config_coll.find({}, {"job_id": 1, "updated_at": 1, "is_active": 1, "type": 1, "seconds": 1, "hour": 1, "minute": 1, "day_of_week": 1}):
+        updated = doc.get("updated_at")
+        if hasattr(updated, "timestamp"):
+            updated_value = str(updated.timestamp())
+        else:
+            updated_value = str(updated)
+        parts.append(
+            "|".join(
+                [
+                    str(doc.get("job_id", "")),
+                    str(doc.get("is_active", "")),
+                    str(doc.get("type", "")),
+                    str(doc.get("seconds", "")),
+                    str(doc.get("hour", "")),
+                    str(doc.get("minute", "")),
+                    str(doc.get("day_of_week", "")),
+                    updated_value,
+                ]
+            )
+        )
+    return "\n".join(sorted(parts))
+
+
+def scheduler_jobs_snapshot() -> dict:
+    """Return the scheduler in-memory job state for admin/status APIs."""
+    jobs = {}
+    for job in scheduler.get_jobs():
+        jobs[job.id] = {
+            "id": job.id,
+            "name": job.name,
+            "next_run_time": job.next_run_time.isoformat() if job.next_run_time else None,
+        }
+    return jobs
+
+
+def write_scheduler_status(state: str = "running", error: str = None) -> None:
+    """Persist runner heartbeat and loaded APScheduler job snapshot."""
+    _get_scheduler_status_collection().update_one(
+        {"_id": _SCHEDULER_STATUS_ID},
+        {
+            "$set": {
+                "instance_id": _SCHEDULER_INSTANCE_ID,
+                "state": state,
+                "heartbeat_at": _utc_now(),
+                "heartbeat_ts": time.time(),
+                "jobs": scheduler_jobs_snapshot(),
+                "scheduler_running": scheduler.running,
+                "error": error,
+                "updated_at": _utc_now(),
+            },
+            "$setOnInsert": {"created_at": _utc_now()},
+        },
+        upsert=True,
+    )
 
 
 def _acquire_scheduler_job_lock(job_id: str, ttl_seconds: int = 1800) -> bool:
