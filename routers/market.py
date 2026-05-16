@@ -6,6 +6,7 @@ from auth import get_current_active_user
 from db import get_db_collections, get_analyzer_db, get_data_db
 from market_analysis_cache import market_analysis_cache
 from datetime import date, datetime
+import time
 from services.tushare_cached import get_latest_trade_date
 from external_data import external_market_data
 from utils.stock_utils import serialize_doc
@@ -13,6 +14,11 @@ from bson import ObjectId
 from services.analysis_tasks import build_task_doc
 
 router = APIRouter()
+
+_HOME_SUMMARIES_CACHE_TTL_SECONDS = 60
+_MARKET_ANALYSIS_SUMMARY_CACHE_TTL_SECONDS = 60
+_home_summaries_cache: Dict[str, Any] = {"key": None, "expires_at": 0.0, "payload": None}
+_market_analysis_summary_cache: Dict[str, Any] = {"key": None, "expires_at": 0.0, "payload": None}
 
 
 def _compact_summary_text(value: Any, fallback: str, max_len: int = 48) -> str:
@@ -224,6 +230,58 @@ def _collect_home_summary_cards(analysis_date: Optional[str] = None) -> Dict[str
             "user_tip": market_result.get("user_tip"),
         },
     }
+
+
+def _get_cached_home_summary_cards(analysis_date: Optional[str] = None) -> Dict[str, Any]:
+    cache_key = analysis_date or ""
+    now = time.time()
+    if (
+        _home_summaries_cache.get("key") == cache_key
+        and _home_summaries_cache.get("payload") is not None
+        and float(_home_summaries_cache.get("expires_at") or 0) > now
+    ):
+        return _home_summaries_cache["payload"]
+    payload = _collect_home_summary_cards(analysis_date)
+    _home_summaries_cache.update({
+        "key": cache_key,
+        "payload": payload,
+        "expires_at": now + _HOME_SUMMARIES_CACHE_TTL_SECONDS,
+    })
+    return payload
+
+
+def _get_cached_market_analysis_summary(analysis_date: Optional[str] = None) -> Dict[str, Any]:
+    cache_key = analysis_date or ""
+    now = time.time()
+    if (
+        _market_analysis_summary_cache.get("key") == cache_key
+        and _market_analysis_summary_cache.get("payload") is not None
+        and float(_market_analysis_summary_cache.get("expires_at") or 0) > now
+    ):
+        return _market_analysis_summary_cache["payload"]
+
+    result = fetch_market_analysis_result(analysis_date)
+    summary = _build_market_home_summary(result)
+    payload = {
+        "success": bool(result.get("success")),
+        "data": {
+            "status": result.get("analysisType") or ("已生成" if result.get("success") else "等待生成"),
+            "summary_line": summary["summary_line"],
+            "signals": summary["signals"],
+            "tone": summary["tone"],
+            "risk_tag": summary["risk_tag"],
+            "updated_at": (result.get("cache_info") or {}).get("created_at") or result.get("analysis_date"),
+            "analysis_date": result.get("analysis_date"),
+        },
+        "error": result.get("error"),
+        "user_tip": result.get("user_tip"),
+    }
+    _market_analysis_summary_cache.update({
+        "key": cache_key,
+        "payload": payload,
+        "expires_at": now + _MARKET_ANALYSIS_SUMMARY_CACHE_TTL_SECONDS,
+    })
+    return payload
 
 
 def _theme_lag_trade_date_compact(trade_date: str) -> str:
@@ -657,22 +715,7 @@ async def get_market_analysis_summary(
     current_user: dict = Depends(get_current_active_user)
 ):
     _ = current_user
-    result = fetch_market_analysis_result(date)
-    summary = _build_market_home_summary(result)
-    return {
-        "success": bool(result.get("success")),
-        "data": {
-            "status": result.get("analysisType") or ("已生成" if result.get("success") else "等待生成"),
-            "summary_line": summary["summary_line"],
-            "signals": summary["signals"],
-            "tone": summary["tone"],
-            "risk_tag": summary["risk_tag"],
-            "updated_at": (result.get("cache_info") or {}).get("created_at") or result.get("analysis_date"),
-            "analysis_date": result.get("analysis_date"),
-        },
-        "error": result.get("error"),
-        "user_tip": result.get("user_tip"),
-    }
+    return _get_cached_market_analysis_summary(date)
 
 
 @router.get("/home-summaries")
@@ -684,7 +727,7 @@ async def get_home_summaries(
     try:
         return {
             "success": True,
-            "data": _collect_home_summary_cards(date),
+            "data": _get_cached_home_summary_cards(date),
         }
     except Exception as e:
         return {

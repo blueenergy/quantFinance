@@ -9,6 +9,7 @@
 """
 
 from datetime import datetime, timezone
+import time
 from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, HTTPException, Query
@@ -22,6 +23,10 @@ from services.data_monitoring import (
 )
 
 router = APIRouter(prefix="/data-pulse", tags=["data-pulse"])
+_DATA_PULSE_OVERVIEW_CACHE_TTL_SECONDS = 60
+_DATA_PULSE_NEWS_CACHE_TTL_SECONDS = 60
+_data_pulse_overview_cache: Dict[str, Any] = {"expires_at": 0.0, "payload": None}
+_data_pulse_news_cache: Dict[str, Any] = {"key": None, "expires_at": 0.0, "payload": None}
 
 
 def _get_international_news_doc():
@@ -106,13 +111,28 @@ async def get_coverage_gaps(
 async def get_international_news(
     category: Optional[str] = Query(None, description="指定分类"),
 ):
+    cache_key = category or ""
+    now = time.time()
+    if (
+        _data_pulse_news_cache.get("key") == cache_key
+        and _data_pulse_news_cache.get("payload") is not None
+        and float(_data_pulse_news_cache.get("expires_at") or 0) > now
+    ):
+        return _data_pulse_news_cache["payload"]
+
     doc = _get_international_news_doc()
 
     if not doc:
-        return {
+        payload = {
             "success": False,
             "message": "暂无新闻数据，数据同步引擎可能尚未运行。",
         }
+        _data_pulse_news_cache.update({
+            "key": cache_key,
+            "payload": payload,
+            "expires_at": now + _DATA_PULSE_NEWS_CACHE_TTL_SECONDS,
+        })
+        return payload
 
     categories = doc.get("categories", {})
     fetched_at = doc.get("fetched_at")
@@ -129,7 +149,7 @@ async def get_international_news(
     if category and category in categories:
         categories = {category: categories[category]}
 
-    return {
+    payload = {
         "success": True,
         "fetched_at": fetched_at.strftime("%Y-%m-%d %H:%M UTC") if fetched_at else None,
         "age_minutes": age_minutes,
@@ -137,6 +157,12 @@ async def get_international_news(
         "total": doc.get("total", 0),
         "categories": categories,
     }
+    _data_pulse_news_cache.update({
+        "key": cache_key,
+        "payload": payload,
+        "expires_at": now + _DATA_PULSE_NEWS_CACHE_TTL_SECONDS,
+    })
+    return payload
 
 
 @router.get("/status")
@@ -148,6 +174,13 @@ async def get_data_sync_status():
 
 @router.get("/overview")
 async def get_data_pulse_overview():
+    now = time.time()
+    if (
+        _data_pulse_overview_cache.get("payload") is not None
+        and float(_data_pulse_overview_cache.get("expires_at") or 0) > now
+    ):
+        return _data_pulse_overview_cache["payload"]
+
     dm = build_data_monitoring_overview()
     freshness_rows = dm.get("freshness") or []
 
@@ -181,7 +214,12 @@ async def get_data_pulse_overview():
             "headlines": headlines,
         }
 
-    return {"success": True, "overview": overview}
+    payload = {"success": True, "overview": overview}
+    _data_pulse_overview_cache.update({
+        "payload": payload,
+        "expires_at": now + _DATA_PULSE_OVERVIEW_CACHE_TTL_SECONDS,
+    })
+    return payload
 
 
 @router.get("/dag")
