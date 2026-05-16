@@ -146,6 +146,10 @@ PREFERENCE_COUNT_FIELDS = (
 )
 PREFERENCE_DIMENSION_WEIGHTS = {"event_type": 1.0, "category": 0.6, "subject_type": 0.4}
 MAX_PREFERENCE_WEIGHT = 5.0
+QUALITY_REVIEW_STATUSES = ("confirmed", "faded", "unconfirmed", "insufficient_data")
+QUALITY_DIMENSION_WEIGHTS = {"event_type": 1.0, "category": 0.6, "subject_type": 0.3}
+MAX_GLOBAL_QUALITY_WEIGHT = 4.0
+GLOBAL_QUALITY_MIN_DECISIVE_COUNT = 3
 
 
 def get_event_type_metadata() -> Dict[str, Dict[str, Any]]:
@@ -711,6 +715,7 @@ def get_market_insight_focus(
     feedback_context = _build_focus_feedback_context(user_id, td)
     review_context = _build_focus_review_context(td)
     preference_context = _build_user_preference_context(user_id)
+    quality_context = _build_global_quality_context()
     by_subject: Dict[str, Dict[str, Any]] = {}
     for row in rows:
         focus = _build_focus_item(
@@ -720,6 +725,7 @@ def get_market_insight_focus(
             feedback_context,
             review_context,
             preference_context,
+            quality_context,
         )
         key = _focus_subject_key(row)
         current = by_subject.get(key)
@@ -754,6 +760,7 @@ def _build_focus_item(
     feedback_context: Optional[Dict[str, Any]] = None,
     review_context: Optional[Dict[str, Any]] = None,
     preference_context: Optional[Dict[str, Any]] = None,
+    quality_context: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     event_type = str(event.get("event_type") or "")
     confidence = _num(event.get("confidence"), 0.0) or 0.0
@@ -769,6 +776,7 @@ def _build_focus_item(
     review = _focus_review_for_key(focus_key, review_context or {})
     feedback_weight = FOCUS_FEEDBACK_WEIGHTS.get(str(feedback.get("action") or ""), 0.0)
     preference_weight = _event_preference_weight(event, preference_context or {})
+    global_quality_weight = _event_global_quality_weight(event, quality_context or {})
     attention_score = min(
         100.0,
         max(
@@ -780,7 +788,8 @@ def _build_focus_item(
             + subject_weight
             + relevance_weight
             + feedback_weight
-            + preference_weight,
+            + preference_weight
+            + global_quality_weight,
         ),
     )
     metadata = EVENT_TYPE_METADATA.get(event_type, {})
@@ -792,7 +801,7 @@ def _build_focus_item(
         "category": metadata.get("category") or "",
         "title": event.get("title") or metadata.get("label") or event_type,
         "summary": event.get("summary") or metadata.get("meaning") or "",
-        "why_focus": _focus_reason(event, metadata, attention_score, preference_weight),
+        "why_focus": _focus_reason(event, metadata, attention_score, preference_weight, global_quality_weight),
         "next_action": _focus_next_action(event, metadata),
         "score_breakdown": {
             "confidence_component": round(confidence * 0.55, 1),
@@ -803,6 +812,7 @@ def _build_focus_item(
             "user_relevance_weight": relevance_weight,
             "feedback_weight": feedback_weight,
             "preference_weight": preference_weight,
+            "global_quality_weight": global_quality_weight,
         },
         "relevance": relevance,
         "feedback": feedback,
@@ -824,11 +834,16 @@ def _focus_reason(
     metadata: Dict[str, Any],
     attention_score: float,
     preference_weight: float = 0.0,
+    global_quality_weight: float = 0.0,
 ) -> str:
     if preference_weight >= 4.0:
         return "结合您过往反馈，这类焦点更符合您的关注偏好。"
     if preference_weight <= -4.0:
         return "该焦点客观分较高，但同类内容曾被您多次降权，建议快速确认即可。"
+    if global_quality_weight >= 3.0:
+        return "同类焦点在历史盘后验证中表现较好，值得优先确认。"
+    if global_quality_weight <= -3.0:
+        return "同类焦点历史验证质量偏弱，建议结合证据链谨慎判断。"
     event_type = event.get("event_type")
     if event_type == "COUNTER_TREND_SECTOR_STRENGTH":
         return "弱市里仍然逆势扩散，属于稀缺且更值得优先确认的方向。"
@@ -1042,6 +1057,147 @@ def _event_preference_weight(event: Dict[str, Any], preference_context: Dict[str
         pref = preference_context.get(f"{dimension}:{key}") or {}
         weighted += (_num(pref.get("score"), 0.0) or 0.0) * PREFERENCE_DIMENSION_WEIGHTS.get(dimension, 0.0)
     return _clamp_preference_weight(weighted)
+
+
+def _quality_dimensions_for_review(review: Dict[str, Any]) -> Dict[str, str]:
+    event_type = str(review.get("event_type") or "")
+    subject_type = str(review.get("subject_type") or "")
+    metadata = EVENT_TYPE_METADATA.get(event_type, {})
+    dimensions = {
+        "event_type": event_type,
+        "subject_type": subject_type,
+    }
+    if metadata.get("category"):
+        dimensions["category"] = str(metadata["category"])
+    return {dimension: key for dimension, key in dimensions.items() if key}
+
+
+def _calculate_global_quality_score(stats: Dict[str, int]) -> Dict[str, Any]:
+    confirmed_count = int(stats.get("confirmed_count", 0))
+    faded_count = int(stats.get("faded_count", 0))
+    unconfirmed_count = int(stats.get("unconfirmed_count", 0))
+    insufficient_data_count = int(stats.get("insufficient_data_count", 0))
+    reviewed_count = confirmed_count + faded_count + unconfirmed_count + insufficient_data_count
+    decisive_count = confirmed_count + faded_count
+    confirmation_rate = round(confirmed_count / decisive_count, 4) if decisive_count else 0.0
+    fade_rate = round(faded_count / decisive_count, 4) if decisive_count else 0.0
+    reliability = min(1.0, decisive_count / 20.0)
+    raw_score = ((confirmation_rate - 0.5) * 8.0 * reliability) if decisive_count else 0.0
+    weight = 0.0
+    if decisive_count >= GLOBAL_QUALITY_MIN_DECISIVE_COUNT:
+        weight = round(max(-MAX_GLOBAL_QUALITY_WEIGHT, min(MAX_GLOBAL_QUALITY_WEIGHT, raw_score)), 1)
+    return {
+        "reviewed_count": reviewed_count,
+        "decisive_count": decisive_count,
+        "confirmation_rate": confirmation_rate,
+        "fade_rate": fade_rate,
+        "score": round(raw_score, 2),
+        "weight": weight,
+    }
+
+
+def rebuild_market_insight_global_quality() -> Dict[str, Any]:
+    collections = get_db_collections()
+    review_coll = collections.get("market_insight_focus_reviews")
+    quality_coll = collections.get("market_insight_global_quality")
+    if review_coll is None or quality_coll is None:
+        return {"success": True, "count": 0, "data": []}
+
+    buckets: Dict[str, Dict[str, Any]] = {}
+    for review in review_coll.find({}):
+        status = str(review.get("status") or "")
+        if status not in QUALITY_REVIEW_STATUSES:
+            continue
+        for dimension, key in _quality_dimensions_for_review(review).items():
+            bucket_key = f"{dimension}:{key}"
+            bucket = buckets.setdefault(
+                bucket_key,
+                {
+                    "dimension": dimension,
+                    "key": key,
+                    "confirmed_count": 0,
+                    "faded_count": 0,
+                    "unconfirmed_count": 0,
+                    "insufficient_data_count": 0,
+                    "last_reviewed_at": None,
+                },
+            )
+            count_field = f"{status}_count"
+            bucket[count_field] += 1
+            checked_at = review.get("checked_at")
+            if checked_at is not None and (
+                bucket.get("last_reviewed_at") is None or checked_at > bucket.get("last_reviewed_at")
+            ):
+                bucket["last_reviewed_at"] = checked_at
+
+    now = time.time()
+    docs = []
+    for bucket in buckets.values():
+        metrics = _calculate_global_quality_score(bucket)
+        doc = {
+            **bucket,
+            **metrics,
+            "updated_at": now,
+        }
+        quality_coll.update_one(
+            {"dimension": doc["dimension"], "key": doc["key"]},
+            {"$set": doc, "$setOnInsert": {"created_at": now}},
+            upsert=True,
+        )
+        docs.append(doc)
+    quality_coll.create_index(
+        [("dimension", ASCENDING), ("key", ASCENDING)],
+        unique=True,
+        name="dimension_key_unique",
+        background=True,
+    )
+    quality_coll.create_index([("weight", DESCENDING), ("decisive_count", DESCENDING)], name="quality_rank_idx", background=True)
+    docs.sort(key=lambda item: (item.get("weight", 0.0), item.get("decisive_count", 0)), reverse=True)
+    return {"success": True, "count": len(docs), "data": docs}
+
+
+def list_market_insight_global_quality(
+    dimension: Optional[str] = None,
+    limit: int = 100,
+) -> Dict[str, Any]:
+    coll = get_db_collections().get("market_insight_global_quality")
+    if coll is None:
+        return {"success": True, "count": 0, "data": []}
+    query: Dict[str, Any] = {}
+    if dimension:
+        query["dimension"] = dimension
+    cursor = coll.find(query).sort([("weight", DESCENDING), ("decisive_count", DESCENDING)]).limit(limit)
+    rows = [serialize_doc(doc) for doc in cursor]
+    return {"success": True, "count": len(rows), "data": rows}
+
+
+def _build_global_quality_context() -> Dict[str, Dict[str, Any]]:
+    coll = get_db_collections().get("market_insight_global_quality")
+    if coll is None:
+        return {}
+    context: Dict[str, Dict[str, Any]] = {}
+    for doc in coll.find({}):
+        dimension = str(doc.get("dimension") or "")
+        key = str(doc.get("key") or "")
+        if not dimension or not key:
+            continue
+        context[f"{dimension}:{key}"] = {
+            "weight": _num(doc.get("weight"), 0.0) or 0.0,
+            "dimension": dimension,
+            "key": key,
+            "decisive_count": int(_num(doc.get("decisive_count"), 0.0) or 0),
+        }
+    return context
+
+
+def _event_global_quality_weight(event: Dict[str, Any], quality_context: Dict[str, Dict[str, Any]]) -> float:
+    if not quality_context:
+        return 0.0
+    weighted = 0.0
+    for dimension, key in _preference_dimensions_for_event(event).items():
+        quality = quality_context.get(f"{dimension}:{key}") or {}
+        weighted += (_num(quality.get("weight"), 0.0) or 0.0) * QUALITY_DIMENSION_WEIGHTS.get(dimension, 0.0)
+    return round(max(-MAX_GLOBAL_QUALITY_WEIGHT, min(MAX_GLOBAL_QUALITY_WEIGHT, weighted)), 1)
 
 
 def _build_focus_feedback_context(user_id: Optional[str], trade_date: str) -> Dict[str, Dict[str, Any]]:
@@ -1268,6 +1424,7 @@ def _upsert_focus_reviews(reviews: List[Dict[str, Any]]) -> int:
         _apply_review_preference_to_feedback(review)
     coll.create_index([("trade_date", DESCENDING), ("status", ASCENDING)], name="trade_status_idx", background=True)
     coll.create_index([("focus_key", ASCENDING)], unique=True, name="focus_key_unique", background=True)
+    rebuild_market_insight_global_quality()
     return len(reviews)
 
 

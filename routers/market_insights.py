@@ -17,7 +17,9 @@ from services.market_insight_engine import (
     get_market_insight_overview,
     get_sector_strength,
     get_sector_strength_series,
+    list_market_insight_global_quality,
     list_market_insight_events,
+    rebuild_market_insight_global_quality,
     review_market_insight_focus,
     save_market_insight_focus_feedback,
 )
@@ -90,6 +92,22 @@ def focus_review(
     current_user: dict = Depends(get_current_active_user),  # noqa: ARG001
 ):
     return review_market_insight_focus(trade_date=trade_date, horizon_minutes=horizon_minutes)
+
+
+@router.get("/quality")
+def quality(
+    dimension: Optional[str] = Query(None, pattern="^(event_type|category|subject_type)$"),
+    limit: int = Query(100, ge=1, le=500),
+    current_user: dict = Depends(get_current_active_user),  # noqa: ARG001
+):
+    return list_market_insight_global_quality(dimension=dimension, limit=limit)
+
+
+@router.post("/quality/refresh")
+def quality_refresh(
+    current_user: dict = Depends(get_current_active_user),  # noqa: ARG001
+):
+    return rebuild_market_insight_global_quality()
 
 
 @router.get("/events")

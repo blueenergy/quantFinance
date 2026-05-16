@@ -171,6 +171,40 @@ def test_focus_review_passes_params_to_engine(monkeypatch):
 
 
 @pytest.mark.unit
+def test_quality_passes_params_to_engine(monkeypatch):
+    captured = {}
+
+    def fake_quality(**kwargs):
+        captured.update(kwargs)
+        return {"success": True, "count": 1, "data": [{"dimension": "event_type"}]}
+
+    monkeypatch.setattr(market_insights, "list_market_insight_global_quality", fake_quality)
+
+    res = _client().get("/api/market-insights/quality", params={"dimension": "event_type", "limit": 20})
+
+    assert res.status_code == 200
+    assert res.json()["count"] == 1
+    assert captured == {"dimension": "event_type", "limit": 20}
+
+
+@pytest.mark.unit
+def test_quality_refresh_calls_engine(monkeypatch):
+    called = {}
+
+    def fake_refresh():
+        called["refresh"] = True
+        return {"success": True, "count": 2, "data": []}
+
+    monkeypatch.setattr(market_insights, "rebuild_market_insight_global_quality", fake_refresh)
+
+    res = _client().post("/api/market-insights/quality/refresh")
+
+    assert res.status_code == 200
+    assert res.json()["count"] == 2
+    assert called["refresh"] is True
+
+
+@pytest.mark.unit
 def test_events_passes_filter_params_to_engine(monkeypatch):
     captured = {}
 

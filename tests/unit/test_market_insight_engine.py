@@ -420,6 +420,127 @@ def test_get_market_insight_focus_applies_user_preference_weight(monkeypatch):
 
 
 @pytest.mark.unit
+def test_rebuild_market_insight_global_quality_aggregates_reviews(monkeypatch):
+    quality = FakeCollection([])
+    finance = {
+        "market_insight_focus_reviews": FakeCollection(
+            [
+                {
+                    "focus_key": "a",
+                    "event_type": "SECTOR_DIFFUSION",
+                    "subject_type": "sector",
+                    "status": "confirmed",
+                    "checked_at": 10.0,
+                },
+                {
+                    "focus_key": "b",
+                    "event_type": "SECTOR_DIFFUSION",
+                    "subject_type": "sector",
+                    "status": "confirmed",
+                    "checked_at": 20.0,
+                },
+                {
+                    "focus_key": "c",
+                    "event_type": "SECTOR_DIFFUSION",
+                    "subject_type": "sector",
+                    "status": "faded",
+                    "checked_at": 30.0,
+                },
+                {
+                    "focus_key": "d",
+                    "event_type": "SECTOR_FALSE_STRENGTH",
+                    "subject_type": "sector",
+                    "status": "insufficient_data",
+                    "checked_at": 40.0,
+                },
+            ]
+        ),
+        "market_insight_global_quality": quality,
+    }
+    monkeypatch.setattr(engine, "get_db_collections", lambda: finance)
+
+    result = engine.rebuild_market_insight_global_quality()
+
+    assert result["success"] is True
+    assert result["count"] == 5
+    event_type_updates = [
+        update["$set"]
+        for query, update, _ in quality.upserts
+        if query == {"dimension": "event_type", "key": "SECTOR_DIFFUSION"}
+    ]
+    assert event_type_updates[0]["confirmed_count"] == 2
+    assert event_type_updates[0]["faded_count"] == 1
+    assert event_type_updates[0]["decisive_count"] == 3
+    assert event_type_updates[0]["confirmation_rate"] == pytest.approx(0.6667)
+    assert event_type_updates[0]["weight"] == pytest.approx(0.2)
+
+
+@pytest.mark.unit
+def test_get_market_insight_focus_applies_global_quality_weight(monkeypatch):
+    finance = {
+        "market_insight_events": FakeCollection(
+            [
+                {
+                    "_id": "a",
+                    "trade_date": "20260515",
+                    "snapshot_time": "202605151030",
+                    "event_type": "SECTOR_DIFFUSION",
+                    "severity": "medium",
+                    "confidence": 77.0,
+                    "subject_type": "sector",
+                    "subject_code": "801011.SI",
+                    "subject_name": "银行",
+                    "title": "银行扩散",
+                    "summary": "银行上涨家数扩散。",
+                },
+                {
+                    "_id": "b",
+                    "trade_date": "20260515",
+                    "snapshot_time": "202605151030",
+                    "event_type": "SECTOR_FALSE_STRENGTH",
+                    "severity": "medium",
+                    "confidence": 78.0,
+                    "subject_type": "sector",
+                    "subject_code": "801012.SI",
+                    "subject_name": "地产",
+                    "title": "地产假强",
+                    "summary": "地产表面强势。",
+                },
+            ]
+        ),
+        "trader_positions": FakeCollection([]),
+        "intraday_t0_mock_positions": FakeCollection([]),
+        "user_watchlists": FakeCollection([]),
+        "market_insight_focus_feedback": FakeCollection([]),
+        "market_insight_user_preferences": FakeCollection([]),
+        "market_insight_global_quality": FakeCollection(
+            [
+                {
+                    "dimension": "event_type",
+                    "key": "SECTOR_DIFFUSION",
+                    "weight": 4.0,
+                    "decisive_count": 30,
+                },
+                {
+                    "dimension": "category",
+                    "key": "去妄存真类",
+                    "weight": -4.0,
+                    "decisive_count": 30,
+                },
+            ]
+        ),
+    }
+    monkeypatch.setattr(engine, "get_db_collections", lambda: finance)
+
+    result = engine.get_market_insight_focus("2026-05-15", limit=2, user_id="u1")
+
+    assert result["data"][0]["primary_event"]["event_type"] == "SECTOR_DIFFUSION"
+    assert result["data"][0]["score_breakdown"]["global_quality_weight"] == 4.0
+    assert result["data"][1]["score_breakdown"]["global_quality_weight"] == -2.4
+    assert "历史盘后验证" in result["data"][0]["why_focus"]
+
+
+@pytest.mark.unit
 def test_review_market_insight_focus_confirms_sector_diffusion(monkeypatch):
     reviews = FakeCollection([])
     finance = {

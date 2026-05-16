@@ -86,6 +86,7 @@ def get_db_collections() -> Dict[str, Collection]:
         "market_insight_focus_feedback": db["market_insight_focus_feedback"],
         "market_insight_focus_reviews": db["market_insight_focus_reviews"],
         "market_insight_user_preferences": db["market_insight_user_preferences"],
+        "market_insight_global_quality": db["market_insight_global_quality"],
         # 主题补涨验证订阅（物化/通知水位线；见 theme_lag_validation_subscription_task）
         "theme_lag_validation_subscriptions": db["theme_lag_validation_subscriptions"],
         "app_settings": db["app_settings"],  # 全局可配置项（如主导航按等级可见性）
