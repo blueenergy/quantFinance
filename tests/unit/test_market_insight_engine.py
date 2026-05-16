@@ -301,6 +301,125 @@ def test_save_market_insight_focus_feedback_upserts(monkeypatch):
 
 
 @pytest.mark.unit
+def test_update_user_preference_from_feedback_updates_dimensions(monkeypatch):
+    preferences = FakeCollection([])
+    finance = {"market_insight_user_preferences": preferences}
+    monkeypatch.setattr(engine, "get_db_collections", lambda: finance)
+
+    result = engine.update_user_preference_from_feedback(
+        user_id="u1",
+        focus_key="20260515|202605151030|SECTOR_DIFFUSION|sector|801011.SI",
+        action="valuable",
+    )
+
+    assert len(result) == 3
+    written = {doc["dimension"]: doc for doc in result}
+    assert written["event_type"]["key"] == "SECTOR_DIFFUSION"
+    assert written["event_type"]["valuable_count"] == 1
+    assert written["event_type"]["score"] == 2.0
+    assert written["category"]["key"] == "板块扩散类"
+    assert written["subject_type"]["key"] == "sector"
+    assert preferences.upserts[0][0] == {"user_id": "u1", "dimension": "event_type", "key": "SECTOR_DIFFUSION"}
+
+
+@pytest.mark.unit
+def test_update_user_preference_from_feedback_replaces_previous_action(monkeypatch):
+    preferences = FakeCollection(
+        [
+            {
+                "user_id": "u1",
+                "dimension": "event_type",
+                "key": "SECTOR_DIFFUSION",
+                "valuable_count": 0,
+                "ignore_count": 1,
+                "false_positive_count": 0,
+                "confirmed_count": 0,
+                "faded_count": 0,
+                "score": -1.0,
+            }
+        ]
+    )
+    finance = {"market_insight_user_preferences": preferences}
+    monkeypatch.setattr(engine, "get_db_collections", lambda: finance)
+
+    result = engine.update_user_preference_from_feedback(
+        user_id="u1",
+        focus_key="20260515|202605151030|SECTOR_DIFFUSION|sector|801011.SI",
+        action="valuable",
+        previous_action="ignore",
+    )
+
+    event_type_pref = next(doc for doc in result if doc["dimension"] == "event_type")
+    assert event_type_pref["valuable_count"] == 1
+    assert event_type_pref["ignore_count"] == 0
+    assert event_type_pref["score"] == 2.0
+
+
+@pytest.mark.unit
+def test_get_market_insight_focus_applies_user_preference_weight(monkeypatch):
+    finance = {
+        "market_insight_events": FakeCollection(
+            [
+                {
+                    "_id": "a",
+                    "trade_date": "20260515",
+                    "snapshot_time": "202605151030",
+                    "event_type": "SECTOR_DIFFUSION",
+                    "severity": "medium",
+                    "confidence": 77.0,
+                    "subject_type": "sector",
+                    "subject_code": "801011.SI",
+                    "subject_name": "银行",
+                    "title": "银行扩散",
+                    "summary": "银行上涨家数扩散。",
+                },
+                {
+                    "_id": "b",
+                    "trade_date": "20260515",
+                    "snapshot_time": "202605151030",
+                    "event_type": "SECTOR_FALSE_STRENGTH",
+                    "severity": "medium",
+                    "confidence": 78.0,
+                    "subject_type": "sector",
+                    "subject_code": "801012.SI",
+                    "subject_name": "地产",
+                    "title": "地产假强",
+                    "summary": "地产表面强势。",
+                },
+            ]
+        ),
+        "trader_positions": FakeCollection([]),
+        "intraday_t0_mock_positions": FakeCollection([]),
+        "user_watchlists": FakeCollection([]),
+        "market_insight_focus_feedback": FakeCollection([]),
+        "market_insight_user_preferences": FakeCollection(
+            [
+                {
+                    "user_id": "u1",
+                    "dimension": "event_type",
+                    "key": "SECTOR_DIFFUSION",
+                    "score": 20.0,
+                },
+                {
+                    "user_id": "u1",
+                    "dimension": "category",
+                    "key": "去妄存真类",
+                    "score": -20.0,
+                },
+            ]
+        ),
+    }
+    monkeypatch.setattr(engine, "get_db_collections", lambda: finance)
+
+    result = engine.get_market_insight_focus("2026-05-15", limit=2, user_id="u1")
+
+    assert result["data"][0]["primary_event"]["event_type"] == "SECTOR_DIFFUSION"
+    assert result["data"][0]["score_breakdown"]["preference_weight"] == 5.0
+    assert result["data"][1]["score_breakdown"]["preference_weight"] == -5.0
+    assert "过往反馈" in result["data"][0]["why_focus"]
+
+
+@pytest.mark.unit
 def test_review_market_insight_focus_confirms_sector_diffusion(monkeypatch):
     reviews = FakeCollection([])
     finance = {
@@ -354,6 +473,69 @@ def test_review_market_insight_focus_confirms_sector_diffusion(monkeypatch):
     assert result["data"][0]["label"] == "已验证"
     assert result["data"][0]["metrics"]["delta_peak"] == pytest.approx(0.09)
     assert reviews.upserts[0][1]["$set"]["status"] == "confirmed"
+
+
+@pytest.mark.unit
+def test_review_market_insight_focus_updates_preferences_for_feedback_users(monkeypatch):
+    focus_key = "20260515|202605151030|SECTOR_DIFFUSION|sector|801011.SI"
+    reviews = FakeCollection([])
+    feedback = FakeCollection(
+        [
+            {
+                "user_id": "u1",
+                "trade_date": "20260515",
+                "focus_key": focus_key,
+                "action": "valuable",
+            }
+        ]
+    )
+    preferences = FakeCollection([])
+    finance = {
+        "market_insight_events": FakeCollection(
+            [
+                {
+                    "_id": "a",
+                    "trade_date": "20260515",
+                    "snapshot_time": "202605151030",
+                    "event_type": "SECTOR_DIFFUSION",
+                    "severity": "medium",
+                    "confidence": 80.0,
+                    "subject_type": "sector",
+                    "subject_code": "801011.SI",
+                    "subject_name": "银行",
+                    "level": "L2",
+                    "evidence": {"positive_ratio_now": 0.55},
+                }
+            ]
+        ),
+        "market_insight_focus_reviews": reviews,
+        "market_insight_focus_feedback": feedback,
+        "market_insight_user_preferences": preferences,
+    }
+    realtime = {
+        "realtime_sector_strength": FakeCollection(
+            [
+                {
+                    "trade_date": "20260515",
+                    "snapshot_time": "202605151045",
+                    "level": "L2",
+                    "sector_code": "801011.SI",
+                    "positive_ratio": 0.64,
+                }
+            ]
+        )
+    }
+    monkeypatch.setattr(engine, "get_db_collections", lambda: finance)
+    monkeypatch.setattr(engine, "get_data_db", lambda: realtime)
+
+    result = engine.review_market_insight_focus("2026-05-15", horizon_minutes=60)
+
+    assert result["data"][0]["status"] == "confirmed"
+    first_pref_update = preferences.upserts[0][1]["$set"]
+    assert first_pref_update["user_id"] == "u1"
+    assert first_pref_update["confirmed_count"] == 1
+    assert first_pref_update["score"] == 1.0
+    assert feedback.upserts[0][1]["$set"]["preference_review_status"] == "confirmed"
 
 
 @pytest.mark.unit

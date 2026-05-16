@@ -128,6 +128,24 @@ FOCUS_REVIEW_LABELS = {
     "unconfirmed": "未验证",
     "insufficient_data": "待观察",
 }
+PREFERENCE_FEEDBACK_DELTAS = {
+    "valuable": {"valuable_count": 1},
+    "ignore": {"ignore_count": 1},
+    "false_positive": {"false_positive_count": 1},
+}
+PREFERENCE_REVIEW_DELTAS = {
+    "confirmed": {"confirmed_count": 1},
+    "faded": {"faded_count": 1},
+}
+PREFERENCE_COUNT_FIELDS = (
+    "valuable_count",
+    "ignore_count",
+    "false_positive_count",
+    "confirmed_count",
+    "faded_count",
+)
+PREFERENCE_DIMENSION_WEIGHTS = {"event_type": 1.0, "category": 0.6, "subject_type": 0.4}
+MAX_PREFERENCE_WEIGHT = 5.0
 
 
 def get_event_type_metadata() -> Dict[str, Dict[str, Any]]:
@@ -692,9 +710,17 @@ def get_market_insight_focus(
     relevance_context = _build_user_relevance_context(user_id)
     feedback_context = _build_focus_feedback_context(user_id, td)
     review_context = _build_focus_review_context(td)
+    preference_context = _build_user_preference_context(user_id)
     by_subject: Dict[str, Dict[str, Any]] = {}
     for row in rows:
-        focus = _build_focus_item(row, latest_snapshot, relevance_context, feedback_context, review_context)
+        focus = _build_focus_item(
+            row,
+            latest_snapshot,
+            relevance_context,
+            feedback_context,
+            review_context,
+            preference_context,
+        )
         key = _focus_subject_key(row)
         current = by_subject.get(key)
         if not current or focus["attention_score"] > current["attention_score"]:
@@ -727,6 +753,7 @@ def _build_focus_item(
     relevance_context: Optional[Dict[str, Any]] = None,
     feedback_context: Optional[Dict[str, Any]] = None,
     review_context: Optional[Dict[str, Any]] = None,
+    preference_context: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     event_type = str(event.get("event_type") or "")
     confidence = _num(event.get("confidence"), 0.0) or 0.0
@@ -741,6 +768,7 @@ def _build_focus_item(
     feedback = _focus_feedback_for_key(focus_key, feedback_context or {})
     review = _focus_review_for_key(focus_key, review_context or {})
     feedback_weight = FOCUS_FEEDBACK_WEIGHTS.get(str(feedback.get("action") or ""), 0.0)
+    preference_weight = _event_preference_weight(event, preference_context or {})
     attention_score = min(
         100.0,
         max(
@@ -751,7 +779,8 @@ def _build_focus_item(
             + recency_weight
             + subject_weight
             + relevance_weight
-            + feedback_weight,
+            + feedback_weight
+            + preference_weight,
         ),
     )
     metadata = EVENT_TYPE_METADATA.get(event_type, {})
@@ -763,7 +792,7 @@ def _build_focus_item(
         "category": metadata.get("category") or "",
         "title": event.get("title") or metadata.get("label") or event_type,
         "summary": event.get("summary") or metadata.get("meaning") or "",
-        "why_focus": _focus_reason(event, metadata, attention_score),
+        "why_focus": _focus_reason(event, metadata, attention_score, preference_weight),
         "next_action": _focus_next_action(event, metadata),
         "score_breakdown": {
             "confidence_component": round(confidence * 0.55, 1),
@@ -773,6 +802,7 @@ def _build_focus_item(
             "subject_weight": subject_weight,
             "user_relevance_weight": relevance_weight,
             "feedback_weight": feedback_weight,
+            "preference_weight": preference_weight,
         },
         "relevance": relevance,
         "feedback": feedback,
@@ -789,7 +819,16 @@ def _recency_attention_weight(snapshot_time: str, latest_snapshot: str) -> float
     return 3.0
 
 
-def _focus_reason(event: Dict[str, Any], metadata: Dict[str, Any], attention_score: float) -> str:
+def _focus_reason(
+    event: Dict[str, Any],
+    metadata: Dict[str, Any],
+    attention_score: float,
+    preference_weight: float = 0.0,
+) -> str:
+    if preference_weight >= 4.0:
+        return "结合您过往反馈，这类焦点更符合您的关注偏好。"
+    if preference_weight <= -4.0:
+        return "该焦点客观分较高，但同类内容曾被您多次降权，建议快速确认即可。"
     event_type = event.get("event_type")
     if event_type == "COUNTER_TREND_SECTOR_STRENGTH":
         return "弱市里仍然逆势扩散，属于稀缺且更值得优先确认的方向。"
@@ -821,6 +860,188 @@ def _focus_event_key(event: Dict[str, Any]) -> str:
             str(event.get("subject_code") or event.get("subject_name") or ""),
         ]
     )
+
+
+def _preference_dimensions_from_focus_key(focus_key: str) -> Dict[str, str]:
+    parts = str(focus_key or "").split("|")
+    if len(parts) < 5:
+        return {}
+    event_type = parts[2]
+    subject_type = parts[3]
+    metadata = EVENT_TYPE_METADATA.get(event_type, {})
+    dimensions = {
+        "event_type": event_type,
+        "subject_type": subject_type,
+    }
+    if metadata.get("category"):
+        dimensions["category"] = str(metadata["category"])
+    return {dimension: key for dimension, key in dimensions.items() if key}
+
+
+def _preference_dimensions_for_event(event: Dict[str, Any]) -> Dict[str, str]:
+    event_type = str(event.get("event_type") or "")
+    subject_type = str(event.get("subject_type") or "")
+    metadata = EVENT_TYPE_METADATA.get(event_type, {})
+    dimensions = {
+        "event_type": event_type,
+        "subject_type": subject_type,
+    }
+    if metadata.get("category"):
+        dimensions["category"] = str(metadata["category"])
+    return {dimension: key for dimension, key in dimensions.items() if key}
+
+
+def _calculate_user_preference_score(counts: Dict[str, Any]) -> float:
+    return round(
+        (_num(counts.get("valuable_count"), 0.0) or 0.0) * 2.0
+        - (_num(counts.get("ignore_count"), 0.0) or 0.0) * 1.0
+        - (_num(counts.get("false_positive_count"), 0.0) or 0.0) * 3.0
+        + (_num(counts.get("confirmed_count"), 0.0) or 0.0) * 1.0
+        - (_num(counts.get("faded_count"), 0.0) or 0.0) * 1.0,
+        2,
+    )
+
+
+def _merge_preference_deltas(*deltas: Dict[str, int]) -> Dict[str, int]:
+    merged = {field: 0 for field in PREFERENCE_COUNT_FIELDS}
+    for delta in deltas:
+        for field, value in delta.items():
+            if field in merged:
+                merged[field] += int(value)
+    return {field: value for field, value in merged.items() if value}
+
+
+def _reverse_preference_delta(action_or_status: Optional[str]) -> Dict[str, int]:
+    delta = PREFERENCE_FEEDBACK_DELTAS.get(str(action_or_status or ""))
+    if delta is None:
+        delta = PREFERENCE_REVIEW_DELTAS.get(str(action_or_status or ""), {})
+    return {field: -value for field, value in delta.items()}
+
+
+def _clamp_preference_weight(value: float) -> float:
+    return round(max(-MAX_PREFERENCE_WEIGHT, min(MAX_PREFERENCE_WEIGHT, value)), 1)
+
+
+def _update_user_preference_counts(
+    user_id: str,
+    dimensions: Dict[str, str],
+    deltas: Dict[str, int],
+) -> List[Dict[str, Any]]:
+    if not user_id or not dimensions or not deltas:
+        return []
+    coll = get_db_collections().get("market_insight_user_preferences")
+    if coll is None:
+        return []
+    now = time.time()
+    updated = []
+    for dimension, key in dimensions.items():
+        query = {"user_id": user_id, "dimension": dimension, "key": key}
+        existing = coll.find_one(query) or {}
+        counts = {field: int(_num(existing.get(field), 0.0) or 0) for field in PREFERENCE_COUNT_FIELDS}
+        for field, value in deltas.items():
+            if field in counts:
+                counts[field] = max(0, counts[field] + int(value))
+        doc = {
+            **query,
+            **counts,
+            "score": _calculate_user_preference_score(counts),
+            "updated_at": now,
+        }
+        coll.update_one(query, {"$set": doc, "$setOnInsert": {"created_at": now}}, upsert=True)
+        updated.append(doc)
+    coll.create_index(
+        [("user_id", ASCENDING), ("dimension", ASCENDING), ("key", ASCENDING)],
+        unique=True,
+        name="user_dimension_key_unique",
+        background=True,
+    )
+    return updated
+
+
+def update_user_preference_from_feedback(
+    user_id: str,
+    focus_key: str,
+    action: str,
+    previous_action: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    if action not in FOCUS_FEEDBACK_ACTIONS:
+        raise ValueError("unsupported feedback action")
+    if previous_action == action:
+        return []
+    dimensions = _preference_dimensions_from_focus_key(focus_key)
+    deltas = _merge_preference_deltas(
+        _reverse_preference_delta(previous_action),
+        PREFERENCE_FEEDBACK_DELTAS.get(action, {}),
+    )
+    return _update_user_preference_counts(user_id, dimensions, deltas)
+
+
+def update_user_preference_from_review(focus_key: str, review_status: str) -> int:
+    collections = get_db_collections()
+    feedback_coll = collections.get("market_insight_focus_feedback")
+    if feedback_coll is None:
+        return 0
+    dimensions = _preference_dimensions_from_focus_key(focus_key)
+    if not dimensions:
+        return 0
+    applied = 0
+    for feedback in feedback_coll.find({"focus_key": focus_key}):
+        user_id = str(feedback.get("user_id") or "")
+        if not user_id:
+            continue
+        previous_status = str(feedback.get("preference_review_status") or "")
+        if previous_status == review_status:
+            continue
+        deltas = _merge_preference_deltas(
+            _reverse_preference_delta(previous_status),
+            PREFERENCE_REVIEW_DELTAS.get(review_status, {}),
+        )
+        if deltas:
+            _update_user_preference_counts(user_id, dimensions, deltas)
+            applied += 1
+        feedback_coll.update_one(
+            {"user_id": user_id, "focus_key": focus_key},
+            {"$set": {"preference_review_status": review_status, "preference_review_updated_at": time.time()}},
+            upsert=False,
+        )
+    return applied
+
+
+def _apply_review_preference_to_feedback(review: Dict[str, Any]) -> int:
+    return update_user_preference_from_review(
+        focus_key=str(review.get("focus_key") or ""),
+        review_status=str(review.get("status") or ""),
+    )
+
+
+def _build_user_preference_context(user_id: Optional[str]) -> Dict[str, Dict[str, Any]]:
+    if not user_id:
+        return {}
+    coll = get_db_collections().get("market_insight_user_preferences")
+    if coll is None:
+        return {}
+    context: Dict[str, Dict[str, Any]] = {}
+    for doc in coll.find({"user_id": user_id}):
+        dimension = str(doc.get("dimension") or "")
+        key = str(doc.get("key") or "")
+        if not dimension or not key:
+            continue
+        context[f"{dimension}:{key}"] = {
+            "score": _num(doc.get("score"), 0.0) or 0.0,
+            "dimension": dimension,
+            "key": key,
+        }
+    return context
+
+
+def _event_preference_weight(event: Dict[str, Any], preference_context: Dict[str, Dict[str, Any]]) -> float:
+    if not preference_context:
+        return 0.0
+    weighted = 0.0
+    for dimension, key in _preference_dimensions_for_event(event).items():
+        pref = preference_context.get(f"{dimension}:{key}") or {}
+        weighted += (_num(pref.get("score"), 0.0) or 0.0) * PREFERENCE_DIMENSION_WEIGHTS.get(dimension, 0.0)
+    return _clamp_preference_weight(weighted)
 
 
 def _build_focus_feedback_context(user_id: Optional[str], trade_date: str) -> Dict[str, Dict[str, Any]]:
@@ -888,6 +1109,9 @@ def save_market_insight_focus_feedback(
         raise ValueError("unsupported feedback action")
     td = _compact_trade_date(trade_date) if trade_date else str(focus_key).split("|", 1)[0]
     now = time.time()
+    collections = get_db_collections()
+    coll = collections["market_insight_focus_feedback"]
+    previous = coll.find_one({"user_id": user_id, "focus_key": focus_key}) or {}
     doc = {
         "user_id": user_id,
         "trade_date": td,
@@ -896,12 +1120,21 @@ def save_market_insight_focus_feedback(
         "note": note or "",
         "updated_at": now,
     }
-    coll = get_db_collections()["market_insight_focus_feedback"]
     coll.update_one(
         {"user_id": user_id, "focus_key": focus_key},
         {"$set": doc, "$setOnInsert": {"created_at": now}},
         upsert=True,
     )
+    update_user_preference_from_feedback(
+        user_id=user_id,
+        focus_key=focus_key,
+        action=action,
+        previous_action=previous.get("action"),
+    )
+    review_coll = collections.get("market_insight_focus_reviews")
+    review = review_coll.find_one({"focus_key": focus_key}) if review_coll is not None else None
+    if review:
+        _apply_review_preference_to_feedback(review)
     coll.create_index([("user_id", ASCENDING), ("trade_date", DESCENDING)], name="user_trade_date_idx", background=True)
     coll.create_index([("user_id", ASCENDING), ("focus_key", ASCENDING)], unique=True, name="user_focus_unique", background=True)
     return {"success": True, "data": _serialize_focus_feedback(doc)}
@@ -1032,6 +1265,7 @@ def _upsert_focus_reviews(reviews: List[Dict[str, Any]]) -> int:
     coll = get_db_collections()["market_insight_focus_reviews"]
     for review in reviews:
         coll.update_one({"focus_key": review["focus_key"]}, {"$set": review}, upsert=True)
+        _apply_review_preference_to_feedback(review)
     coll.create_index([("trade_date", DESCENDING), ("status", ASCENDING)], name="trade_status_idx", background=True)
     coll.create_index([("focus_key", ASCENDING)], unique=True, name="focus_key_unique", background=True)
     return len(reviews)
