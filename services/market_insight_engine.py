@@ -1022,6 +1022,101 @@ def update_user_preference_from_review(focus_key: str, review_status: str) -> in
     return applied
 
 
+def rebuild_market_insight_user_preferences(
+    user_id: Optional[str] = None,
+    dry_run: bool = False,
+) -> Dict[str, Any]:
+    collections = get_db_collections()
+    feedback_coll = collections.get("market_insight_focus_feedback")
+    preference_coll = collections.get("market_insight_user_preferences")
+    review_coll = collections.get("market_insight_focus_reviews")
+    if feedback_coll is None or preference_coll is None:
+        return {"success": True, "dry_run": dry_run, "user_id": user_id, "count": 0, "data": []}
+
+    review_status_by_key: Dict[str, str] = {}
+    if review_coll is not None:
+        for review in review_coll.find({}):
+            focus_key = str(review.get("focus_key") or "")
+            status = str(review.get("status") or "")
+            if focus_key and status in PREFERENCE_REVIEW_DELTAS:
+                review_status_by_key[focus_key] = status
+
+    feedback_query: Dict[str, Any] = {}
+    if user_id:
+        feedback_query["user_id"] = user_id
+
+    buckets: Dict[str, Dict[str, Any]] = {}
+    processed_feedback_count = 0
+    skipped_feedback_count = 0
+    for feedback in feedback_coll.find(feedback_query):
+        feedback_user_id = str(feedback.get("user_id") or "")
+        focus_key = str(feedback.get("focus_key") or "")
+        action = str(feedback.get("action") or "")
+        dimensions = _preference_dimensions_from_focus_key(focus_key)
+        if not feedback_user_id or action not in FOCUS_FEEDBACK_ACTIONS or not dimensions:
+            skipped_feedback_count += 1
+            continue
+        processed_feedback_count += 1
+        deltas = _merge_preference_deltas(
+            PREFERENCE_FEEDBACK_DELTAS.get(action, {}),
+            PREFERENCE_REVIEW_DELTAS.get(review_status_by_key.get(focus_key, ""), {}),
+        )
+        for dimension, key in dimensions.items():
+            bucket_key = f"{feedback_user_id}|{dimension}|{key}"
+            bucket = buckets.setdefault(
+                bucket_key,
+                {
+                    "user_id": feedback_user_id,
+                    "dimension": dimension,
+                    "key": key,
+                    **{field: 0 for field in PREFERENCE_COUNT_FIELDS},
+                },
+            )
+            for field, value in deltas.items():
+                if field in bucket:
+                    bucket[field] += int(value)
+
+    now = time.time()
+    docs = []
+    for bucket in buckets.values():
+        doc = {
+            **bucket,
+            "score": _calculate_user_preference_score(bucket),
+            "updated_at": now,
+            "rebuilt_at": now,
+        }
+        docs.append(doc)
+
+    if not dry_run:
+        delete_query: Dict[str, Any] = {}
+        if user_id:
+            delete_query["user_id"] = user_id
+        preference_coll.delete_many(delete_query)
+        for doc in docs:
+            preference_coll.update_one(
+                {"user_id": doc["user_id"], "dimension": doc["dimension"], "key": doc["key"]},
+                {"$set": doc, "$setOnInsert": {"created_at": now}},
+                upsert=True,
+            )
+        preference_coll.create_index(
+            [("user_id", ASCENDING), ("dimension", ASCENDING), ("key", ASCENDING)],
+            unique=True,
+            name="user_dimension_key_unique",
+            background=True,
+        )
+
+    docs.sort(key=lambda item: (item["user_id"], item["dimension"], item["key"]))
+    return {
+        "success": True,
+        "dry_run": dry_run,
+        "user_id": user_id,
+        "processed_feedback_count": processed_feedback_count,
+        "skipped_feedback_count": skipped_feedback_count,
+        "count": len(docs),
+        "data": docs,
+    }
+
+
 def _apply_review_preference_to_feedback(review: Dict[str, Any]) -> int:
     return update_user_preference_from_review(
         focus_key=str(review.get("focus_key") or ""),

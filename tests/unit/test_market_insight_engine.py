@@ -22,6 +22,7 @@ class FakeCollection:
     def __init__(self, rows=None):
         self.rows = rows or []
         self.upserts = []
+        self.deleted = []
 
     def find_one(self, query=None, projection=None, sort=None):
         rows = self.find(query or {}, projection)
@@ -39,6 +40,9 @@ class FakeCollection:
 
     def update_one(self, query, update, upsert=False):
         self.upserts.append((query, update, upsert))
+
+    def delete_many(self, query):
+        self.deleted.append(query)
 
     def create_index(self, *args, **kwargs):
         return None
@@ -353,6 +357,118 @@ def test_update_user_preference_from_feedback_replaces_previous_action(monkeypat
     assert event_type_pref["valuable_count"] == 1
     assert event_type_pref["ignore_count"] == 0
     assert event_type_pref["score"] == 2.0
+
+
+@pytest.mark.unit
+def test_rebuild_market_insight_user_preferences_from_history(monkeypatch):
+    preferences = FakeCollection(
+        [
+            {
+                "user_id": "u1",
+                "dimension": "event_type",
+                "key": "OLD",
+                "valuable_count": 99,
+            }
+        ]
+    )
+    finance = {
+        "market_insight_focus_feedback": FakeCollection(
+            [
+                {
+                    "user_id": "u1",
+                    "focus_key": "20260515|202605151030|SECTOR_DIFFUSION|sector|801011.SI",
+                    "action": "valuable",
+                },
+                {
+                    "user_id": "u1",
+                    "focus_key": "20260515|202605151035|SECTOR_FALSE_STRENGTH|sector|801012.SI",
+                    "action": "false_positive",
+                },
+                {
+                    "user_id": "u2",
+                    "focus_key": "20260515|202605151040|SECTOR_DIFFUSION|sector|801013.SI",
+                    "action": "ignore",
+                },
+            ]
+        ),
+        "market_insight_focus_reviews": FakeCollection(
+            [
+                {
+                    "focus_key": "20260515|202605151030|SECTOR_DIFFUSION|sector|801011.SI",
+                    "status": "confirmed",
+                },
+                {
+                    "focus_key": "20260515|202605151035|SECTOR_FALSE_STRENGTH|sector|801012.SI",
+                    "status": "faded",
+                },
+            ]
+        ),
+        "market_insight_user_preferences": preferences,
+    }
+    monkeypatch.setattr(engine, "get_db_collections", lambda: finance)
+
+    result = engine.rebuild_market_insight_user_preferences()
+
+    assert result["success"] is True
+    assert result["dry_run"] is False
+    assert result["processed_feedback_count"] == 3
+    assert result["count"] == 8
+    assert preferences.deleted == [{}]
+    event_type_updates = {
+        (update["$set"]["user_id"], update["$set"]["key"]): update["$set"]
+        for _, update, _ in preferences.upserts
+        if update["$set"]["dimension"] == "event_type"
+    }
+    subject_updates = {
+        update["$set"]["user_id"]: update["$set"]
+        for _, update, _ in preferences.upserts
+        if update["$set"]["dimension"] == "subject_type" and update["$set"]["key"] == "sector"
+    }
+    assert event_type_updates[("u1", "SECTOR_DIFFUSION")]["valuable_count"] == 1
+    assert event_type_updates[("u1", "SECTOR_DIFFUSION")]["confirmed_count"] == 1
+    assert event_type_updates[("u1", "SECTOR_DIFFUSION")]["score"] == 3.0
+    assert event_type_updates[("u1", "SECTOR_FALSE_STRENGTH")]["false_positive_count"] == 1
+    assert event_type_updates[("u1", "SECTOR_FALSE_STRENGTH")]["faded_count"] == 1
+    assert event_type_updates[("u1", "SECTOR_FALSE_STRENGTH")]["score"] == -4.0
+    assert event_type_updates[("u2", "SECTOR_DIFFUSION")]["ignore_count"] == 1
+    assert subject_updates["u1"]["valuable_count"] == 1
+    assert subject_updates["u1"]["false_positive_count"] == 1
+    assert subject_updates["u1"]["confirmed_count"] == 1
+    assert subject_updates["u1"]["faded_count"] == 1
+
+
+@pytest.mark.unit
+def test_rebuild_market_insight_user_preferences_filters_user_and_dry_run(monkeypatch):
+    preferences = FakeCollection([])
+    finance = {
+        "market_insight_focus_feedback": FakeCollection(
+            [
+                {
+                    "user_id": "u1",
+                    "focus_key": "20260515|202605151030|SECTOR_DIFFUSION|sector|801011.SI",
+                    "action": "valuable",
+                },
+                {
+                    "user_id": "u2",
+                    "focus_key": "20260515|202605151040|SECTOR_FALSE_STRENGTH|sector|801012.SI",
+                    "action": "ignore",
+                },
+            ]
+        ),
+        "market_insight_focus_reviews": FakeCollection([]),
+        "market_insight_user_preferences": preferences,
+    }
+    monkeypatch.setattr(engine, "get_db_collections", lambda: finance)
+
+    result = engine.rebuild_market_insight_user_preferences(user_id="u1", dry_run=True)
+
+    assert result["success"] is True
+    assert result["dry_run"] is True
+    assert result["user_id"] == "u1"
+    assert result["processed_feedback_count"] == 1
+    assert result["count"] == 3
+    assert preferences.deleted == []
+    assert preferences.upserts == []
 
 
 @pytest.mark.unit

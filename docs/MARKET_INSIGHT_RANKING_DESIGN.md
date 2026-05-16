@@ -153,12 +153,32 @@ flowchart TD
   - 同步刷新 `market_insight_global_quality`。
   - 对已反馈该焦点的用户，更新个人画像中的 `confirmed_count` 或 `faded_count`。
 
+## 重算工具
+
+当评分公式、维度权重或历史数据修复后，需要从历史反馈重新生成用户画像，避免旧增量结果残留。
+
+脚本：
+
+```bash
+python tools/rebuild_market_insight_user_preferences.py --dry-run
+python tools/rebuild_market_insight_user_preferences.py --apply
+python tools/rebuild_market_insight_user_preferences.py --user-id u1 --apply
+```
+
+规则：
+
+- 数据来源是 `market_insight_focus_feedback` 和 `market_insight_focus_reviews`。
+- `--dry-run` 只计算结果，不写入 MongoDB。
+- `--apply` 会先删除目标范围内旧的 `market_insight_user_preferences`，再写入重算结果。
+- 指定 `--user-id` 时，只重建该用户画像；不指定时重建全部用户画像。
+- 重算不依赖 feedback 文档中的 `preference_review_status` 缓存字段，而是直接读取当前 review 结果。
+
 ## 维护建议
 
 - 调整权重时，优先改限制范围和维度权重，不要直接放大单个信号。
 - 如果用户反馈和全局质量出现冲突，个人偏好只影响个人排序，全局质量只做轻量纠偏。
 - 如果未来要做运营看板，应优先读取 `market_insight_global_quality`，不要直接扫描所有 `focus_reviews`。
-- 如果评分公式变更，应增加重算脚本，从历史 feedback/review 重新生成画像和质量评分。
+- 如果评分公式变更，应先用 `--dry-run` 检查重算结果，再用 `--apply` 写入。
 
 ## 测试覆盖
 
@@ -171,6 +191,7 @@ flowchart TD
 
 - 用户反馈更新画像。
 - 盘后验证回写已反馈用户画像。
+- 偏好画像重算工具。
 - 全局质量评分聚合。
 - 全局质量权重影响焦点排序。
 - 质量评分查询和刷新 API。
