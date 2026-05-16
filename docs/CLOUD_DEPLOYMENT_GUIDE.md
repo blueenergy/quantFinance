@@ -198,7 +198,9 @@ volumes:
 
 ## 🌐 Nginx配置
 
-### nginx.conf
+当前 Docker 前端服务不再从 `quantFinance/nginx.conf` 挂载配置。`quant-web` 使用 `../quantFinance-dashboard` 构建镜像，并在容器启动时通过 `quantFinance-dashboard/nginx.template.conf` 或 `nginx.http.template.conf` 渲染 Nginx 配置。下面的完整 `nginx.conf` 仅适用于手工维护宿主机 Nginx 的传统部署方式。
+
+### 手工宿主机 nginx.conf 示例
 ```nginx
 events {
     worker_connections 1024;

@@ -55,12 +55,13 @@ If you have certificates from a commercial CA:
 
 After obtaining certificates:
 
-1. **For Docker deployment**: Uncomment SSL lines in `nginx.conf`:
-   ```nginx
-   listen 443 ssl http2;
-   ssl_certificate /etc/nginx/ssl/cert.pem;
-   ssl_certificate_key /etc/nginx/ssl/key.pem;
+1. **For Docker deployment**: mount the certificate directory and set the dashboard Nginx template variables:
+   ```bash
+   SSL_CERT=/etc/nginx/ssl/cert.pem
+   SSL_KEY=/etc/nginx/ssl/key.pem
    ```
+
+   `quant-web` renders `quantFinance-dashboard/nginx.template.conf` at container startup when `SSL_CERT` is set.
 
 2. **For Vite dev server**: Uncomment HTTPS section in `vite.config.mjs`:
    ```javascript
@@ -70,7 +71,7 @@ After obtaining certificates:
    }
    ```
 
-3. **Optional**: Enable HTTP to HTTPS redirect by uncommenting the redirect server block in nginx.conf
+3. **Optional**: Add HTTP to HTTPS redirect logic in `quantFinance-dashboard/nginx.template.conf`
 
 4. Restart services:
    ```bash

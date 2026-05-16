@@ -57,7 +57,7 @@ sudo nano /etc/nginx/sites-available/quantfinance
 - `Dockerfile.backend` - 后端服务容器
 - **前端**：不在本仓库单独 Dockerfile；`docker-compose.yml` 中 `quant-web` 使用 **`../quantFinance-dashboard`** 作为 build context，**`Dockerfile.fast`** 构建（需与 `quantFinance` 同级克隆 `quantFinance-dashboard`）
 - `docker-compose.yml` - 完整服务编排
-- `nginx.conf` - Nginx配置（与 `quant-web` 挂载配合）
+- **前端 Nginx**：由 `quantFinance-dashboard/nginx.template.conf` / `nginx.http.template.conf` 在容器启动时渲染，`quantFinance` 不再挂载独立 `nginx.conf`
 
 ### 环境配置
 - `.env.production` - 生产环境变量

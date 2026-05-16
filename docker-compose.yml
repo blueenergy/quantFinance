@@ -366,10 +366,13 @@ services:
     profiles: [ "frontend" ] # Optional: Only start with --profile frontend
     environment:
       - BACKEND_URL=http://quant-api:3001
+      - ASSISTANT_URL=http://quant-assistant:8002
+      - WS_WORKER_HOST=quant-strategy-manager
+      - SSL_CERT=${SSL_CERT:-}
+      - SSL_KEY=${SSL_KEY:-}
     networks:
       - quant-network
     volumes:
-      - ./nginx.conf:/etc/nginx/nginx.conf:ro
       - ./ssl:/etc/nginx/ssl:ro # SSL证书目录
     logging:
       driver: json-file
