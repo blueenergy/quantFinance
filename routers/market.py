@@ -50,6 +50,20 @@ def _set_sector_spectrum_cache(cache_key: str, payload: Dict[str, Any]) -> Dict[
     return payload
 
 
+def _sector_strength_distribution(doc: Dict[str, Any]) -> Dict[str, int]:
+    return {
+        "gt_7": 0,
+        "p5_7": 0,
+        "p2_5": 0,
+        "p0_2": int(doc.get("positive_count") or 0),
+        "flat": int(doc.get("flat_count") or 0),
+        "m2_0": int(doc.get("negative_count") or 0),
+        "m5_2": 0,
+        "m7_5": 0,
+        "lt_m7": 0,
+    }
+
+
 def _compact_summary_text(value: Any, fallback: str, max_len: int = 48) -> str:
     text = str(value or "").strip()
     if not text:
@@ -1398,6 +1412,110 @@ def get_market_spectrum_sectors(
                 continue
             trimmed.append(row)
             per_date[row["trade_date"]] += 1
+        docs = trimmed
+
+    return _set_sector_spectrum_cache(cache_key, {"data": docs, "level": level, "ma_period": ma_period})
+
+
+@router.get('/market-spectrum/realtime-sectors', summary="获取实时板块阴阳谱数据", tags=["Market"])
+def get_market_spectrum_realtime_sectors(
+    start_time: str = Query(..., description="开始时间,格式YYYYMMDDHHMM"),
+    end_time: str = Query(..., description="结束时间,格式YYYYMMDDHHMM"),
+    level: str = Query("L1", pattern="^L[12]$", description="申万层级: L1 或 L2"),
+    ma_period: int = Query(5, ge=2, le=30, description="均线周期"),
+    limit: int = Query(80, ge=1, le=300, description="返回板块数量上限"),
+    sector_code: Optional[str] = Query(None, description="可选：只返回指定板块的区间曲线"),
+):
+    """Return materialized realtime sector breadth snapshots.
+
+    Data is produced by realtime_daily_k sync into realtime_sector_strength,
+    so the query path stays light enough for the realtime spectrum tab.
+    """
+    cache_key = "|".join([
+        "realtime",
+        start_time,
+        end_time,
+        level,
+        str(ma_period),
+        str(limit),
+        sector_code or "",
+    ])
+    cached = _get_sector_spectrum_cache(cache_key)
+    if cached is not None:
+        return cached
+
+    collection = get_data_db()["realtime_sector_strength"]
+    query: Dict[str, Any] = {
+        "snapshot_time": {"$gte": start_time, "$lte": end_time},
+        "level": level,
+    }
+    if sector_code:
+        query["sector_code"] = sector_code
+
+    projection = {
+        "_id": 0,
+        "snapshot_time": 1,
+        "trade_date": 1,
+        "level": 1,
+        "sector_code": 1,
+        "sector_name": 1,
+        "stock_count": 1,
+        "above_ma5_count": 1,
+        "above_ma5_ratio": 1,
+        "positive_count": 1,
+        "negative_count": 1,
+        "flat_count": 1,
+        "avg_pct_chg": 1,
+        "median_pct_chg": 1,
+        "total_amount_yuan": 1,
+        "relative_positive_ratio": 1,
+        "data_source": 1,
+        "updated_at": 1,
+    }
+    docs: List[Dict[str, Any]] = []
+    for row in collection.find(query, projection).sort([("snapshot_time", 1), ("above_ma5_ratio", -1)]):
+        total = int(row.get("stock_count") or 0)
+        if total <= 0:
+            continue
+        above = int(row.get("above_ma5_count") or 0)
+        yang = _num_or_none(row.get("above_ma5_ratio"))
+        if yang is None:
+            yang = above / total
+        docs.append({
+            "trade_date": str(row.get("snapshot_time") or ""),
+            "snapshot_time": str(row.get("snapshot_time") or ""),
+            "trade_day": str(row.get("trade_date") or "")[:8],
+            "level": level,
+            "sector_code": str(row.get("sector_code") or ""),
+            "sector_name": str(row.get("sector_name") or ""),
+            "yang_spectrum": yang,
+            "yin_spectrum": 1 - yang,
+            "total_stocks": total,
+            "above_ma_count": above,
+            "below_ma_count": total - above,
+            "positive_count": int(row.get("positive_count") or 0),
+            "negative_count": int(row.get("negative_count") or 0),
+            "flat_count": int(row.get("flat_count") or 0),
+            "avg_pct_chg": _num_or_none(row.get("avg_pct_chg")),
+            "median_pct_chg": _num_or_none(row.get("median_pct_chg")),
+            "total_amount_yuan": _num_or_none(row.get("total_amount_yuan")),
+            "relative_positive_ratio": _num_or_none(row.get("relative_positive_ratio")),
+            "distribution": _sector_strength_distribution(row),
+            "ma_period": ma_period,
+            "granularity": "daily_realtime_sector",
+            "data_source": row.get("data_source"),
+            "updated_at": row.get("updated_at"),
+        })
+
+    docs.sort(key=lambda row: (row["trade_date"], -row["yang_spectrum"], row["sector_code"]))
+    if limit and not sector_code:
+        per_snapshot: Dict[str, int] = defaultdict(int)
+        trimmed: List[Dict[str, Any]] = []
+        for row in docs:
+            if per_snapshot[row["trade_date"]] >= limit:
+                continue
+            trimmed.append(row)
+            per_snapshot[row["trade_date"]] += 1
         docs = trimmed
 
     return _set_sector_spectrum_cache(cache_key, {"data": docs, "level": level, "ma_period": ma_period})
