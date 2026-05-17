@@ -270,7 +270,7 @@ pipelines:
     depends_on: []
     trigger_on_complete: false
     run_mode: cron
-    schedule_hint: "仅 full：Supercronic crontab.txt 工作日 22:35 → daily_market_sync.sh hotstock；domestic 的 crontab_domestic.txt 当前未包含此项"
+    schedule_hint: "Supercronic 工作日 10:30/11:30/14:00/15:00/16:00/18:00/20:00/22:10 → daily_market_sync.sh hotstock；同步 THS + DC 原始热股榜单"
     freshness:
       database: quant_data
       collection: hot_stock_raw

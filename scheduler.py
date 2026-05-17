@@ -526,7 +526,7 @@ def market_insight_focus_review_task():
 
 
 def hot_stock_poll_task(source: str):
-    """热股轮询任务 - 每30分钟检查 THS / DC 热榜是否有新数据。"""
+    """热股分析任务 - 基于最新 THS / DC 热榜数据检查并提交分析。"""
     from db import get_db_collections, get_analyzer_db
     from services.analysis_tasks import build_task_doc
 
@@ -628,16 +628,20 @@ DEFAULT_SCHEDULES = {
         'day_of_week': 'mon-fri'
     },
     'hot_stock_poll_ths': {
-        'name': "同花顺热股轮询",
-        'type': "interval",
-        'seconds': 3600,
-        'is_active': False,  # 默认关闭；需要时在管理后台启用
+        'name': "同花顺热股每日分析 (22:30)",
+        'type': "cron",
+        'hour': 22,
+        'minute': 30,
+        'day_of_week': 'mon-fri',
+        'is_active': True,
     },
     'hot_stock_poll_dc': {
-        'name': "东方财富热股轮询",
-        'type': "interval",
-        'seconds': 1800,
-        'is_active': False,  # 默认关闭；需要时在管理后台启用
+        'name': "东方财富热股每日分析 (22:30)",
+        'type': "cron",
+        'hour': 22,
+        'minute': 30,
+        'day_of_week': 'mon-fri',
+        'is_active': True,
     },
     'theme_lag_validation_subscribe_1530': {
         'name': "主题补涨验证订阅扫描 (15:30)",
@@ -720,6 +724,29 @@ def sync_job(job_id, config_data):
         
     return True
 
+def _migrate_legacy_hot_stock_schedule(job_id: str, db_config: dict, default_config: dict) -> dict:
+    """Move old disabled interval hot-stock jobs to the new daily analysis default."""
+    legacy_defaults = {
+        "hot_stock_poll_ths": 3600,
+        "hot_stock_poll_dc": 1800,
+    }
+    legacy_seconds = legacy_defaults.get(job_id)
+    if not legacy_seconds:
+        return db_config
+
+    is_legacy_default = (
+        db_config.get("type") == "interval"
+        and int(db_config.get("seconds") or 0) == legacy_seconds
+        and db_config.get("is_active") is False
+    )
+    if not is_legacy_default:
+        return db_config
+
+    migrated = default_config.copy()
+    migrated["job_id"] = job_id
+    migrated["updated_at"] = datetime.now()
+    return migrated
+
 def apply_schedule_config():
     """Load config from DB and apply to scheduler."""
     from db import get_db_collections
@@ -737,7 +764,14 @@ def apply_schedule_config():
     for job_id, default_config in DEFAULT_SCHEDULES.items():
         if job_id in custom_configs:
             # Use combined config (db overrides defaults)
-            db_config = custom_configs[job_id]
+            db_config = _migrate_legacy_hot_stock_schedule(
+                job_id,
+                custom_configs[job_id],
+                default_config,
+            )
+            if db_config is not custom_configs[job_id]:
+                config_coll.update_one({"job_id": job_id}, {"$set": db_config})
+                log.info("Migrated legacy hot stock schedule: %s", job_id)
             merged_config = {**default_config, **db_config}
             sync_job(job_id, merged_config)
         else:
