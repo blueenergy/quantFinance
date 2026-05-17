@@ -1,5 +1,6 @@
 from dotenv import load_dotenv
 import logging
+import os
 # 加载 .env 文件中的环境变量
 load_dotenv()
 
@@ -173,18 +174,19 @@ app.include_router(market_insights_router, prefix="/api", tags=["火眼金睛"])
 # 工具范围：仅 tag="Hermes quant tools" 的路由（hermes_quant_tools.py）
 # 扩展：往 routers/hermes_quant_tools.py 加路由即可自动出现在 MCP 工具列表
 # ---------------------------------------------------------------------------
-from fastapi import Depends
-from fastapi_mcp import FastApiMCP, AuthConfig
-from auth import require_hermes_quant_internal_key
+if os.getenv("ENABLE_MCP_SERVER", "true").strip().lower() in ("1", "true", "yes", "on"):
+    from fastapi import Depends
+    from fastapi_mcp import FastApiMCP, AuthConfig
+    from auth import require_hermes_quant_internal_key
 
-_mcp = FastApiMCP(
-    app,
-    name="wukong-quant",
-    description="A-share quantitative finance tools (ladder, market data, ETF, macro)",
-    include_tags=["Hermes quant tools"],
-    auth_config=AuthConfig(
-        dependencies=[Depends(require_hermes_quant_internal_key)],
-    ),
-    headers=["x-hermes-quant-key"],  # 将此 header 转发给底层路由的 Depends 校验
-)
-_mcp.mount_http(mount_path="/api/mcp")  # 挂载在 /api/mcp
+    _mcp = FastApiMCP(
+        app,
+        name="wukong-quant",
+        description="A-share quantitative finance tools (ladder, market data, ETF, macro)",
+        include_tags=["Hermes quant tools"],
+        auth_config=AuthConfig(
+            dependencies=[Depends(require_hermes_quant_internal_key)],
+        ),
+        headers=["x-hermes-quant-key"],  # 将此 header 转发给底层路由的 Depends 校验
+    )
+    _mcp.mount_http(mount_path="/api/mcp")  # 挂载在 /api/mcp

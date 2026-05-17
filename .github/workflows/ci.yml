@@ -80,6 +80,8 @@ jobs:
           timeout 300 docker pull "$IMAGE"
 
           log_step "Stopping existing containers"
+          timeout 30 docker stop -t 20 quant-mcp 2>/dev/null || true
+          timeout 30 docker rm quant-mcp 2>/dev/null || true
           timeout 30 docker stop -t 20 quant-scheduler 2>/dev/null || true
           timeout 30 docker rm quant-scheduler 2>/dev/null || true
           timeout 30 docker stop -t 20 quant-api 2>/dev/null || true
@@ -93,6 +95,7 @@ jobs:
             -p 3001:3001 \
             -e TZ=Asia/Shanghai \
             -e ENABLE_EMBEDDED_SCHEDULER=false \
+            -e ENABLE_MCP_SERVER=false \
             -e API_WORKERS=2 \
             --log-driver json-file \
             --log-opt max-size=50m \
@@ -100,6 +103,27 @@ jobs:
             -v /home/deployuser/quantFinance/.env:/app/.env:ro \
             -v /home/deployuser/quantFinance/logs:/app/logs \
             "$IMAGE"
+
+          log_step "Starting quant-mcp"
+          timeout 60 docker run -d \
+            --name quant-mcp \
+            --restart unless-stopped \
+            --add-host=host.docker.internal:host-gateway \
+            -p 3002:3002 \
+            -e TZ=Asia/Shanghai \
+            -e ENABLE_EMBEDDED_SCHEDULER=false \
+            -e ENABLE_MCP_SERVER=true \
+            --health-cmd "curl -f http://localhost:3002/health || exit 1" \
+            --health-interval 30s \
+            --health-timeout 10s \
+            --health-retries 3 \
+            --log-driver json-file \
+            --log-opt max-size=50m \
+            --log-opt max-file=3 \
+            -v /home/deployuser/quantFinance/.env:/app/.env:ro \
+            -v /home/deployuser/quantFinance/logs:/app/logs \
+            "$IMAGE" \
+            uvicorn main:app --host 0.0.0.0 --port 3002 --workers 1 --log-level info
 
           log_step "Starting quant-scheduler"
           timeout 60 docker run -d \
@@ -120,7 +144,7 @@ jobs:
             python scheduler_runner.py
 
           log_step "Listing deployed containers"
-          docker ps --filter "name=quant-api" --filter "name=quant-scheduler"
+          docker ps --filter "name=quant-api" --filter "name=quant-mcp" --filter "name=quant-scheduler"
 
           log_step "Pruning old images"
           timeout 120 docker image prune -f || true
