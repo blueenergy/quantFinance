@@ -157,6 +157,11 @@ services:
       - DEPLOY_MODE=${DEPLOY_MODE:-full}
       - SECONDARY_MONGO_URI=${SECONDARY_MONGO_URI:-}
       - SECONDARY_MONGO_DB=${SECONDARY_MONGO_DB:-finance}
+      # Realtime daily K snapshots and intraday market spectrum; enable explicitly in production.
+      - ENABLE_REALTIME_DAILY_K=${ENABLE_REALTIME_DAILY_K:-0}
+      - REALTIME_DAILY_K_ALLOW_OUTSIDE_SESSION=${REALTIME_DAILY_K_ALLOW_OUTSIDE_SESSION:-0}
+      - REALTIME_DAILY_K_BATCH_SIZE=${REALTIME_DAILY_K_BATCH_SIZE:-500}
+      - REALTIME_DAILY_K_MA_PERIOD=${REALTIME_DAILY_K_MA_PERIOD:-5}
       # Trigger quant-api to generate intraday T+0 signals after realtime daily K sync.
       # quant-data-engine uses host networking, so call the host-published API port.
       - INTRADAY_T0_TRIGGER_URL=${INTRADAY_T0_TRIGGER_URL:-http://127.0.0.1:3001/api/intraday-t0/signals/generate-all}
@@ -173,6 +178,7 @@ services:
       - CRON_MONEYFLOW_DAILY=${CRON_MONEYFLOW_DAILY:-}
       - CRON_SENTIMENT_DAILY=${CRON_SENTIMENT_DAILY:-}
       - CRON_HOTSTOCK_DAILY=${CRON_HOTSTOCK_DAILY:-}
+      - CRON_REALTIME_DAILY_K=${CRON_REALTIME_DAILY_K:-}
       # Weekly fund holdings (Tushare fund_portfolio); default Sun 19:00 in crontab
       - CRON_FUND_PORTFOLIO=${CRON_FUND_PORTFOLIO:-}
     restart: unless-stopped
