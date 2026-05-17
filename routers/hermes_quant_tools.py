@@ -31,7 +31,8 @@ Hermes 容器内可调用的只读 quant-api 端点（共享密钥，无用户 J
 """
 
 import asyncio
-from datetime import datetime
+import os
+from datetime import datetime, timedelta
 from typing import Any, Dict, Optional
 
 from bson import ObjectId
@@ -47,6 +48,15 @@ from services.analysis_tasks import build_task_doc
 from services.ladder_daily import build_daily_ladder_payload
 
 router = APIRouter(prefix="/hermes-tools", tags=["Hermes quant tools"])
+MCP_ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("MCP_ACCESS_TOKEN_EXPIRE_MINUTES", "43200"))
+
+
+def _format_expiry(minutes: int) -> str:
+    if minutes % 1440 == 0:
+        return f"{minutes // 1440}d"
+    if minutes % 60 == 0:
+        return f"{minutes // 60}h"
+    return f"{minutes}m"
 
 # ---------------------------------------------------------------------------
 # 内部工具函数
@@ -700,7 +710,7 @@ async def user_login(
     _: bool = Depends(require_hermes_quant_internal_key),
 ):
     """
-    用户登录，返回 JWT token（有效期 8 小时）。
+    用户登录，返回 JWT token（默认有效期 30 天，可用 MCP_ACCESS_TOKEN_EXPIRE_MINUTES 调整）。
 
     登录成功后，将返回的 token 配置到 MCP headers 的 X-User-Token 字段，
     之后即可使用 user_profile / user_watchlist_stocks 等个人化工具。
@@ -714,12 +724,15 @@ async def user_login(
     user = authenticate_user(req.username, req.password)
     if not user:
         return {"success": False, "error": "用户名或密码错误"}
-    token = create_access_token(data={"sub": user["username"]})
+    token = create_access_token(
+        data={"sub": user["username"]},
+        expires_delta=timedelta(minutes=MCP_ACCESS_TOKEN_EXPIRE_MINUTES),
+    )
     return {
         "success": True,
         "username": user["username"],
         "token": token,
-        "expires_in": "8h",
+        "expires_in": _format_expiry(MCP_ACCESS_TOKEN_EXPIRE_MINUTES),
         "next_step": (
             "请将上面的 token 添加到 .vscode/mcp.json 的 wukong-quant.headers 中："
             ' "X-User-Token": "<token>"，然后重载 VS Code 窗口。'
