@@ -31,6 +31,7 @@ services:
       - HERMES_CHAT_TEMPERATURE=${HERMES_CHAT_TEMPERATURE:-0.7}
       # Hermes -> quant-api internal tools (连板天梯等); must match hermes service
       - HERMES_QUANT_INTERNAL_KEY=${HERMES_QUANT_INTERNAL_KEY:-}
+      - BACKTEST_WORKER_TOKEN=${BACKTEST_WORKER_TOKEN:-}
       - ENABLE_EMBEDDED_SCHEDULER=false
       - ENABLE_MCP_SERVER=false
       - API_WORKERS=${API_WORKERS:-2}
@@ -282,7 +283,7 @@ services:
       - DB_NAME=${MONGO_DB}
       - MONGO_DB=${DATA_DB_NAME:-quant_data}
       - API_BASE_URL=${BACKTEST_API_BASE_URL:-http://quant-api:3001/api}
-      - API_TOKEN=${BACKTEST_API_TOKEN}
+      - BACKTEST_WORKER_TOKEN=${BACKTEST_WORKER_TOKEN}
       - WORKER_ID=${BACKTEST_WORKER_ID:-}
       - POLL_INTERVAL=${BACKTEST_POLL_INTERVAL:-5}
       - LOG_LEVEL=INFO

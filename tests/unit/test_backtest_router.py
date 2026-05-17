@@ -130,6 +130,11 @@ def mock_user():
     }
 
 
+def worker_headers(monkeypatch):
+    monkeypatch.setenv("BACKTEST_WORKER_TOKEN", "test-worker-secret")
+    return {"X-Backtest-Worker-Token": "test-worker-secret"}
+
+
 # ============================================================================
 # User API Tests - Task Management
 # ============================================================================
@@ -179,6 +184,46 @@ def test_create_backtest_task(monkeypatch, mock_user):
     assert len(collections["backtest_tasks"].docs) == 1
     assert collections["backtest_tasks"].docs[0].get("preset") == "turtle_conservative"
     
+    client.app.dependency_overrides.clear()
+
+
+@pytest.mark.unit
+def test_create_etf_backtest_task(monkeypatch, mock_user):
+    """Test creating an ETF backtest task."""
+    collections = {
+        "backtest_tasks": FakeBacktestCollection([]),
+        "backtest_results": FakeBacktestCollection([]),
+        "users": FakeBacktestCollection([]),
+        "stock_info": FakeBacktestCollection([]),
+        "etf_basic": FakeBacktestCollection([
+            {"ts_code": "510300.SH", "name": "沪深300ETF"}
+        ])
+    }
+
+    monkeypatch.setattr(backtest, 'get_db_collections', lambda: collections)
+
+    client = TestClient(app)
+    client.app.dependency_overrides[get_current_user] = lambda: mock_user
+
+    payload = {
+        "symbol": "510300.SH",
+        "asset_type": "etf",
+        "strategy_key": "turtle",
+        "strategy_params": {"period": 20},
+        "start_date": "20240101",
+        "end_date": "20241231",
+        "initial_cash": 1000000.0
+    }
+
+    response = client.post("/api/backtest/tasks", json=payload)
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["symbol"] == "510300.SH"
+    assert data["asset_type"] == "etf"
+    assert data.get("stock_name") == "沪深300ETF"
+    assert collections["backtest_tasks"].docs[0].get("asset_type") == "etf"
+
     client.app.dependency_overrides.clear()
 
 
@@ -540,16 +585,13 @@ def test_poll_pending_tasks(monkeypatch, mock_user):
     monkeypatch.setattr(backtest, 'get_db_collections', lambda: collections)
     
     client = TestClient(app)
-    client.app.dependency_overrides[get_current_user] = lambda: mock_user
-    
-    response = client.get("/api/backtest/tasks/pending/poll")
+
+    response = client.get("/api/backtest/tasks/pending/poll", headers=worker_headers(monkeypatch))
     assert response.status_code == 200
     data = response.json()
     assert len(data) == 2
     assert all(task["task_id"] for task in data)
     
-    client.app.dependency_overrides.clear()
-
 
 @pytest.mark.unit
 def test_claim_backtest_task(monkeypatch, mock_user):
@@ -581,9 +623,9 @@ def test_claim_backtest_task(monkeypatch, mock_user):
     monkeypatch.setattr(backtest, 'get_db_collections', lambda: collections)
     
     client = TestClient(app)
-    client.app.dependency_overrides[get_current_user] = lambda: mock_user
-    
-    response = client.post("/api/backtest/tasks/bt_001/claim?worker_id=worker1")
+    headers = worker_headers(monkeypatch)
+
+    response = client.post("/api/backtest/tasks/bt_001/claim?worker_id=worker1", headers=headers)
     assert response.status_code == 200
     assert "claimed successfully" in response.json()["message"]
     
@@ -593,11 +635,9 @@ def test_claim_backtest_task(monkeypatch, mock_user):
     assert task["worker_id"] == "worker1"
     
     # Try to claim again (should fail)
-    response = client.post("/api/backtest/tasks/bt_001/claim?worker_id=worker2")
+    response = client.post("/api/backtest/tasks/bt_001/claim?worker_id=worker2", headers=headers)
     assert response.status_code == 409
     
-    client.app.dependency_overrides.clear()
-
 
 @pytest.mark.unit
 def test_report_backtest_result(monkeypatch, mock_user):
@@ -629,7 +669,6 @@ def test_report_backtest_result(monkeypatch, mock_user):
     monkeypatch.setattr(backtest, 'get_db_collections', lambda: collections)
     
     client = TestClient(app)
-    client.app.dependency_overrides[get_current_user] = lambda: mock_user
     
     payload = {
         "metrics": {
@@ -656,7 +695,11 @@ def test_report_backtest_result(monkeypatch, mock_user):
         ]
     }
     
-    response = client.post("/api/backtest/tasks/bt_001/report", json=payload)
+    response = client.post(
+        "/api/backtest/tasks/bt_001/report",
+        json=payload,
+        headers=worker_headers(monkeypatch),
+    )
     assert response.status_code == 200
     assert "successfully" in response.json()["message"]
     
@@ -670,8 +713,6 @@ def test_report_backtest_result(monkeypatch, mock_user):
     assert result["task_id"] == "bt_001"
     assert result["metrics"]["total_return"] == 0.15
     
-    client.app.dependency_overrides.clear()
-
 
 @pytest.mark.unit
 def test_report_backtest_failure(monkeypatch, mock_user):
@@ -703,10 +744,10 @@ def test_report_backtest_failure(monkeypatch, mock_user):
     monkeypatch.setattr(backtest, 'get_db_collections', lambda: collections)
     
     client = TestClient(app)
-    client.app.dependency_overrides[get_current_user] = lambda: mock_user
     
     response = client.post(
-        "/api/backtest/tasks/bt_001/fail?error_message=Strategy%20execution%20failed"
+        "/api/backtest/tasks/bt_001/fail?error_message=Strategy%20execution%20failed",
+        headers=worker_headers(monkeypatch),
     )
     assert response.status_code == 200
     
@@ -715,4 +756,11 @@ def test_report_backtest_failure(monkeypatch, mock_user):
     assert task["status"] == "failed"
     assert "failed" in task.get("error_message", "").lower()
     
-    client.app.dependency_overrides.clear()
+@pytest.mark.unit
+def test_worker_api_rejects_missing_token(monkeypatch):
+    monkeypatch.setenv("BACKTEST_WORKER_TOKEN", "test-worker-secret")
+    client = TestClient(app)
+
+    response = client.get("/api/backtest/tasks/pending/poll")
+
+    assert response.status_code == 401

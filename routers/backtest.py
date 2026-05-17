@@ -4,7 +4,9 @@ This module provides APIs for users to create, manage, and retrieve backtesting 
 Workers can poll for pending tasks, claim them, and report results.
 """
 
-from fastapi import APIRouter, HTTPException, Depends
+import os
+
+from fastapi import APIRouter, HTTPException, Depends, Header, status
 from datetime import datetime, date
 from enum import Enum
 from pydantic import BaseModel, Field,ConfigDict,field_validator
@@ -24,7 +26,8 @@ router = APIRouter(prefix="/backtest", tags=["backtest"])
 
 class BacktestTaskCreate(BaseModel):
     """Request model for creating a backtest task"""
-    symbol: str = Field(..., description="Stock symbol (e.g., 000858)")
+    symbol: str = Field(..., description="Trading symbol (e.g., 000858.SZ or 510300.SH)")
+    asset_type: str = Field(default="stock", description="Asset type: stock or etf")
     strategy_key: str = Field(..., description="Strategy key from STRATEGY_MAP")
     preset: Optional[str] = Field(default=None, description="Optional preset name (e.g., turtle_conservative)")
     strategy_params: Dict[str, Any] = Field(default_factory=dict, description="Strategy parameters")
@@ -58,6 +61,7 @@ class BacktestTaskResponse(BaseModel):
     task_id: str = Field(..., description="Unique identifier for the backtest task")
     user_id: str = Field(..., description="Identifier of the user who initiated the task")
     symbol: str = Field(..., description="Trading symbol for the backtest (e.g., 'AAPL')")
+    asset_type: str = Field(default="stock", description="Asset type: stock or etf")
     stock_name: Optional[str] = Field(default=None, description="Human-readable stock name")
     strategy_key: str = Field(..., description="Key identifying the trading strategy used")
     preset: Optional[str] = Field(default=None, description="Preset name used when creating the task")
@@ -130,6 +134,7 @@ class BacktestResultResponse(BaseModel):
     task_id: str
     user_id: str
     symbol: str
+    asset_type: str = "stock"
     strategy_key: str
     strategy_params: Optional[Dict[str, Any]] = None  # 添加策略参数
     metrics: BacktestResultMetrics
@@ -141,6 +146,49 @@ class BacktestResultResponse(BaseModel):
 # ============================================================================
 # User APIs - Task Management
 # ============================================================================
+
+def _normalize_asset_type(asset_type: Optional[str]) -> str:
+    value = (asset_type or "stock").strip().lower()
+    if value not in {"stock", "etf"}:
+        raise HTTPException(status_code=400, detail="asset_type must be 'stock' or 'etf'")
+    return value
+
+
+def _lookup_symbol_name(collections: Dict[str, Any], symbol: Optional[str], asset_type: str) -> Optional[str]:
+    if not symbol:
+        return None
+    if asset_type == "etf":
+        etf_basic_col = collections.get("etf_basic")
+        if etf_basic_col is None:
+            return None
+        info = etf_basic_col.find_one({"ts_code": symbol})
+    else:
+        stock_info_col = collections.get("stock_info")
+        if stock_info_col is None:
+            return None
+        info = stock_info_col.find_one({"symbol": symbol})
+    if info and isinstance(info, dict):
+        name = info.get("name")
+        return name if isinstance(name, str) and name else None
+    return None
+
+
+def require_backtest_worker_token(
+    x_backtest_worker_token: Optional[str] = Header(None, alias="X-Backtest-Worker-Token"),
+) -> bool:
+    """Shared secret for backtest-worker internal APIs."""
+    expected = os.getenv("BACKTEST_WORKER_TOKEN", "").strip()
+    if not expected:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="BACKTEST_WORKER_TOKEN is not configured",
+        )
+    if not x_backtest_worker_token or x_backtest_worker_token.strip() != expected:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or missing X-Backtest-Worker-Token",
+        )
+    return True
 
 @router.post("/tasks", response_model=BacktestTaskResponse)
 async def create_backtest_task(
@@ -154,7 +202,7 @@ async def create_backtest_task(
     """
     collections = get_db_collections()
     backtest_tasks_col = collections["backtest_tasks"]
-    stock_info_col = collections.get("stock_info")
+    asset_type = _normalize_asset_type(task.asset_type)
     
     # Generate task ID
     task_id = f"bt_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{task.symbol}"
@@ -164,6 +212,7 @@ async def create_backtest_task(
         "task_id": task_id,
         "user_id": current_user["id"],
         "symbol": task.symbol,
+        "asset_type": asset_type,
         "strategy_key": task.strategy_key,
         "preset": task.preset,
         "strategy_params": task.strategy_params,
@@ -183,21 +232,14 @@ async def create_backtest_task(
     if not result.inserted_id:
         raise HTTPException(status_code=500, detail="Failed to create backtest task")
     
-    stock_name = None
-    if stock_info_col is not None:
-        try:
-            info = stock_info_col.find_one({"symbol": task_doc["symbol"]})
-            if info and isinstance(info, dict):
-                name = info.get("name")
-                stock_name = name if isinstance(name, str) and name else None
-        except Exception:
-            stock_name = None
+    stock_name = _lookup_symbol_name(collections, task_doc["symbol"], asset_type)
 
     # Return response
     return BacktestTaskResponse(
         task_id=task_doc["task_id"],
         user_id=str(task_doc["user_id"]),
         symbol=task_doc["symbol"],
+        asset_type=asset_type,
         stock_name=stock_name,
         strategy_key=task_doc["strategy_key"],
         preset=task_doc.get("preset"),
@@ -223,7 +265,6 @@ async def list_backtest_tasks(
     """
     collections = get_db_collections()
     backtest_tasks_col = collections["backtest_tasks"]
-    stock_info_col = collections.get("stock_info")
 
     query = {"user_id": current_user["id"]}
     if status:
@@ -232,23 +273,23 @@ async def list_backtest_tasks(
     tasks = list(backtest_tasks_col.find(query).sort("created_at", -1).limit(limit))
 
     symbol_to_name: Dict[str, str] = {}
-    if stock_info_col is not None:
-        for t in tasks:
-            sym = t.get("symbol")
-            if not sym or sym in symbol_to_name:
-                continue
-            info = stock_info_col.find_one({"symbol": sym})
-            if info and isinstance(info, dict):
-                name = info.get("name")
-                if isinstance(name, str) and name:
-                    symbol_to_name[sym] = name
+    for t in tasks:
+        sym = t.get("symbol")
+        asset_type = _normalize_asset_type(t.get("asset_type"))
+        cache_key = f"{asset_type}:{sym}"
+        if not sym or cache_key in symbol_to_name:
+            continue
+        name = _lookup_symbol_name(collections, sym, asset_type)
+        if name:
+            symbol_to_name[cache_key] = name
 
     return [
         BacktestTaskResponse(
             task_id=task["task_id"],
             user_id=str(task.get("user_id", "")),
             symbol=task["symbol"],
-            stock_name=symbol_to_name.get(task["symbol"]),
+            asset_type=_normalize_asset_type(task.get("asset_type")),
+            stock_name=symbol_to_name.get(f"{_normalize_asset_type(task.get('asset_type'))}:{task['symbol']}"),
             strategy_key=task["strategy_key"],
             preset=task.get("preset"),
             strategy_params=task.get("strategy_params", {}) or {},
@@ -274,7 +315,6 @@ async def get_backtest_task(
     """Get backtest task details"""
     collections = get_db_collections()
     backtest_tasks_col = collections["backtest_tasks"]
-    stock_info_col = collections.get("stock_info")
 
     task = backtest_tasks_col.find_one({
         "task_id": task_id,
@@ -284,17 +324,14 @@ async def get_backtest_task(
     if not task:
         raise HTTPException(status_code=404, detail="Backtest task not found")
 
-    stock_name = None
-    if stock_info_col is not None:
-        info = stock_info_col.find_one({"symbol": task.get("symbol")})
-        if info and isinstance(info, dict):
-            name = info.get("name")
-            stock_name = name if isinstance(name, str) and name else None
+    asset_type = _normalize_asset_type(task.get("asset_type"))
+    stock_name = _lookup_symbol_name(collections, task.get("symbol"), asset_type)
 
     return BacktestTaskResponse(
         task_id=task.get("task_id") or task_id,
         user_id=str(task.get("user_id", "")),
         symbol=task.get("symbol"),
+        asset_type=asset_type,
         stock_name=stock_name,
         strategy_key=task.get("strategy_key"),
         preset=task.get("preset"),
@@ -432,6 +469,7 @@ async def get_backtest_result(
         task_id=result["task_id"],
         user_id=str(result["user_id"]),
         symbol=result["symbol"],
+        asset_type=_normalize_asset_type(result.get("asset_type") or task.get("asset_type")),
         strategy_key=result["strategy_key"],
         strategy_params=result.get("strategy_params") or task.get("strategy_params"),  # 从 result 或 task 获取参数
         metrics=BacktestResultMetrics(**result.get("metrics", {})),
@@ -448,7 +486,7 @@ async def get_backtest_result(
 @router.get("/tasks/pending/poll")
 async def poll_pending_tasks(
     limit: int = 10,
-    current_user: dict = Depends(get_current_user)
+    _worker_auth: bool = Depends(require_backtest_worker_token)
 ):
     """Poll for pending backtest tasks (Worker endpoint)
     
@@ -470,6 +508,7 @@ async def poll_pending_tasks(
             "task_id": task["task_id"],
             "user_id": str(task["user_id"]),
             "symbol": task["symbol"],
+            "asset_type": _normalize_asset_type(task.get("asset_type")),
             "strategy_key": task["strategy_key"],
             "preset": task.get("preset"),
             "strategy_params": task.get("strategy_params", {}),
@@ -486,7 +525,7 @@ async def poll_pending_tasks(
 async def claim_backtest_task(
     task_id: str,
     worker_id: str,
-    current_user: dict = Depends(get_current_user)
+    _worker_auth: bool = Depends(require_backtest_worker_token)
 ):
     """Claim a backtest task (Worker endpoint)
     
@@ -520,7 +559,7 @@ async def claim_backtest_task(
 async def report_backtest_result(
     task_id: str,
     result: BacktestResultReport,
-    current_user: dict = Depends(get_current_user)
+    _worker_auth: bool = Depends(require_backtest_worker_token)
 ):
     """Report backtest results (Worker endpoint)
     
@@ -547,6 +586,7 @@ async def report_backtest_result(
         "task_id": task_id,
         "user_id": task["user_id"],
         "symbol": task["symbol"],
+        "asset_type": _normalize_asset_type(task.get("asset_type")),
         "strategy_key": task["strategy_key"],
         "metrics": result.metrics.model_dump(),
         "trades": [trade.model_dump() for trade in result.trades],
@@ -579,7 +619,7 @@ async def report_backtest_result(
 async def report_backtest_failure(
     task_id: str,
     error_message: str,
-    current_user: dict = Depends(get_current_user)
+    _worker_auth: bool = Depends(require_backtest_worker_token)
 ):
     """Report backtest failure (Worker endpoint)
     

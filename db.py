@@ -95,6 +95,7 @@ def get_db_collections() -> Dict[str, Collection]:
         "stock_scores": db["stock_scores"],
         # Stock reference data lives in quant_data
         "stock_info": data_db["stock_info"],
+        "etf_basic": data_db["etf_basic"],
     }
 
 def get_collection(name: str):
