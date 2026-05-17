@@ -1,4 +1,5 @@
 # 新增：获取market spectrum的API接口
+from collections import defaultdict
 from typing import Optional, Dict, Any, List, Mapping
 from fastapi import APIRouter, Query, Depends, HTTPException
 from models.all_models import MarketAnalysisRequest
@@ -17,8 +18,36 @@ router = APIRouter()
 
 _HOME_SUMMARIES_CACHE_TTL_SECONDS = 60
 _MARKET_ANALYSIS_SUMMARY_CACHE_TTL_SECONDS = 60
+_SECTOR_SPECTRUM_CACHE_TTL_SECONDS = 300
 _home_summaries_cache: Dict[str, Any] = {"key": None, "expires_at": 0.0, "payload": None}
 _market_analysis_summary_cache: Dict[str, Any] = {"key": None, "expires_at": 0.0, "payload": None}
+_sector_spectrum_cache: Dict[str, Dict[str, Any]] = {}
+_sector_members_cache: Dict[str, Dict[str, Any]] = {}
+
+
+def _num_or_none(value: Any) -> Optional[float]:
+    try:
+        if value is None:
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _get_sector_spectrum_cache(cache_key: str) -> Optional[Dict[str, Any]]:
+    now = time.time()
+    cached = _sector_spectrum_cache.get(cache_key) or {}
+    if cached.get("payload") is not None and float(cached.get("expires_at") or 0) > now:
+        return cached["payload"]
+    return None
+
+
+def _set_sector_spectrum_cache(cache_key: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    _sector_spectrum_cache[cache_key] = {
+        "payload": payload,
+        "expires_at": time.time() + _SECTOR_SPECTRUM_CACHE_TTL_SECONDS,
+    }
+    return payload
 
 
 def _compact_summary_text(value: Any, fallback: str, max_len: int = 48) -> str:
@@ -1201,41 +1230,206 @@ def get_market_spectrum(
     return {"data": data}
 
 
-@router.get('/market-spectrum-minute', summary="获取分钟级市场阴阳谱数据", tags=["Market"])
+def _resolve_sector_members(level: str) -> Dict[str, Dict[str, str]]:
+    now = time.time()
+    cached = _sector_members_cache.get(level) or {}
+    if cached.get("payload") is not None and float(cached.get("expires_at") or 0) > now:
+        return cached["payload"]
+
+    prefix = level.lower()
+    cursor = get_data_db()["sw_index_member"].find(
+        {"src": "SW2021", "is_new": "Y"},
+        {
+            "_id": 0,
+            "con_code": 1,
+            f"{prefix}_code": 1,
+            f"{prefix}_name": 1,
+        },
+    )
+    members: Dict[str, Dict[str, str]] = {}
+    for doc in cursor:
+        symbol = str(doc.get("con_code") or "").strip()
+        sector_code = str(doc.get(f"{prefix}_code") or "").strip()
+        sector_name = str(doc.get(f"{prefix}_name") or "").strip()
+        if symbol and sector_code and sector_name:
+            members[symbol] = {"sector_code": sector_code, "sector_name": sector_name}
+    _sector_members_cache[level] = {
+        "payload": members,
+        "expires_at": now + _SECTOR_SPECTRUM_CACHE_TTL_SECONDS,
+    }
+    return members
+
+
+def _sector_distribution(rows: List[Dict[str, Any]]) -> Dict[str, int]:
+    return {
+        "gt_7": sum(1 for row in rows if (_num_or_none(row.get("pct_chg")) or 0) > 7),
+        "p5_7": sum(1 for row in rows if 5 < (_num_or_none(row.get("pct_chg")) or 0) <= 7),
+        "p2_5": sum(1 for row in rows if 2 < (_num_or_none(row.get("pct_chg")) or 0) <= 5),
+        "p0_2": sum(1 for row in rows if 0 < (_num_or_none(row.get("pct_chg")) or 0) <= 2),
+        "flat": sum(1 for row in rows if (_num_or_none(row.get("pct_chg")) or 0) == 0),
+        "m2_0": sum(1 for row in rows if -2 <= (_num_or_none(row.get("pct_chg")) or 0) < 0),
+        "m5_2": sum(1 for row in rows if -5 <= (_num_or_none(row.get("pct_chg")) or 0) < -2),
+        "m7_5": sum(1 for row in rows if -7 <= (_num_or_none(row.get("pct_chg")) or 0) < -5),
+        "lt_m7": sum(1 for row in rows if (_num_or_none(row.get("pct_chg")) or 0) < -7),
+    }
+
+
+def _previous_trade_dates(volume_price, start_date: str, needed: int) -> List[str]:
+    """Return latest trading dates before start_date using trade_date index order."""
+    if needed <= 0:
+        return []
+    out: List[str] = []
+    seen = set()
+    cursor = volume_price.find(
+        {"trade_date": {"$lt": start_date}, "close": {"$exists": True, "$ne": None}},
+        {"_id": 0, "trade_date": 1},
+    ).sort("trade_date", -1).limit(max(needed * 8000, 20000))
+    for row in cursor:
+        trade_date = str(row.get("trade_date") or "")
+        if not trade_date or trade_date in seen:
+            continue
+        seen.add(trade_date)
+        out.append(trade_date)
+        if len(out) >= needed:
+            break
+    return sorted(out)
+
+
+@router.get('/market-spectrum/sectors', summary="获取板块日线阴阳谱数据", tags=["Market"])
+def get_market_spectrum_sectors(
+    start_date: str = Query(..., description="开始日期,格式YYYYMMDD"),
+    end_date: str = Query(..., description="结束日期,格式YYYYMMDD"),
+    level: str = Query("L1", pattern="^L[12]$", description="申万层级: L1 或 L2"),
+    ma_period: int = Query(5, ge=2, le=30, description="均线周期"),
+    limit: int = Query(80, ge=1, le=300, description="返回板块数量上限"),
+    sector_code: Optional[str] = Query(None, description="可选：只返回指定板块的区间曲线"),
+):
+    """Dynamically aggregate daily sector breadth from volume_price.
+
+    The first version intentionally supports L1/L2 only. L3 is better served as
+    an anomaly drill-down because the full list is noisy and expensive.
+    """
+    cache_key = "|".join([start_date, end_date, level, str(ma_period), str(limit), sector_code or ""])
+    cached = _get_sector_spectrum_cache(cache_key)
+    if cached is not None:
+        return cached
+
+    data_db = get_data_db()
+    members = _resolve_sector_members(level)
+    if sector_code:
+        members = {
+            symbol: sector
+            for symbol, sector in members.items()
+            if sector["sector_code"] == sector_code
+        }
+    if not members:
+        return {"data": [], "level": level, "error": "No sector members"}
+
+    volume_price = data_db["volume_price"]
+    lookback_start = start_date
+    prev_days = _previous_trade_dates(volume_price, start_date, ma_period - 1)
+    if prev_days:
+        lookback_start = prev_days[0]
+
+    cursor = volume_price.find(
+        {
+            "trade_date": {"$gte": lookback_start, "$lte": end_date},
+            "close": {"$exists": True, "$ne": None},
+        },
+        {"_id": 0, "symbol": 1, "trade_date": 1, "close": 1, "pct_chg": 1},
+    ).sort([("symbol", 1), ("trade_date", 1)])
+
+    rows_by_symbol: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for doc in cursor:
+        symbol = str(doc.get("symbol") or "")
+        if symbol in members:
+            rows_by_symbol[symbol].append(doc)
+
+    groups: Dict[tuple, List[Dict[str, Any]]] = defaultdict(list)
+    for symbol, rows in rows_by_symbol.items():
+        sector = members[symbol]
+        for idx, row in enumerate(rows):
+            trade_date = str(row.get("trade_date") or "")
+            if trade_date < start_date or trade_date > end_date:
+                continue
+            window = rows[max(0, idx - ma_period + 1): idx + 1]
+            closes = [_num_or_none(item.get("close")) for item in window]
+            closes = [value for value in closes if value is not None]
+            if len(closes) < ma_period:
+                continue
+            close = _num_or_none(row.get("close"))
+            if close is None:
+                continue
+            enriched = {
+                **row,
+                "sector_code": sector["sector_code"],
+                "sector_name": sector["sector_name"],
+                "above_ma": close > (sum(closes) / len(closes)),
+            }
+            groups[(trade_date, sector["sector_code"], sector["sector_name"])].append(enriched)
+
+    docs: List[Dict[str, Any]] = []
+    for (trade_date, sector_code, sector_name), rows in groups.items():
+        total = len(rows)
+        if total <= 0:
+            continue
+        above = sum(1 for row in rows if row.get("above_ma"))
+        docs.append({
+            "trade_date": trade_date,
+            "level": level,
+            "sector_code": sector_code,
+            "sector_name": sector_name,
+            "yang_spectrum": above / total,
+            "yin_spectrum": 1 - (above / total),
+            "total_stocks": total,
+            "above_ma_count": above,
+            "below_ma_count": total - above,
+            "distribution": _sector_distribution(rows),
+            "ma_period": ma_period,
+            "granularity": "daily_sector",
+        })
+
+    docs.sort(key=lambda row: (row["trade_date"], -row["yang_spectrum"], row["sector_code"]))
+    if limit and not sector_code:
+        per_date: Dict[str, int] = defaultdict(int)
+        trimmed: List[Dict[str, Any]] = []
+        for row in docs:
+            if per_date[row["trade_date"]] >= limit:
+                continue
+            trimmed.append(row)
+            per_date[row["trade_date"]] += 1
+        docs = trimmed
+
+    return _set_sector_spectrum_cache(cache_key, {"data": docs, "level": level, "ma_period": ma_period})
+
+
+@router.get('/market-spectrum-minute', summary="获取实时日K阴阳谱数据", tags=["Market"])
 def get_market_spectrum_minute(
     start_time: str = Query(..., description="开始时间,格式YYYYMMDDHHMM"),
     end_time: str = Query(..., description="结束时间,格式YYYYMMDDHHMM"),
     ma_period: int = Query(5, description="均线周期,默认5"),
-    spectrum_type: str = Query("daily_realtime", alias="type", description="曲线类型: minute 或 daily_realtime")
 ):
-    """获取分钟级市场阴阳谱数据.
+    """获取实时日K阴阳谱数据.
 
     数据来源:
-      - type=daily_realtime: market_spectrum_realtime_daily (实时日K快照阴阳谱)
-      - type=minute: market_spectrum_minute (旧分钟MA阴阳谱)
+      - market_spectrum_realtime_daily (实时日K快照阴阳谱)
     字段包括:
       - trade_date: YYYYMMDDHHMM
       - yang_spectrum / yin_spectrum
       - total_stocks
       - above_ma_count / below_ma_count
-      - ma_period, granularity 字段区分来源
+      - ma_period, granularity
     """
     data_collections = get_data_db()
-    if spectrum_type == 'daily_realtime':
-        collection = data_collections.get('market_spectrum_realtime_daily')  # type: ignore
-    else:
-        collection = data_collections.get('market_spectrum_minute')  # type: ignore
+    collection = data_collections.get('market_spectrum_realtime_daily')  # type: ignore
 
     if collection is None:
         raise HTTPException(status_code=500, detail="market spectrum collection not configured")
 
-    # Map type -> granularity field stored in DB
-    granularity = 'daily_realtime' if spectrum_type == 'daily_realtime' else 'minute'
-
     query = {
         'trade_date': {'$gte': start_time, '$lte': end_time},
         'ma_period': ma_period,
-        'granularity': granularity
+        'granularity': 'daily_realtime'
     }
     projection = {
         '_id': 0,
