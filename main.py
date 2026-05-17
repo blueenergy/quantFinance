@@ -187,6 +187,7 @@ if os.getenv("ENABLE_MCP_SERVER", "true").strip().lower() in ("1", "true", "yes"
         auth_config=AuthConfig(
             dependencies=[Depends(require_hermes_quant_internal_key)],
         ),
-        headers=["x-hermes-quant-key"],  # 将此 header 转发给底层路由的 Depends 校验
+        # 将 MCP client headers 转发给底层路由的 Depends 校验。
+        headers=["x-hermes-quant-key", "x-user-token"],
     )
     _mcp.mount_http(mount_path="/api/mcp")  # 挂载在 /api/mcp
