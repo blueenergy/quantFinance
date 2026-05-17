@@ -36,7 +36,7 @@ from datetime import datetime, timedelta
 from typing import Any, Dict, Optional
 
 from bson import ObjectId
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from pydantic import BaseModel
 
 from auth import get_user_from_header_token, require_hermes_quant_internal_key
@@ -62,8 +62,10 @@ def _format_expiry(minutes: int) -> str:
 # 内部工具函数
 # ---------------------------------------------------------------------------
 
-def _resolve_user(username: Optional[str]) -> Dict[str, Any]:
-    """根据 username 查库；未提供则返回 hermes-system 虚拟用户。"""
+def _resolve_user(username: Optional[str], x_user_token: Optional[str] = None) -> Dict[str, Any]:
+    """优先使用 MCP 登录 token；未提供时按 username 归属，最后回退到 hermes-system。"""
+    if x_user_token:
+        return get_user_from_header_token(x_user_token=x_user_token)
     if username:
         user = db["users"].find_one({"username": username})
         if user:
@@ -111,6 +113,7 @@ class DeepAnalysisRequest(BaseModel):
 @router.post("/analysis/deep", operation_id="submit_deep")
 async def hermes_submit_deep_analysis(
     body: DeepAnalysisRequest,
+    x_user_token: Optional[str] = Header(None, alias="X-User-Token"),
     _: bool = Depends(require_hermes_quant_internal_key),
 ):
     """
@@ -120,7 +123,7 @@ async def hermes_submit_deep_analysis(
     本接口仅供需要异步追踪多个任务的高级场景使用。
     """
     collections = get_db_collections()
-    user = _resolve_user(body.username)
+    user = _resolve_user(body.username, x_user_token)
 
     task_doc = build_task_doc(
         current_user=user,
@@ -152,6 +155,7 @@ async def hermes_submit_deep_analysis(
 async def hermes_deep_analysis_wait(
     body: DeepAnalysisRequest,
     timeout: int = Query(180, ge=30, le=300, description="最长等待秒数，默认 180"),
+    x_user_token: Optional[str] = Header(None, alias="X-User-Token"),
     _: bool = Depends(require_hermes_quant_internal_key),
 ):
     """
@@ -161,7 +165,7 @@ async def hermes_deep_analysis_wait(
     适合 Hermes 等不擅长多轮工具调用循环的场景。
     """
     collections = get_db_collections()
-    user = _resolve_user(body.username)
+    user = _resolve_user(body.username, x_user_token)
 
     task_doc = build_task_doc(
         current_user=user,
@@ -203,6 +207,7 @@ async def hermes_deep_analysis_wait(
             "task_id": task_id,
             "symbol": body.symbol,
             "status": "completed",
+            "attributed_to": user["username"],
             "analysis": analysis,
             "model": result.get("model"),
             "elapsed_seconds": elapsed,
