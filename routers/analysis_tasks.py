@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import os
 from datetime import datetime
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from bson import ObjectId
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -11,15 +12,21 @@ from db import get_analyzer_db, get_db_collections
 from services.analysis_tasks import (
     can_access_task,
     build_task_doc,
+    compute_queue_ahead,
+    estimate_task_duration_seconds,
+    estimate_wait_seconds,
     format_dt,
     infer_task_data_date,
     infer_task_type,
     normalize_task_status,
+    queue_wait_seconds_to_text,
     summarize_task_result,
 )
 
 
 router = APIRouter(prefix="/analysis-tasks", tags=["分析任务中心"])
+ANALYSIS_WORKER_PARALLELISM = max(1, int(os.getenv("ANALYSIS_WORKER_PARALLELISM", "1")))
+PROCESSING_STALE_MINUTES = max(5, int(os.getenv("ANALYSIS_TASK_STALE_MINUTES", "60")))
 
 
 RENDER_TYPE_MAP = {
@@ -246,6 +253,167 @@ async def list_analysis_tasks(
             "limit": limit,
             "total": total,
         },
+    }
+
+
+def _queue_status_hint(status: str, estimated_wait_seconds: Optional[int]) -> str:
+    if status == "pending":
+        return queue_wait_seconds_to_text(estimated_wait_seconds)
+    if status == "processing":
+        return "正在分析，LLM 响应时间可能有波动"
+    if status == "completed":
+        return "已完成"
+    if status == "completed_with_parse_error":
+        return "已完成，但结果解析存在问题"
+    if status == "failed":
+        return "任务失败"
+    return "状态未知"
+
+
+def _processing_age_minutes(task: Dict[str, Any], now: datetime) -> Optional[int]:
+    started_at = task.get("started_at") or task.get("updated_at")
+    if not isinstance(started_at, datetime):
+        return None
+    return max(0, int((now - started_at).total_seconds() // 60))
+
+
+def _serialize_processing_task(task: Dict[str, Any], now: datetime) -> Dict[str, Any]:
+    age = _processing_age_minutes(task, now)
+    task_type = infer_task_type(task)
+    return {
+        "task_id": str(task.get("_id")),
+        "task_type": task_type,
+        "status": normalize_task_status(task.get("status")),
+        "symbol": task.get("symbol"),
+        "stock_name": task.get("stock_name"),
+        "source": task.get("source"),
+        "priority": int(task.get("priority") or 0),
+        "created_by_user_id": task.get("created_by_user_id") or task.get("user_id"),
+        "created_by_username": task.get("created_by_username"),
+        "worker_id": task.get("worker_id"),
+        "started_at": format_dt(task.get("started_at")),
+        "updated_at": format_dt(task.get("updated_at")),
+        "processing_age_minutes": age,
+        "stale": bool(age is not None and age >= PROCESSING_STALE_MINUTES),
+    }
+
+
+def _fetch_queue_docs(tasks_col, query: Dict[str, Any], limit: int, status: Optional[str]) -> List[Dict[str, Any]]:
+    if status:
+        return list(tasks_col.find(query).sort("created_at", -1).limit(limit))
+
+    running_query = dict(query)
+    running_query["status"] = {"$in": ["pending", "processing"]}
+    terminal_query = dict(query)
+    terminal_query["status"] = {"$in": ["completed", "completed_with_parse_error", "failed"]}
+
+    running_docs = list(tasks_col.find(running_query).sort([("status", -1), ("priority", -1), ("created_at", 1)]).limit(limit))
+    remaining = max(0, limit - len(running_docs))
+    if remaining <= 0:
+        return running_docs
+    seen_ids = {doc.get("_id") for doc in running_docs}
+    terminal_docs = [
+        doc
+        for doc in tasks_col.find(terminal_query).sort("created_at", -1).limit(remaining)
+        if doc.get("_id") not in seen_ids
+    ]
+    return running_docs + terminal_docs
+
+
+@router.get("/queue", summary="获取分析任务队列状态")
+async def get_analysis_task_queue(
+    limit: int = Query(50, ge=1, le=200),
+    status: Optional[str] = Query(None, description="可选状态过滤：pending/processing/completed/failed"),
+    current_user: dict = Depends(get_current_active_user),
+):
+    collections = get_db_collections()
+    tasks_col = collections["analysis_tasks"]
+    now = datetime.now()
+
+    pending_count = tasks_col.count_documents({"status": "pending"})
+    processing_count = tasks_col.count_documents({"status": "processing"})
+    completed_count = tasks_col.count_documents({"status": {"$in": ["completed", "completed_with_parse_error"]}})
+    failed_count = tasks_col.count_documents({"status": "failed"})
+    estimated_parallelism = ANALYSIS_WORKER_PARALLELISM
+    processing_docs = list(tasks_col.find({"status": "processing"}).sort([("started_at", -1), ("updated_at", -1)]))
+    stale_processing_count = sum(1 for task in processing_docs if (_processing_age_minutes(task, now) or 0) >= PROCESSING_STALE_MINUTES)
+
+    query: Dict[str, Any] = _build_user_filter(current_user)
+    if status:
+        query["status"] = normalize_task_status(status)
+    else:
+        query["status"] = {"$in": ["pending", "processing", "completed", "completed_with_parse_error", "failed"]}
+
+    docs = _fetch_queue_docs(tasks_col, query, limit, status)
+    duration_cache: Dict[str, int] = {}
+    items = []
+    for task in docs:
+        task_id = str(task.get("_id"))
+        task_type = infer_task_type(task)
+        normalized_status = normalize_task_status(task.get("status"))
+        average_duration = duration_cache.get(task_type)
+        if average_duration is None:
+            average_duration = estimate_task_duration_seconds(tasks_col, task_type)
+            duration_cache[task_type] = average_duration
+
+        queue_ahead = compute_queue_ahead(tasks_col, task) if normalized_status == "pending" else 0
+        estimated_wait = None
+        if normalized_status == "pending":
+            estimated_wait = estimate_wait_seconds(
+                queue_ahead=queue_ahead,
+                processing_count=processing_count,
+                average_duration_seconds=average_duration,
+                estimated_parallelism=estimated_parallelism,
+            )
+
+        items.append(
+            {
+                "task_id": task_id,
+                "task_type": task_type,
+                "status": normalized_status,
+                "priority": int(task.get("priority") or 0),
+                "symbol": task.get("symbol"),
+                "stock_name": task.get("stock_name"),
+                "source": task.get("source"),
+                "created_at": format_dt(task.get("created_at")),
+                "updated_at": format_dt(task.get("updated_at")),
+                "started_at": format_dt(task.get("started_at")),
+                "completed_at": format_dt(task.get("completed_at")),
+                "failed_at": format_dt(task.get("failed_at")),
+                "worker_id": task.get("worker_id"),
+                "data_date": infer_task_data_date(task),
+                "queue_ahead": queue_ahead,
+                "estimated_wait_seconds": estimated_wait,
+                "wait_hint": _queue_status_hint(normalized_status, estimated_wait),
+                "average_duration_seconds": average_duration,
+                "error": task.get("error"),
+                "result_summary": summarize_task_result(task),
+                "render_type": _get_render_type(task_type),
+                "revision_of": task.get("revision_of"),
+                "created_by_user_id": task.get("created_by_user_id") if current_user.get("is_admin") else None,
+                "created_by_username": task.get("created_by_username") if current_user.get("is_admin") else None,
+            }
+        )
+
+    return {
+        "success": True,
+        "global": {
+            "pending_count": pending_count,
+            "processing_count": processing_count,
+            "stale_processing_count": stale_processing_count,
+            "completed_count": completed_count,
+            "failed_count": failed_count,
+            "estimated_parallelism": estimated_parallelism,
+            "parallelism_source": "ANALYSIS_WORKER_PARALLELISM",
+            "processing_stale_minutes": PROCESSING_STALE_MINUTES,
+            "default_average_duration_seconds": estimate_task_duration_seconds(tasks_col, "deep_analysis"),
+            "updated_at": datetime.now().isoformat(),
+        },
+        "processing_tasks": [
+            _serialize_processing_task(task, now)
+            for task in processing_docs
+        ] if current_user.get("is_admin") else [],
+        "items": items,
     }
 
 

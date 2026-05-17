@@ -10,7 +10,14 @@ from utils.stock_utils import serialize_doc, format_trade_date
 from bson import ObjectId
 from models.analysis_task import AnalysisTaskCreate
 from services.quota_manager import QuotaManager
-from services.analysis_tasks import build_task_doc, can_access_task
+from services.analysis_tasks import (
+    build_task_doc,
+    can_access_task,
+    compute_queue_ahead,
+    estimate_task_duration_seconds,
+    estimate_wait_seconds,
+    queue_wait_seconds_to_text,
+)
 from services.analysis_history import build_user_analysis_history_payload
 from db import db
 from routers.entitlements_matrix import (
@@ -21,6 +28,7 @@ from routers.entitlements_matrix import (
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
+ANALYSIS_WORKER_PARALLELISM = max(1, int(os.getenv("ANALYSIS_WORKER_PARALLELISM", "1")))
 
 
 def _normalize_task_status(raw_status: Any) -> str:
@@ -369,6 +377,28 @@ async def get_analysis_task_status(
         "analysis_mode": task.get("params", {}).get("analysis_mode", "classic"),
         "created_at": task.get("created_at").isoformat() if task.get("created_at") else None
     }
+    if response["status"] == "pending":
+        processing_count = collections["analysis_tasks"].count_documents({"status": "processing"})
+        task_type = str(task.get("task_type") or task.get("type") or "deep_analysis")
+        queue_ahead = compute_queue_ahead(collections["analysis_tasks"], task)
+        average_duration = estimate_task_duration_seconds(collections["analysis_tasks"], task_type)
+        estimated_wait = estimate_wait_seconds(
+            queue_ahead=queue_ahead,
+            processing_count=processing_count,
+            average_duration_seconds=average_duration,
+            estimated_parallelism=ANALYSIS_WORKER_PARALLELISM,
+        )
+        response.update({
+            "queue_ahead": queue_ahead,
+            "estimated_wait_seconds": estimated_wait,
+            "wait_hint": queue_wait_seconds_to_text(estimated_wait),
+        })
+    elif response["status"] == "processing":
+        response.update({
+            "queue_ahead": 0,
+            "estimated_wait_seconds": 0,
+            "wait_hint": "正在分析，LLM 响应时间可能有波动",
+        })
     
     if response["status"] == "completed":
         result = task.get("result", {})
@@ -719,6 +749,7 @@ async def create_deep_analysis_task(
     try:
         result = collections["analysis_tasks"].insert_one(task_doc)
         task_id = str(result.inserted_id)
+        task_doc["_id"] = result.inserted_id
         
         # 4. 扣除配额
         remaining = _consume_quota_after_submit(
@@ -727,6 +758,16 @@ async def create_deep_analysis_task(
             quota_manager=quota_manager,
         )
         
+        processing_count = collections["analysis_tasks"].count_documents({"status": "processing"})
+        queue_ahead = compute_queue_ahead(collections["analysis_tasks"], task_doc)
+        average_duration = estimate_task_duration_seconds(collections["analysis_tasks"], "deep_analysis")
+        estimated_wait = estimate_wait_seconds(
+            queue_ahead=queue_ahead,
+            processing_count=processing_count,
+            average_duration_seconds=average_duration,
+            estimated_parallelism=ANALYSIS_WORKER_PARALLELISM,
+        )
+
         return {
             "success": True,
             "task_id": task_id,
@@ -734,7 +775,10 @@ async def create_deep_analysis_task(
             "analysis_mode": params.get("analysis_mode", "classic"),
             "message": "深度分析任务已提交",
             "quota_remaining": remaining,
-            "position_in_queue": collections["analysis_tasks"].count_documents({"status": "pending"})
+            "position_in_queue": collections["analysis_tasks"].count_documents({"status": "pending"}),
+            "queue_ahead": queue_ahead,
+            "estimated_wait_seconds": estimated_wait,
+            "wait_hint": queue_wait_seconds_to_text(estimated_wait),
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"任务创建失败: {str(e)}")

@@ -1,11 +1,20 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 
 TERMINAL_STATUSES = {"completed", "failed", "completed_with_parse_error"}
 RUNNING_STATUSES = {"pending", "processing"}
+DEFAULT_TASK_DURATION_SECONDS = {
+    "deep_analysis": 120,
+    "portfolio_analysis": 120,
+    "market_analysis": 180,
+    "global_analysis": 180,
+    "sector_concept_analysis": 90,
+    "hot_stock_analysis": 90,
+    "etf_analysis": 90,
+}
 
 
 def normalize_task_status(raw_status: Any) -> str:
@@ -234,4 +243,103 @@ def summarize_task_result(task: Dict[str, Any]) -> str:
     if isinstance(analysis, str):
         return analysis[:120]
     return "分析完成"
+
+
+def queue_wait_seconds_to_text(seconds: Optional[int]) -> str:
+    if seconds is None:
+        return "预计等待时间暂不可估算"
+    if seconds <= 0:
+        return "即将开始"
+    minutes = max(1, round(seconds / 60))
+    if minutes < 60:
+        return f"预计等待约 {minutes} 分钟"
+    hours = minutes // 60
+    remain = minutes % 60
+    if remain:
+        return f"预计等待约 {hours} 小时 {remain} 分钟"
+    return f"预计等待约 {hours} 小时"
+
+
+def _duration_seconds(task: Dict[str, Any]) -> Optional[float]:
+    start = task.get("started_at") or task.get("created_at")
+    end = task.get("completed_at") or task.get("failed_at") or task.get("updated_at")
+    if not isinstance(start, datetime) or not isinstance(end, datetime):
+        return None
+    seconds = (end - start).total_seconds()
+    if seconds <= 0:
+        return None
+    return seconds
+
+
+def estimate_task_duration_seconds(tasks_col, task_type: str, sample_size: int = 30) -> int:
+    query = {
+        "$or": [{"task_type": task_type}, {"type": task_type}],
+        "status": {"$in": list(TERMINAL_STATUSES)},
+    }
+    docs = tasks_col.find(
+        query,
+        {
+            "_id": 0,
+            "created_at": 1,
+            "started_at": 1,
+            "completed_at": 1,
+            "failed_at": 1,
+            "updated_at": 1,
+        },
+    ).sort("updated_at", -1).limit(sample_size)
+    durations: List[float] = []
+    for doc in docs:
+        seconds = _duration_seconds(doc)
+        if seconds is not None:
+            durations.append(seconds)
+    if durations:
+        durations.sort()
+        # Use median to avoid a single slow LLM call making every ETA look scary.
+        return max(30, int(durations[len(durations) // 2]))
+    return DEFAULT_TASK_DURATION_SECONDS.get(task_type, 120)
+
+
+def compute_queue_ahead(tasks_col, task: Dict[str, Any]) -> int:
+    if normalize_task_status(task.get("status")) != "pending":
+        return 0
+    priority = int(task.get("priority") or 0)
+    created_at = task.get("created_at")
+    if not isinstance(created_at, datetime):
+        return tasks_col.count_documents({"status": "pending"})
+
+    same_priority_before: Dict[str, Any] = {
+        "status": "pending",
+        "priority": priority,
+        "created_at": {"$lt": created_at},
+    }
+    # Worker sort is priority desc + created_at asc. _id keeps same-timestamp
+    # estimates stable without changing worker claim semantics.
+    if task.get("_id") is not None:
+        same_time_before = {
+            "status": "pending",
+            "priority": priority,
+            "created_at": created_at,
+            "_id": {"$lt": task["_id"]},
+        }
+        same_priority_query = {"$or": [same_priority_before, same_time_before]}
+    else:
+        same_priority_query = same_priority_before
+
+    return int(tasks_col.count_documents({"status": "pending", "priority": {"$gt": priority}})) + int(
+        tasks_col.count_documents(same_priority_query)
+    )
+
+
+def estimate_wait_seconds(
+    *,
+    queue_ahead: int,
+    processing_count: int,
+    average_duration_seconds: int,
+    estimated_parallelism: int,
+) -> int:
+    parallelism = max(1, int(estimated_parallelism or 1))
+    units_before_start = max(0, int(queue_ahead))
+    if processing_count > 0:
+        units_before_start += min(int(processing_count), parallelism)
+    return int((units_before_start * max(1, average_duration_seconds)) / parallelism)
 
