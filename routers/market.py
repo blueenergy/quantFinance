@@ -1536,16 +1536,41 @@ def _realtime_amount_yuan_from_doc(doc: Mapping[str, Any]) -> Optional[float]:
 
 
 def _load_stock_names_map(data_db, symbols: List[str]) -> Dict[str, str]:
+    """Resolve display names for ts_code-style symbols (e.g. 000001.SZ).
+
+    Primary source is ``stock_info`` (``symbol`` + ``name``), which matches how
+    the rest of quantFinance resolves names. ``stock_basic`` is used as a
+    fallback when names are still missing.
+    """
     if not symbols:
         return {}
+    uniq = list(dict.fromkeys(symbols))
+    out: Dict[str, str] = {s: s for s in uniq}
+
+    stock_info = data_db["stock_info"]
+    for row in stock_info.find({"symbol": {"$in": uniq}}, {"_id": 0, "symbol": 1, "name": 1, "stock_name": 1}):
+        sym = str(row.get("symbol") or "").strip()
+        if not sym:
+            continue
+        raw = row.get("name") or row.get("stock_name") or ""
+        name = str(raw).strip()
+        if name:
+            out[sym] = name
+
+    missing = [s for s in uniq if out.get(s) == s]
+    if not missing:
+        return out
+
     basic = data_db["stock_basic"]
-    out: Dict[str, str] = {}
-    cursor = basic.find({"ts_code": {"$in": symbols}}, {"_id": 0, "ts_code": 1, "name": 1})
-    for row in cursor:
-        code = str(row.get("ts_code") or "").strip()
+    for row in basic.find(
+        {"$or": [{"ts_code": {"$in": missing}}, {"symbol": {"$in": missing}}]},
+        {"_id": 0, "ts_code": 1, "symbol": 1, "name": 1},
+    ):
+        code = str(row.get("ts_code") or row.get("symbol") or "").strip()
         name = str(row.get("name") or "").strip()
-        if code:
-            out[code] = name or code
+        if code and name and out.get(code) == code:
+            out[code] = name
+
     return out
 
 
