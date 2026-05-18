@@ -1595,6 +1595,12 @@ def _build_sector_leader_previews(rows_out: List[Dict[str, Any]], k: int = 5) ->
             "pct_chg": r.get("pct_chg"),
             "amount_yuan": r.get("amount_yuan"),
             "margin_to_ma": r.get("margin_to_ma"),
+            "limit_up_seen": r.get("limit_up_seen", False),
+            "limit_up_status": r.get("limit_up_status"),
+            "limit_up_reasoning_available": r.get("limit_up_reasoning_available", False),
+            "limit_up_reasoning_status": r.get("limit_up_reasoning_status"),
+            "limit_up_reasoning_symbol": r.get("limit_up_reasoning_symbol"),
+            "limit_up_reasoning_date": r.get("limit_up_reasoning_date"),
         }
 
     by_amt = sorted(rows_out, key=lambda r: -(r.get("amount_yuan") or 0.0))[:k]
@@ -1611,6 +1617,80 @@ def _build_sector_leader_previews(rows_out: List[Dict[str, Any]], k: int = 5) ->
         "leader_pct_chg_top": [slim(r) for r in by_pct],
         "leader_volatility_top": [slim(r) for r in by_abs],
     }
+
+
+def _normalize_ts_code(symbol: str) -> Optional[str]:
+    raw = str(symbol or "").strip()
+    if not raw:
+        return None
+    if "." in raw:
+        return raw
+    bare = raw.split(".")[0]
+    if len(bare) != 6:
+        return raw
+    if bare.startswith(("30", "00", "12")):
+        return f"{bare}.SZ"
+    if bare.startswith(("60", "68", "11")):
+        return f"{bare}.SH"
+    if bare.startswith(("8", "4", "92")):
+        return f"{bare}.BJ"
+    return raw
+
+
+def _attach_limit_up_reasoning_meta(data_db, rows: List[Dict[str, Any]], trade_day: str) -> None:
+    """Annotate contributor rows with limit-up calendar and available LLM reasoning status.
+
+    ``quant_analyzer.limit_up_analysis`` is the single source for LLM
+    reasoning.  ``daily_limit_up`` may contain structural facts or older
+    fallback text, but contributor deep-dive links should not depend on it.
+    """
+    if not rows or not trade_day:
+        return
+
+    symbols = [str(r.get("symbol") or "").strip() for r in rows if r.get("symbol")]
+    ts_code_to_symbol: Dict[str, str] = {}
+    for sym in symbols:
+        ts_code = _normalize_ts_code(sym)
+        if ts_code:
+            ts_code_to_symbol.setdefault(ts_code, sym)
+
+    if not ts_code_to_symbol:
+        return
+
+    for row in rows:
+        row["limit_up_seen"] = False
+        row["limit_up_status"] = None
+        row["limit_up_reasoning_available"] = False
+        row["limit_up_reasoning_status"] = None
+        row["limit_up_reasoning_symbol"] = None
+        row["limit_up_reasoning_date"] = None
+
+    reasoning_by_symbol: Dict[str, Dict[str, Any]] = {}
+    try:
+        analysis_col = get_analyzer_db()["limit_up_analysis"]
+        for doc in analysis_col.find(
+            {"date": trade_day, "symbol": {"$in": list(ts_code_to_symbol.keys())}},
+            {"_id": 0, "symbol": 1, "date": 1},
+        ):
+            doc_symbol = str(doc.get("symbol") or "")
+            orig = ts_code_to_symbol.get(doc_symbol)
+            if not orig:
+                continue
+            reasoning_by_symbol[orig] = {
+                "limit_up_seen": True,
+                "limit_up_status": "reasoned",
+                "limit_up_reasoning_available": True,
+                "limit_up_reasoning_status": "available",
+                "limit_up_reasoning_symbol": doc_symbol,
+                "limit_up_reasoning_date": str(doc.get("date") or trade_day),
+            }
+    except Exception:
+        reasoning_by_symbol = {}
+
+    for row in rows:
+        sym = str(row.get("symbol") or "")
+        if sym in reasoning_by_symbol:
+            row.update(reasoning_by_symbol[sym])
 
 
 def _sector_contributors_payload_daily(
@@ -1688,6 +1768,8 @@ def _sector_contributors_payload_daily(
                 "margin_to_ma": (close_t - ma_line) if ma_line is not None else None,
             }
         )
+
+    _attach_limit_up_reasoning_meta(data_db, rows_out, trade_date)
 
     above_rows = [r for r in rows_out if r.get("above_ma")]
     below_rows = [r for r in rows_out if not r.get("above_ma")]
@@ -1816,6 +1898,8 @@ def _sector_contributors_payload_realtime(
                 "margin_to_ma": (p - ma_line),
             }
         )
+
+    _attach_limit_up_reasoning_meta(data_db, rows_out, trade_day)
 
     above_rows = [r for r in rows_out if r.get("above_ma")]
     below_rows = [r for r in rows_out if not r.get("above_ma")]

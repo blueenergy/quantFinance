@@ -22,6 +22,24 @@ class FeedbackRequest(BaseModel):
     is_broken: bool = False
 
 
+def _normalize_ts_code(symbol: str) -> Optional[str]:
+    raw = str(symbol or "").strip()
+    if not raw:
+        return None
+    if "." in raw:
+        return raw
+    bare = raw.split(".")[0]
+    if len(bare) != 6:
+        return raw
+    if bare.startswith(("30", "00", "12")):
+        return f"{bare}.SZ"
+    if bare.startswith(("60", "68", "11")):
+        return f"{bare}.SH"
+    if bare.startswith(("8", "4", "92")):
+        return f"{bare}.BJ"
+    return raw
+
+
 
 def serialize_doc(doc: dict) -> dict:
     """序列化 MongoDB 文档"""
@@ -334,7 +352,8 @@ async def get_reasoning_detail(
     # limit_up_analysis lives in quant_analyzer DB (written by quantAnalyzer)
     analysis_col = get_analyzer_db()["limit_up_analysis"]
     
-    log = analysis_col.find_one({"symbol": symbol, "date": date})
+    ts_code = _normalize_ts_code(symbol)
+    log = analysis_col.find_one({"symbol": ts_code, "date": date}) if ts_code else None
     
     if not log:
         return {
