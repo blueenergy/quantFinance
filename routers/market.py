@@ -1819,7 +1819,7 @@ def _sector_contributors_payload_realtime(
 )
 def get_market_spectrum_sector_contributors(
     mode: str = Query(..., pattern="^(daily|realtime)$", description="daily=日线收盘; realtime=实时日K快照"),
-    level: str = Query("L1", pattern="^L[12]$", description="申万 L1 或 L2"),
+    level: str = Query("L1", pattern="^L[123]$", description="申万 L1、L2 或 L3"),
     sector_code: str = Query(..., min_length=1, description="板块指数代码，如 801080.SI"),
     trade_date: Optional[str] = Query(None, description="YYYYMMDD，mode=daily 时必填"),
     snapshot_time: Optional[str] = Query(None, description="YYYYMMDDHHMM，mode=realtime 时必填"),
