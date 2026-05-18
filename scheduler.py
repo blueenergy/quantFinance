@@ -181,206 +181,6 @@ def _release_scheduler_job_lock(job_id: str) -> None:
         {"$set": {"locked_until": time.time(), "updated_at": time.time()}},
     )
 
-
-# Default trigger configurations
-def check_worker_timeouts_task():
-    from db import get_db_collections
-    from services.email_service import send_worker_timeout_alert
-    
-    try:
-        collections = get_db_collections()
-        worker_status_coll = collections["worker_status"]
-        notifications_coll = collections["notifications"]
-        settings_coll = collections["notification_settings"]
-        users_coll = collections["users"]
-        
-        now = time.time()
-        
-        # Get all users with timeout alerts enabled
-        enabled_settings = settings_coll.find({
-            "worker_timeout_enabled": True
-        })
-        
-        for setting in enabled_settings:
-            user_id = setting.get("user_id")
-            threshold_minutes = setting.get("worker_timeout_threshold_minutes", 3)
-            threshold_seconds = threshold_minutes * 60
-            
-            # Find workers that have timed out
-            cutoff_time = now - threshold_seconds
-            
-            timed_out_workers = worker_status_coll.find({
-                "user_id": user_id,
-                "last_heartbeat": {"$lt": cutoff_time},
-                "status": {"$ne": "stopped"}  # Don't alert for intentionally stopped workers
-            })
-            
-            for worker in timed_out_workers:
-                worker_id = worker.get("worker_id")
-                
-                # Check if we already sent alert recently (avoid spam)
-                recent_alert = notifications_coll.find_one({
-                    "user_id": user_id,
-                    "type": "worker_timeout",
-                    "data.worker_id": worker_id,
-                    "created_at": {"$gt": now - 1800}  # No alert in last 30 min
-                })
-                
-                if recent_alert:
-                    continue  # Skip if already alerted recently
-                
-                # Create notification
-                last_heartbeat_time = datetime.fromtimestamp(
-                    worker.get("last_heartbeat", now)
-                ).strftime("%Y-%m-%d %H:%M:%S")
-                
-                notification = {
-                    "user_id": user_id,
-                    "type": "worker_timeout",
-                    "title": f"⚠️ Worker 超时警告",
-                    "message": f"{worker.get('symbol')} ({worker.get('strategy')}) 已超过 {threshold_minutes} 分钟未响应",
-                    "data": {
-                        "worker_id": worker_id,
-                        "symbol": worker.get("symbol"),
-                        "strategy": worker.get("strategy"),
-                        "last_heartbeat": worker.get("last_heartbeat"),
-                        "last_heartbeat_time": last_heartbeat_time
-                    },
-                    "priority": "high",
-                    "is_read": False,
-                    "created_at": now
-                }
-                
-                notifications_coll.insert_one(notification)
-                log.info(f"Created timeout alert for worker {worker_id} (user {user_id})")
-                
-                # Send email if enabled
-                if setting.get("email_notifications_enabled"):
-                    user = users_coll.find_one({"_id": user_id})
-                    if user and user.get("email"):
-                        send_worker_timeout_alert(
-                            to_email=user["email"],
-                            username=user.get("username", "User"),
-                            worker_info={
-                                "symbol": worker.get("symbol"),
-                                "strategy": worker.get("strategy"),
-                                "last_heartbeat_time": last_heartbeat_time
-                            }
-                        )
-    except Exception as e:
-        log.error(f"Failed to check worker timeouts: {e}", exc_info=True)
-
-
-def send_daily_reports_task():
-    """Send daily worker activity reports to all users."""
-    from db import get_db_collections
-    from services.email_service import send_daily_report
-    from datetime import timedelta
-    
-    try:
-        collections = get_db_collections()
-        settings_coll = collections["notification_settings"]
-        users_coll = collections["users"]
-        activity_coll = collections["worker_activity"]
-        signals_coll = collections["trade_signals"]
-        executions_coll = collections["trade_executions"]
-        worker_status_coll = collections["worker_status"]
-        
-        # Get today's date range
-        today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
-        tomorrow = today + timedelta(days=1)
-        today_ts = today.timestamp()
-        tomorrow_ts = tomorrow.timestamp()
-        
-        # Get all users with daily reports enabled
-        enabled_settings = settings_coll.find({
-            "daily_report_enabled": True,
-            "email_notifications_enabled": True
-        })
-        
-        for setting in enabled_settings:
-            user_id = setting.get("user_id")
-            
-            # Get user info
-            user = users_coll.find_one({"_id": user_id})
-            if not user or not user.get("email"):
-                continue
-            
-            # Collect today's statistics
-            total_scans = activity_coll.count_documents({
-                "user_id": user_id,
-                "activity_type": "scan",
-                "timestamp": {"$gte": today_ts, "$lt": tomorrow_ts}
-            })
-            
-            total_signals = signals_coll.count_documents({
-                "user_id": user_id,
-                "timestamp": {"$gte": today_ts, "$lt": tomorrow_ts}
-            })
-            
-            total_trades = executions_coll.count_documents({
-                "user_id": user_id,
-                "mode": "live",
-                "timestamp": {"$gte": today_ts, "$lt": tomorrow_ts}
-            })
-            
-            # Get worker summaries
-            workers = []
-            worker_docs = worker_status_coll.find({"user_id": user_id})
-            
-            for worker in worker_docs:
-                worker_id = worker.get("worker_id")
-                
-                worker_scans = activity_coll.count_documents({
-                    "user_id": user_id,
-                    "worker_id": worker_id,
-                    "activity_type": "scan",
-                    "timestamp": {"$gte": today_ts, "$lt": tomorrow_ts}
-                })
-                
-                worker_signals = signals_coll.count_documents({
-                    "user_id": user_id,
-                    "symbol": worker.get("symbol"),
-                    "strategy": worker.get("strategy"),
-                    "timestamp": {"$gte": today_ts, "$lt": tomorrow_ts}
-                })
-                
-                # Calculate uptime
-                started_at = worker.get("started_at", time.time())
-                uptime_seconds = time.time() - started_at
-                uptime_hours = int(uptime_seconds / 3600)
-                uptime_minutes = int((uptime_seconds % 3600) / 60)
-                uptime_str = f"{uptime_hours}h {uptime_minutes}m" if uptime_hours > 0 else f"{uptime_minutes}m"
-                
-                workers.append({
-                    "symbol": worker.get("symbol"),
-                    "strategy": worker.get("strategy"),
-                    "scans": worker_scans,
-                    "signals": worker_signals,
-                    "uptime": uptime_str
-                })
-            
-            # Prepare report data
-            report_data = {
-                "date": today.strftime("%Y-%m-%d"),
-                "total_scans": total_scans,
-                "total_signals": total_signals,
-                "total_trades": total_trades,
-                "workers": workers
-            }
-            
-            # Send email
-            send_daily_report(
-                to_email=user["email"],
-                username=user.get("username", "User"),
-                report_data=report_data
-            )
-            log.info(f"Daily report sent to {user['email']}")
-            
-    except Exception as e:
-        log.error(f"Failed to send daily reports: {e}", exc_info=True)
-
-
 def generate_market_analysis_task(job_id: str):
     """Schedule AI market analysis task to MongoDB (picked up by quantAnalyzer).
     
@@ -568,8 +368,6 @@ def hot_stock_poll_task(source: str):
 
 # Map of configurable tasks to logic（启用/停用请用 Admin 与 DB 中的 is_active，勿在此注释注册项）
 TASK_MAP = {
-    'check_worker_timeouts': check_worker_timeouts_task,
-    'send_daily_reports': send_daily_reports_task,
     'market_analysis_1000': generate_market_analysis_task,
     'market_analysis_1130': generate_market_analysis_task,
     'market_analysis_1630': generate_market_analysis_task,
@@ -587,17 +385,6 @@ TASK_MAP = {
 
 # Default trigger configurations
 DEFAULT_SCHEDULES = {
-    'check_worker_timeouts': {
-        'name': "Worker状态监控",
-        'type': "interval",
-        'seconds': 60
-    },
-    'send_daily_reports': {
-        'name': "发送每日盈亏报告",
-        'type': "cron",
-        'hour': 17,
-        'minute': 0
-    },
     'market_analysis_1000': {
         'name': "早盘市场分析 (10:00)",
         'type': "cron",
@@ -628,18 +415,18 @@ DEFAULT_SCHEDULES = {
         'day_of_week': 'mon-fri'
     },
     'hot_stock_poll_ths': {
-        'name': "同花顺热股每日分析 (22:30)",
+        'name': "同花顺热股每日分析 (23:05)",
         'type': "cron",
-        'hour': 22,
-        'minute': 30,
+        'hour': 23,
+        'minute': 5,
         'day_of_week': 'mon-fri',
         'is_active': True,
     },
     'hot_stock_poll_dc': {
-        'name': "东方财富热股每日分析 (22:30)",
+        'name': "东方财富热股每日分析 (23:05)",
         'type': "cron",
-        'hour': 22,
-        'minute': 30,
+        'hour': 23,
+        'minute': 5,
         'day_of_week': 'mon-fri',
         'is_active': True,
     },
@@ -727,16 +514,16 @@ def sync_job(job_id, config_data):
 def _migrate_legacy_hot_stock_schedule(job_id: str, db_config: dict, default_config: dict) -> dict:
     """Move old disabled interval hot-stock jobs to the new daily analysis default."""
     legacy_defaults = {
-        "hot_stock_poll_ths": 3600,
-        "hot_stock_poll_dc": 1800,
+        "hot_stock_poll_ths": {1800, 3600},
+        "hot_stock_poll_dc": {1800},
     }
-    legacy_seconds = legacy_defaults.get(job_id)
-    if not legacy_seconds:
+    legacy_seconds_set = legacy_defaults.get(job_id)
+    if not legacy_seconds_set:
         return db_config
 
     is_legacy_default = (
         db_config.get("type") == "interval"
-        and int(db_config.get("seconds") or 0) == legacy_seconds
+        and int(db_config.get("seconds") or 0) in legacy_seconds_set
         and db_config.get("is_active") is False
     )
     if not is_legacy_default:
@@ -782,6 +569,14 @@ def apply_schedule_config():
             row["updated_at"] = datetime.now()
             config_coll.insert_one(row)
             sync_job(job_id, row)
+
+    stale_job_ids = sorted(set(custom_configs) - set(DEFAULT_SCHEDULES))
+    if stale_job_ids:
+        config_coll.delete_many({"job_id": {"$in": stale_job_ids}})
+        for job_id in stale_job_ids:
+            if scheduler.get_job(job_id):
+                scheduler.remove_job(job_id)
+        log.info("Removed stale schedule configs: %s", ", ".join(stale_job_ids))
             
     return True
 
