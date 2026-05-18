@@ -76,7 +76,11 @@ from routers.earnings import router as earnings_router
 from routers.analysis_tasks import router as analysis_tasks_router
 from routers.shenwan_index import router as shenwan_index_router
 from routers.assistant_bff import router as assistant_bff_router
-from routers.hermes_quant_tools import router as hermes_quant_tools_router
+from routers.hermes_quant_tools import (
+    MCP_ACTION_TAG,
+    MCP_READ_TAG,
+    router as hermes_quant_tools_router,
+)
 from routers.macro import router as macro_router
 from routers.kline_series import router as kline_series_router
 from routers.intraday_t0 import router as intraday_t0_router
@@ -171,7 +175,7 @@ app.include_router(market_insights_router, prefix="/api", tags=["火眼金睛"])
 # MCP 服务器：暴露 quant-api 工具给 Hermes 等多智能体框架
 # 端点：POST/GET/DELETE /mcp  (Streamable HTTP, MCP spec 2025-03-26)
 # 鉴权：复用现有 HERMES_QUANT_INTERNAL_KEY (X-Hermes-Quant-Key header)
-# 工具范围：仅 tag="Hermes quant tools" 的路由（hermes_quant_tools.py）
+# 工具范围：按 MCP_SERVER_MODE 拆成 read/actions 两个工具面。
 # 扩展：往 routers/hermes_quant_tools.py 加路由即可自动出现在 MCP 工具列表
 # ---------------------------------------------------------------------------
 if os.getenv("ENABLE_MCP_SERVER", "true").strip().lower() in ("1", "true", "yes", "on"):
@@ -179,15 +183,56 @@ if os.getenv("ENABLE_MCP_SERVER", "true").strip().lower() in ("1", "true", "yes"
     from fastapi_mcp import FastApiMCP, AuthConfig
     from auth import require_hermes_quant_internal_key
 
-    _mcp = FastApiMCP(
-        app,
-        name="wukong-quant",
-        description="A-share quantitative finance tools (ladder, market data, ETF, macro)",
-        include_tags=["Hermes quant tools"],
-        auth_config=AuthConfig(
-            dependencies=[Depends(require_hermes_quant_internal_key)],
-        ),
-        # 将 MCP client headers 转发给底层路由的 Depends 校验。
-        headers=["x-hermes-quant-key", "x-user-token"],
-    )
-    _mcp.mount_http(mount_path="/api/mcp")  # 挂载在 /api/mcp
+    _mcp_instances = []
+
+    def _mount_mcp_server(*, name: str, description: str, tags: list[str], mount_path: str) -> None:
+        mcp = FastApiMCP(
+            app,
+            name=name,
+            description=description,
+            include_tags=tags,
+            auth_config=AuthConfig(
+                dependencies=[Depends(require_hermes_quant_internal_key)],
+            ),
+            # 将 MCP client headers 转发给底层路由的 Depends 校验。
+            headers=["x-hermes-quant-key", "x-user-token"],
+        )
+        mcp.mount_http(mount_path=mount_path)
+        _mcp_instances.append(mcp)
+
+    _mcp_mode = os.getenv("MCP_SERVER_MODE", "all").strip().lower()
+
+    if _mcp_mode == "read":
+        _mount_mcp_server(
+            name="wukong-quant-read",
+            description="Read-only A-share quantitative finance tools",
+            tags=[MCP_READ_TAG],
+            mount_path="/api/mcp",
+        )
+    elif _mcp_mode == "actions":
+        _mount_mcp_server(
+            name="wukong-quant-actions",
+            description="Action tools for submitting analysis tasks and user mutations",
+            tags=[MCP_ACTION_TAG],
+            mount_path="/api/mcp",
+        )
+    else:
+        _mount_mcp_server(
+            name="wukong-quant-read",
+            description="Read-only A-share quantitative finance tools",
+            tags=[MCP_READ_TAG],
+            mount_path="/api/mcp/read",
+        )
+        _mount_mcp_server(
+            name="wukong-quant-actions",
+            description="Action tools for submitting analysis tasks and user mutations",
+            tags=[MCP_ACTION_TAG],
+            mount_path="/api/mcp/actions",
+        )
+        # Backward-compatible combined endpoint for local/dev deployments.
+        _mount_mcp_server(
+            name="wukong-quant",
+            description="A-share quantitative finance tools (read + actions)",
+            tags=[MCP_READ_TAG, MCP_ACTION_TAG],
+            mount_path="/api/mcp",
+        )

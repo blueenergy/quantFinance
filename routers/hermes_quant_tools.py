@@ -1,7 +1,8 @@
 """
-Hermes 容器内可调用的只读 quant-api 端点（共享密钥，无用户 JWT）。
+Hermes 容器内可调用的 quant-api 工具端点（共享密钥，无用户 JWT）。
 
 搭配 docker-compose 中 QUANT_API_URL + HERMES_QUANT_INTERNAL_KEY。
+MCP 暴露面按 route tag 拆分为 wukong-quant-read 与 wukong-quant-actions。
 
 端点一览：
   GET  /hermes-tools/ladder/daily          — 连板天梯
@@ -47,7 +48,10 @@ from services.analysis_history import build_user_analysis_history_payload
 from services.analysis_tasks import build_task_doc
 from services.ladder_daily import build_daily_ladder_payload
 
-router = APIRouter(prefix="/hermes-tools", tags=["Hermes quant tools"])
+MCP_READ_TAG = "Hermes quant read tools"
+MCP_ACTION_TAG = "Hermes quant action tools"
+
+router = APIRouter(prefix="/hermes-tools")
 MCP_ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("MCP_ACCESS_TOKEN_EXPIRE_MINUTES", "43200"))
 
 
@@ -89,7 +93,7 @@ def _norm_task_status(raw: Any) -> str:
 # 连板天梯
 # ---------------------------------------------------------------------------
 
-@router.get("/ladder/daily", operation_id="ladder_daily")
+@router.get("/ladder/daily", operation_id="ladder_daily", tags=[MCP_READ_TAG])
 async def hermes_ladder_daily(
     date: Optional[str] = Query(None, description="YYYYMMDD，默认今天"),
     _: bool = Depends(require_hermes_quant_internal_key),
@@ -110,7 +114,7 @@ class DeepAnalysisRequest(BaseModel):
     model: Optional[str] = None
 
 
-@router.post("/analysis/deep", operation_id="submit_deep")
+@router.post("/analysis/deep", operation_id="submit_deep", tags=[MCP_ACTION_TAG])
 async def hermes_submit_deep_analysis(
     body: DeepAnalysisRequest,
     x_user_token: Optional[str] = Header(None, alias="X-User-Token"),
@@ -151,7 +155,7 @@ async def hermes_submit_deep_analysis(
     }
 
 
-@router.post("/analysis/deep-and-wait", operation_id="deep_analysis")
+@router.post("/analysis/deep-and-wait", operation_id="deep_analysis", tags=[MCP_ACTION_TAG])
 async def hermes_deep_analysis_wait(
     body: DeepAnalysisRequest,
     timeout: int = Query(180, ge=30, le=300, description="最长等待秒数，默认 180"),
@@ -230,7 +234,7 @@ async def hermes_deep_analysis_wait(
         }
 
 
-@router.get("/analysis/task/{task_id}", operation_id="task_status")
+@router.get("/analysis/task/{task_id}", operation_id="task_status", tags=[MCP_ACTION_TAG])
 async def hermes_get_task_status(
     task_id: str,
     _: bool = Depends(require_hermes_quant_internal_key),
@@ -271,7 +275,7 @@ async def hermes_get_task_status(
     return resp
 
 
-@router.get("/analysis/history", operation_id="analysis_history")
+@router.get("/analysis/history", operation_id="analysis_history", tags=[MCP_READ_TAG])
 async def hermes_get_analysis_history(
     symbol: str = Query(..., description="股票代码，例如 600519 或 600519.SH"),
     username: Optional[str] = Query(None, description="归属用户；留空则查 hermes-system"),
@@ -297,7 +301,7 @@ async def hermes_get_analysis_history(
 # 涨停全景叙事
 # ---------------------------------------------------------------------------
 
-@router.get("/ladder/narrative", operation_id="ladder_narrative")
+@router.get("/ladder/narrative", operation_id="ladder_narrative", tags=[MCP_READ_TAG])
 async def hermes_ladder_narrative(
     date: Optional[str] = Query(None, description="交易日 YYYYMMDD，默认最新有数据的交易日"),
     _: bool = Depends(require_hermes_quant_internal_key),
@@ -337,7 +341,7 @@ async def hermes_ladder_narrative(
 # AI 大盘分析（市场总结）
 # ---------------------------------------------------------------------------
 
-@router.get("/market/summary", operation_id="market_summary")
+@router.get("/market/summary", operation_id="market_summary", tags=[MCP_READ_TAG])
 async def hermes_market_summary(
     date: Optional[str] = Query(None, description="日期 YYYY-MM-DD，默认最新交易日"),
     _: bool = Depends(require_hermes_quant_internal_key),
@@ -363,7 +367,7 @@ async def hermes_market_summary(
 # 热股分析
 # ---------------------------------------------------------------------------
 
-@router.get("/market/hot-stock", operation_id="hot_stock")
+@router.get("/market/hot-stock", operation_id="hot_stock", tags=[MCP_READ_TAG])
 async def hermes_hot_stock(
     source: str = Query("ths", description="数据源: ths（同花顺）或 dc（东方财富）"),
     _: bool = Depends(require_hermes_quant_internal_key),
@@ -401,7 +405,7 @@ async def hermes_hot_stock(
 # 全球市场简报
 # ---------------------------------------------------------------------------
 
-@router.get("/market/global", operation_id="global_market")
+@router.get("/market/global", operation_id="global_market", tags=[MCP_READ_TAG])
 async def hermes_global_market(
     _: bool = Depends(require_hermes_quant_internal_key),
 ):
@@ -427,7 +431,7 @@ async def hermes_global_market(
 # 宏观 AI 分析
 # ---------------------------------------------------------------------------
 
-@router.get("/macro/analysis", operation_id="macro_analysis")
+@router.get("/macro/analysis", operation_id="macro_analysis", tags=[MCP_READ_TAG])
 async def hermes_macro_analysis(
     scope: str = Query("china_macro", description="china_macro（中国宏观）或 us_macro（美国利率）"),
     _: bool = Depends(require_hermes_quant_internal_key),
@@ -459,7 +463,7 @@ async def hermes_macro_analysis(
 # 板块/概念 AI 分析
 # ---------------------------------------------------------------------------
 
-@router.get("/sector/latest", operation_id="sector_latest")
+@router.get("/sector/latest", operation_id="sector_latest", tags=[MCP_READ_TAG])
 async def hermes_sector_latest(
     source: str = Query("dc", description="数据源: dc（东方财富，默认）或 ths（同花顺）"),
     _: bool = Depends(require_hermes_quant_internal_key),
@@ -494,7 +498,7 @@ async def hermes_sector_latest(
 # 财报猎手异动信号
 # ---------------------------------------------------------------------------
 
-@router.get("/earnings/signals", operation_id="earnings_signals")
+@router.get("/earnings/signals", operation_id="earnings_signals", tags=[MCP_READ_TAG])
 async def hermes_earnings_signals(
     days: int = Query(7, ge=1, le=30, description="扫描最近 N 天的异动信号，默认 7 天"),
     _: bool = Depends(require_hermes_quant_internal_key),
@@ -575,7 +579,7 @@ async def hermes_earnings_signals(
 _RANKING_INDEX_CODES = ("hs300", "a500", "csi500", "csi1000", "star50")
 
 
-@router.get("/stock/ranking", operation_id="stock_ranking")
+@router.get("/stock/ranking", operation_id="stock_ranking", tags=[MCP_READ_TAG])
 async def stock_ranking(
     index_code: str = Query("hs300", description="指数: hs300/a500/csi500/csi1000/star50"),
     top: int = Query(20, ge=1, le=100, description="返回前 N 名，默认 20"),
@@ -662,7 +666,7 @@ async def stock_ranking(
 # 单股量化评分详情
 # ---------------------------------------------------------------------------
 
-@router.get("/stock/score-detail", operation_id="stock_score_detail")
+@router.get("/stock/score-detail", operation_id="stock_score_detail", tags=[MCP_READ_TAG])
 async def stock_score_detail(
     symbol: str = Query(..., description="股票代码，如 600519"),
     _: bool = Depends(require_hermes_quant_internal_key),
@@ -709,7 +713,7 @@ class _UserLoginRequest(BaseModel):
     password: str
 
 
-@router.post("/user/login", operation_id="user_login")
+@router.post("/user/login", operation_id="user_login", tags=[MCP_ACTION_TAG])
 async def user_login(
     req: _UserLoginRequest,
     _: bool = Depends(require_hermes_quant_internal_key),
@@ -750,7 +754,7 @@ async def user_login(
 # 用户账户信息
 # ---------------------------------------------------------------------------
 
-@router.get("/user/profile", operation_id="user_profile")
+@router.get("/user/profile", operation_id="user_profile", tags=[MCP_READ_TAG])
 async def user_profile(
     user: dict = Depends(get_user_from_header_token),
     _: bool = Depends(require_hermes_quant_internal_key),
@@ -777,7 +781,7 @@ async def user_profile(
 # 用户自选股评分列表
 # ---------------------------------------------------------------------------
 
-@router.get("/user/watchlist", operation_id="user_watchlist_stocks")
+@router.get("/user/watchlist", operation_id="user_watchlist_stocks", tags=[MCP_READ_TAG])
 async def user_watchlist_stocks(
     strategy: str = Query("balanced", description="评分策略：balanced / aggressive / conservative"),
     user: dict = Depends(get_user_from_header_token),
@@ -858,7 +862,7 @@ class _WatchlistSymbolRequest(BaseModel):
     symbol: str
 
 
-@router.post("/user/watchlist/add", operation_id="user_watchlist_add")
+@router.post("/user/watchlist/add", operation_id="user_watchlist_add", tags=[MCP_ACTION_TAG])
 async def user_watchlist_add(
     req: _WatchlistSymbolRequest,
     user: dict = Depends(get_user_from_header_token),
@@ -878,7 +882,7 @@ async def user_watchlist_add(
     return {"success": True, "symbol": req.symbol, "action": "added"}
 
 
-@router.delete("/user/watchlist/remove/{symbol}", operation_id="user_watchlist_remove")
+@router.delete("/user/watchlist/remove/{symbol}", operation_id="user_watchlist_remove", tags=[MCP_ACTION_TAG])
 async def user_watchlist_remove(
     symbol: str,
     user: dict = Depends(get_user_from_header_token),
@@ -901,7 +905,7 @@ async def user_watchlist_remove(
 # 自选股历史分析记录
 # ---------------------------------------------------------------------------
 
-@router.get("/user/watchlist/history", operation_id="user_watchlist_history")
+@router.get("/user/watchlist/history", operation_id="user_watchlist_history", tags=[MCP_READ_TAG])
 async def user_watchlist_history(
     symbol: Optional[str] = Query(None, description="可选：筛选指定股票的历史分析，不填则返回所有自选股历史"),
     limit: int = Query(10, description="最多返回条数，默认 10，最大 50"),
@@ -927,7 +931,7 @@ async def user_watchlist_history(
 # 申万行业指数 PE/PB 历史分位
 # ---------------------------------------------------------------------------
 
-@router.get("/shenwan/pe-pb", operation_id="shenwan_index")
+@router.get("/shenwan/pe-pb", operation_id="shenwan_index", tags=[MCP_READ_TAG])
 async def shenwan_pe_pb(
     ts_code: str = Query(..., description="申万行业指数 ts_code，如 801012.SI（采掘）、801010.SI（农林牧渔）"),
     _: bool = Depends(require_hermes_quant_internal_key),
@@ -1072,7 +1076,7 @@ def _screen_compare(left: float, op: str, right: float) -> bool:
     return False
 
 
-@router.get("/stock/screen", operation_id="stock_screen")
+@router.get("/stock/screen", operation_id="stock_screen", tags=[MCP_READ_TAG])
 async def hermes_stock_screen(
     period: str = Query(..., description="目标报告期 YYYYMMDD，如 20260331；或 'latest' 自动取最近期"),
     filters: str = Query(..., description="ScreenFilter 列表的 JSON 字符串"),

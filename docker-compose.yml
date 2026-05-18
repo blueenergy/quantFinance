@@ -45,12 +45,12 @@ services:
         max-size: "50m"
         max-file: "3"
 
-  # 独立 MCP 服务（单 worker，避免 Streamable HTTP session 跨 worker 丢失）
+  # 只读 MCP 服务：查询行情/天梯/分析缓存，可按需水平扩容。
   quant-mcp:
     build:
       context: .
       dockerfile: Dockerfile.backend
-    container_name: quant-mcp
+    container_name: quant-mcp-read
     command: [ "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "3002", "--workers", "1", "--log-level", "info" ]
     ports:
       - "3002:3002"
@@ -65,6 +65,7 @@ services:
       - HERMES_QUANT_INTERNAL_KEY=${HERMES_QUANT_INTERNAL_KEY:-}
       - ENABLE_EMBEDDED_SCHEDULER=false
       - ENABLE_MCP_SERVER=true
+      - MCP_SERVER_MODE=read
     extra_hosts:
       - "host.docker.internal:host-gateway"
     networks:
@@ -72,6 +73,45 @@ services:
     restart: unless-stopped
     healthcheck:
       test: [ "CMD", "curl", "-f", "http://localhost:3002/health" ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
+
+  # 动作 MCP 服务：提交分析任务、登录、自选股增删等有副作用操作。
+  # 保持单 worker，避免 Streamable HTTP session 跨 worker 丢失。
+  quant-mcp-actions:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    container_name: quant-mcp-actions
+    command: [ "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "3003", "--workers", "1", "--log-level", "info" ]
+    ports:
+      - "3003:3003"
+    environment:
+      - MONGO_URI=${MONGO_URI:-mongodb://host.docker.internal:27017/}
+      - MONGO_URL=${MONGO_URI:-mongodb://host.docker.internal:27017/}
+      - DB_NAME=${MONGO_DB}
+      - ANALYZER_DB_NAME=${ANALYZER_DB_NAME:-quant_analyzer}
+      - REALTIME_DB_NAME=${REALTIME_DB_NAME:-quant_realtime}
+      - JWT_SECRET_KEY=${JWT_SECRET_KEY}
+      - TZ=Asia/Shanghai
+      - HERMES_QUANT_INTERNAL_KEY=${HERMES_QUANT_INTERNAL_KEY:-}
+      - ENABLE_EMBEDDED_SCHEDULER=false
+      - ENABLE_MCP_SERVER=true
+      - MCP_SERVER_MODE=actions
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - quant-network
+    restart: unless-stopped
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:3003/health" ]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -457,6 +497,8 @@ services:
     environment:
       - BACKEND_URL=http://quant-api:3001
       - MCP_URL=http://quant-mcp:3002
+      - MCP_READ_URL=http://quant-mcp:3002
+      - MCP_ACTIONS_URL=http://quant-mcp-actions:3003
       - ASSISTANT_URL=http://quant-assistant:8002
       - WS_WORKER_HOST=quant-strategy-manager
       - SSL_CERT=${SSL_CERT:-}
