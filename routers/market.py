@@ -1574,6 +1574,45 @@ def _load_stock_names_map(data_db, symbols: List[str]) -> Dict[str, str]:
     return out
 
 
+def _build_sector_leader_previews(rows_out: List[Dict[str, Any]], k: int = 5) -> Dict[str, Any]:
+    """Top-k representatives by amount, pct_chg, and |pct_chg| (volatility / attention proxy).
+
+    Same snapshot as MA contributor tables; multiple lenses for user judgment, not a single '龙头' label.
+    """
+    if not rows_out or k <= 0:
+        return {
+            "leader_preview_k": k,
+            "leader_amount_top": [],
+            "leader_pct_chg_top": [],
+            "leader_volatility_top": [],
+        }
+
+    def slim(r: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "symbol": r.get("symbol"),
+            "name": r.get("name"),
+            "close": r.get("close"),
+            "pct_chg": r.get("pct_chg"),
+            "amount_yuan": r.get("amount_yuan"),
+            "margin_to_ma": r.get("margin_to_ma"),
+        }
+
+    by_amt = sorted(rows_out, key=lambda r: -(r.get("amount_yuan") or 0.0))[:k]
+    by_pct = sorted(
+        rows_out,
+        key=lambda r: r.get("pct_chg") if r.get("pct_chg") is not None else float("-inf"),
+        reverse=True,
+    )[:k]
+    with_pct = [r for r in rows_out if r.get("pct_chg") is not None]
+    by_abs = sorted(with_pct, key=lambda r: abs(float(r.get("pct_chg") or 0.0)), reverse=True)[:k]
+    return {
+        "leader_preview_k": k,
+        "leader_amount_top": [slim(r) for r in by_amt],
+        "leader_pct_chg_top": [slim(r) for r in by_pct],
+        "leader_volatility_top": [slim(r) for r in by_abs],
+    }
+
+
 def _sector_contributors_payload_daily(
     data_db,
     *,
@@ -1668,6 +1707,7 @@ def _sector_contributors_payload_daily(
 
     total = len(rows_out)
     above_ct = len(above_rows)
+    previews = _build_sector_leader_previews(rows_out, k=5)
     return {
         "success": True,
         "mode": "daily",
@@ -1682,6 +1722,7 @@ def _sector_contributors_payload_daily(
         "yang_spectrum": (above_ct / total) if total else None,
         "top_above_ma": above_rows[:top_n],
         "top_below_ma": below_rows[:top_n],
+        **previews,
     }
 
 
@@ -1794,6 +1835,7 @@ def _sector_contributors_payload_realtime(
 
     total = len(rows_out)
     above_ct = len(above_rows)
+    previews = _build_sector_leader_previews(rows_out, k=5)
     return {
         "success": True,
         "mode": "realtime",
@@ -1809,6 +1851,7 @@ def _sector_contributors_payload_realtime(
         "yang_spectrum": (above_ct / total) if total else None,
         "top_above_ma": above_rows[:top_n],
         "top_below_ma": below_rows[:top_n],
+        **previews,
     }
 
 
