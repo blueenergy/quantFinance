@@ -100,6 +100,14 @@ def test_fetch_market_data_no_data(monkeypatch):
 
 
 @pytest.mark.unit
+def test_normalize_compact_date_for_sector_contributors():
+    from routers.market import _normalize_compact_date
+
+    assert _normalize_compact_date("2026-05-15") == "20260515"
+    assert _normalize_compact_date("20260515") == "20260515"
+
+
+@pytest.mark.unit
 def test_prune_market_data_for_dashboard_categories_shape():
     md = {
         "categories": {

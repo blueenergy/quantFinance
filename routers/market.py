@@ -4,7 +4,7 @@ from typing import Optional, Dict, Any, List, Mapping
 from fastapi import APIRouter, Query, Depends, HTTPException
 from models.all_models import MarketAnalysisRequest
 from auth import get_current_active_user
-from db import get_db_collections, get_analyzer_db, get_data_db
+from db import get_db_collections, get_analyzer_db, get_data_db, realtime_db
 from market_analysis_cache import market_analysis_cache
 from datetime import date, datetime
 import time
@@ -1519,6 +1519,334 @@ def get_market_spectrum_realtime_sectors(
         docs = trimmed
 
     return _set_sector_spectrum_cache(cache_key, {"data": docs, "level": level, "ma_period": ma_period})
+
+
+def _normalize_compact_date(value: str) -> str:
+    return str(value or "").replace("-", "")[:8]
+
+
+def _realtime_amount_yuan_from_doc(doc: Mapping[str, Any]) -> Optional[float]:
+    raw = _num_or_none(doc.get("realtime_amount_yuan"))
+    if raw is not None:
+        return raw
+    amt_k = _num_or_none(doc.get("amount"))
+    if amt_k is None:
+        return None
+    return amt_k * 1000.0
+
+
+def _load_stock_names_map(data_db, symbols: List[str]) -> Dict[str, str]:
+    if not symbols:
+        return {}
+    basic = data_db["stock_basic"]
+    out: Dict[str, str] = {}
+    cursor = basic.find({"ts_code": {"$in": symbols}}, {"_id": 0, "ts_code": 1, "name": 1})
+    for row in cursor:
+        code = str(row.get("ts_code") or "").strip()
+        name = str(row.get("name") or "").strip()
+        if code:
+            out[code] = name or code
+    return out
+
+
+def _sector_contributors_payload_daily(
+    data_db,
+    *,
+    level: str,
+    sector_code: str,
+    trade_date: str,
+    ma_period: int,
+    top_n: int,
+) -> Dict[str, Any]:
+    members = _resolve_sector_members(level)
+    members = {s: m for s, m in members.items() if m.get("sector_code") == sector_code}
+    if not members:
+        return {"success": False, "error": "No members for sector", "rows": []}
+
+    sector_name = next((m.get("sector_name", "") for m in members.values()), "")
+    symbols = sorted(members.keys())
+    volume_price = data_db["volume_price"]
+    lookback_start = trade_date
+    prev_days = _previous_trade_dates(volume_price, trade_date, ma_period - 1)
+    if prev_days:
+        lookback_start = prev_days[0]
+
+    cursor = volume_price.find(
+        {
+            "symbol": {"$in": symbols},
+            "trade_date": {"$gte": lookback_start, "$lte": trade_date},
+            "close": {"$exists": True, "$ne": None},
+        },
+        {"_id": 0, "symbol": 1, "trade_date": 1, "close": 1, "pct_chg": 1, "amount": 1},
+    ).sort([("symbol", 1), ("trade_date", 1)])
+
+    rows_by_symbol: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for doc in cursor:
+        sym = str(doc.get("symbol") or "")
+        if sym in members:
+            rows_by_symbol[sym].append(doc)
+
+    names = _load_stock_names_map(data_db, symbols)
+    rows_out: List[Dict[str, Any]] = []
+    for sym in symbols:
+        seq = rows_by_symbol.get(sym, [])
+        if not seq:
+            continue
+        idx = None
+        for i, row in enumerate(seq):
+            if str(row.get("trade_date") or "") == trade_date:
+                idx = i
+                break
+        if idx is None:
+            continue
+        window = seq[max(0, idx - ma_period + 1): idx + 1]
+        closes = [_num_or_none(r.get("close")) for r in window]
+        closes = [c for c in closes if c is not None]
+        if len(closes) < ma_period:
+            continue
+        close_t = _num_or_none(seq[idx].get("close"))
+        if close_t is None:
+            continue
+        ma_line = sum(closes) / len(closes)
+        above_ma = close_t > ma_line
+        pct = _num_or_none(seq[idx].get("pct_chg"))
+        amt_k = _num_or_none(seq[idx].get("amount"))
+        amount_yuan = amt_k * 1000.0 if amt_k is not None else None
+        rows_out.append(
+            {
+                "symbol": sym,
+                "name": names.get(sym, sym),
+                "close": close_t,
+                "pct_chg": pct,
+                "amount_yuan": amount_yuan,
+                "ma": ma_line,
+                "above_ma": above_ma,
+                "margin_to_ma": (close_t - ma_line) if ma_line is not None else None,
+            }
+        )
+
+    above_rows = [r for r in rows_out if r.get("above_ma")]
+    below_rows = [r for r in rows_out if not r.get("above_ma")]
+    above_rows.sort(
+        key=lambda r: (
+            -(r.get("amount_yuan") or 0.0),
+            -(r.get("pct_chg") or 0.0),
+            -(r.get("margin_to_ma") or 0.0),
+        )
+    )
+    below_rows.sort(
+        key=lambda r: (
+            (r.get("pct_chg") if r.get("pct_chg") is not None else 0.0),
+            -(r.get("amount_yuan") or 0.0),
+        )
+    )
+
+    total = len(rows_out)
+    above_ct = len(above_rows)
+    return {
+        "success": True,
+        "mode": "daily",
+        "level": level,
+        "sector_code": sector_code,
+        "sector_name": sector_name,
+        "trade_date": trade_date,
+        "ma_period": ma_period,
+        "total_members": len(symbols),
+        "computed": total,
+        "above_ma_count": above_ct,
+        "yang_spectrum": (above_ct / total) if total else None,
+        "top_above_ma": above_rows[:top_n],
+        "top_below_ma": below_rows[:top_n],
+    }
+
+
+def _sector_contributors_payload_realtime(
+    data_db,
+    *,
+    level: str,
+    sector_code: str,
+    snapshot_time: str,
+    ma_period: int,
+    top_n: int,
+) -> Dict[str, Any]:
+    trade_day = str(snapshot_time)[:8]
+    members = _resolve_sector_members(level)
+    members = {s: m for s, m in members.items() if m.get("sector_code") == sector_code}
+    if not members:
+        return {"success": False, "error": "No members for sector", "rows": []}
+
+    sector_name = next((m.get("sector_name", "") for m in members.values()), "")
+    symbols = sorted(members.keys())
+    volume_price = data_db["volume_price"]
+    lookback_start = trade_day
+    prev_days = _previous_trade_dates(volume_price, trade_day, ma_period - 1)
+    if prev_days:
+        lookback_start = prev_days[0]
+    need_prev = ma_period - 1
+
+    cursor_vp = volume_price.find(
+        {
+            "symbol": {"$in": symbols},
+            "trade_date": {"$gte": lookback_start, "$lt": trade_day},
+            "close": {"$exists": True, "$ne": None},
+        },
+        {"_id": 0, "symbol": 1, "trade_date": 1, "close": 1},
+    ).sort([("symbol", 1), ("trade_date", 1)])
+
+    closes_before: Dict[str, List[float]] = defaultdict(list)
+    for doc in cursor_vp:
+        sym = str(doc.get("symbol") or "")
+        c = _num_or_none(doc.get("close"))
+        if sym in members and c is not None:
+            closes_before[sym].append(c)
+
+    sum_prev_by_symbol: Dict[str, Optional[float]] = {}
+    for sym in symbols:
+        seq = closes_before.get(sym, [])
+        if len(seq) < need_prev:
+            sum_prev_by_symbol[sym] = None
+        else:
+            sum_prev_by_symbol[sym] = float(sum(seq[-need_prev:]))
+
+    rt_col = realtime_db["volume_price_realtime_latest"]
+    rt_docs = list(
+        rt_col.find(
+            {"trade_date": trade_day, "symbol": {"$in": symbols}},
+            {
+                "_id": 0,
+                "symbol": 1,
+                "close": 1,
+                "pct_chg": 1,
+                "volume": 1,
+                "amount": 1,
+                "realtime_amount_yuan": 1,
+            },
+        )
+    )
+    rt_by_symbol = {str(d.get("symbol")): d for d in rt_docs if d.get("symbol")}
+
+    names = _load_stock_names_map(data_db, symbols)
+    rows_out: List[Dict[str, Any]] = []
+    for sym in symbols:
+        doc = rt_by_symbol.get(sym)
+        if not doc:
+            continue
+        p = _num_or_none(doc.get("close"))
+        sum_prev = sum_prev_by_symbol.get(sym)
+        if p is None or sum_prev is None:
+            continue
+        ma_line = (sum_prev + p) / ma_period
+        above_ma = p > ma_line
+        rows_out.append(
+            {
+                "symbol": sym,
+                "name": names.get(sym, sym),
+                "close": p,
+                "pct_chg": _num_or_none(doc.get("pct_chg")),
+                "amount_yuan": _realtime_amount_yuan_from_doc(doc),
+                "volume": doc.get("volume"),
+                "ma": ma_line,
+                "above_ma": above_ma,
+                "margin_to_ma": (p - ma_line),
+            }
+        )
+
+    above_rows = [r for r in rows_out if r.get("above_ma")]
+    below_rows = [r for r in rows_out if not r.get("above_ma")]
+    above_rows.sort(
+        key=lambda r: (
+            -(r.get("amount_yuan") or 0.0),
+            -(r.get("pct_chg") or 0.0),
+            -(r.get("margin_to_ma") or 0.0),
+        )
+    )
+    below_rows.sort(
+        key=lambda r: (
+            (r.get("pct_chg") if r.get("pct_chg") is not None else 0.0),
+            -(r.get("amount_yuan") or 0.0),
+        )
+    )
+
+    total = len(rows_out)
+    above_ct = len(above_rows)
+    return {
+        "success": True,
+        "mode": "realtime",
+        "level": level,
+        "sector_code": sector_code,
+        "sector_name": sector_name,
+        "snapshot_time": snapshot_time,
+        "trade_day": trade_day,
+        "ma_period": ma_period,
+        "total_members": len(symbols),
+        "computed": total,
+        "above_ma_count": above_ct,
+        "yang_spectrum": (above_ct / total) if total else None,
+        "top_above_ma": above_rows[:top_n],
+        "top_below_ma": below_rows[:top_n],
+    }
+
+
+@router.get(
+    "/market-spectrum/sector-contributors",
+    summary="板块贡献股拆解（按站上MA与成交排序）",
+    tags=["Market"],
+)
+def get_market_spectrum_sector_contributors(
+    mode: str = Query(..., pattern="^(daily|realtime)$", description="daily=日线收盘; realtime=实时日K快照"),
+    level: str = Query("L1", pattern="^L[12]$", description="申万 L1 或 L2"),
+    sector_code: str = Query(..., min_length=1, description="板块指数代码，如 801080.SI"),
+    trade_date: Optional[str] = Query(None, description="YYYYMMDD，mode=daily 时必填"),
+    snapshot_time: Optional[str] = Query(None, description="YYYYMMDDHHMM，mode=realtime 时必填"),
+    ma_period: int = Query(5, ge=2, le=30),
+    top_n: int = Query(30, ge=5, le=150),
+):
+    """List sector member stocks with MA alignment consistent with sector spectrum tabs.
+
+    * **daily**: same rolling window as ``/market-spectrum/sectors`` (``volume_price`` closes).
+    * **realtime**: last ``ma_period-1`` ``volume_price`` closes **before** trade day plus
+      today's snapshot close from ``volume_price_realtime_latest`` (aligned with data-engine
+      realtime sector strength).
+    """
+    cache_key = "|".join(
+        ["contrib", mode, level, sector_code, str(ma_period), str(top_n), trade_date or "", snapshot_time or ""]
+    )
+    cached = _get_sector_spectrum_cache(cache_key)
+    if cached is not None:
+        return cached
+
+    data_db = get_data_db()
+    if mode == "daily":
+        td = _normalize_compact_date(trade_date or "")
+        if len(td) != 8:
+            raise HTTPException(status_code=400, detail="trade_date is required (YYYYMMDD) for mode=daily")
+        payload = _sector_contributors_payload_daily(
+            data_db,
+            level=level,
+            sector_code=sector_code,
+            trade_date=td,
+            ma_period=ma_period,
+            top_n=top_n,
+        )
+    else:
+        st = str(snapshot_time or "").strip()
+        if len(st) < 12:
+            raise HTTPException(
+                status_code=400,
+                detail="snapshot_time is required (YYYYMMDDHHMM) for mode=realtime",
+            )
+        payload = _sector_contributors_payload_realtime(
+            data_db,
+            level=level,
+            sector_code=sector_code,
+            snapshot_time=st,
+            ma_period=ma_period,
+            top_n=top_n,
+        )
+
+    if payload.get("success"):
+        return _set_sector_spectrum_cache(cache_key, payload)
+    return payload
 
 
 @router.get('/market-spectrum-minute', summary="获取实时日K阴阳谱数据", tags=["Market"])
