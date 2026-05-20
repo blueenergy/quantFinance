@@ -245,12 +245,19 @@ def get_user_watchlist_stocks(current_user: dict = Depends(get_current_active_us
         volume_price_col = data_collections["volume_price"]
         etf_basic_col = data_collections.get("etf_basic")
         etf_daily_col = data_collections.get("etf_daily")
+        sw_industry_map = _load_sw_industry_map(
+            data_collections.get("sw_index_member"),
+            symbols,
+        )
         
         for symbol in symbols:
+            industry = ""
+            sw_industry = sw_industry_map.get(remove_exchange_suffix(symbol))
             # Check Stock first
             stock_info = data_collections["stock_info"].find_one({"symbol": symbol})
             if stock_info:
                 name = stock_info["name"] if "name" in stock_info else symbol
+                industry = stock_info.get("industry", "")
                 asset_type = "stock"
                 latest_record = volume_price_col.find_one(
                     {"symbol": symbol},
@@ -282,6 +289,8 @@ def get_user_watchlist_stocks(current_user: dict = Depends(get_current_active_us
                 stock_data = {
                     "symbol": symbol,
                     "name": name,
+                    "industry": industry,
+                    "sw_industry": sw_industry,
                     "asset_type": asset_type,
                     "close": latest_record.get("close"),
                     "trade_date": latest_record.get("trade_date"),
@@ -302,6 +311,8 @@ def get_user_watchlist_stocks(current_user: dict = Depends(get_current_active_us
                 result.append({
                     "symbol": symbol,
                     "name": name,
+                    "industry": industry,
+                    "sw_industry": sw_industry,
                     "asset_type": asset_type,
                     "close": None,
                     "trade_date": None,
@@ -399,6 +410,84 @@ def _resolve_etf_ts_code(etf_basic_col, symbol: str) -> Optional[str]:
         if doc and doc.get("ts_code"):
             return str(doc["ts_code"]).strip()
     return None
+
+
+_SW_INDUSTRY_PROJ = {
+    "_id": 0,
+    "con_code": 1,
+    "name": 1,
+    "l1_code": 1,
+    "l1_name": 1,
+    "l2_code": 1,
+    "l2_name": 1,
+    "l3_code": 1,
+    "l3_name": 1,
+    "src": 1,
+}
+
+
+def _format_sw_industry(doc: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not doc:
+        return None
+    return {
+        "symbol": doc.get("con_code", ""),
+        "name": doc.get("name", ""),
+        "l1_code": doc.get("l1_code", ""),
+        "l1_name": doc.get("l1_name", ""),
+        "l2_code": doc.get("l2_code", ""),
+        "l2_name": doc.get("l2_name", ""),
+        "l3_code": doc.get("l3_code", ""),
+        "l3_name": doc.get("l3_name", ""),
+        "src": doc.get("src", "SW2021"),
+    }
+
+
+def _load_sw_industry_map(sw_member_col, symbols: List[str], src: str = "SW2021") -> Dict[str, Dict[str, Any]]:
+    """批量读取自选股票的申万 L1/L2/L3 行业，key 为去后缀代码。"""
+    if sw_member_col is None or not symbols:
+        return {}
+
+    variants = list(dict.fromkeys(v for symbol in symbols for v in _symbol_variants(symbol)))
+    if not variants:
+        return {}
+
+    by_norm: Dict[str, Dict[str, Any]] = {}
+
+    def put_doc(doc: Dict[str, Any]) -> None:
+        con_code = str(doc.get("con_code") or "").strip()
+        norm = remove_exchange_suffix(con_code)
+        if norm and norm not in by_norm:
+            by_norm[norm] = _format_sw_industry(doc) or {}
+
+    try:
+        for doc in sw_member_col.find(
+            {"con_code": {"$in": variants}, "src": src, "is_new": "Y"},
+            _SW_INDUSTRY_PROJ,
+        ):
+            put_doc(doc)
+
+        missing_norms = {
+            remove_exchange_suffix(symbol)
+            for symbol in symbols
+            if remove_exchange_suffix(symbol) not in by_norm
+        }
+        if missing_norms:
+            cursor = sw_member_col.find(
+                {"con_code": {"$in": variants}, "src": src},
+                _SW_INDUSTRY_PROJ,
+            )
+            try:
+                cursor = cursor.sort("in_date", -1)
+            except Exception:
+                pass
+            for doc in cursor:
+                norm = remove_exchange_suffix(str(doc.get("con_code") or ""))
+                if norm in missing_norms:
+                    put_doc(doc)
+    except Exception:
+        return {}
+
+    return by_norm
 
 
 def _merge_variants(*groups: List[str]) -> List[str]:
@@ -594,6 +683,10 @@ def get_user_watchlist_realtime(current_user: dict = Depends(get_current_active_
             etf_ts = _resolve_etf_ts_code(etf_basic_col, symbol)
             eff_variants = _merge_variants(_symbol_variants(symbol), [etf_ts] if etf_ts else [])
             sym_ctx[symbol] = {"variants": eff_variants, "etf_ts": etf_ts}
+        sw_industry_map = _load_sw_industry_map(
+            data_collections.get("sw_index_member"),
+            symbols,
+        )
 
         yesterday_close_map = {}
         volume_price_col = data_collections["volume_price"]
@@ -661,9 +754,12 @@ def get_user_watchlist_realtime(current_user: dict = Depends(get_current_active_
         for symbol in symbols:
             variants = sym_ctx[symbol]["variants"]
             etf_ts = sym_ctx[symbol]["etf_ts"]
+            industry = ""
+            sw_industry = sw_industry_map.get(remove_exchange_suffix(symbol))
             stock_info = stock_info_col.find_one({"symbol": {"$in": variants}})
             if stock_info:
                 name = stock_info["name"] if "name" in stock_info else symbol
+                industry = stock_info.get("industry", "")
                 asset_type = "stock"
             else:
                 etf_info = (
@@ -713,6 +809,8 @@ def get_user_watchlist_realtime(current_user: dict = Depends(get_current_active_
                 result.append({
                     "symbol": symbol,
                     "name": name,
+                    "industry": industry,
+                    "sw_industry": sw_industry,
                     "asset_type": asset_type,
                     "price": _safe_round_price(current_price),
                     "open": _safe_round_price(o),
@@ -749,6 +847,8 @@ def get_user_watchlist_realtime(current_user: dict = Depends(get_current_active_
                 result.append({
                     "symbol": symbol,
                     "name": name,
+                    "industry": industry,
+                    "sw_industry": sw_industry,
                     "asset_type": asset_type,
                     "price": _safe_round_price(close),
                     "open": _safe_round_price(vp.get("open")),
@@ -789,6 +889,8 @@ def get_user_watchlist_realtime(current_user: dict = Depends(get_current_active_
                             {
                                 "symbol": symbol,
                                 "name": name,
+                                "industry": industry,
+                                "sw_industry": sw_industry,
                                 "asset_type": asset_type,
                                 "price": round(close, 2),
                                 "open": round(row["open"], 2)
@@ -815,6 +917,8 @@ def get_user_watchlist_realtime(current_user: dict = Depends(get_current_active_
                 result.append({
                     "symbol": symbol,
                     "name": name,
+                    "industry": industry,
+                    "sw_industry": sw_industry,
                     "asset_type": asset_type,
                     "price": round(yesterday_close, 2),
                     "open": None,
@@ -829,6 +933,8 @@ def get_user_watchlist_realtime(current_user: dict = Depends(get_current_active_
                 result.append({
                     "symbol": symbol,
                     "name": name,
+                    "industry": industry,
+                    "sw_industry": sw_industry,
                     "asset_type": asset_type,
                     "price": None,
                     "open": None,
