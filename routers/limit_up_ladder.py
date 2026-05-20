@@ -420,15 +420,24 @@ async def get_limit_up_narrative(
     data_db = get_data_db()
     narrative_col = _analyzer_cols["limit_up_daily_narrative"]
 
-    # Resolve date
+    # Resolve date against the latest ladder/raw limit-up data, not the latest
+    # completed narrative. Otherwise a stale narrative can mask fresh ladder data.
     if not date:
-        latest_doc = narrative_col.find_one(sort=[("trade_date", -1)])
-        if latest_doc:
-            date = latest_doc["trade_date"]
+        today = datetime.now().strftime("%Y%m%d")
+        latest_ladder = data_db["limit_up_ladder"].find_one(
+            {"date": {"$lte": today}},
+            sort=[("date", -1)],
+            projection={"date": 1},
+        )
+        if latest_ladder:
+            date = latest_ladder["date"]
         else:
-            # Fall back to latest daily_limit_up date
-            latest_stock = data_db["daily_limit_up"].find_one(sort=[("date", -1)])
-            date = (latest_stock or {}).get("date") or datetime.now().strftime("%Y%m%d")
+            latest_stock = data_db["daily_limit_up"].find_one(
+                {"date": {"$lte": today}},
+                sort=[("date", -1)],
+                projection={"date": 1},
+            )
+            date = (latest_stock or {}).get("date") or today
 
     doc = narrative_col.find_one({"trade_date": date})
 
