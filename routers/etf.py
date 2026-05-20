@@ -448,13 +448,43 @@ class AnalyzeRequest(BaseModel):
     symbol: str
     force: bool = False
 
+
+def _etf_symbol_variants(symbol: str) -> List[str]:
+    s = (symbol or "").strip().upper()
+    if not s:
+        return []
+    raw = s.split(".", 1)[0]
+    out: List[str] = []
+    for item in (s, raw, f"{raw}.SH", f"{raw}.SZ"):
+        if item and item not in out:
+            out.append(item)
+    return out
+
+
+def _resolve_etf_ts_code(symbol: str) -> Optional[str]:
+    variants = _etf_symbol_variants(symbol)
+    if not variants:
+        return None
+    basic = data_db["etf_basic"].find_one({"ts_code": {"$in": variants}})
+    if basic and basic.get("ts_code"):
+        return str(basic["ts_code"]).strip().upper()
+    raw = variants[1] if len(variants) > 1 else variants[0].split(".", 1)[0]
+    if len(raw) == 6 and raw.isdigit():
+        basic = data_db["etf_basic"].find_one({"ts_code": {"$regex": f"^{raw}\\."}})
+        if basic and basic.get("ts_code"):
+            return str(basic["ts_code"]).strip().upper()
+    return None
+
+
 @router.post("/analyze", summary="手动触发ETF智能分析")
 async def submit_etf_analysis(
     request: AnalyzeRequest,
     current_user: dict = Depends(get_current_active_user),
 ):
     """Submit an ETF analysis task to the background worker (quantAnalyzer)."""
-    symbol = request.symbol.upper()
+    symbol = _resolve_etf_ts_code(request.symbol)
+    if not symbol:
+        raise HTTPException(status_code=404, detail=f"ETF {request.symbol.upper()} not found")
     basic = data_db["etf_basic"].find_one({"ts_code": symbol})
     if not basic:
         raise HTTPException(status_code=404, detail=f"ETF {symbol} not found")

@@ -31,6 +31,42 @@ logger = logging.getLogger(__name__)
 ANALYSIS_WORKER_PARALLELISM = max(1, int(os.getenv("ANALYSIS_WORKER_PARALLELISM", "1")))
 
 
+def _symbol_variants_for_etf(symbol: str) -> List[str]:
+    """Return likely ETF ts_code variants for exact lookup."""
+    s = (symbol or "").strip().upper()
+    if not s:
+        return []
+    raw = s.split(".", 1)[0]
+    variants: List[str] = []
+    for item in (s, raw, f"{raw}.SH", f"{raw}.SZ"):
+        if item and item not in variants:
+            variants.append(item)
+    return variants
+
+
+def _resolve_etf_ts_code(symbol: str) -> Optional[str]:
+    """Resolve a watchlist symbol to canonical ETF ts_code when it is an ETF."""
+    variants = _symbol_variants_for_etf(symbol)
+    if not variants:
+        return None
+    try:
+        etf_basic_col = get_data_db().get("etf_basic")
+        if etf_basic_col is None:
+            return None
+        doc = etf_basic_col.find_one({"ts_code": {"$in": variants}})
+        if doc and doc.get("ts_code"):
+            return str(doc["ts_code"]).strip().upper()
+
+        raw = variants[1] if len(variants) > 1 else variants[0].split(".", 1)[0]
+        if len(raw) == 6 and raw.isdigit():
+            doc = etf_basic_col.find_one({"ts_code": {"$regex": f"^{raw}\\."}})
+            if doc and doc.get("ts_code"):
+                return str(doc["ts_code"]).strip().upper()
+    except Exception as exc:
+        logger.warning("Failed to resolve ETF ts_code for %s: %s", symbol, exc)
+    return None
+
+
 def _normalize_task_status(raw_status: Any) -> str:
     """
     Normalize task status to canonical lowercase strings expected by frontend:
@@ -373,6 +409,7 @@ async def get_analysis_task_status(
     response = {
         "task_id": task_id,
         "status": _normalize_task_status(task.get("status", "unknown")),
+        "task_type": task.get("task_type") or task.get("type"),
         "type": task.get("params", {}).get("analysis_type", "combined"),
         "analysis_mode": task.get("params", {}).get("analysis_mode", "classic"),
         "created_at": task.get("created_at").isoformat() if task.get("created_at") else None
@@ -732,6 +769,59 @@ async def create_deep_analysis_task(
         params["feedback"] = request.feedback
     if request.skip_review:
         params["skip_review"] = True
+
+    etf_ts_code = _resolve_etf_ts_code(request.symbol)
+    if etf_ts_code:
+        task_doc = build_task_doc(
+            current_user=current_user,
+            task_type="etf_analysis",
+            priority=request.priority,
+            symbol=etf_ts_code,
+            params={"symbol": etf_ts_code, "force": True},
+            provider=request.provider,
+            model=request.model,
+            source="manual_trigger",
+            revision_of=request.revision_of,
+            feedback=request.feedback,
+        )
+        try:
+            result = collections["analysis_tasks"].insert_one(task_doc)
+            task_id = str(result.inserted_id)
+            task_doc["_id"] = result.inserted_id
+
+            remaining = _consume_quota_after_submit(
+                current_user=current_user,
+                entitlement=ent,
+                quota_manager=quota_manager,
+            )
+
+            processing_count = collections["analysis_tasks"].count_documents({"status": "processing"})
+            queue_ahead = compute_queue_ahead(collections["analysis_tasks"], task_doc)
+            average_duration = estimate_task_duration_seconds(collections["analysis_tasks"], "etf_analysis")
+            estimated_wait = estimate_wait_seconds(
+                queue_ahead=queue_ahead,
+                processing_count=processing_count,
+                average_duration_seconds=average_duration,
+                estimated_parallelism=ANALYSIS_WORKER_PARALLELISM,
+            )
+
+            return {
+                "success": True,
+                "task_id": task_id,
+                "status": "pending",
+                "analysis_mode": "etf",
+                "asset_type": "etf",
+                "task_type": "etf_analysis",
+                "symbol": etf_ts_code,
+                "message": "ETF分析任务已提交",
+                "quota_remaining": remaining,
+                "position_in_queue": collections["analysis_tasks"].count_documents({"status": "pending"}),
+                "queue_ahead": queue_ahead,
+                "estimated_wait_seconds": estimated_wait,
+                "wait_hint": queue_wait_seconds_to_text(estimated_wait),
+            }
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"ETF任务创建失败: {str(e)}")
 
     task_doc = build_task_doc(
         current_user=current_user,

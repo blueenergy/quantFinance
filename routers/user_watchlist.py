@@ -251,21 +251,29 @@ def get_user_watchlist_stocks(current_user: dict = Depends(get_current_active_us
             stock_info = data_collections["stock_info"].find_one({"symbol": symbol})
             if stock_info:
                 name = stock_info["name"] if "name" in stock_info else symbol
+                asset_type = "stock"
                 latest_record = volume_price_col.find_one(
                     {"symbol": symbol},
                     sort=[("trade_date", -1)]
                 )
             else:
                 # Check ETF
-                etf_info = etf_basic_col.find_one({"ts_code": symbol}) if etf_basic_col is not None else None
+                etf_ts = _resolve_etf_ts_code(etf_basic_col, symbol)
+                etf_info = (
+                    etf_basic_col.find_one({"ts_code": etf_ts})
+                    if etf_basic_col is not None and etf_ts
+                    else None
+                )
                 if etf_info:
                     name = etf_info["name"] if "name" in etf_info else symbol
+                    asset_type = "etf"
                     latest_record = etf_daily_col.find_one(
-                        {"ts_code": symbol},
+                        {"ts_code": etf_ts},
                         sort=[("trade_date", -1)]
                     ) if etf_daily_col is not None else None
                 else:
                     name = symbol
+                    asset_type = "unknown"
                     latest_record = None
 
             if latest_record:
@@ -274,6 +282,7 @@ def get_user_watchlist_stocks(current_user: dict = Depends(get_current_active_us
                 stock_data = {
                     "symbol": symbol,
                     "name": name,
+                    "asset_type": asset_type,
                     "close": latest_record.get("close"),
                     "trade_date": latest_record.get("trade_date"),
                     "volume": latest_record.get("vol"),
@@ -293,6 +302,7 @@ def get_user_watchlist_stocks(current_user: dict = Depends(get_current_active_us
                 result.append({
                     "symbol": symbol,
                     "name": name,
+                    "asset_type": asset_type,
                     "close": None,
                     "trade_date": None,
                     "volume": None,
@@ -654,6 +664,7 @@ def get_user_watchlist_realtime(current_user: dict = Depends(get_current_active_
             stock_info = stock_info_col.find_one({"symbol": {"$in": variants}})
             if stock_info:
                 name = stock_info["name"] if "name" in stock_info else symbol
+                asset_type = "stock"
             else:
                 etf_info = (
                     etf_basic_col.find_one({"ts_code": {"$in": variants}})
@@ -662,8 +673,10 @@ def get_user_watchlist_realtime(current_user: dict = Depends(get_current_active_
                 )
                 if etf_info:
                     name = etf_info["name"] if "name" in etf_info else symbol
+                    asset_type = "etf"
                 else:
                     name = symbol
+                    asset_type = "unknown"
             
             norm = remove_exchange_suffix(symbol)
             item = realtime_by_norm.get(norm)
@@ -700,6 +713,7 @@ def get_user_watchlist_realtime(current_user: dict = Depends(get_current_active_
                 result.append({
                     "symbol": symbol,
                     "name": name,
+                    "asset_type": asset_type,
                     "price": _safe_round_price(current_price),
                     "open": _safe_round_price(o),
                     "high": _safe_round_price(h),
@@ -735,6 +749,7 @@ def get_user_watchlist_realtime(current_user: dict = Depends(get_current_active_
                 result.append({
                     "symbol": symbol,
                     "name": name,
+                    "asset_type": asset_type,
                     "price": _safe_round_price(close),
                     "open": _safe_round_price(vp.get("open")),
                     "high": _safe_round_price(vp.get("high")),
@@ -774,6 +789,7 @@ def get_user_watchlist_realtime(current_user: dict = Depends(get_current_active_
                             {
                                 "symbol": symbol,
                                 "name": name,
+                                "asset_type": asset_type,
                                 "price": round(close, 2),
                                 "open": round(row["open"], 2)
                                 if row.get("open") is not None
@@ -799,6 +815,7 @@ def get_user_watchlist_realtime(current_user: dict = Depends(get_current_active_
                 result.append({
                     "symbol": symbol,
                     "name": name,
+                    "asset_type": asset_type,
                     "price": round(yesterday_close, 2),
                     "open": None,
                     "high": None,
@@ -812,6 +829,7 @@ def get_user_watchlist_realtime(current_user: dict = Depends(get_current_active_
                 result.append({
                     "symbol": symbol,
                     "name": name,
+                    "asset_type": asset_type,
                     "price": None,
                     "open": None,
                     "high": None,
