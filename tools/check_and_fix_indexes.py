@@ -85,6 +85,14 @@ EXPECTED: Dict[str, List[IndexSpec]] = {
                   reason="回测任务队列"),
         IndexSpec("backtest_tasks", [("user_id", 1), ("created_at", -1)],
                   reason="按用户查回测任务"),
+        IndexSpec("backtest_tasks", [("batch_id", 1), ("created_at", 1)],
+                  sparse=True, reason="按批量实验查子任务"),
+        IndexSpec("backtest_tasks", [("batch_id", 1), ("status", 1)],
+                  sparse=True, reason="批量实验状态聚合"),
+        IndexSpec("backtest_batches", [("batch_id", 1)], unique=True,
+                  reason="按批量实验 ID 查详情"),
+        IndexSpec("backtest_batches", [("user_id", 1), ("created_at", -1)],
+                  reason="用户批量实验列表"),
         IndexSpec("backtest_results", [("task_id", 1)], unique=True,
                   reason="按任务 ID 取回测结果"),
         IndexSpec("stock_scores", [("ts_code", 1), ("score_date", -1)],
@@ -130,6 +138,8 @@ EXPECTED: Dict[str, List[IndexSpec]] = {
                   reason="按任务查评估"),
         IndexSpec("portfolio_analysis", [("user_id", 1), ("analysis_date", -1)],
                   reason="用户组合分析"),
+        IndexSpec("backtest_batch_reviews", [("batch_id", 1), ("created_at", -1)],
+                  reason="按批量回测实验查 AI 复盘"),
     ],
 
     # ── quant_data DB ───────────────────────────────────────────────────────

@@ -73,6 +73,7 @@ def get_db_collections() -> Dict[str, Collection]:
         # Backtesting system
         "backtest_tasks": db["backtest_tasks"],  # 回测任务
         "backtest_results": db["backtest_results"],  # 回测结果
+        "backtest_batches": db["backtest_batches"],  # 批量回测实验
         # Permission and service upgrade
         "upgrade_requests": db["upgrade_requests"],  # 服务升级申请
         # Phase 10: Async Task Queue Architecture
@@ -96,6 +97,7 @@ def get_db_collections() -> Dict[str, Collection]:
         # Stock reference data lives in quant_data
         "stock_info": data_db["stock_info"],
         "etf_basic": data_db["etf_basic"],
+        "index_constituents": data_db["index_constituents"],
     }
 
 def get_collection(name: str):
@@ -130,6 +132,8 @@ def get_analyzer_db():
         "limit_up_daily_narrative": analyzer_db["limit_up_daily_narrative"],
         # A-share multi-index IV snapshot + LLM interpretation (written by quantAnalyzer)
         "iv_analysis": analyzer_db["iv_analysis"],
+        # Strategy Lab batch review output (written by quantAnalyzer)
+        "backtest_batch_reviews": analyzer_db["backtest_batch_reviews"],
     }
 
 def get_data_db():
