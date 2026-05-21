@@ -1391,7 +1391,11 @@ def save_market_insight_focus_feedback(
     return {"success": True, "data": _serialize_focus_feedback(doc)}
 
 
-def review_market_insight_focus(trade_date: Optional[str] = None, horizon_minutes: int = 60) -> Dict[str, Any]:
+def review_market_insight_focus(
+    trade_date: Optional[str] = None,
+    horizon_minutes: int = 60,
+    rebuild_quality: bool = True,
+) -> Dict[str, Any]:
     td = _compact_trade_date(trade_date)
     rows = list_market_insight_events(trade_date=td, limit=500)
     reviews = []
@@ -1400,7 +1404,7 @@ def review_market_insight_focus(trade_date: Optional[str] = None, horizon_minute
             continue
         review = _review_sector_focus_event(event, horizon_minutes)
         reviews.append(review)
-    written = _upsert_focus_reviews(reviews)
+    written = _upsert_focus_reviews(reviews, rebuild_quality=rebuild_quality)
     return {"success": True, "trade_date": td, "horizon_minutes": horizon_minutes, "written": written, "data": reviews}
 
 
@@ -1461,6 +1465,20 @@ def _review_sector_focus_event(event: Dict[str, Any], horizon_minutes: int) -> D
     trough = min(values)
     delta_latest = latest - baseline
     delta_peak = peak - baseline
+    event_type = str(event.get("event_type") or "")
+    rel_values = [
+        _num(row.get("relative_positive_ratio"))
+        for row in rows
+        if _num(row.get("relative_positive_ratio")) is not None
+    ]
+    rel_latest = rel_values[-1] if rel_values else None
+    rel_min = min(rel_values) if rel_values else None
+    rel_avg = sum(rel_values) / len(rel_values) if rel_values else None
+    parent_metrics = (
+        _review_parent_sector_follow_through(event, snapshot_time, end_time)
+        if event_type == "EARLY_SECTOR_DIFFUSION"
+        else {}
+    )
     metrics = {
         "baseline_positive_ratio": baseline,
         "latest_positive_ratio": latest,
@@ -1468,13 +1486,18 @@ def _review_sector_focus_event(event: Dict[str, Any], horizon_minutes: int) -> D
         "trough_positive_ratio": trough,
         "delta_latest": delta_latest,
         "delta_peak": delta_peak,
+        "relative_positive_ratio_latest": rel_latest,
+        "relative_positive_ratio_min": rel_min,
+        "relative_positive_ratio_avg": rel_avg,
+        **parent_metrics,
         "sample_count": len(values),
         "first_snapshot_time": rows[0].get("snapshot_time"),
         "last_snapshot_time": rows[-1].get("snapshot_time"),
     }
-    if delta_peak >= 0.08 or delta_latest >= 0.05:
+
+    if _review_confirmed_by_event_type(event_type, baseline, latest, peak, delta_latest, delta_peak, metrics):
         status = "confirmed"
-        summary = f"后续 {horizon_minutes} 分钟内上涨比例最高提升至 {peak:.1%}，焦点得到验证。"
+        summary = _review_confirmed_summary(event_type, horizon_minutes, latest, peak, metrics)
     elif delta_latest <= -0.08 or trough <= baseline - 0.10:
         status = "faded"
         summary = f"后续 {horizon_minutes} 分钟内上涨比例回落至 {latest:.1%}，焦点被反证。"
@@ -1482,6 +1505,115 @@ def _review_sector_focus_event(event: Dict[str, Any], horizon_minutes: int) -> D
         status = "unconfirmed"
         summary = f"后续 {horizon_minutes} 分钟内上涨比例变化有限，暂未验证。"
     return _focus_review_doc(event, focus_key, status, summary, horizon_minutes, metrics)
+
+
+def _review_parent_sector_follow_through(
+    event: Dict[str, Any],
+    snapshot_time: str,
+    end_time: str,
+) -> Dict[str, Any]:
+    evidence = event.get("evidence") or {}
+    parent_l2_code = str(evidence.get("parent_l2_code") or "")
+    parent_l1_code = str(evidence.get("parent_l1_code") or "")
+    trade_date = str(event.get("trade_date") or "")
+
+    def parent_stats(level: str, code: str) -> Dict[str, Any]:
+        if not all([trade_date, level, code]):
+            return {}
+        rows = list(
+            get_data_db()["realtime_sector_strength"]
+            .find(
+                {
+                    "trade_date": trade_date,
+                    "level": level,
+                    "sector_code": code,
+                    "snapshot_time": {"$gt": snapshot_time, "$lte": end_time},
+                },
+                {"_id": 0},
+            )
+            .sort("snapshot_time", ASCENDING)
+        )
+        values = [_num(row.get("positive_ratio")) for row in rows]
+        values = [value for value in values if value is not None]
+        rels = [_num(row.get("relative_positive_ratio")) for row in rows]
+        rels = [value for value in rels if value is not None]
+        if not values:
+            return {"sample_count": 0}
+        return {
+            "sample_count": len(values),
+            "latest_positive_ratio": values[-1],
+            "peak_positive_ratio": max(values),
+            "relative_positive_ratio_latest": rels[-1] if rels else None,
+            "relative_positive_ratio_peak": max(rels) if rels else None,
+        }
+
+    l2 = parent_stats("L2", parent_l2_code)
+    l1 = parent_stats("L1", parent_l1_code)
+    l2_confirmed = (
+        l2.get("peak_positive_ratio") is not None
+        and l2.get("peak_positive_ratio") >= 0.55
+        and (l2.get("relative_positive_ratio_peak") is None or l2.get("relative_positive_ratio_peak") >= 0.06)
+    )
+    l1_confirmed = (
+        l1.get("peak_positive_ratio") is not None
+        and l1.get("peak_positive_ratio") >= 0.52
+        and (l1.get("relative_positive_ratio_peak") is None or l1.get("relative_positive_ratio_peak") >= 0.03)
+    )
+    return {
+        "parent_l2_follow_through": l2,
+        "parent_l1_follow_through": l1,
+        "parent_follow_through_confirmed": bool(l2_confirmed or l1_confirmed),
+    }
+
+
+def _review_confirmed_by_event_type(
+    event_type: str,
+    baseline: float,
+    latest: float,
+    peak: float,
+    delta_latest: float,
+    delta_peak: float,
+    metrics: Dict[str, Any],
+) -> bool:
+    if delta_peak >= 0.08 or delta_latest >= 0.05:
+        return True
+
+    if event_type == "SECTOR_DIFFUSION":
+        # 扩散类事件触发时已较强，后续维持高位也应视为确认，而非必须继续大幅扩散。
+        return peak >= max(0.58, baseline - 0.02) and latest >= max(0.55, baseline - 0.05)
+
+    if event_type == "EARLY_SECTOR_DIFFUSION":
+        return bool(metrics.get("parent_follow_through_confirmed")) or (
+            peak >= 0.62 and latest >= max(0.56, baseline - 0.04)
+        )
+
+    if event_type == "COUNTER_TREND_SECTOR_STRENGTH":
+        rel_latest = metrics.get("relative_positive_ratio_latest")
+        rel_min = metrics.get("relative_positive_ratio_min")
+        return (
+            latest >= max(0.52, baseline - 0.05)
+            and rel_latest is not None
+            and rel_latest >= 0.08
+            and (rel_min is None or rel_min >= 0.0)
+        )
+
+    return False
+
+
+def _review_confirmed_summary(
+    event_type: str,
+    horizon_minutes: int,
+    latest: float,
+    peak: float,
+    metrics: Dict[str, Any],
+) -> str:
+    if event_type == "SECTOR_DIFFUSION" and metrics.get("delta_peak", 0) < 0.08:
+        return f"后续 {horizon_minutes} 分钟内上涨比例维持在 {latest:.1%}，扩散状态得到确认。"
+    if event_type == "EARLY_SECTOR_DIFFUSION" and metrics.get("parent_follow_through_confirmed"):
+        return f"后续 {horizon_minutes} 分钟内上级行业跟随扩散，早期扩散得到验证。"
+    if event_type == "COUNTER_TREND_SECTOR_STRENGTH" and metrics.get("delta_peak", 0) < 0.08:
+        return f"后续 {horizon_minutes} 分钟内板块相对强度保持为正，逆势扩散得到验证。"
+    return f"后续 {horizon_minutes} 分钟内上涨比例最高提升至 {peak:.1%}，焦点得到验证。"
 
 
 def _focus_review_doc(
@@ -1510,7 +1642,7 @@ def _focus_review_doc(
     }
 
 
-def _upsert_focus_reviews(reviews: List[Dict[str, Any]]) -> int:
+def _upsert_focus_reviews(reviews: List[Dict[str, Any]], rebuild_quality: bool = True) -> int:
     if not reviews:
         return 0
     coll = get_db_collections()["market_insight_focus_reviews"]
@@ -1519,7 +1651,8 @@ def _upsert_focus_reviews(reviews: List[Dict[str, Any]]) -> int:
         _apply_review_preference_to_feedback(review)
     coll.create_index([("trade_date", DESCENDING), ("status", ASCENDING)], name="trade_status_idx", background=True)
     coll.create_index([("focus_key", ASCENDING)], unique=True, name="focus_key_unique", background=True)
-    rebuild_market_insight_global_quality()
+    if rebuild_quality:
+        rebuild_market_insight_global_quality()
     return len(reviews)
 
 

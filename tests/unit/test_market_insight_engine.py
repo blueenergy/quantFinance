@@ -713,6 +713,169 @@ def test_review_market_insight_focus_confirms_sector_diffusion(monkeypatch):
 
 
 @pytest.mark.unit
+def test_review_sector_diffusion_confirms_when_strength_holds(monkeypatch):
+    finance = {
+        "market_insight_events": FakeCollection(
+            [
+                {
+                    "_id": "a",
+                    "trade_date": "20260515",
+                    "snapshot_time": "202605151030",
+                    "event_type": "SECTOR_DIFFUSION",
+                    "severity": "medium",
+                    "confidence": 80.0,
+                    "subject_type": "sector",
+                    "subject_code": "801011.SI",
+                    "subject_name": "银行",
+                    "level": "L2",
+                    "evidence": {"positive_ratio_now": 0.62},
+                }
+            ]
+        ),
+        "market_insight_focus_reviews": FakeCollection([]),
+    }
+    realtime = {
+        "realtime_sector_strength": FakeCollection(
+            [
+                {
+                    "trade_date": "20260515",
+                    "snapshot_time": "202605151045",
+                    "level": "L2",
+                    "sector_code": "801011.SI",
+                    "positive_ratio": 0.60,
+                },
+                {
+                    "trade_date": "20260515",
+                    "snapshot_time": "202605151100",
+                    "level": "L2",
+                    "sector_code": "801011.SI",
+                    "positive_ratio": 0.59,
+                },
+            ]
+        )
+    }
+    monkeypatch.setattr(engine, "get_db_collections", lambda: finance)
+    monkeypatch.setattr(engine, "get_data_db", lambda: realtime)
+
+    result = engine.review_market_insight_focus("2026-05-15", horizon_minutes=60)
+
+    assert result["data"][0]["status"] == "confirmed"
+    assert "维持" in result["data"][0]["summary"]
+
+
+@pytest.mark.unit
+def test_review_early_diffusion_confirms_when_parent_follows(monkeypatch):
+    finance = {
+        "market_insight_events": FakeCollection(
+            [
+                {
+                    "_id": "a",
+                    "trade_date": "20260515",
+                    "snapshot_time": "202605151030",
+                    "event_type": "EARLY_SECTOR_DIFFUSION",
+                    "severity": "medium",
+                    "confidence": 82.0,
+                    "subject_type": "sector",
+                    "subject_code": "851011.SI",
+                    "subject_name": "大型银行",
+                    "level": "L3",
+                    "evidence": {
+                        "positive_ratio_now": 0.62,
+                        "parent_l2_code": "801011.SI",
+                        "parent_l1_code": "801010.SI",
+                    },
+                }
+            ]
+        ),
+        "market_insight_focus_reviews": FakeCollection([]),
+    }
+    realtime = {
+        "realtime_sector_strength": FakeCollection(
+            [
+                {
+                    "trade_date": "20260515",
+                    "snapshot_time": "202605151045",
+                    "level": "L3",
+                    "sector_code": "851011.SI",
+                    "positive_ratio": 0.60,
+                    "relative_positive_ratio": 0.08,
+                },
+                {
+                    "trade_date": "20260515",
+                    "snapshot_time": "202605151100",
+                    "level": "L2",
+                    "sector_code": "801011.SI",
+                    "positive_ratio": 0.56,
+                    "relative_positive_ratio": 0.07,
+                },
+            ]
+        )
+    }
+    monkeypatch.setattr(engine, "get_db_collections", lambda: finance)
+    monkeypatch.setattr(engine, "get_data_db", lambda: realtime)
+
+    result = engine.review_market_insight_focus("2026-05-15", horizon_minutes=60)
+
+    assert result["data"][0]["status"] == "confirmed"
+    assert result["data"][0]["metrics"]["parent_follow_through_confirmed"] is True
+    assert "上级行业" in result["data"][0]["summary"]
+
+
+@pytest.mark.unit
+def test_review_counter_trend_confirms_when_relative_strength_persists(monkeypatch):
+    finance = {
+        "market_insight_events": FakeCollection(
+            [
+                {
+                    "_id": "a",
+                    "trade_date": "20260515",
+                    "snapshot_time": "202605151030",
+                    "event_type": "COUNTER_TREND_SECTOR_STRENGTH",
+                    "severity": "high",
+                    "confidence": 86.0,
+                    "subject_type": "sector",
+                    "subject_code": "801011.SI",
+                    "subject_name": "银行",
+                    "level": "L2",
+                    "evidence": {"positive_ratio_now": 0.58},
+                }
+            ]
+        ),
+        "market_insight_focus_reviews": FakeCollection([]),
+    }
+    realtime = {
+        "realtime_sector_strength": FakeCollection(
+            [
+                {
+                    "trade_date": "20260515",
+                    "snapshot_time": "202605151045",
+                    "level": "L2",
+                    "sector_code": "801011.SI",
+                    "positive_ratio": 0.56,
+                    "relative_positive_ratio": 0.10,
+                },
+                {
+                    "trade_date": "20260515",
+                    "snapshot_time": "202605151100",
+                    "level": "L2",
+                    "sector_code": "801011.SI",
+                    "positive_ratio": 0.55,
+                    "relative_positive_ratio": 0.09,
+                },
+            ]
+        )
+    }
+    monkeypatch.setattr(engine, "get_db_collections", lambda: finance)
+    monkeypatch.setattr(engine, "get_data_db", lambda: realtime)
+
+    result = engine.review_market_insight_focus("2026-05-15", horizon_minutes=60)
+
+    assert result["data"][0]["status"] == "confirmed"
+    assert result["data"][0]["metrics"]["relative_positive_ratio_min"] == pytest.approx(0.09)
+    assert "相对强度" in result["data"][0]["summary"]
+
+
+@pytest.mark.unit
 def test_review_market_insight_focus_updates_preferences_for_feedback_users(monkeypatch):
     focus_key = "20260515|202605151030|SECTOR_DIFFUSION|sector|801011.SI"
     reviews = FakeCollection([])
