@@ -14,7 +14,7 @@ ts.set_token(os.getenv("TUSHARE_TOKEN"))  # 请替换为你的真实 token
 pro = ts.pro_api()
 
 # 连接 MongoDB
-mongo_url = os.getenv("MONGO_URL", "mongodb://localhost:27017")
+mongo_url = os.getenv("MONGO_URI", "mongodb://localhost:27017")
 client = MongoClient(mongo_url)
 db = client["finance"]
 collection = db["stock_info"]

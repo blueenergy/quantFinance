@@ -218,7 +218,7 @@ def build_report() -> Dict[str, Any]:
 
     return {
         "ok": True,
-        "mongo_uri_host": (os.getenv("MONGO_URI") or os.getenv("MONGO_URL", "")).split("@")[-1][:64],
+        "mongo_uri_host": os.getenv("MONGO_URI", "").split("@")[-1][:64],
         "finance_db": db.name,
         "data_db": data_db.name,
         "run": run,

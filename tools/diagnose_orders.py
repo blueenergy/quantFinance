@@ -21,7 +21,7 @@ log = logging.getLogger("diagnose_orders")
 
 def check_submitted_orders():
     # MongoDB connection details (default to localhost if not set)
-    mongo_url = os.environ.get("MONGO_URL", "mongodb://localhost:27017")
+    mongo_url = os.environ.get("MONGO_URI", "mongodb://localhost:27017")
     mongo_db_name = os.environ.get("MONGO_DB", "quant_finance")
     
     try:

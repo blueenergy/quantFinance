@@ -9,7 +9,6 @@ services:
       - "3001:3001"
     environment:
       - MONGO_URI=${MONGO_URI:-mongodb://host.docker.internal:27017/}
-      - MONGO_URL=${MONGO_URI:-mongodb://host.docker.internal:27017/}
       - DB_NAME=${MONGO_DB}
       - ANALYZER_DB_NAME=${ANALYZER_DB_NAME:-quant_analyzer}
       - REALTIME_DB_NAME=${REALTIME_DB_NAME:-quant_realtime}
@@ -56,7 +55,6 @@ services:
       - "3002:3002"
     environment:
       - MONGO_URI=${MONGO_URI:-mongodb://host.docker.internal:27017/}
-      - MONGO_URL=${MONGO_URI:-mongodb://host.docker.internal:27017/}
       - DB_NAME=${MONGO_DB}
       - ANALYZER_DB_NAME=${ANALYZER_DB_NAME:-quant_analyzer}
       - REALTIME_DB_NAME=${REALTIME_DB_NAME:-quant_realtime}
@@ -95,7 +93,6 @@ services:
       - "3003:3003"
     environment:
       - MONGO_URI=${MONGO_URI:-mongodb://host.docker.internal:27017/}
-      - MONGO_URL=${MONGO_URI:-mongodb://host.docker.internal:27017/}
       - DB_NAME=${MONGO_DB}
       - ANALYZER_DB_NAME=${ANALYZER_DB_NAME:-quant_analyzer}
       - REALTIME_DB_NAME=${REALTIME_DB_NAME:-quant_realtime}
@@ -131,7 +128,6 @@ services:
     command: [ "python", "scheduler_runner.py" ]
     environment:
       - MONGO_URI=${MONGO_URI:-mongodb://host.docker.internal:27017/}
-      - MONGO_URL=${MONGO_URI:-mongodb://host.docker.internal:27017/}
       - DB_NAME=${MONGO_DB}
       - ANALYZER_DB_NAME=${ANALYZER_DB_NAME:-quant_analyzer}
       - REALTIME_DB_NAME=${REALTIME_DB_NAME:-quant_realtime}
@@ -172,7 +168,6 @@ services:
       dockerfile: Dockerfile
     environment:
       - MONGO_URI=${MONGO_URI:-mongodb://host.docker.internal:27017/}
-      - MONGO_URL=${MONGO_URI:-mongodb://host.docker.internal:27017/}
       - DB_NAME=${MONGO_DB}
       - ANALYZER_DB_NAME=${ANALYZER_DB_NAME:-quant_analyzer}
       - TUSHARE_TOKEN=${TUSHARE_TOKEN}
@@ -220,7 +215,6 @@ services:
     environment:
       # Use same DB as API
       - MONGO_URI=${MONGO_URI:-mongodb://host.docker.internal:27017/}
-      - MONGO_URL=${MONGO_URI:-mongodb://host.docker.internal:27017/}
       - DB_NAME=${MONGO_DB}
       - REALTIME_DB_NAME=${REALTIME_DB_NAME:-quant_realtime}
       - TUSHARE_TOKEN=${TUSHARE_TOKEN}
@@ -319,7 +313,6 @@ services:
     container_name: backtest-worker
     environment:
       - MONGO_URI=${MONGO_URI:-mongodb://host.docker.internal:27017/}
-      - MONGO_URL=${MONGO_URI:-mongodb://host.docker.internal:27017/}
       - DB_NAME=${MONGO_DB}
       - MONGO_DB=${DATA_DB_NAME:-quant_data}
       - API_BASE_URL=${BACKTEST_API_BASE_URL:-http://quant-api:3001/api}
@@ -357,7 +350,6 @@ services:
     container_name: quant-scorer
     environment:
       - MONGO_URI=${MONGO_URI:-mongodb://host.docker.internal:27017/}
-      - MONGO_URL=${MONGO_URI:-mongodb://host.docker.internal:27017/}
       - MONGO_DB=${MONGO_DB}
       - TUSHARE_TOKEN=${TUSHARE_TOKEN}
       - MAX_WORKERS=${SCORING_MAX_WORKERS:-6}

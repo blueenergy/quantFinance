@@ -26,7 +26,7 @@ load_dotenv()
 
 
 def _mongo_client() -> MongoClient:
-    uri = os.getenv("MONGO_URI", os.getenv("MONGO_URL", "mongodb://localhost:27017"))
+    uri = os.getenv("MONGO_URI", "mongodb://localhost:27017")
     return MongoClient(uri)
 
 

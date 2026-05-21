@@ -5,7 +5,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-mongo_url = os.getenv("MONGO_URL", "mongodb://localhost:27017")
+mongo_url = os.getenv("MONGO_URI", "mongodb://localhost:27017")
 client = MongoClient(mongo_url)
 db = client["finance"]
 collection = db["volume_price"]

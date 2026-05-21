@@ -25,7 +25,7 @@ def create_trade_signals_index():
     """Create unique index on trade_signals collection."""
     load_dotenv()
     
-    mongo_uri = os.getenv("MONGO_URL", "mongodb://localhost:27017")
+    mongo_uri = os.getenv("MONGO_URI", "mongodb://localhost:27017")
     mongo_db = os.getenv("MONGO_DB", "finance")
     
     client = MongoClient(mongo_uri)
@@ -107,7 +107,7 @@ def find_duplicates():
     """Find existing duplicate signals."""
     load_dotenv()
     
-    mongo_uri = os.getenv("MONGO_URL", "mongodb://localhost:27017")
+    mongo_uri = os.getenv("MONGO_URI", "mongodb://localhost:27017")
     mongo_db = os.getenv("MONGO_DB", "finance")
     
     client = MongoClient(mongo_uri)

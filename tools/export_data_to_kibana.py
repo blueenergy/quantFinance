@@ -10,7 +10,7 @@ load_dotenv()
 class StockDataExporter:
     def __init__(self):
         # MongoDB 连接
-        self.mongo_client = MongoClient(os.getenv("MONGO_URL", "mongodb://localhost:27017"))
+        self.mongo_client = MongoClient(os.getenv("MONGO_URI", "mongodb://localhost:27017"))
         self.mongo_db = self.mongo_client["finance"]
         
         # ✅ 修复 Elasticsearch 连接参数

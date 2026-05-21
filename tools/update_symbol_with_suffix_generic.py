@@ -16,7 +16,7 @@ from utils.symbol_utils import normalize_symbol
 load_dotenv()
 
 # MongoDB connection
-mongo_url = os.getenv("MONGO_URL", "mongodb://localhost:27017")
+mongo_url = os.getenv("MONGO_URI", "mongodb://localhost:27017")
 DB_NAME = "finance"
 client = MongoClient(mongo_url)
 db = client[DB_NAME]

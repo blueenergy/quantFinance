@@ -35,7 +35,7 @@ def main() -> int:
     )
     args = p.parse_args()
 
-    uri = os.getenv("MONGO_URI", os.getenv("MONGO_URL", "mongodb://localhost:27017"))
+    uri = os.getenv("MONGO_URI", "mongodb://localhost:27017")
     finance_db = os.getenv("MONGO_DB", "finance")
     data_db = os.getenv("DATA_DB_NAME", "quant_data")
 

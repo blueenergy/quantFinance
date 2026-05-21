@@ -26,7 +26,7 @@ load_dotenv(os.path.join(os.path.dirname(__file__), "quantFinance", ".env"),
             override=False)
 load_dotenv(override=False)  # fallback to cwd .env
 
-MONGO_URI   = os.getenv("MONGO_URI", os.getenv("MONGO_URL", "mongodb://localhost:27017"))
+MONGO_URI   = os.getenv("MONGO_URI", "mongodb://localhost:27017")
 DB_FINANCE  = os.getenv("MONGO_DB", "finance")
 DB_ANALYZER = os.getenv("ANALYZER_DB_NAME", "quant_analyzer")
 DB_DATA     = os.getenv("DATA_DB_NAME", "quant_data")

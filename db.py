@@ -6,7 +6,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # MongoDB connection settings
-mongo_url = os.getenv("MONGO_URI", os.getenv("MONGO_URL", "mongodb://localhost:27017"))
+mongo_url = os.getenv("MONGO_URI", "mongodb://localhost:27017")
 DB_NAME = os.getenv("MONGO_DB", "finance")
 ANALYZER_DB_NAME = os.getenv("ANALYZER_DB_NAME", "quant_analyzer")
 data_db_name = os.getenv("DATA_DB_NAME", "quant_data")
