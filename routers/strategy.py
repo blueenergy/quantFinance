@@ -37,14 +37,14 @@ def list_strategies(current_user: Dict = Depends(get_current_user)) -> Dict[str,
 	
 	if col is None:
 		# Fallback to hardcoded map if database not available
-		return _list_strategies_fallback()
+		return _list_strategies_fallback(current_user)
 	
 	try:
 		# Read from database
 		strats = list(col.find({}, {"_id": 0}))
 		if not strats:
 			# If no data in database, use fallback
-			return _list_strategies_fallback()
+			return _list_strategies_fallback(current_user)
 			
 		out = []
 		user_service_level = current_user.get("service_level", "free") if current_user else "free"
