@@ -1077,29 +1077,9 @@ async def poll_pending_tasks(
     """
     collections = get_db_collections()
     backtest_tasks_col = collections["backtest_tasks"]
-    now = datetime.now()
-    invalid_result = backtest_tasks_col.update_many(
-        {
-            "status": "pending",
-            "$or": [
-                {"start_date": {"$exists": False}},
-                {"end_date": {"$exists": False}},
-                {"start_date": {"$in": ["", None]}},
-                {"end_date": {"$in": ["", None]}},
-            ],
-        },
-        {
-            "$set": {
-                "status": "failed",
-                "error_message": "Invalid backtest task: start_date/end_date are required",
-                "completed_at": now,
-            }
-        },
-    )
-    if invalid_result.modified_count:
-        # Keep the worker queue clean when old malformed tasks exist.
-        pass
-    
+
+    # Poll is a hot path: only read valid pending tasks. Legacy malformed rows are
+    # excluded here; run tools/cleanup_invalid_backtest_tasks.py to quarantine them.
     tasks = list(
         backtest_tasks_col
         .find({

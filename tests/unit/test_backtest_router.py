@@ -724,8 +724,8 @@ def test_poll_pending_tasks(monkeypatch, mock_user):
     
 
 @pytest.mark.unit
-def test_poll_pending_tasks_marks_missing_dates_failed(monkeypatch, mock_user):
-    """Worker poll should quarantine malformed pending tasks instead of dispatching them."""
+def test_poll_pending_tasks_skips_missing_dates(monkeypatch, mock_user):
+    """Worker poll should not return malformed pending tasks (cleanup is offline)."""
     collections = {
         "backtest_tasks": FakeBacktestCollection([
             {
@@ -764,8 +764,7 @@ def test_poll_pending_tasks_marks_missing_dates_failed(monkeypatch, mock_user):
     assert response.status_code == 200
     assert [task["task_id"] for task in response.json()] == ["bt_valid"]
     dirty = collections["backtest_tasks"].find_one({"task_id": "bt_dirty"})
-    assert dirty["status"] == "failed"
-    assert "start_date/end_date" in dirty["error_message"]
+    assert dirty["status"] == "pending"
 
 
 @pytest.mark.unit
