@@ -719,6 +719,50 @@ async def get_backtest_batch_results(
     return _clean_for_response({"batch_id": batch_id, "total": total, "offset": offset, "limit": limit, "rows": rows[offset:offset + limit]})
 
 
+@router.delete("/batches/{batch_id}")
+async def delete_backtest_batch(
+    batch_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """Delete a batch experiment and all child tasks/results for the current user."""
+    collections = get_db_collections()
+    batch = collections["backtest_batches"].find_one({"batch_id": batch_id, "user_id": current_user["id"]})
+    if not batch:
+        raise HTTPException(status_code=404, detail="Backtest batch not found")
+
+    cancelled_active = collections["backtest_tasks"].update_many(
+        {
+            "batch_id": batch_id,
+            "user_id": current_user["id"],
+            "status": {"$in": ["pending", "claimed", "running"]},
+        },
+        {"$set": {"status": "cancelled", "completed_at": datetime.now()}},
+    ).modified_count
+
+    tasks = list(collections["backtest_tasks"].find({"batch_id": batch_id, "user_id": current_user["id"]}))
+    task_ids = [t["task_id"] for t in tasks if t.get("task_id")]
+    if task_ids:
+        collections["backtest_results"].delete_many({"task_id": {"$in": task_ids}})
+    deleted_tasks = collections["backtest_tasks"].delete_many(
+        {"batch_id": batch_id, "user_id": current_user["id"]}
+    ).deleted_count
+    collections["backtest_batches"].delete_one({"batch_id": batch_id, "user_id": current_user["id"]})
+
+    try:
+        get_analyzer_db()["backtest_batch_reviews"].delete_many({"batch_id": batch_id})
+    except Exception:
+        pass
+
+    return _clean_for_response(
+        {
+            "message": "Backtest batch deleted",
+            "batch_id": batch_id,
+            "deleted_tasks": deleted_tasks,
+            "cancelled_active": cancelled_active,
+        }
+    )
+
+
 @router.post("/batches/{batch_id}/cancel")
 async def cancel_backtest_batch(
     batch_id: str,
@@ -732,7 +776,16 @@ async def cancel_backtest_batch(
         {"batch_id": batch_id, "user_id": current_user["id"], "status": {"$in": ["pending", "claimed", "running"]}},
         {"$set": {"status": "cancelled", "completed_at": datetime.now()}},
     )
-    collections["backtest_batches"].update_one({"batch_id": batch_id}, {"$set": {"status": "cancelled", "updated_at": datetime.now()}})
+    if result.modified_count <= 0:
+        return {
+            "message": "No active tasks to cancel (batch may already be completed)",
+            "batch_id": batch_id,
+            "cancelled_tasks": 0,
+        }
+    collections["backtest_batches"].update_one(
+        {"batch_id": batch_id},
+        {"$set": {"status": "cancelled", "updated_at": datetime.now()}},
+    )
     return {"message": "Batch cancelled", "batch_id": batch_id, "cancelled_tasks": result.modified_count}
 
 
@@ -1249,3 +1302,8 @@ async def report_backtest_failure(
         raise HTTPException(status_code=404, detail="Backtest task not found")
     
     return {"message": "Failure reported", "task_id": task_id}
+
+
+from routers.strategy_lab_loops import router as strategy_lab_loops_router
+
+router.include_router(strategy_lab_loops_router)

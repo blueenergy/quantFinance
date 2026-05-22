@@ -151,6 +151,22 @@ class FakeBacktestCollection:
         
         return DeleteResult(0)
 
+    def delete_many(self, query):
+        """Mock delete_many"""
+        class DeleteResult:
+            def __init__(self, deleted_count):
+                self.deleted_count = deleted_count
+
+        deleted = 0
+        remaining = []
+        for doc in self.docs:
+            if self._matches(doc, query):
+                deleted += 1
+            else:
+                remaining.append(doc)
+        self.docs = remaining
+        return DeleteResult(deleted)
+
 
 @pytest.fixture
 def mock_user():
@@ -485,6 +501,61 @@ def test_get_backtest_task(monkeypatch, mock_user):
     response = client.get("/api/backtest/tasks/bt_999")
     assert response.status_code == 404
     
+    client.app.dependency_overrides.clear()
+
+
+@pytest.mark.unit
+def test_delete_backtest_batch(monkeypatch, mock_user):
+    """Test deleting a batch removes batch doc, tasks, and results."""
+    collections = {
+        "backtest_batches": FakeBacktestCollection(
+            [
+                {
+                    "batch_id": "bb_del",
+                    "user_id": "user123",
+                    "name": "to delete",
+                    "status": "completed",
+                }
+            ]
+        ),
+        "backtest_tasks": FakeBacktestCollection(
+            [
+                {
+                    "task_id": "bt_a",
+                    "batch_id": "bb_del",
+                    "user_id": "user123",
+                    "status": "completed",
+                },
+                {
+                    "task_id": "bt_b",
+                    "batch_id": "bb_del",
+                    "user_id": "user123",
+                    "status": "pending",
+                },
+            ]
+        ),
+        "backtest_results": FakeBacktestCollection(
+            [
+                {"task_id": "bt_a", "metrics": {}},
+                {"task_id": "bt_b", "metrics": {}},
+            ]
+        ),
+        "users": FakeBacktestCollection([]),
+    }
+    monkeypatch.setattr(backtest, "get_db_collections", lambda: collections)
+    monkeypatch.setattr(backtest, "get_analyzer_db", lambda: {"backtest_batch_reviews": FakeBacktestCollection([])})
+
+    client = TestClient(app)
+    client.app.dependency_overrides[get_current_user] = lambda: mock_user
+
+    response = client.delete("/api/backtest/batches/bb_del")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["deleted_tasks"] == 2
+    assert collections["backtest_batches"].find_one({"batch_id": "bb_del"}) is None
+    assert len(collections["backtest_tasks"].docs) == 0
+    assert len(collections["backtest_results"].docs) == 0
+
     client.app.dependency_overrides.clear()
 
 
