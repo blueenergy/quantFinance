@@ -34,27 +34,43 @@ class FakeBacktestCollection:
         self.docs.append(doc.copy())
         return InsertResult(doc_id)
     
-    def find(self, query=None):
+    def _matches(self, doc, query):
+        if not query:
+            return True
+        for key, value in query.items():
+            if key == "$or":
+                if not any(self._matches(doc, subquery) for subquery in value):
+                    return False
+                continue
+            doc_value = doc.get(key)
+            if isinstance(value, dict):
+                if "$exists" in value:
+                    exists = key in doc
+                    if exists != value["$exists"]:
+                        return False
+                if "$in" in value and doc_value not in value["$in"]:
+                    return False
+                if "$nin" in value and doc_value in value["$nin"]:
+                    return False
+                continue
+            if doc_value != value:
+                return False
+        return True
+
+    def find(self, query=None, projection=None):
         """Mock find with query support"""
         if query is None or query == {}:
             filtered = self.docs[:]
         else:
-            filtered = []
-            for doc in self.docs:
-                match = True
-                for key, value in query.items():
-                    if doc.get(key) != value:
-                        match = False
-                        break
-                if match:
-                    filtered.append(doc)
+            filtered = [doc for doc in self.docs if self._matches(doc, query)]
         
         class Cursor(list):
             def __init__(self, items):
                 super().__init__(items)
             
-            def sort(self, field, direction):
-                # Sort by field (we'll keep it simple for tests)
+            def sort(self, field, direction=None):
+                if isinstance(field, list):
+                    field, direction = field[0]
                 return Cursor(sorted(self, key=lambda x: x.get(field, ''), reverse=(direction == -1)))
             
             def limit(self, n):
@@ -65,12 +81,7 @@ class FakeBacktestCollection:
     def find_one(self, query):
         """Mock find_one"""
         for doc in self.docs:
-            match = True
-            for key, value in query.items():
-                if doc.get(key) != value:
-                    match = False
-                    break
-            if match:
+            if self._matches(doc, query):
                 return doc.copy()
         return None
     
@@ -82,12 +93,7 @@ class FakeBacktestCollection:
                 self.modified_count = modified_count
         
         for doc in self.docs:
-            match = True
-            for key, value in query.items():
-                if doc.get(key) != value:
-                    match = False
-                    break
-            if match:
+            if self._matches(doc, query):
                 if '$set' in update:
                     doc.update(update['$set'])
                 return UpdateResult(1, 1)
@@ -100,6 +106,37 @@ class FakeBacktestCollection:
             return UpdateResult(0, 1)
         
         return UpdateResult(0, 0)
+
+    def update_many(self, query, update):
+        """Mock update_many"""
+        class UpdateResult:
+            def __init__(self, matched_count, modified_count):
+                self.matched_count = matched_count
+                self.modified_count = modified_count
+
+        matched = 0
+        modified = 0
+        for doc in self.docs:
+            if self._matches(doc, query):
+                matched += 1
+                if '$set' in update:
+                    doc.update(update['$set'])
+                    modified += 1
+        return UpdateResult(matched, modified)
+
+    def insert_many(self, docs):
+        """Mock insert_many"""
+        class InsertManyResult:
+            def __init__(self, inserted_ids):
+                self.inserted_ids = inserted_ids
+
+        ids = []
+        for doc in docs:
+            doc_id = ObjectId()
+            doc['_id'] = doc_id
+            self.docs.append(doc.copy())
+            ids.append(doc_id)
+        return InsertManyResult(ids)
     
     def delete_one(self, query):
         """Mock delete_one"""
@@ -108,12 +145,7 @@ class FakeBacktestCollection:
                 self.deleted_count = deleted_count
         
         for i, doc in enumerate(self.docs):
-            match = True
-            for key, value in query.items():
-                if doc.get(key) != value:
-                    match = False
-                    break
-            if match:
+            if self._matches(doc, query):
                 del self.docs[i]
                 return DeleteResult(1)
         
@@ -148,7 +180,7 @@ def test_create_backtest_task(monkeypatch, mock_user):
         "backtest_results": FakeBacktestCollection([]),
         "users": FakeBacktestCollection([]),
         "stock_info": FakeBacktestCollection([
-            {"symbol": "000858", "name": "五粮液"}
+            {"symbol": "000858.SZ", "name": "五粮液"}
         ])
     }
     
@@ -172,7 +204,7 @@ def test_create_backtest_task(monkeypatch, mock_user):
     
     assert response.status_code == 200
     data = response.json()
-    assert data["symbol"] == "000858"
+    assert data["symbol"] == "000858.SZ"
     assert data["strategy_key"] == "turtle"
     assert data["preset"] == "turtle_conservative"
     assert data.get("stock_name") == "五粮液"
@@ -301,6 +333,104 @@ def test_list_backtest_tasks(monkeypatch, mock_user):
     assert len(data) == 1
     assert data[0]["status"] == "pending"
     
+    client.app.dependency_overrides.clear()
+
+
+@pytest.mark.unit
+def test_list_backtest_tasks_excludes_batch_children_by_default(monkeypatch, mock_user):
+    """Batch child tasks should stay out of the single-stock backtest page."""
+    collections = {
+        "backtest_tasks": FakeBacktestCollection([
+            {
+                "task_id": "bt_single",
+                "user_id": "user123",
+                "symbol": "000858",
+                "asset_type": "stock",
+                "strategy_key": "turtle",
+                "preset": None,
+                "strategy_params": {},
+                "start_date": "20240101",
+                "end_date": "20241231",
+                "initial_cash": 1000000.0,
+                "status": "completed",
+                "worker_id": None,
+                "created_at": datetime.now(),
+            },
+            {
+                "task_id": "bt_batch_child",
+                "batch_id": "bb_001",
+                "user_id": "user123",
+                "symbol": "600036",
+                "asset_type": "stock",
+                "strategy_key": "turtle",
+                "preset": None,
+                "strategy_params": {},
+                "start_date": "20240101",
+                "end_date": "20241231",
+                "initial_cash": 1000000.0,
+                "status": "completed",
+                "worker_id": None,
+                "created_at": datetime.now(),
+            },
+        ]),
+        "backtest_results": FakeBacktestCollection([]),
+        "users": FakeBacktestCollection([]),
+        "stock_info": FakeBacktestCollection([]),
+    }
+    monkeypatch.setattr(backtest, 'get_db_collections', lambda: collections)
+
+    client = TestClient(app)
+    client.app.dependency_overrides[get_current_user] = lambda: mock_user
+
+    response = client.get("/api/backtest/tasks")
+    assert response.status_code == 200
+    assert [row["task_id"] for row in response.json()] == ["bt_single"]
+
+    response = client.get("/api/backtest/tasks?include_batch=true")
+    assert response.status_code == 200
+    assert {row["task_id"] for row in response.json()} == {"bt_single", "bt_batch_child"}
+
+    client.app.dependency_overrides.clear()
+
+
+@pytest.mark.unit
+def test_list_backtest_tasks_tolerates_empty_historical_dates(monkeypatch, mock_user):
+    """Old malformed tasks with empty dates should not break task history."""
+    collections = {
+        "backtest_tasks": FakeBacktestCollection([
+            {
+                "task_id": "bt_dirty",
+                "user_id": "user123",
+                "symbol": "000858",
+                "asset_type": "stock",
+                "strategy_key": "turtle",
+                "preset": None,
+                "strategy_params": {},
+                "start_date": "",
+                "end_date": "",
+                "initial_cash": 1000000.0,
+                "status": "failed",
+                "worker_id": None,
+                "created_at": datetime.now(),
+                "error_message": "legacy bad task",
+            },
+        ]),
+        "backtest_results": FakeBacktestCollection([]),
+        "users": FakeBacktestCollection([]),
+        "stock_info": FakeBacktestCollection([]),
+    }
+    monkeypatch.setattr(backtest, 'get_db_collections', lambda: collections)
+
+    client = TestClient(app)
+    client.app.dependency_overrides[get_current_user] = lambda: mock_user
+
+    response = client.get("/api/backtest/tasks")
+    assert response.status_code == 200
+    data = response.json()
+    assert data[0]["task_id"] == "bt_dirty"
+    assert data[0]["start_date"] is None
+    assert data[0]["end_date"] is None
+
     client.app.dependency_overrides.clear()
 
 
@@ -594,6 +724,51 @@ def test_poll_pending_tasks(monkeypatch, mock_user):
     
 
 @pytest.mark.unit
+def test_poll_pending_tasks_marks_missing_dates_failed(monkeypatch, mock_user):
+    """Worker poll should quarantine malformed pending tasks instead of dispatching them."""
+    collections = {
+        "backtest_tasks": FakeBacktestCollection([
+            {
+                "task_id": "bt_dirty",
+                "user_id": "user123",
+                "symbol": "000858",
+                "strategy_key": "turtle",
+                "strategy_params": {},
+                "start_date": "",
+                "end_date": "",
+                "initial_cash": 1000000.0,
+                "status": "pending",
+                "created_at": datetime.now(),
+            },
+            {
+                "task_id": "bt_valid",
+                "user_id": "user123",
+                "symbol": "600036",
+                "strategy_key": "turtle",
+                "strategy_params": {},
+                "start_date": "20240101",
+                "end_date": "20241231",
+                "initial_cash": 1000000.0,
+                "status": "pending",
+                "created_at": datetime.now(),
+            },
+        ]),
+        "backtest_results": FakeBacktestCollection([]),
+        "users": FakeBacktestCollection([]),
+    }
+    monkeypatch.setattr(backtest, 'get_db_collections', lambda: collections)
+
+    client = TestClient(app)
+    response = client.get("/api/backtest/tasks/pending/poll", headers=worker_headers(monkeypatch))
+
+    assert response.status_code == 200
+    assert [task["task_id"] for task in response.json()] == ["bt_valid"]
+    dirty = collections["backtest_tasks"].find_one({"task_id": "bt_dirty"})
+    assert dirty["status"] == "failed"
+    assert "start_date/end_date" in dirty["error_message"]
+
+
+@pytest.mark.unit
 def test_claim_backtest_task(monkeypatch, mock_user):
     """Test worker claiming a task"""
     # Create fresh collections for this test
@@ -713,6 +888,64 @@ def test_report_backtest_result(monkeypatch, mock_user):
     assert result["task_id"] == "bt_001"
     assert result["metrics"]["total_return"] == 0.15
     
+
+@pytest.mark.unit
+def test_report_backtest_result_cleans_large_ints(monkeypatch):
+    """Persisting worker results should not fail on values beyond BSON int64."""
+    collections = {
+        "backtest_tasks": FakeBacktestCollection([
+            {
+                "task_id": "bt_001",
+                "user_id": "user123",
+                "symbol": "000858",
+                "strategy_key": "turtle",
+                "strategy_params": {},
+                "start_date": "20240101",
+                "end_date": "20241231",
+                "initial_cash": 1000000.0,
+                "status": "claimed",
+                "worker_id": "worker1",
+                "created_at": datetime.now(),
+            }
+        ]),
+        "backtest_results": FakeBacktestCollection([]),
+        "users": FakeBacktestCollection([]),
+    }
+    monkeypatch.setattr(backtest, 'get_db_collections', lambda: collections)
+
+    huge_int = 2 ** 80
+    client = TestClient(app)
+    response = client.post(
+        "/api/backtest/tasks/bt_001/report",
+        json={
+            "metrics": {
+                "total_return": 0.15,
+                "sharpe_ratio": 1.2,
+                "max_drawdown": -0.08,
+                "win_rate": 0.6,
+                "total_trades": huge_int,
+            },
+            "trades": [
+                {
+                    "datetime": "2024-03-15 10:30:00",
+                    "action": "buy",
+                    "price": 15.5,
+                    "quantity": huge_int,
+                    "commission": 5.0,
+                    "pnl": 0,
+                    "cumulative_pnl": 0,
+                }
+            ],
+            "equity_curve": [{"date": "2024-12-31", "value": huge_int}],
+        },
+        headers=worker_headers(monkeypatch),
+    )
+
+    assert response.status_code == 200
+    stored = collections["backtest_results"].docs[0]
+    assert stored["metrics"]["total_trades"] == str(huge_int)
+    assert stored["trades"][0]["quantity"] == str(huge_int)
+
 
 @pytest.mark.unit
 def test_report_backtest_failure(monkeypatch, mock_user):

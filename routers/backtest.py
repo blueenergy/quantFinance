@@ -375,7 +375,9 @@ def _clean_for_mongo(value: Any) -> Any:
     if isinstance(value, float):
         return value if math.isfinite(value) else None
     if isinstance(value, int):
-        return value
+        if -(2 ** 63) <= value <= (2 ** 63 - 1):
+            return value
+        return str(value)
     if isinstance(value, dict):
         return {str(k): _clean_for_mongo(v) for k, v in value.items()}
     if isinstance(value, (list, tuple)):
@@ -383,6 +385,37 @@ def _clean_for_mongo(value: Any) -> Any:
     if hasattr(value, "item"):
         try:
             return _clean_for_mongo(value.item())
+        except Exception:
+            pass
+    if hasattr(value, "isoformat"):
+        try:
+            return value.isoformat()
+        except Exception:
+            pass
+    return str(value)
+
+
+def _clean_for_response(value: Any) -> Any:
+    """Normalize Mongo documents for FastAPI JSON responses."""
+    if value is None or isinstance(value, (str, bool)):
+        return value
+    if isinstance(value, ObjectId):
+        return str(value)
+    if isinstance(value, (datetime, date)):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, int):
+        if -(2 ** 63) <= value <= (2 ** 63 - 1):
+            return value
+        return str(value)
+    if isinstance(value, dict):
+        return {str(k): _clean_for_response(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_clean_for_response(v) for v in value]
+    if hasattr(value, "item"):
+        try:
+            return _clean_for_response(value.item())
         except Exception:
             pass
     if hasattr(value, "isoformat"):
@@ -460,7 +493,7 @@ def _serialize_batch(batch: Dict[str, Any], summary: Optional[Dict[str, Any]] = 
     if summary is not None:
         out["summary"] = summary
         out["status"] = summary.get("status", out.get("status"))
-    return out
+    return _clean_for_response(out)
 
 
 def require_backtest_worker_token(
@@ -683,7 +716,7 @@ async def get_backtest_batch_results(
     present.sort(key=lambda r: r.get(sort_by), reverse=reverse)
     rows = present + missing
     total = len(rows)
-    return {"batch_id": batch_id, "total": total, "offset": offset, "limit": limit, "rows": rows[offset:offset + limit]}
+    return _clean_for_response({"batch_id": batch_id, "total": total, "offset": offset, "limit": limit, "rows": rows[offset:offset + limit]})
 
 
 @router.post("/batches/{batch_id}/cancel")
@@ -796,7 +829,7 @@ async def list_backtest_batch_reviews(
         .sort("created_at", -1)
         .limit(limit)
     )
-    return [{k: v for k, v in review.items() if k != "_id"} for review in reviews]
+    return [_clean_for_response({k: v for k, v in review.items() if k != "_id"}) for review in reviews]
 
 
 @router.get("/tasks", response_model=List[BacktestTaskResponse])
