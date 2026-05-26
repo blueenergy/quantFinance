@@ -39,6 +39,15 @@ STOCK_RANKING_INDEX_CODES: Tuple[str, ...] = (
     "star50",
 )
 
+SCORE_SORT_FIELDS: Dict[str, str] = {
+    "cycle": "cycle_score",
+    "growth": "growth_score",
+    "fundamental": "fundamental_score",
+    "value": "value_score",
+    "technical": "technical_score",
+    "money_flow": "money_flow_score",
+}
+
 
 def _aggregate_index_ranking_score_docs(
     stock_scores: Any, index_code: str, score_date: Optional[str]
@@ -61,6 +70,25 @@ def _aggregate_index_ranking_score_docs(
         return list(stock_scores.aggregate(pipeline))
     except Exception:
         return []
+
+
+def _normalize_sort_by(sort_by: Optional[str]) -> str:
+    key = (sort_by or "composite").strip().lower()
+    if key in ("composite", "total", "score"):
+        return "composite"
+    if key not in SCORE_SORT_FIELDS:
+        raise HTTPException(
+            status_code=400,
+            detail="不支持的 sort_by: %s；允许: composite, %s"
+            % (sort_by, ", ".join(SCORE_SORT_FIELDS.keys())),
+        )
+    return key
+
+
+def _score_sort_value(row: dict, sort_by: str, strategy: str) -> float:
+    if sort_by == "composite":
+        return extract_strategy_score(row.get("composite_score", 0), strategy)
+    return safe_float(row.get(SCORE_SORT_FIELDS[sort_by]), 0.0)
 
 
 # using helpers from stock-scoring-system/utils/score_utils.py
@@ -573,6 +601,10 @@ async def get_stock_rankings_by_index(
         "balanced",
         description="与全市场榜一致：balanced/aggressive/conservative 等",
     ),
+    sort_by: str = Query(
+        "composite",
+        description="排序维度：composite/cycle/growth/fundamental/value/technical/money_flow",
+    ),
     date: Optional[str] = Query(
         None,
         description="YYYYMMDD；不传则每只股票取最新 score_date 后再筛 index_codes",
@@ -597,11 +629,10 @@ async def get_stock_rankings_by_index(
         stock_scores = db["stock_scores"]
         stock_info = db["stock_info"]
         effective_strategy = (strategy or "balanced").strip() or "balanced"
+        sort_key = _normalize_sort_by(sort_by)
         raw = _aggregate_index_ranking_score_docs(stock_scores, ic, date)
         raw.sort(
-            key=lambda d: extract_strategy_score(
-                d.get("composite_score", 0), effective_strategy
-            ),
+            key=lambda d: _score_sort_value(d, sort_key, effective_strategy),
             reverse=True,
         )
         symbols = [s.get("symbol") for s in raw if s.get("symbol")]
@@ -675,7 +706,11 @@ async def get_stock_rankings(
     min_score: Optional[float] = Query(None, description="最低分数过滤"),
     exclude_st: bool = Query(True, description="是否排除ST股票"),
     date: Optional[str] = Query(None, description="指定日期 YYYYMMDD,默认为最新日期"),
-    strategy: str = Query('balanced', description="指定排行榜策略，balanced/aggressive/conservative")
+    strategy: str = Query('balanced', description="指定排行榜策略，balanced/aggressive/conservative"),
+    sort_by: str = Query(
+        "composite",
+        description="排序维度：composite/cycle/growth/fundamental/value/technical/money_flow",
+    ),
 ):
     """
     获取股票评分排行榜 - 每只股票只显示最新一天的评分（简洁实现）
@@ -684,6 +719,8 @@ async def get_stock_rankings(
         db = get_db_collections_from_request(request)
         stock_scores = db['stock_scores']
         stock_info = db['stock_info']
+        effective_strategy = (strategy or "balanced").strip() or "balanced"
+        sort_key = _normalize_sort_by(sort_by)
 
         # Efficient aggregation: $sort -> $group (first doc) -> project -> sort
         if date:
@@ -704,7 +741,6 @@ async def get_stock_rankings(
                     "score_date": 1
                 }},
                 {"$sort": {"composite_score": -1}},
-                {"$limit": limit * 2}
             ]
         else:
             # sort by score_date desc, then group by symbol taking first
@@ -728,7 +764,6 @@ async def get_stock_rankings(
                 pipeline.append({"$match": {"composite_score": {"$gte": min_score}}})
             pipeline.extend([
                 {"$sort": {"composite_score": -1}},
-                {"$limit": limit * 2}
             ])
 
         try:
@@ -759,7 +794,10 @@ async def get_stock_rankings(
             top_stocks = all_stocks
 
         # use centralized helper to extract strategy-specific score
-        top_stocks.sort(key=lambda s: extract_strategy_score(s.get('composite_score', 0), strategy), reverse=True)
+        top_stocks.sort(
+            key=lambda s: _score_sort_value(s, sort_key, effective_strategy),
+            reverse=True,
+        )
 
         formatted = []
         for stock in top_stocks[:limit]:
@@ -1115,6 +1153,10 @@ async def get_selected_stock_rankings(
         None,
         description="与 /stock-rankings 一致，如 balanced/aggressive/conservative；优先于 body.strategy",
     ),
+    sort_by: str = Query(
+        "composite",
+        description="排序维度：composite/cycle/growth/fundamental/value/technical/money_flow",
+    ),
     offset: int = Query(0, ge=0, description="分页：排序后截取起点"),
     page_size: Optional[int] = Query(
         None,
@@ -1137,6 +1179,7 @@ async def get_selected_stock_rankings(
         qs = (strategy or "").strip()
         bs = (body.strategy or "").strip() if body.strategy else ""
         effective_strategy = qs or bs or "balanced"
+        sort_key = _normalize_sort_by(sort_by)
         # support optional multi-date per-symbol queries via body.dates
         dates = getattr(body, 'dates', None) or None
         if dates:
@@ -1215,7 +1258,17 @@ async def get_selected_stock_rankings(
                     'score_date': latest_any.get('score_date') if latest_any else ''
                 })
             formatted_stocks.sort(
-                key=lambda row: extract_strategy_score(row.get("composite_score", 0), effective_strategy),
+                key=lambda row: (
+                    _score_sort_value(row, sort_key, effective_strategy)
+                    if sort_key == "composite"
+                    else max(
+                        (
+                            safe_float(fields.get(SCORE_SORT_FIELDS[sort_key]), 0.0)
+                            for fields in (row.get("per_date_fields") or {}).values()
+                        ),
+                        default=0.0,
+                    )
+                ),
                 reverse=True,
             )
             return {
@@ -1274,7 +1327,7 @@ async def get_selected_stock_rankings(
             stock["industry"] = inf.get("industry", "") if inf else ""
         # 按当前策略降序（兼容 composite_score 为 dict 或数值；聚合 $sort 对 dict 不可靠，统一在 Python 侧排序）
         selected_stocks.sort(
-            key=lambda x: extract_strategy_score(x.get("composite_score", 0), effective_strategy),
+            key=lambda x: _score_sort_value(x, sort_key, effective_strategy),
             reverse=True,
         )
         # 格式化返回数据

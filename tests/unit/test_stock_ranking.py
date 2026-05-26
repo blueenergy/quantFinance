@@ -209,6 +209,27 @@ def test_stock_rankings_sorts_mixed_composite(monkeypatch):
 
 
 @pytest.mark.unit
+def test_stock_rankings_can_sort_by_single_dimension(monkeypatch):
+    docs = [
+        {'symbol': 'AAA.SH', 'composite_score': {'balanced': 90}, 'cycle_score': 1, 'value_score': 2, 'fundamental_score': 3, 'growth_score': 10, 'technical_score': 5, 'money_flow_score': 20, 'score_date': '20250920'},
+        {'symbol': 'BBB.SH', 'composite_score': {'balanced': 70}, 'cycle_score': 1, 'value_score': 2, 'fundamental_score': 3, 'growth_score': 95, 'technical_score': 5, 'money_flow_score': 10, 'score_date': '20250920'},
+    ]
+    info_docs = [{'symbol': 'AAA.SH', 'name': 'A Corp'}, {'symbol': 'BBB.SH', 'name': 'B Corp'}]
+    fake_db = FakeDB(stock_scores_docs=docs, stock_info_docs=info_docs)
+    monkeypatch.setattr(stock_ranking, 'get_db_collections', lambda: fake_db)
+    monkeypatch.setattr(
+        stock_ranking,
+        'get_data_db',
+        lambda: {'volume_price': FakeVolumePriceCollection([])},
+    )
+
+    client = TestClient(app)
+    resp = client.get('/api/stock-rankings?limit=2&sort_by=growth')
+    assert resp.status_code == 200
+    assert [row['symbol'] for row in resp.json()['data']] == ['BBB.SH', 'AAA.SH']
+
+
+@pytest.mark.unit
 def test_selected_stock_rankings_defaults_and_fields(monkeypatch):
     docs = [
         {'symbol': 'CCC.SH', 'composite_score': {'balanced': 60}, 'cycle_score': 11, 'value_score': 19, 'fundamental_score': 25, 'growth_score': 6, 'technical_score': 9, 'money_flow_score': 5, 'score_date': '20250919'},
@@ -366,6 +387,49 @@ def test_selected_stock_rankings_sorts_by_strategy_query(monkeypatch):
     )
     assert r_q_over.status_code == 200
     assert [s["symbol"] for s in r_q_over.json()["data"]] == ["AAA.SH", "BBB.SH"]
+
+
+@pytest.mark.unit
+def test_selected_stock_rankings_can_sort_by_dimension(monkeypatch):
+    docs = [
+        {
+            "symbol": "AAA.SH",
+            "composite_score": {"balanced": 90},
+            "cycle_score": 1,
+            "value_score": 1,
+            "fundamental_score": 1,
+            "growth_score": 50,
+            "technical_score": 1,
+            "money_flow_score": 10,
+            "score_date": "20250919",
+        },
+        {
+            "symbol": "BBB.SH",
+            "composite_score": {"balanced": 60},
+            "cycle_score": 1,
+            "value_score": 1,
+            "fundamental_score": 1,
+            "growth_score": 40,
+            "technical_score": 1,
+            "money_flow_score": 99,
+            "score_date": "20250919",
+        },
+    ]
+    info_docs = [{"symbol": "AAA.SH", "name": "A"}, {"symbol": "BBB.SH", "name": "B"}]
+    fake_db = FakeDB(stock_scores_docs=docs, stock_info_docs=info_docs)
+    monkeypatch.setattr(stock_ranking, "get_db_collections", lambda: fake_db)
+    monkeypatch.setattr(
+        stock_ranking,
+        "get_data_db",
+        lambda: {"volume_price": FakeVolumePriceCollection([])},
+    )
+    client = TestClient(app)
+    r = client.post(
+        "/api/stock-rankings/selected?sort_by=money_flow",
+        json={"symbols": ["AAA.SH", "BBB.SH"]},
+    )
+    assert r.status_code == 200
+    assert [s["symbol"] for s in r.json()["data"]] == ["BBB.SH", "AAA.SH"]
 
 
 @pytest.mark.unit
@@ -724,7 +788,7 @@ def test_by_index_rankings_latest_per_symbol_and_sort(monkeypatch):
             "cycle_score": 1,
             "value_score": 1,
             "fundamental_score": 1,
-            "growth_score": 1,
+            "growth_score": 5,
             "technical_score": 1,
             "money_flow_score": 1,
             "score_date": "20250920",
@@ -736,7 +800,7 @@ def test_by_index_rankings_latest_per_symbol_and_sort(monkeypatch):
             "cycle_score": 1,
             "value_score": 1,
             "fundamental_score": 1,
-            "growth_score": 1,
+            "growth_score": 9,
             "technical_score": 1,
             "money_flow_score": 1,
             "score_date": "20250920",
@@ -779,6 +843,11 @@ def test_by_index_rankings_latest_per_symbol_and_sort(monkeypatch):
     r_agg = client.get("/api/stock-rankings/by-index/csi500?strategy=aggressive")
     # A 最新 aggressive=20，B=30 → 降序 B 在前
     assert [x["symbol"] for x in r_agg.json()["data"]] == ["B.SH", "A.SH"]
+
+    r_growth = client.get("/api/stock-rankings/by-index/csi500?sort_by=growth")
+    assert r_growth.status_code == 200
+    # A 最新 growth=5，B=9 → 按成长分降序 B 在前。
+    assert [x["symbol"] for x in r_growth.json()["data"]] == ["B.SH", "A.SH"]
 
 
 @pytest.mark.unit
