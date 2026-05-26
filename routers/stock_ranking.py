@@ -5,6 +5,7 @@ from utils.score_utils import safe_round, safe_float, extract_strategy_score
 from typing import Optional, List, Any, cast, Dict, Tuple, Set
 from pydantic import BaseModel
 from datetime import datetime, timedelta
+from calendar import monthrange
 from bson import ObjectId
 
 router = APIRouter(tags=["股票排名"])
@@ -74,6 +75,12 @@ RETURN_SINCE_EMPTY: Dict[str, Any] = {
     "return_since_score_pct": None,
     "price_base_trade_date": None,
     "price_latest_trade_date": None,
+}
+
+PRIOR_3M_EMPTY: Dict[str, Any] = {
+    "prior_3m_return_pct": None,
+    "prior_3m_base_trade_date": None,
+    "prior_3m_end_trade_date": None,
 }
 
 
@@ -263,6 +270,36 @@ def _return_since_from_docs(latest_doc: Optional[dict], base_doc: Optional[dict]
     return out
 
 
+def _yyyymmdd_months_before(date_str: str, months: int) -> Optional[str]:
+    """Return YYYYMMDD roughly ``months`` calendar months before ``date_str``."""
+    s = str(date_str or "").strip().replace("-", "")[:8]
+    if len(s) < 8:
+        return None
+    try:
+        y, m, d = int(s[:4]), int(s[4:6]), int(s[6:8])
+    except ValueError:
+        return None
+    m -= months
+    while m <= 0:
+        y -= 1
+        m += 12
+    d = min(d, monthrange(y, m)[1])
+    return f"{y:04d}{m:02d}{d:02d}"
+
+
+def _prior_3m_return_from_docs(end_doc: Optional[dict], base_doc: Optional[dict]) -> dict:
+    out = dict(PRIOR_3M_EMPTY)
+    end_close = _close_from_volume_price_doc(end_doc)
+    base_close = _close_from_volume_price_doc(base_doc)
+    if end_close is None or base_close is None:
+        return out
+    pct = (end_close / base_close - 1.0) * 100.0
+    out["prior_3m_return_pct"] = round(pct, 2)
+    out["prior_3m_base_trade_date"] = _trade_date_str(base_doc)
+    out["prior_3m_end_trade_date"] = _trade_date_str(end_doc)
+    return out
+
+
 def _pick_vp_doc(vp_by_symbol: Dict[str, Any], sym: str) -> Optional[dict]:
     """从 bulk 结果中取文档：``volume_price.symbol`` 可能与 ``stock_scores`` 后缀不一致。"""
     for k in _symbol_key_variants(sym):
@@ -354,6 +391,34 @@ def compute_return_since_score(
     return _return_since_from_docs(latest_doc, base_doc)
 
 
+def compute_prior_3m_return(
+    volume_price_col: Any,
+    symbol: str,
+    score_date: str,
+    end_by_key: Dict[Tuple[str, str], Any],
+    base_by_key: Dict[Tuple[str, str], Any],
+) -> dict:
+    """
+    Baseline: last trading day's close on or before score_date minus 3 calendar months.
+    End: last trading day's close on or before score_date.
+    """
+    if not symbol or not score_date or len(str(score_date).strip()) < 8:
+        return dict(PRIOR_3M_EMPTY)
+    sd = str(score_date).strip()[:8]
+    base_sd = _yyyymmdd_months_before(sd, 3)
+    if not base_sd:
+        return dict(PRIOR_3M_EMPTY)
+
+    end_key = (symbol, sd)
+    if end_key not in end_by_key:
+        end_by_key[end_key] = _fetch_base_doc_single(volume_price_col, symbol, sd)
+    base_key = (symbol, base_sd)
+    if base_key not in base_by_key:
+        base_by_key[base_key] = _fetch_base_doc_single(volume_price_col, symbol, base_sd)
+
+    return _prior_3m_return_from_docs(end_by_key[end_key], base_by_key[base_key])
+
+
 def enrich_rows_return_since_score(rows: List[dict], volume_price_col: Any) -> None:
     """批量写涨跌字段：Mongo 往返约 1 + 不同 score_date 种数 + 少量回退查询。"""
     if not rows:
@@ -420,6 +485,84 @@ def enrich_rows_return_since_score(rows: List[dict], volume_price_col: Any) -> N
         latest_doc = _pick_vp_doc(latest_map, sym)
         base_doc = base_map.get((sym, sd))
         row.update(_return_since_from_docs(latest_doc, base_doc))
+
+
+def enrich_rows_prior_3m_return(rows: List[dict], volume_price_col: Any) -> None:
+    """批量写评分日前 3 个月涨跌字段。"""
+    if not rows:
+        return
+    if not hasattr(volume_price_col, "aggregate"):
+        end_by_key: Dict[Tuple[str, str], Any] = {}
+        base_by_key: Dict[Tuple[str, str], Any] = {}
+        for row in rows:
+            row.update(
+                compute_prior_3m_return(
+                    volume_price_col,
+                    row.get("symbol") or "",
+                    str(row.get("score_date") or ""),
+                    end_by_key,
+                    base_by_key,
+                )
+            )
+        return
+
+    by_sd: Dict[str, List[str]] = {}
+    for row in rows:
+        sym = row.get("symbol") or ""
+        sd = str(row.get("score_date") or "").strip()[:8]
+        if len(sd) < 8 or not sym:
+            row.update(dict(PRIOR_3M_EMPTY))
+            continue
+        by_sd.setdefault(sd, []).append(sym)
+
+    end_map: Dict[Tuple[str, str], Any] = {}
+    base_map: Dict[Tuple[str, str], Any] = {}
+    for sd, syms in by_sd.items():
+        base_sd = _yyyymmdd_months_before(sd, 3)
+        if not base_sd:
+            continue
+        uniq_syms = list(dict.fromkeys(syms))
+        uniq_vp = _expanded_query_symbols(uniq_syms)
+        end_bulk = _bulk_base_by_symbol_string(volume_price_col, uniq_vp, sd)
+        base_bulk = _bulk_base_by_symbol_string(volume_price_col, uniq_vp, base_sd)
+        for sym in uniq_syms:
+            end_doc = _pick_vp_doc(end_bulk, sym)
+            if end_doc and _close_from_volume_price_doc(end_doc) is not None:
+                end_map[(sym, sd)] = end_doc
+            base_doc = _pick_vp_doc(base_bulk, sym)
+            if base_doc and _close_from_volume_price_doc(base_doc) is not None:
+                base_map[(sym, base_sd)] = base_doc
+        for sym in uniq_syms:
+            if (sym, sd) not in end_map:
+                doc = None
+                for k in _symbol_key_variants(sym):
+                    fd = _fetch_base_doc_single(volume_price_col, k, sd)
+                    if fd and _close_from_volume_price_doc(fd) is not None:
+                        doc = fd
+                        break
+                end_map[(sym, sd)] = doc
+            if (sym, base_sd) not in base_map:
+                doc = None
+                for k in _symbol_key_variants(sym):
+                    fd = _fetch_base_doc_single(volume_price_col, k, base_sd)
+                    if fd and _close_from_volume_price_doc(fd) is not None:
+                        doc = fd
+                        break
+                base_map[(sym, base_sd)] = doc
+
+    for row in rows:
+        sym = row.get("symbol") or ""
+        sd = str(row.get("score_date") or "").strip()[:8]
+        base_sd = _yyyymmdd_months_before(sd, 3)
+        if not sym or len(sd) < 8 or not base_sd:
+            row.update(dict(PRIOR_3M_EMPTY))
+            continue
+        row.update(
+            _prior_3m_return_from_docs(
+                end_map.get((sym, sd)),
+                base_map.get((sym, base_sd)),
+            )
+        )
 
 
 @router.get("/stock-rankings/by-index/{index_code}")
@@ -502,6 +645,7 @@ async def get_stock_rankings_by_index(
                 "score_date": stock.get("score_date", ""),
             }
             row.update(dict(RETURN_SINCE_EMPTY))
+            row.update(dict(PRIOR_3M_EMPTY))
             formatted.append(row)
         return {
             "success": True,
@@ -624,7 +768,7 @@ async def get_stock_rankings(
             if not isinstance(cs, dict):
                 cs = {'balanced': cs}
 
-            formatted.append({
+            row = {
                 'symbol': stock.get('symbol', ''),
                 'name': stock.get('name', ''),
                 'industry': stock.get('industry', ''),
@@ -636,12 +780,17 @@ async def get_stock_rankings(
                 'technical_score': safe_round(stock.get('technical_score', 0), 2),
                 'money_flow_score': safe_round(stock.get('money_flow_score', 0), 2),
                 'score_date': stock.get('score_date', '')
-            })
+            }
+            row.update(dict(RETURN_SINCE_EMPTY))
+            row.update(dict(PRIOR_3M_EMPTY))
+            formatted.append(row)
 
         try:
-            enrich_rows_return_since_score(formatted, get_data_db()["volume_price"])
+            vp_col = get_data_db()["volume_price"]
+            enrich_rows_return_since_score(formatted, vp_col)
+            enrich_rows_prior_3m_return(formatted, vp_col)
         except Exception as ex:
-            print(f"[stock-rankings] enrich return_since_score failed: {ex}")
+            print(f"[stock-rankings] enrich price returns failed: {ex}")
 
         return {
             "success": True,
@@ -1011,13 +1160,19 @@ async def get_selected_stock_rankings(
                 per_date_scores = {}
                 per_date_fields = {}
                 per_date_return_since: Dict[str, dict] = {}
+                per_date_prior_3m_return: Dict[str, dict] = {}
                 latest_by_symbol: Dict[str, Any] = {}
                 base_by_key: Dict[Tuple[str, str], Any] = {}
+                prior_end_by_key: Dict[Tuple[str, str], Any] = {}
+                prior_base_by_key: Dict[Tuple[str, str], Any] = {}
                 latest_any = None
                 for d in dates:
                     if vp_col is not None:
                         per_date_return_since[d] = compute_return_since_score(
                             vp_col, sym, d, latest_by_symbol, base_by_key
+                        )
+                        per_date_prior_3m_return[d] = compute_prior_3m_return(
+                            vp_col, sym, d, prior_end_by_key, prior_base_by_key
                         )
                     else:
                         per_date_return_since[d] = {
@@ -1025,6 +1180,7 @@ async def get_selected_stock_rankings(
                             "price_base_trade_date": None,
                             "price_latest_trade_date": None,
                         }
+                        per_date_prior_3m_return[d] = dict(PRIOR_3M_EMPTY)
                     doc = _find_one_stock_score(stock_scores, sym, d)
                     if doc:
                         latest_any = latest_any or doc
@@ -1055,6 +1211,7 @@ async def get_selected_stock_rankings(
                     'per_date_scores': per_date_scores,
                     'per_date_fields': per_date_fields,
                     'per_date_return_since': per_date_return_since,
+                    'per_date_prior_3m_return': per_date_prior_3m_return,
                     'score_date': latest_any.get('score_date') if latest_any else ''
                 })
             formatted_stocks.sort(
@@ -1141,6 +1298,8 @@ async def get_selected_stock_rankings(
                 'money_flow_score': safe_round(stock.get('money_flow_score', 0), 2),
                 'score_date': stock.get('score_date', date if date else '')
             }
+            formatted_stock.update(dict(RETURN_SINCE_EMPTY))
+            formatted_stock.update(dict(PRIOR_3M_EMPTY))
             formatted_stocks.append(formatted_stock)
         total_all = len(formatted_stocks)
         if page_size is not None:
@@ -1149,14 +1308,17 @@ async def get_selected_stock_rankings(
             page_rows = formatted_stocks
         if _should_enrich_return_since(body, len(symbols)):
             try:
+                vp_col = get_data_db()["volume_price"]
                 enrich_rows_return_since_score(
-                    page_rows, get_data_db()["volume_price"]
+                    page_rows, vp_col
                 )
+                enrich_rows_prior_3m_return(page_rows, vp_col)
             except Exception as ex:
-                print(f"[stock-rankings/selected] enrich return_since_score failed: {ex}")
+                print(f"[stock-rankings/selected] enrich price returns failed: {ex}")
         else:
             for fs in page_rows:
                 fs.update(RETURN_SINCE_EMPTY)
+                fs.update(PRIOR_3M_EMPTY)
         for fs in page_rows:
             fs["symbol"] = _requested_symbol_for_db_row(fs.get("symbol", ""), symbols)
         eff_page_size = page_size if page_size is not None else total_all

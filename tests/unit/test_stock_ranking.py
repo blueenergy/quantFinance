@@ -161,9 +161,11 @@ class FakeVolumePriceCollection:
 
 def _vp_ranking_pair():
     return [
+        {"symbol": "AAA.SH", "trade_date": "20250620", "close": 80},
         {"symbol": "AAA.SH", "trade_date": "20250901", "close": 50},
         {"symbol": "AAA.SH", "trade_date": "20250920", "close": 100},
         {"symbol": "AAA.SH", "trade_date": "20251001", "close": 110},
+        {"symbol": "BBB.SH", "trade_date": "20250620", "close": 250},
         {"symbol": "BBB.SH", "trade_date": "20250920", "close": 200},
         {"symbol": "BBB.SH", "trade_date": "20251001", "close": 180},
     ]
@@ -200,6 +202,10 @@ def test_stock_rankings_sorts_mixed_composite(monkeypatch):
     assert data['data'][1]['return_since_score_pct'] == pytest.approx(10.0)
     assert data['data'][1]['price_base_trade_date'] == '20250920'
     assert data['data'][1]['price_latest_trade_date'] == '20251001'
+    assert data['data'][0]['prior_3m_return_pct'] == pytest.approx(-20.0)
+    assert data['data'][1]['prior_3m_return_pct'] == pytest.approx(25.0)
+    assert data['data'][1]['prior_3m_base_trade_date'] == '20250620'
+    assert data['data'][1]['prior_3m_end_trade_date'] == '20250920'
 
 
 @pytest.mark.unit
@@ -216,9 +222,11 @@ def test_selected_stock_rankings_defaults_and_fields(monkeypatch):
 
     monkeypatch.setattr(stock_ranking, 'get_db_collections', fake_get_collections)
     vp = [
+        {"symbol": "CCC.SH", "trade_date": "20250619", "close": 50},
         {"symbol": "CCC.SH", "trade_date": "20250910", "close": 80},
         {"symbol": "CCC.SH", "trade_date": "20250919", "close": 100},
         {"symbol": "CCC.SH", "trade_date": "20251005", "close": 115},
+        {"symbol": "DDD.SH", "trade_date": "20250619", "close": 50},
         {"symbol": "DDD.SH", "trade_date": "20250919", "close": 50},
         {"symbol": "DDD.SH", "trade_date": "20251005", "close": 50},
     ]
@@ -243,6 +251,9 @@ def test_selected_stock_rankings_defaults_and_fields(monkeypatch):
     by_sym = {s['symbol']: s for s in j['data']}
     assert by_sym['CCC.SH']['return_since_score_pct'] == pytest.approx(15.0)
     assert by_sym['DDD.SH']['return_since_score_pct'] == pytest.approx(0.0)
+    assert by_sym['CCC.SH']['prior_3m_return_pct'] == pytest.approx(100.0)
+    assert by_sym['CCC.SH']['prior_3m_base_trade_date'] == '20250619'
+    assert by_sym['CCC.SH']['prior_3m_end_trade_date'] == '20250919'
 
 
 @pytest.mark.unit
@@ -256,6 +267,8 @@ def test_selected_multi_date_per_date_return_since(monkeypatch):
 
     monkeypatch.setattr(stock_ranking, 'get_db_collections', lambda: fake_db)
     vp = [
+        {"symbol": "EEE.SH", "trade_date": "20250610", "close": 5},
+        {"symbol": "EEE.SH", "trade_date": "20250620", "close": 10},
         {"symbol": "EEE.SH", "trade_date": "20250905", "close": 10},
         {"symbol": "EEE.SH", "trade_date": "20250910", "close": 10},
         {"symbol": "EEE.SH", "trade_date": "20250920", "close": 20},
@@ -282,6 +295,11 @@ def test_selected_multi_date_per_date_return_since(monkeypatch):
     assert pr['20250910']['return_since_score_pct'] == pytest.approx(300.0)
     # 20250920 base close 20, latest 40 -> +100%
     assert pr['20250920']['return_since_score_pct'] == pytest.approx(100.0)
+    p3 = row['per_date_prior_3m_return']
+    assert p3['20250910']['prior_3m_return_pct'] == pytest.approx(100.0)
+    assert p3['20250920']['prior_3m_return_pct'] == pytest.approx(100.0)
+    assert p3['20250920']['prior_3m_base_trade_date'] == '20250620'
+    assert p3['20250920']['prior_3m_end_trade_date'] == '20250920'
 
 
 @pytest.mark.unit
@@ -534,6 +552,7 @@ def test_selected_skips_volume_price_enrich_when_over_auto_threshold(monkeypatch
     assert r.status_code == 200
     for row in r.json()["data"]:
         assert row.get("return_since_score_pct") is None
+        assert row.get("prior_3m_return_pct") is None
 
 
 @pytest.mark.unit
@@ -639,6 +658,7 @@ def test_selected_index_mode_skips_enrich(monkeypatch):
     assert r.status_code == 200
     assert called == []
     assert r.json()["data"][0].get("return_since_score_pct") is None
+    assert r.json()["data"][0].get("prior_3m_return_pct") is None
 
 
 @pytest.mark.unit
@@ -679,6 +699,7 @@ def test_selected_skip_return_since_true_in_body(monkeypatch):
     assert r.status_code == 200
     assert called == []
     assert r.json()["data"][0].get("return_since_score_pct") is None
+    assert r.json()["data"][0].get("prior_3m_return_pct") is None
 
 
 @pytest.mark.unit
@@ -753,6 +774,7 @@ def test_by_index_rankings_latest_per_symbol_and_sort(monkeypatch):
     assert [x["symbol"] for x in j["data"]] == ["B.SH", "A.SH"]
     assert j["data"][0]["composite_score"]["balanced"] == 80
     assert j["data"][0].get("return_since_score_pct") is None
+    assert j["data"][0].get("prior_3m_return_pct") is None
 
     r_agg = client.get("/api/stock-rankings/by-index/csi500?strategy=aggressive")
     # A 最新 aggressive=20，B=30 → 降序 B 在前
