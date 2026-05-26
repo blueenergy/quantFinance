@@ -82,6 +82,22 @@ class BasicCollection:
         if "ts_code" in query and isinstance(query["ts_code"], dict) and "$in" in query["ts_code"]:
             inc = set(query["ts_code"]["$in"])
             return ChainCursor([dict(d) for d in self.docs if d.get("ts_code") in inc])
+        if "$or" in query:
+            def matches_clause(doc, clause):
+                for key, expected in clause.items():
+                    value = doc.get(key)
+                    if hasattr(expected, "search"):
+                        return bool(expected.search(str(value or "")))
+                    if isinstance(expected, dict) and "$in" in expected:
+                        return value in expected["$in"]
+                    return value == expected
+                return False
+
+            return ChainCursor([
+                dict(d)
+                for d in self.docs
+                if any(matches_clause(d, clause) for clause in query["$or"])
+            ])
         filtered = [dict(d) for d in self.docs if all(d.get(k) == v for k, v in query.items())]
         return ChainCursor(filtered)
 
@@ -197,6 +213,26 @@ def test_etf_list_sort_serializes_decimal128(monkeypatch):
     assert isinstance(row["total_share"], float)
     assert row["total_share"] == pytest.approx(1.5)
     assert isinstance(row["total_size"], float)
+
+
+@pytest.mark.unit
+def test_etf_list_search_matches_benchmark_and_alias(monkeypatch):
+    basic_docs = [
+        {"ts_code": "512100.SH", "name": "南方中证1000ETF", "benchmark": "中证1000指数"},
+        {"ts_code": "510300.SH", "name": "沪深300ETF", "benchmark": "沪深300指数"},
+    ]
+    monkeypatch.setattr(
+        etf_mod,
+        "data_db",
+        _make_data_db({"etf_basic": BasicCollection(basic_docs)}),
+    )
+    client = TestClient(app)
+
+    r = client.get("/api/etf/list", params={"q": "1000"})
+
+    assert r.status_code == 200
+    codes = [row["ts_code"] for row in r.json()["data"]]
+    assert "512100.SH" in codes
 
 
 @pytest.mark.unit

@@ -33,6 +33,17 @@ FEATURED_ETF_CODES = [
     "513100.SH",  # 纳斯达ETF（华安）
 ]
 
+ETF_SEARCH_ALIASES = {
+    "300": ["510300.SH", "159919.SZ"],
+    "沪深300": ["510300.SH", "159919.SZ"],
+    "500": ["510500.SH", "159922.SZ"],
+    "中证500": ["510500.SH", "159922.SZ"],
+    "1000": ["512100.SH"],
+    "中证1000": ["512100.SH"],
+    "a500": ["159852.SZ"],
+    "中证a500": ["159852.SZ"],
+}
+
 @router.get("/list")
 async def get_etf_list(
     q: Optional[str] = Query(None, description="Search by symbol or name"),
@@ -106,8 +117,19 @@ async def get_etf_list(
         results = merged
     elif q:
         # Full-text search mode
-        pattern = re.compile(q, re.IGNORECASE)
-        query = {"$or": [{"ts_code": pattern}, {"name": pattern}]}
+        q_clean = q.strip()
+        pattern = re.compile(re.escape(q_clean), re.IGNORECASE)
+        alias_codes = ETF_SEARCH_ALIASES.get(q_clean.lower(), [])
+        query = {
+            "$or": [
+                {"ts_code": pattern},
+                {"name": pattern},
+                {"benchmark": pattern},
+                {"management": pattern},
+                {"index_name": pattern},
+                {"ts_code": {"$in": alias_codes}},
+            ]
+        }
         cursor = data_db["etf_basic"].find(query, {"_id": 0}).limit(limit)
         results = list(cursor)
     elif featured:
