@@ -89,8 +89,9 @@ from routers.navigation_policy import user_router as navigation_user_router
 from routers.entitlements_matrix import router as entitlements_matrix_router
 from production_config import configure_production_app
 from contextlib import asynccontextmanager
+import asyncio
 import os
-from scheduler import start_scheduler, stop_scheduler
+from scheduler import start_scheduler, stop_scheduler, write_scheduler_status
 
 
 class _NoiseFilter(logging.Filter):
@@ -109,11 +110,35 @@ async def lifespan(app: FastAPI):
     logging.getLogger("apscheduler.executors.default").setLevel(logging.WARNING)
     logging.getLogger("apscheduler.scheduler").setLevel(logging.WARNING)
     embedded_scheduler_enabled = os.getenv("ENABLE_EMBEDDED_SCHEDULER", "false").lower() in {"1", "true", "yes"}
+    scheduler_heartbeat_task = None
+
+    async def _embedded_scheduler_heartbeat():
+        interval = int(os.getenv("SCHEDULER_HEARTBEAT_INTERVAL_SECONDS", "15"))
+        while True:
+            try:
+                write_scheduler_status("running")
+            except Exception as exc:
+                logging.getLogger(__name__).warning("embedded scheduler heartbeat failed: %s", exc)
+            await asyncio.sleep(interval)
+
     if embedded_scheduler_enabled:
         start_scheduler()
-    yield
-    if embedded_scheduler_enabled:
-        stop_scheduler()
+        scheduler_heartbeat_task = asyncio.create_task(_embedded_scheduler_heartbeat())
+    try:
+        yield
+    finally:
+        if scheduler_heartbeat_task:
+            scheduler_heartbeat_task.cancel()
+            try:
+                await scheduler_heartbeat_task
+            except asyncio.CancelledError:
+                pass
+        if embedded_scheduler_enabled:
+            try:
+                write_scheduler_status("stopped")
+            except Exception:
+                pass
+            stop_scheduler()
 
 app = FastAPI(lifespan=lifespan)
 

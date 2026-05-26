@@ -7,6 +7,10 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
+# 本地开发默认由 uvicorn 进程内嵌 APScheduler，避免 Strategy Lab Loop、
+# 定时复盘等功能因为独立 scheduler_runner 未启动而静默不推进。
+export ENABLE_EMBEDDED_SCHEDULER="${ENABLE_EMBEDDED_SCHEDULER:-true}"
+
 RELOAD_ARGS=()
 for d in routers services models utils tools config monitoring; do
   if [[ -d "$d" ]]; then

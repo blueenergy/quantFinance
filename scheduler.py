@@ -297,6 +297,18 @@ def generate_global_analysis_task(job_id: str):
         log.error(f"[Global Analysis] Scheduling failed: {e}", exc_info=True)
 
 
+def strategy_lab_loop_tick_task():
+    """Advance Strategy Lab auto-iteration loops (batch → review → rerun)."""
+    from services.strategy_lab_loop import advance_all_running_loops
+
+    try:
+        count = advance_all_running_loops()
+        if count:
+            log.info("[StrategyLabLoop] advanced %s loop(s)", count)
+    except Exception as exc:
+        log.error("[StrategyLabLoop] tick failed: %s", exc, exc_info=True)
+
+
 def theme_lag_validation_subscription_scan_task(job_id: str):
     """按订阅扫描 theme_lag_candidate_validation，写入 notifications；邮件见用户通知设置。"""
     from services.theme_lag_validation_subscription_task import run_theme_lag_validation_subscription_scan
@@ -381,6 +393,7 @@ TASK_MAP = {
         'theme_lag_validation_subscribe_1630'
     ),
     'market_insight_focus_review_1530': market_insight_focus_review_task,
+    'strategy_lab_loop_tick': strategy_lab_loop_tick_task,
 }
 
 # Default trigger configurations
@@ -452,6 +465,12 @@ DEFAULT_SCHEDULES = {
         'hour': 15,
         'minute': 30,
         'day_of_week': 'mon-fri',
+        'is_active': True,
+    },
+    'strategy_lab_loop_tick': {
+        'name': "Strategy Lab 自动迭代推进",
+        'type': "interval",
+        'seconds': 45,
         'is_active': True,
     },
 }

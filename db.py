@@ -74,6 +74,7 @@ def get_db_collections() -> Dict[str, Collection]:
         "backtest_tasks": db["backtest_tasks"],  # 回测任务
         "backtest_results": db["backtest_results"],  # 回测结果
         "backtest_batches": db["backtest_batches"],  # 批量回测实验
+        "strategy_lab_loops": db["strategy_lab_loops"],  # Strategy Lab 自动迭代
         # Permission and service upgrade
         "upgrade_requests": db["upgrade_requests"],  # 服务升级申请
         # Phase 10: Async Task Queue Architecture
@@ -134,6 +135,7 @@ def get_analyzer_db():
         "iv_analysis": analyzer_db["iv_analysis"],
         # Strategy Lab batch review output (written by quantAnalyzer)
         "backtest_batch_reviews": analyzer_db["backtest_batch_reviews"],
+        "strategy_lab_loop_reports": analyzer_db["strategy_lab_loop_reports"],
     }
 
 def get_data_db():

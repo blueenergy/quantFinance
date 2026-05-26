@@ -540,6 +540,7 @@ def test_delete_backtest_batch(monkeypatch, mock_user):
                 {"task_id": "bt_b", "metrics": {}},
             ]
         ),
+        "strategy_lab_loops": FakeBacktestCollection([]),
         "users": FakeBacktestCollection([]),
     }
     monkeypatch.setattr(backtest, "get_db_collections", lambda: collections)
@@ -555,6 +556,76 @@ def test_delete_backtest_batch(monkeypatch, mock_user):
     assert collections["backtest_batches"].find_one({"batch_id": "bb_del"}) is None
     assert len(collections["backtest_tasks"].docs) == 0
     assert len(collections["backtest_results"].docs) == 0
+
+    client.app.dependency_overrides.clear()
+
+
+@pytest.mark.unit
+def test_delete_backtest_batch_allows_terminal_loop_link(monkeypatch, mock_user):
+    """Deleting a batch linked only to a terminal Strategy Lab Loop is allowed."""
+    collections = {
+        "backtest_batches": FakeBacktestCollection(
+            [{"batch_id": "bb_linked", "user_id": "user123", "name": "linked"}]
+        ),
+        "backtest_tasks": FakeBacktestCollection([]),
+        "backtest_results": FakeBacktestCollection([]),
+        "strategy_lab_loops": FakeBacktestCollection(
+            [
+                {
+                    "loop_id": "sl_test",
+                    "user_id": "user123",
+                    "root_batch_id": "bb_linked",
+                    "current_batch_id": "bb_linked",
+                    "status": "completed",
+                }
+            ]
+        ),
+        "users": FakeBacktestCollection([]),
+    }
+    monkeypatch.setattr(backtest, "get_db_collections", lambda: collections)
+    monkeypatch.setattr(backtest, "get_analyzer_db", lambda: {"backtest_batch_reviews": FakeBacktestCollection([])})
+
+    client = TestClient(app)
+    client.app.dependency_overrides[get_current_user] = lambda: mock_user
+
+    response = client.delete("/api/backtest/batches/bb_linked")
+    assert response.status_code == 200
+    assert collections["backtest_batches"].find_one({"batch_id": "bb_linked"}) is None
+
+    client.app.dependency_overrides.clear()
+
+
+@pytest.mark.unit
+def test_delete_backtest_batch_rejects_active_loop_link(monkeypatch, mock_user):
+    """Deleting a batch linked to an active Strategy Lab Loop should be blocked."""
+    collections = {
+        "backtest_batches": FakeBacktestCollection(
+            [{"batch_id": "bb_linked", "user_id": "user123", "name": "linked"}]
+        ),
+        "backtest_tasks": FakeBacktestCollection([]),
+        "backtest_results": FakeBacktestCollection([]),
+        "strategy_lab_loops": FakeBacktestCollection(
+            [
+                {
+                    "loop_id": "sl_test",
+                    "user_id": "user123",
+                    "root_batch_id": "bb_linked",
+                    "current_batch_id": "bb_linked",
+                    "status": "running",
+                }
+            ]
+        ),
+        "users": FakeBacktestCollection([]),
+    }
+    monkeypatch.setattr(backtest, "get_db_collections", lambda: collections)
+
+    client = TestClient(app)
+    client.app.dependency_overrides[get_current_user] = lambda: mock_user
+
+    response = client.delete("/api/backtest/batches/bb_linked")
+    assert response.status_code == 400
+    assert "自动迭代 Loop" in response.json()["detail"]
+    assert collections["backtest_batches"].find_one({"batch_id": "bb_linked"}) is not None
 
     client.app.dependency_overrides.clear()
 

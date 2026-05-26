@@ -15,6 +15,7 @@ DEFAULT_TASK_DURATION_SECONDS = {
     "hot_stock_analysis": 90,
     "etf_analysis": 90,
     "backtest_batch_review": 180,
+    "strategy_lab_loop_report": 240,
 }
 
 
@@ -118,6 +119,9 @@ def infer_task_data_date(task: Dict[str, Any]) -> Optional[str]:
 
     if ttype == "backtest_batch_review":
         return _norm_iso_date(result.get("created_at") or params.get("end_date"))
+
+    if ttype == "strategy_lab_loop_report":
+        return _norm_iso_date(result.get("created_at"))
 
     if ttype in {"limit_up_feedback", "broken_limit_up_feedback", "limit_up", "broken_limit_up"}:
         return _norm_iso_date(params.get("date"))
@@ -238,6 +242,11 @@ def summarize_task_result(task: Dict[str, Any]) -> str:
         if isinstance(review, dict):
             return str(review.get("summary") or "批量回测复盘完成")[:120]
         return "批量回测复盘完成"
+    if task_type == "strategy_lab_loop_report":
+        report = result.get("report")
+        if isinstance(report, dict):
+            return str(report.get("summary") or "Loop 综合报告完成")[:120]
+        return "Loop 综合报告完成"
     if task_type in {"global_analysis", "market_analysis"}:
         return str(result.get("summary") or result.get("conclusion") or "市场分析完成")[:120]
     if task_type == "x_influencer_post_analysis":

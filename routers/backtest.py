@@ -496,6 +496,38 @@ def _serialize_batch(batch: Dict[str, Any], summary: Optional[Dict[str, Any]] = 
     return _clean_for_response(out)
 
 
+def _is_batch_ref(value: Any) -> bool:
+    part = str(value or "").strip()
+    return part.startswith("rerun:") or part.startswith("bb_")
+
+
+def _resolve_source_universe_for_rerun(collections: Dict[str, Any], batch: Dict[str, Any], user_id: str) -> Dict[str, Any]:
+    universe_type = batch.get("source_universe_type") or batch.get("original_universe_type") or batch.get("universe_type")
+    universe_value = batch.get("source_universe_value") or batch.get("original_universe_value") or batch.get("universe_value")
+    if universe_value and not _is_batch_ref(universe_value):
+        return {"source_universe_type": universe_type, "source_universe_value": universe_value}
+
+    parent_id = batch.get("parent_batch_id")
+    if not parent_id and str(batch.get("universe_value") or "").startswith("rerun:"):
+        parent_id = str(batch.get("universe_value"))[len("rerun:") :]
+
+    seen = set()
+    while parent_id and parent_id not in seen:
+        seen.add(parent_id)
+        parent = collections["backtest_batches"].find_one({"batch_id": parent_id, "user_id": user_id}) or {}
+        if not parent:
+            break
+        universe_type = parent.get("source_universe_type") or parent.get("original_universe_type") or parent.get("universe_type")
+        universe_value = parent.get("source_universe_value") or parent.get("original_universe_value") or parent.get("universe_value")
+        if universe_value and not _is_batch_ref(universe_value):
+            return {"source_universe_type": universe_type, "source_universe_value": universe_value}
+        parent_id = parent.get("parent_batch_id")
+        if not parent_id and str(parent.get("universe_value") or "").startswith("rerun:"):
+            parent_id = str(parent.get("universe_value"))[len("rerun:") :]
+
+    return {"source_universe_type": universe_type, "source_universe_value": universe_value}
+
+
 def require_backtest_worker_token(
     x_backtest_worker_token: Optional[str] = Header(None, alias="X-Backtest-Worker-Token"),
 ) -> bool:
@@ -730,6 +762,28 @@ async def delete_backtest_batch(
     if not batch:
         raise HTTPException(status_code=404, detail="Backtest batch not found")
 
+    linked_loop = collections.get("strategy_lab_loops")
+    if linked_loop is not None:
+        loop = linked_loop.find_one(
+            {
+                "user_id": current_user["id"],
+                "status": {"$in": ["running", "paused"]},
+                "$or": [
+                    {"root_batch_id": batch_id},
+                    {"current_batch_id": batch_id},
+                    {"batch_chain": batch_id},
+                ],
+            }
+        )
+        if loop:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"实验已关联自动迭代 Loop（{loop.get('loop_id')}），"
+                    "请先删除历史 Loop 或取消/结束该 Loop 后再删除实验"
+                ),
+            )
+
     cancelled_active = collections["backtest_tasks"].update_many(
         {
             "batch_id": batch_id,
@@ -821,12 +875,15 @@ async def rerun_backtest_batch(
         query["status"] = {"$in": payload.only_statuses}
     source_tasks = list(collections["backtest_tasks"].find(query).sort("batch_index", 1))
     symbols = [t["symbol"] for t in source_tasks]
+    source_universe = _resolve_source_universe_for_rerun(collections, batch, current_user["id"])
+    source_universe_type = source_universe.get("source_universe_type")
+    source_universe_value = source_universe.get("source_universe_value")
     new_payload = BacktestBatchCreate(
         name=payload.name or f"{batch.get('name', batch_id)} rerun",
         symbols=symbols,
         asset_type=batch.get("asset_type", "stock"),
         universe_type="manual",
-        universe_value=f"rerun:{batch_id}",
+        universe_value=source_universe_value,
         strategy_key=payload.strategy_key or batch["strategy_key"],
         preset=payload.preset if payload.preset is not None else batch.get("preset"),
         strategy_params=payload.strategy_params if payload.strategy_params is not None else batch.get("strategy_params", {}),
@@ -835,7 +892,18 @@ async def rerun_backtest_batch(
         initial_cash=payload.initial_cash or batch.get("initial_cash", 1000000.0),
         limit_symbols=0,
     )
-    return await create_backtest_batch(new_payload, current_user)
+    result = await create_backtest_batch(new_payload, current_user)
+    collections["backtest_batches"].update_one(
+        {"batch_id": result["batch_id"]},
+        {
+            "$set": {
+                "parent_batch_id": batch_id,
+                "source_universe_type": source_universe_type,
+                "source_universe_value": source_universe_value,
+            }
+        },
+    )
+    return {**result, "parent_batch_id": batch_id, "source_universe_type": source_universe_type, "source_universe_value": source_universe_value}
 
 
 @router.post("/batches/{batch_id}/review")
