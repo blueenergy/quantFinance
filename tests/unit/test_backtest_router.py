@@ -353,6 +353,48 @@ def test_list_backtest_tasks(monkeypatch, mock_user):
 
 
 @pytest.mark.unit
+def test_list_backtest_batches_refreshes_cached_status(monkeypatch, mock_user):
+    collections = {
+        "backtest_batches": FakeBacktestCollection([
+            {
+                "batch_id": "bb_done",
+                "user_id": "user123",
+                "name": "done batch",
+                "status": "pending",
+                "created_at": datetime.now(),
+            }
+        ]),
+        "backtest_tasks": FakeBacktestCollection([
+            {
+                "task_id": "bt_done",
+                "batch_id": "bb_done",
+                "user_id": "user123",
+                "symbol": "512100.SH",
+                "status": "completed",
+            }
+        ]),
+        "backtest_results": FakeBacktestCollection([
+            {"task_id": "bt_done", "metrics": {"total_return": 0.12}}
+        ]),
+        "strategy_lab_loops": FakeBacktestCollection([]),
+        "users": FakeBacktestCollection([]),
+    }
+    monkeypatch.setattr(backtest, "get_db_collections", lambda: collections)
+
+    client = TestClient(app)
+    client.app.dependency_overrides[get_current_user] = lambda: mock_user
+
+    response = client.get("/api/backtest/batches")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body[0]["status"] == "completed"
+    assert collections["backtest_batches"].docs[0]["status"] == "completed"
+
+    client.app.dependency_overrides.clear()
+
+
+@pytest.mark.unit
 def test_list_backtest_tasks_excludes_batch_children_by_default(monkeypatch, mock_user):
     """Batch child tasks should stay out of the single-stock backtest page."""
     collections = {
@@ -733,6 +775,9 @@ def test_get_backtest_result(monkeypatch, mock_user):
             "strategy_key": "turtle",
             "metrics": {
                 "total_return": 0.15,
+                "invested_return": 0.18,
+                "invested_cash": 850000.0,
+                "capital_utilization": 0.85,
                 "sharpe_ratio": 1.2,
                 "max_drawdown": -0.08,
                 "win_rate": 0.6,
@@ -768,6 +813,9 @@ def test_get_backtest_result(monkeypatch, mock_user):
     data = response.json()
     assert data["task_id"] == "bt_completed"
     assert data["metrics"]["total_return"] == 0.15
+    assert data["metrics"]["invested_return"] == 0.18
+    assert data["metrics"]["invested_cash"] == 850000.0
+    assert data["metrics"]["capital_utilization"] == 0.85
     assert len(data["trades"]) == 1
     assert len(data["equity_curve"]) == 2
     
@@ -989,6 +1037,9 @@ def test_report_backtest_result(monkeypatch, mock_user):
     payload = {
         "metrics": {
             "total_return": 0.15,
+            "invested_return": 0.18,
+            "invested_cash": 850000.0,
+            "capital_utilization": 0.85,
             "sharpe_ratio": 1.2,
             "max_drawdown": -0.08,
             "win_rate": 0.6,
@@ -1028,6 +1079,9 @@ def test_report_backtest_result(monkeypatch, mock_user):
     result = collections["backtest_results"].docs[0]
     assert result["task_id"] == "bt_001"
     assert result["metrics"]["total_return"] == 0.15
+    assert result["metrics"]["invested_return"] == 0.18
+    assert result["metrics"]["invested_cash"] == 850000.0
+    assert result["metrics"]["capital_utilization"] == 0.85
     
 
 @pytest.mark.unit

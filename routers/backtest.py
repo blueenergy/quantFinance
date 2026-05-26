@@ -156,6 +156,9 @@ class BacktestTaskResponse(BaseModel):
 class BacktestResultMetrics(BaseModel):
     """Backtest result metrics"""
     total_return: Optional[float] = None
+    invested_return: Optional[float] = None
+    invested_cash: Optional[float] = None
+    capital_utilization: Optional[float] = None
     sharpe_ratio: Optional[float] = None
     max_drawdown: Optional[float] = None
     win_rate: Optional[float] = None
@@ -487,6 +490,19 @@ def _summarize_batch(tasks: List[Dict[str, Any]], results_by_task: Dict[str, Dic
     }
 
 
+def _refresh_batch_summary(collections: Dict[str, Any], batch_id: str, user_id: str) -> Dict[str, Any]:
+    tasks = list(collections["backtest_tasks"].find({"batch_id": batch_id, "user_id": user_id}))
+    task_ids = [t["task_id"] for t in tasks]
+    results = list(collections["backtest_results"].find({"task_id": {"$in": task_ids}})) if task_ids else []
+    results_by_task = {r.get("task_id"): r for r in results}
+    summary = _summarize_batch(tasks, results_by_task)
+    collections["backtest_batches"].update_one(
+        {"batch_id": batch_id, "user_id": user_id},
+        {"$set": {"summary": summary, "status": summary["status"], "updated_at": datetime.now()}},
+    )
+    return summary
+
+
 def _serialize_batch(batch: Dict[str, Any], summary: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     out = {k: v for k, v in batch.items() if k != "_id"}
     out["id"] = str(batch.get("_id")) if batch.get("_id") else None
@@ -677,7 +693,14 @@ async def list_backtest_batches(
     if status:
         query["status"] = status
     batches = list(collections["backtest_batches"].find(query).sort("created_at", -1).limit(limit))
-    return [_serialize_batch(b) for b in batches]
+    out = []
+    for batch in batches:
+        try:
+            summary = _refresh_batch_summary(collections, batch.get("batch_id"), current_user["id"])
+            out.append(_serialize_batch(batch, summary))
+        except Exception:
+            out.append(_serialize_batch(batch))
+    return out
 
 
 @router.get("/batches/{batch_id}")
@@ -690,13 +713,7 @@ async def get_backtest_batch(
     if not batch:
         raise HTTPException(status_code=404, detail="Backtest batch not found")
     tasks = list(collections["backtest_tasks"].find({"batch_id": batch_id, "user_id": current_user["id"]}))
-    results = list(collections["backtest_results"].find({"task_id": {"$in": [t["task_id"] for t in tasks]}}))
-    results_by_task = {r.get("task_id"): r for r in results}
-    summary = _summarize_batch(tasks, results_by_task)
-    collections["backtest_batches"].update_one(
-        {"batch_id": batch_id},
-        {"$set": {"summary": summary, "status": summary["status"], "updated_at": datetime.now()}},
-    )
+    summary = _refresh_batch_summary(collections, batch_id, current_user["id"])
     return {**_serialize_batch(batch, summary), "tasks_count": len(tasks)}
 
 
@@ -737,6 +754,9 @@ async def get_backtest_batch_results(
             "preset": task.get("preset"),
             "metrics": metrics,
             "total_return": metrics.get("total_return"),
+            "invested_return": metrics.get("invested_return"),
+            "invested_cash": metrics.get("invested_cash"),
+            "capital_utilization": metrics.get("capital_utilization"),
             "max_drawdown": metrics.get("max_drawdown"),
             "sharpe_ratio": metrics.get("sharpe_ratio"),
             "win_rate": metrics.get("win_rate"),
