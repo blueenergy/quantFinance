@@ -93,10 +93,20 @@ async def list_portfolio_plans(
 @router.get("/plans/{plan_id}")
 async def get_portfolio_plan(plan_id: str, current_user: dict = Depends(get_current_user)):
     collections = get_trading_db_collections()
+    data_collections = get_data_db()
     plan = _require_plan(collections, plan_id)
     items = list(collections["portfolio_trade_plan_items"].find({"plan_id": plan_id}).sort("rank", 1))
     reviews = list(collections["portfolio_plan_reviews"].find({"plan_id": plan_id}).sort("created_at", -1))
-    return {"success": True, "data": {"plan": _jsonable(plan), "items": _jsonable(items), "reviews": _jsonable(reviews)}}
+    execution_status = _paper_execution_status(collections, data_collections, plan, items)
+    return {
+        "success": True,
+        "data": {
+            "plan": _jsonable(plan),
+            "items": _jsonable(items),
+            "reviews": _jsonable(reviews),
+            "execution_status": _jsonable(execution_status),
+        },
+    }
 
 
 @router.get("/plans/{plan_id}/items")
@@ -293,6 +303,45 @@ def _apply_paper_execution(collections: Dict[str, Any], data_collections: Dict[s
     )
     collections["portfolio_trade_plans"].update_one({"plan_id": plan_id}, {"$set": {"status": status, "paper_executed_at": now}})
     return {"plan_id": plan_id, "status": status, "executions": executions, "position_snapshot": snapshot}
+
+
+def _paper_execution_status(collections: Dict[str, Any], data_collections: Dict[str, Any], plan: Dict[str, Any], items: List[Dict[str, Any]]) -> Dict[str, Any]:
+    plan_id = str(plan.get("plan_id") or "")
+    execute_date = plan.get("execute_date")
+    effective_execute_date = execute_date or datetime.now().strftime("%Y%m%d")
+    execution_symbols = sorted(
+        {
+            item.get("symbol")
+            for item in items
+            if item.get("symbol") and int(item.get("delta_shares", 0) or 0) != 0
+        }
+    )
+    open_prices = _load_prices(data_collections["volume_price"], execution_symbols, effective_execute_date, "open") if execution_symbols else {}
+    missing_symbols = [symbol for symbol in execution_symbols if symbol not in open_prices]
+    latest_execution = collections["portfolio_paper_executions"].find_one(
+        {"plan_id": plan_id},
+        sort=[("created_at", -1)],
+    )
+    execution_count = collections["portfolio_paper_executions"].count_documents({"plan_id": plan_id})
+
+    if plan.get("status") == "approved":
+        backend_status = "waiting_for_open_prices" if missing_symbols else "ready_for_background_execution"
+    elif plan.get("status") in {"executed_paper", "partially_executed"}:
+        backend_status = str(plan.get("status"))
+    else:
+        backend_status = "not_approved"
+
+    return {
+        "execute_date": execute_date,
+        "effective_execute_date": effective_execute_date,
+        "uses_runtime_execute_date": not bool(execute_date),
+        "open_price_ready": not missing_symbols,
+        "missing_open_price_count": len(missing_symbols),
+        "missing_open_price_examples": missing_symbols[:10],
+        "backend_execution_status": backend_status,
+        "execution_count": execution_count,
+        "latest_execution_result": latest_execution,
+    }
 
 
 def _load_prices(volume_price, symbols: List[str], trade_date: str, field: str) -> Dict[str, float]:
