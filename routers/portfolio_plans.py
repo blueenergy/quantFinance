@@ -199,7 +199,24 @@ def _apply_paper_execution(collections: Dict[str, Any], data_collections: Dict[s
     cash = float(previous.get("cash", plan.get("config_snapshot", {}).get("initial_capital", 1_000_000.0)))
     items = list(collections["portfolio_trade_plan_items"].find({"plan_id": plan_id}).sort("rank", 1))
     symbols = [item.get("symbol") for item in items if item.get("symbol")]
+    execution_symbols = sorted(
+        {
+            item.get("symbol")
+            for item in items
+            if item.get("symbol") and int(item.get("delta_shares", 0) or 0) != 0
+        }
+    )
     open_prices = _load_prices(data_collections["volume_price"], symbols, execute_date, "open")
+    missing_open_prices = [symbol for symbol in execution_symbols if symbol not in open_prices]
+    if missing_open_prices:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"开盘价未就绪：execute_date={execute_date}, "
+                f"missing_count={len(missing_open_prices)}, "
+                f"examples={', '.join(missing_open_prices[:10])}"
+            ),
+        )
     close_prices = _load_prices(data_collections["volume_price"], symbols, execute_date, "close")
     now = datetime.utcnow()
     executions = []
@@ -215,9 +232,7 @@ def _apply_paper_execution(collections: Dict[str, Any], data_collections: Dict[s
             continue
         price = open_prices.get(symbol)
         if not price:
-            partial = True
-            executions.append(_execution_doc(plan, item, "blocked", 0, None, 0.0, "missing_open_price", now))
-            continue
+            raise HTTPException(status_code=409, detail=f"开盘价未就绪：{symbol} {execute_date}")
         current = positions.get(symbol, {"symbol": symbol, "name": item.get("name", ""), "industry": item.get("industry", ""), "shares": 0, "cost_basis": 0.0})
         if delta < 0:
             quantity = min(abs(delta), int(current.get("shares", 0) or 0))
