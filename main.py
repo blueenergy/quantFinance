@@ -61,6 +61,7 @@ from routers.worker_data import router as worker_data_router
 from routers.analysis_details import router as analysis_details_router
 from routers.trading_manual import router as trading_manual_router
 from routers.backtest import router as backtest_router
+from routers.portfolio_plans import router as portfolio_plans_router
 from routers.permissions import router as permissions_router
 from routers.strategy_pool import router as strategy_pool_router
 from routers.strategy_workers import router as strategy_workers_router
@@ -171,6 +172,7 @@ app.include_router(worker_data_router, prefix="/api", tags=["Worker数据"])
 app.include_router(analysis_details_router, prefix="/api/analysis", tags=["全量分析数据"])
 app.include_router(trading_manual_router, prefix="/api", tags=["交易操作手册"])
 app.include_router(backtest_router, prefix="/api", tags=["回测系统"])
+app.include_router(portfolio_plans_router, prefix="/api", tags=["组合交易计划"])
 # 兼容前端与后台两套历史路径：
 # - /api/permissions/...（前端在用）
 # - /api/admin/permissions/...（后台旧路径）

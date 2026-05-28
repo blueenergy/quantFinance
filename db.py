@@ -11,6 +11,7 @@ DB_NAME = os.getenv("MONGO_DB", "finance")
 ANALYZER_DB_NAME = os.getenv("ANALYZER_DB_NAME", "quant_analyzer")
 data_db_name = os.getenv("DATA_DB_NAME", "quant_data")
 realtime_db_name = os.getenv("REALTIME_DB_NAME", "quant_realtime")
+trading_db_name = os.getenv("TRADING_DB_NAME", "quant_trading")
 
 # Singleton client (reuse across app)
 client = MongoClient(mongo_url)
@@ -21,6 +22,8 @@ analyzer_db = client[ANALYZER_DB_NAME]
 data_db = client[data_db_name]
 # Separate DB for high-frequency hot snapshots.
 realtime_db = client[realtime_db_name]
+# Separate DB for execution-domain strategy plans and paper trading.
+trading_db = client[trading_db_name]
 
 import logging as _logging
 _logging.getLogger(__name__).info(
@@ -104,6 +107,19 @@ def get_db_collections() -> Dict[str, Collection]:
 def get_collection(name: str):
     """Get a single collection by name."""
     return db[name]
+
+
+def get_trading_db_collections() -> Dict[str, Collection]:
+    """Return collections from the quant_trading execution-domain database."""
+    return {
+        "portfolio_strategy_configs": trading_db["portfolio_strategy_configs"],
+        "portfolio_trade_plans": trading_db["portfolio_trade_plans"],
+        "portfolio_trade_plan_items": trading_db["portfolio_trade_plan_items"],
+        "portfolio_plan_reviews": trading_db["portfolio_plan_reviews"],
+        "portfolio_paper_positions": trading_db["portfolio_paper_positions"],
+        "portfolio_paper_executions": trading_db["portfolio_paper_executions"],
+        "portfolio_paper_equity": trading_db["portfolio_paper_equity"],
+    }
 
 def get_analyzer_db():
     """
