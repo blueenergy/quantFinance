@@ -37,11 +37,30 @@ def _jsonable(value: Any) -> Any:
     return value
 
 
-def _require_plan(collections: Dict[str, Any], plan_id: str) -> Dict[str, Any]:
-    plan = collections["portfolio_trade_plans"].find_one({"plan_id": plan_id})
+def _current_user_id(current_user: Dict[str, Any]) -> str:
+    user_id = current_user.get("id")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="current user id is missing")
+    return str(user_id)
+
+
+def _require_plan(collections: Dict[str, Any], plan_id: str, current_user: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    query: Dict[str, Any] = {"plan_id": plan_id}
+    if current_user is not None:
+        query["user_id"] = _current_user_id(current_user)
+    plan = collections["portfolio_trade_plans"].find_one(query)
     if not plan:
         raise HTTPException(status_code=404, detail="plan not found")
     return plan
+
+
+def _require_strategy(collections: Dict[str, Any], strategy_id: str, current_user: Dict[str, Any]) -> Dict[str, Any]:
+    strategy = collections["portfolio_strategy_configs"].find_one(
+        {"strategy_id": strategy_id, "user_id": _current_user_id(current_user)}
+    )
+    if not strategy:
+        raise HTTPException(status_code=404, detail="strategy not found")
+    return strategy
 
 
 def _reviewer(current_user: Dict[str, Any]) -> str:
@@ -54,7 +73,7 @@ async def list_portfolio_strategies(
     current_user: dict = Depends(get_current_user),
 ):
     collections = get_trading_db_collections()
-    query: Dict[str, Any] = {}
+    query: Dict[str, Any] = {"user_id": _current_user_id(current_user)}
     if status:
         query["status"] = status
     rows = list(collections["portfolio_strategy_configs"].find(query).sort("strategy_id", 1))
@@ -72,7 +91,7 @@ async def list_portfolio_plans(
     current_user: dict = Depends(get_current_user),
 ):
     collections = get_trading_db_collections()
-    query: Dict[str, Any] = {}
+    query: Dict[str, Any] = {"user_id": _current_user_id(current_user)}
     if strategy_id:
         query["strategy_id"] = strategy_id
     if status:
@@ -94,9 +113,10 @@ async def list_portfolio_plans(
 async def get_portfolio_plan(plan_id: str, current_user: dict = Depends(get_current_user)):
     collections = get_trading_db_collections()
     data_collections = get_data_db()
-    plan = _require_plan(collections, plan_id)
-    items = list(collections["portfolio_trade_plan_items"].find({"plan_id": plan_id}).sort("rank", 1))
-    reviews = list(collections["portfolio_plan_reviews"].find({"plan_id": plan_id}).sort("created_at", -1))
+    plan = _require_plan(collections, plan_id, current_user)
+    owner_query = {"plan_id": plan_id, "user_id": _current_user_id(current_user)}
+    items = list(collections["portfolio_trade_plan_items"].find(owner_query).sort("rank", 1))
+    reviews = list(collections["portfolio_plan_reviews"].find(owner_query).sort("created_at", -1))
     execution_status = _paper_execution_status(collections, data_collections, plan, items)
     return {
         "success": True,
@@ -112,8 +132,8 @@ async def get_portfolio_plan(plan_id: str, current_user: dict = Depends(get_curr
 @router.get("/plans/{plan_id}/items")
 async def get_portfolio_plan_items(plan_id: str, current_user: dict = Depends(get_current_user)):
     collections = get_trading_db_collections()
-    _require_plan(collections, plan_id)
-    items = list(collections["portfolio_trade_plan_items"].find({"plan_id": plan_id}).sort("rank", 1))
+    _require_plan(collections, plan_id, current_user)
+    items = list(collections["portfolio_trade_plan_items"].find({"plan_id": plan_id, "user_id": _current_user_id(current_user)}).sort("rank", 1))
     return {"success": True, "data": _jsonable(items)}
 
 
@@ -129,13 +149,15 @@ async def reject_portfolio_plan(plan_id: str, request: ReviewRequest, current_us
 
 def _review_plan(plan_id: str, decision: str, comment: str, current_user: Dict[str, Any]):
     collections = get_trading_db_collections()
-    plan = _require_plan(collections, plan_id)
+    plan = _require_plan(collections, plan_id, current_user)
     if plan.get("status") not in {"needs_review", "approved", "rejected"}:
         raise HTTPException(status_code=400, detail=f"plan is not reviewable in status {plan.get('status')}")
     now = datetime.utcnow()
+    user_id = _current_user_id(current_user)
     review = {
         "plan_id": plan_id,
         "strategy_id": plan.get("strategy_id"),
+        "user_id": user_id,
         "decision": decision,
         "reviewer": _reviewer(current_user),
         "comment": comment,
@@ -143,7 +165,7 @@ def _review_plan(plan_id: str, decision: str, comment: str, current_user: Dict[s
     }
     collections["portfolio_plan_reviews"].insert_one(review)
     collections["portfolio_trade_plans"].update_one(
-        {"plan_id": plan_id},
+        {"plan_id": plan_id, "user_id": user_id},
         {"$set": {"status": decision, "reviewer": review["reviewer"], "reviewed_at": now}},
     )
     return {"success": True, "data": _jsonable(review)}
@@ -152,8 +174,8 @@ def _review_plan(plan_id: str, decision: str, comment: str, current_user: Dict[s
 @router.get("/plans/{plan_id}/executions")
 async def get_portfolio_plan_executions(plan_id: str, current_user: dict = Depends(get_current_user)):
     collections = get_trading_db_collections()
-    _require_plan(collections, plan_id)
-    rows = list(collections["portfolio_paper_executions"].find({"plan_id": plan_id}).sort("created_at", 1))
+    _require_plan(collections, plan_id, current_user)
+    rows = list(collections["portfolio_paper_executions"].find({"plan_id": plan_id, "user_id": _current_user_id(current_user)}).sort("created_at", 1))
     return {"success": True, "data": _jsonable(rows)}
 
 
@@ -165,7 +187,8 @@ async def execute_portfolio_plan_paper(
 ):
     collections = get_trading_db_collections()
     data_collections = get_data_db()
-    result = _apply_paper_execution(collections, data_collections, plan_id, force=request.force)
+    _require_plan(collections, plan_id, current_user)
+    result = _apply_paper_execution(collections, data_collections, plan_id, force=request.force, user_id=_current_user_id(current_user))
     return {"success": True, "data": _jsonable(result)}
 
 
@@ -177,7 +200,8 @@ async def get_portfolio_strategy_equity(
     current_user: dict = Depends(get_current_user),
 ):
     collections = get_trading_db_collections()
-    query: Dict[str, Any] = {"strategy_id": strategy_id}
+    _require_strategy(collections, strategy_id, current_user)
+    query: Dict[str, Any] = {"strategy_id": strategy_id, "user_id": _current_user_id(current_user)}
     if start_date or end_date:
         date_query: Dict[str, Any] = {}
         if start_date:
@@ -196,8 +220,9 @@ async def get_portfolio_strategy_realtime_equity(
 ):
     collections = get_trading_db_collections()
     data_collections = get_data_db()
+    _require_strategy(collections, strategy_id, current_user)
     snapshot = collections["portfolio_paper_positions"].find_one(
-        {"strategy_id": strategy_id},
+        {"strategy_id": strategy_id, "user_id": _current_user_id(current_user)},
         sort=[("as_of_date", -1)],
     )
     if not snapshot:
@@ -240,7 +265,7 @@ async def get_portfolio_strategy_realtime_equity(
     cash = float(snapshot.get("cash", 0) or 0)
     realtime_equity = cash + market_value
     latest_equity = collections["portfolio_paper_equity"].find_one(
-        {"strategy_id": strategy_id},
+        {"strategy_id": strategy_id, "user_id": _current_user_id(current_user)},
         sort=[("date", -1)],
     ) or {}
     base_equity = float(latest_equity.get("equity", snapshot.get("equity", 0)) or 0)
@@ -269,20 +294,24 @@ async def get_portfolio_strategy_realtime_equity(
     }
 
 
-def _apply_paper_execution(collections: Dict[str, Any], data_collections: Dict[str, Any], plan_id: str, force: bool = False) -> Dict[str, Any]:
-    plan = _require_plan(collections, plan_id)
+def _apply_paper_execution(collections: Dict[str, Any], data_collections: Dict[str, Any], plan_id: str, force: bool = False, user_id: Optional[str] = None) -> Dict[str, Any]:
+    plan = _require_plan(collections, plan_id, {"id": user_id} if user_id else None)
     if plan.get("status") != "approved" and not force:
         raise HTTPException(status_code=400, detail="plan must be approved before paper execution")
     if collections["portfolio_paper_executions"].find_one({"plan_id": plan_id}) and not force:
         raise HTTPException(status_code=400, detail="plan already has paper executions")
 
     strategy_id = plan.get("strategy_id")
+    user_id = plan.get("user_id")
     execute_date = plan.get("execute_date")
     if not strategy_id or not execute_date:
         raise HTTPException(status_code=400, detail="plan is missing strategy_id or execute_date")
 
+    previous_query = {"strategy_id": strategy_id, "as_of_date": {"$lte": plan.get("base_date")}}
+    if user_id:
+        previous_query["user_id"] = user_id
     previous = collections["portfolio_paper_positions"].find_one(
-        {"strategy_id": strategy_id, "as_of_date": {"$lte": plan.get("base_date")}},
+        previous_query,
         sort=[("as_of_date", -1)],
     ) or {}
     positions = {row.get("symbol"): dict(row) for row in previous.get("positions", []) if row.get("symbol")}
@@ -367,6 +396,7 @@ def _apply_paper_execution(collections: Dict[str, Any], data_collections: Dict[s
         collections["portfolio_paper_executions"].insert_many(executions)
     snapshot = {
         "strategy_id": strategy_id,
+        "user_id": user_id,
         "as_of_date": execute_date,
         "plan_id": plan_id,
         "cash": cash,
@@ -375,10 +405,15 @@ def _apply_paper_execution(collections: Dict[str, Any], data_collections: Dict[s
         "positions": position_rows,
         "updated_at": now,
     }
-    collections["portfolio_paper_positions"].replace_one({"strategy_id": strategy_id, "as_of_date": execute_date}, snapshot, upsert=True)
+    position_query = {"strategy_id": strategy_id, "as_of_date": execute_date}
+    equity_query = {"strategy_id": strategy_id, "date": execute_date}
+    if user_id:
+        position_query["user_id"] = user_id
+        equity_query["user_id"] = user_id
+    collections["portfolio_paper_positions"].replace_one(position_query, snapshot, upsert=True)
     collections["portfolio_paper_equity"].replace_one(
-        {"strategy_id": strategy_id, "date": execute_date},
-        {"strategy_id": strategy_id, "date": execute_date, "plan_id": plan_id, "equity": equity, "cash": cash, "market_value": market_value, "updated_at": now},
+        equity_query,
+        {"strategy_id": strategy_id, "user_id": user_id, "date": execute_date, "plan_id": plan_id, "equity": equity, "cash": cash, "market_value": market_value, "updated_at": now},
         upsert=True,
     )
     collections["portfolio_trade_plans"].update_one({"plan_id": plan_id}, {"$set": {"status": status, "paper_executed_at": now}})
@@ -387,6 +422,9 @@ def _apply_paper_execution(collections: Dict[str, Any], data_collections: Dict[s
 
 def _paper_execution_status(collections: Dict[str, Any], data_collections: Dict[str, Any], plan: Dict[str, Any], items: List[Dict[str, Any]]) -> Dict[str, Any]:
     plan_id = str(plan.get("plan_id") or "")
+    execution_query = {"plan_id": plan_id}
+    if plan.get("user_id"):
+        execution_query["user_id"] = plan.get("user_id")
     execute_date = plan.get("execute_date")
     effective_execute_date = execute_date or datetime.now().strftime("%Y%m%d")
     execution_symbols = sorted(
@@ -399,10 +437,10 @@ def _paper_execution_status(collections: Dict[str, Any], data_collections: Dict[
     open_prices = _load_prices(data_collections["volume_price"], execution_symbols, effective_execute_date, "open") if execution_symbols else {}
     missing_symbols = [symbol for symbol in execution_symbols if symbol not in open_prices]
     latest_execution = collections["portfolio_paper_executions"].find_one(
-        {"plan_id": plan_id},
+        execution_query,
         sort=[("created_at", -1)],
     )
-    execution_count = collections["portfolio_paper_executions"].count_documents({"plan_id": plan_id})
+    execution_count = collections["portfolio_paper_executions"].count_documents(execution_query)
 
     if plan.get("status") == "approved":
         backend_status = "waiting_for_open_prices" if missing_symbols else "ready_for_background_execution"
@@ -480,6 +518,7 @@ def _execution_doc(plan: Dict[str, Any], item: Dict[str, Any], action: str, quan
         "execution_id": str(uuid.uuid4()),
         "plan_id": plan["plan_id"],
         "strategy_id": plan["strategy_id"],
+        "user_id": plan.get("user_id"),
         "symbol": item.get("symbol"),
         "name": item.get("name", ""),
         "action": action,
