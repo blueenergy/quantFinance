@@ -189,6 +189,86 @@ async def get_portfolio_strategy_equity(
     return {"success": True, "data": _jsonable(rows)}
 
 
+@router.get("/strategies/{strategy_id}/realtime-equity")
+async def get_portfolio_strategy_realtime_equity(
+    strategy_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    collections = get_trading_db_collections()
+    data_collections = get_data_db()
+    snapshot = collections["portfolio_paper_positions"].find_one(
+        {"strategy_id": strategy_id},
+        sort=[("as_of_date", -1)],
+    )
+    if not snapshot:
+        return {"success": True, "data": None}
+
+    positions = snapshot.get("positions", []) or []
+    symbols = [row.get("symbol") for row in positions if row.get("symbol")]
+    realtime_prices = _load_prices(data_collections["volume_price_realtime_latest"], symbols, "", "close", latest=True)
+    realtime_docs = _load_realtime_docs(data_collections["volume_price_realtime_latest"], symbols)
+    latest_close_prices = _load_latest_close_prices(data_collections["volume_price"], symbols)
+
+    position_rows = []
+    market_value = 0.0
+    for pos in positions:
+        symbol = pos.get("symbol")
+        shares = int(pos.get("shares", 0) or 0)
+        realtime_doc = realtime_docs.get(symbol, {})
+        price_source = "realtime"
+        price = realtime_prices.get(symbol)
+        if price is None:
+            price = latest_close_prices.get(symbol)
+            price_source = "latest_close" if price is not None else "paper_mark"
+        if price is None:
+            price = pos.get("mark_price") or pos.get("cost_basis") or 0
+        price = float(price or 0)
+        value = shares * price
+        market_value += value
+        position_rows.append(
+            {
+                **pos,
+                "realtime_price": price,
+                "realtime_market_value": value,
+                "realtime_trade_time": realtime_doc.get("realtime_trade_time"),
+                "snapshot_time": realtime_doc.get("snapshot_time"),
+                "updated_at": realtime_doc.get("updated_at"),
+                "price_source": price_source,
+            }
+        )
+
+    cash = float(snapshot.get("cash", 0) or 0)
+    realtime_equity = cash + market_value
+    latest_equity = collections["portfolio_paper_equity"].find_one(
+        {"strategy_id": strategy_id},
+        sort=[("date", -1)],
+    ) or {}
+    base_equity = float(latest_equity.get("equity", snapshot.get("equity", 0)) or 0)
+    change = realtime_equity - base_equity if base_equity else None
+    change_pct = change / base_equity if base_equity else None
+    latest_update = max(
+        [str(row.get("updated_at") or row.get("realtime_trade_time") or row.get("snapshot_time") or "") for row in position_rows],
+        default="",
+    )
+    return {
+        "success": True,
+        "data": _jsonable(
+            {
+                "strategy_id": strategy_id,
+                "as_of_date": snapshot.get("as_of_date"),
+                "cash": cash,
+                "market_value": market_value,
+                "equity": realtime_equity,
+                "base_equity": base_equity,
+                "change": change,
+                "change_pct": change_pct,
+                "latest_update": latest_update,
+                "positions": position_rows,
+            }
+        ),
+    }
+
+
 def _apply_paper_execution(collections: Dict[str, Any], data_collections: Dict[str, Any], plan_id: str, force: bool = False) -> Dict[str, Any]:
     plan = _require_plan(collections, plan_id)
     if plan.get("status") != "approved" and not force:
@@ -344,8 +424,11 @@ def _paper_execution_status(collections: Dict[str, Any], data_collections: Dict[
     }
 
 
-def _load_prices(volume_price, symbols: List[str], trade_date: str, field: str) -> Dict[str, float]:
-    rows = volume_price.find({"symbol": {"$in": symbols}, "trade_date": trade_date}, {"_id": 0, "symbol": 1, field: 1, "open": 1, "close": 1})
+def _load_prices(volume_price, symbols: List[str], trade_date: str, field: str, latest: bool = False) -> Dict[str, float]:
+    query: Dict[str, Any] = {"symbol": {"$in": symbols}}
+    if not latest:
+        query["trade_date"] = trade_date
+    rows = volume_price.find(query, {"_id": 0, "symbol": 1, field: 1, "open": 1, "close": 1})
     prices = {}
     for row in rows:
         value = row.get(field) or row.get("close") or row.get("open")
@@ -355,6 +438,40 @@ def _load_prices(volume_price, symbols: List[str], trade_date: str, field: str) 
             continue
         if price > 0:
             prices[row["symbol"]] = price
+    return prices
+
+
+def _load_realtime_docs(volume_price_realtime, symbols: List[str]) -> Dict[str, Dict[str, Any]]:
+    rows = volume_price_realtime.find(
+        {"symbol": {"$in": symbols}},
+        {
+            "_id": 0,
+            "symbol": 1,
+            "close": 1,
+            "realtime_trade_time": 1,
+            "snapshot_time": 1,
+            "updated_at": 1,
+        },
+    )
+    return {row["symbol"]: row for row in rows if row.get("symbol")}
+
+
+def _load_latest_close_prices(volume_price, symbols: List[str]) -> Dict[str, float]:
+    prices: Dict[str, float] = {}
+    for symbol in symbols:
+        row = volume_price.find_one(
+            {"symbol": symbol},
+            sort=[("trade_date", -1)],
+            projection={"_id": 0, "symbol": 1, "close": 1},
+        )
+        if not row:
+            continue
+        try:
+            price = float(row.get("close"))
+        except (TypeError, ValueError):
+            continue
+        if price > 0:
+            prices[symbol] = price
     return prices
 
 
