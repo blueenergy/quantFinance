@@ -204,27 +204,6 @@ def setup_database_pool():
     
     return client
 
-# 应用启动事件
-async def startup_event():
-    """应用启动时的初始化"""
-    logging.info("🚀 悟空量化金融智能助手启动中...")
-    
-    # 初始化数据库连接
-    # app.state.db_client = setup_database_pool()
-    
-    logging.info("✅ 应用启动完成")
-
-# 应用关闭事件  
-async def shutdown_event():
-    """应用关闭时的清理"""
-    logging.info("⏹️ 悟空量化金融智能助手关闭中...")
-    
-    # 关闭数据库连接
-    # if hasattr(app.state, 'db_client'):
-    #     app.state.db_client.close()
-    
-    logging.info("✅ 应用关闭完成")
-
 # 生产环境配置函数
 def configure_production_app(app: FastAPI):
     """配置生产环境应用"""
@@ -237,11 +216,7 @@ def configure_production_app(app: FastAPI):
     
     # 设置监控
     setup_monitoring(app)
-    
-    # 设置生命周期事件
-    app.add_event_handler("startup", startup_event)
-    app.add_event_handler("shutdown", shutdown_event)
-    
+
     return limiter
 
 # 限流装饰器示例

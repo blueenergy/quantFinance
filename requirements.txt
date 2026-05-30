@@ -3,10 +3,11 @@ pandas
 pymongo
 apscheduler
 tushare
-fastapi 
+fastapi==0.136.1
+starlette==0.52.1
 uvicorn[standard]
 httpx
-pydantic
+pydantic==2.13.4
 python-dotenv
 PyYAML>=6.0
 PyJWT
@@ -27,4 +28,4 @@ cryptography>=41.0.7            # 加密库
 python-jose[cryptography]>=3.3.0  # JWT处理
 
 # MCP 服务器（暴露 quant-api 工具给 Hermes 等多智能体框架）
-fastapi-mcp>=0.3.4
+fastapi-mcp==0.4.0
