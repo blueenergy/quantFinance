@@ -192,6 +192,9 @@ pipelines:
         universe_database: quant_data
         universe_collection: stock_info
         match_key: ts_code
+        universe_period_filter:
+          field: list_date
+          op: lte_period
 
   - id: moneyflow
     label: 资金流向

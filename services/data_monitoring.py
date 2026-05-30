@@ -248,12 +248,57 @@ def _field_equality_filter(field: str, norm: str) -> Dict[str, Any]:
     return {"$or": [{field: norm}, {field: as_int}]}
 
 
+def _period_lte_filter(field: str, norm: str) -> Dict[str, Any]:
+    """Match documents whose YYYYMMDD-like field is on or before ``norm``."""
+    if not field or not norm or len(norm) != 8 or not norm.isdigit():
+        return {}
+    try:
+        as_int = int(norm)
+    except ValueError:
+        return {field: {"$lte": norm}}
+    return {
+        "$or": [
+            {field: {"$lte": norm}},
+            {field: {"$lte": as_int}},
+        ]
+    }
+
+
+def _universe_period_filter_query(period_filter: Optional[Dict[str, Any]], norm: str) -> Dict[str, Any]:
+    """Build optional period-aware universe filters from the data catalog."""
+    if not period_filter:
+        return {}
+    op = period_filter.get("op")
+    field = period_filter.get("field")
+    if op == "lte_period" and field:
+        return _period_lte_filter(str(field), norm)
+    return {}
+
+
+def _merge_match_filters(*filters: Dict[str, Any]) -> Dict[str, Any]:
+    """Combine simple Mongo match filters without losing top-level ``$or`` clauses."""
+    parts = [f for f in filters if f]
+    if not parts:
+        return {}
+    if len(parts) == 1:
+        return parts[0]
+    return {"$and": parts}
+
+
+def _universe_base_query(match_key: str, norm: str, period_filter: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    return _merge_match_filters(
+        {match_key: {"$exists": True, "$nin": [None, ""]}},
+        _universe_period_filter_query(period_filter, norm),
+    )
+
+
 def _coverage_latest_ratio(
     data_coll,
     field: str,
     latest_raw: Any,
     universe_coll,
     match_key: str,
+    universe_period_filter: Optional[Dict[str, Any]] = None,
 ) -> Optional[Dict[str, Any]]:
     """
     Global max ``field`` in ``data_coll`` defines the target period ``L``.
@@ -267,12 +312,9 @@ def _coverage_latest_ratio(
     norm = _normalize_yyyymmdd(latest_raw)
     if not norm:
         return None
+    universe_query = _universe_base_query(match_key, norm, universe_period_filter)
     try:
-        denom = int(
-            universe_coll.count_documents(
-                {match_key: {"$exists": True, "$nin": [None, ""]}},
-            )
-        )
+        denom = int(universe_coll.count_documents(universe_query))
     except Exception:
         return None
     if denom <= 0:
@@ -286,6 +328,7 @@ def _coverage_latest_ratio(
                     "from": universe_name,
                     "let": {"mk": f"${match_key}"},
                     "pipeline": [
+                        {"$match": universe_query},
                         {"$match": {"$expr": {"$eq": [f"${match_key}", "$$mk"]}}},
                         {"$limit": 1},
                     ],
@@ -365,6 +408,7 @@ def _append_freshness_row_for_collection(
                 raw,
                 universe_coll,
                 str(cov_cfg["match_key"]),
+                cov_cfg.get("universe_period_filter"),
             )
             if cov:
                 row.update(cov)
@@ -467,6 +511,7 @@ def _iter_coverage_targets() -> List[Dict[str, Any]]:
         u_db = cov.get("universe_database") or database
         match_key = str(cov["match_key"])
         universe_collection = str(cov["universe_collection"])
+        universe_period_filter = cov.get("universe_period_filter")
         field_kind = fr.get("field_kind", "date_string")
         sheets = fr.get("freshness_sheets")
         if isinstance(sheets, list) and len(sheets) > 0:
@@ -483,6 +528,7 @@ def _iter_coverage_targets() -> List[Dict[str, Any]]:
                         "universe_database": u_db,
                         "universe_collection": universe_collection,
                         "match_key": match_key,
+                        "universe_period_filter": universe_period_filter,
                     }
                 )
         elif fr.get("collection"):
@@ -495,6 +541,7 @@ def _iter_coverage_targets() -> List[Dict[str, Any]]:
                     "universe_database": u_db,
                     "universe_collection": universe_collection,
                     "match_key": match_key,
+                    "universe_period_filter": universe_period_filter,
                 }
             )
     return out
@@ -570,12 +617,14 @@ def query_coverage_gaps(
         raw_for_cov,
         universe_coll,
         match_key,
+        cfg.get("universe_period_filter"),
     )
     if not cov:
         raise ValueError("coverage_unavailable")
 
     date_expr = _expr_date_equals_field(field, norm)
     mk = match_key
+    universe_query = _universe_base_query(mk, norm, cfg.get("universe_period_filter"))
     lookup_pipeline: List[Dict[str, Any]] = [
         {
             "$match": {
@@ -591,7 +640,7 @@ def query_coverage_gaps(
     ]
 
     pipeline: List[Dict[str, Any]] = [
-        {"$match": {mk: {"$exists": True, "$nin": [None, ""]}}},
+        {"$match": universe_query},
         {
             "$lookup": {
                 "from": cfg["collection"],
