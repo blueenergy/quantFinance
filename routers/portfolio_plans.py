@@ -11,6 +11,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from auth import get_current_user
+from db import db as finance_db
 from db import get_data_db, get_trading_db_collections
 
 
@@ -70,6 +71,15 @@ def _require_strategy(collections: Dict[str, Any], strategy_id: str) -> Dict[str
 
 def _reviewer(current_user: Dict[str, Any]) -> str:
     return str(current_user.get("username") or current_user.get("email") or current_user.get("id") or "unknown")
+
+
+def _normalize_yyyymmdd(value: Optional[str]) -> Optional[str]:
+    if not value:
+        return None
+    raw = str(value).replace("-", "").strip()
+    if len(raw) >= 8 and raw[:8].isdigit():
+        return raw[:8]
+    return None
 
 
 @router.get("/strategies")
@@ -179,6 +189,46 @@ async def list_portfolio_worker_status(
         query["worker_type"] = worker_type
     rows = list(collections["portfolio_worker_status"].find(query).sort("last_seen_at", -1).limit(limit))
     return {"success": True, "data": _jsonable(rows)}
+
+
+@router.get("/data-watermarks/plan-generation")
+async def get_portfolio_plan_generation_watermark(
+    strategy_id: Optional[str] = Query(default=None),
+    base_date: Optional[str] = Query(default=None),
+    current_user: dict = Depends(get_current_user),
+):
+    _current_user_id(current_user)
+    collections = get_trading_db_collections()
+    strategy = _require_strategy(collections, strategy_id) if strategy_id else {}
+    universe_index = str(strategy.get("universe_index") or "csi1000")
+    normalized_base_date = _normalize_yyyymmdd(base_date)
+
+    scoring_runs = finance_db["scoring_runs"]
+    universe_query = {"universe_index": universe_index}
+    target_query = dict(universe_query)
+    if normalized_base_date:
+        target_query["score_date"] = normalized_base_date
+    target_run = scoring_runs.find_one(target_query, sort=[("updated_at", -1)]) if normalized_base_date else None
+    latest_run = scoring_runs.find_one(universe_query, sort=[("score_date", -1), ("updated_at", -1)])
+    latest_completed_run = scoring_runs.find_one(
+        {**universe_query, "status": "completed"},
+        sort=[("score_date", -1), ("updated_at", -1)],
+    )
+    return {
+        "success": True,
+        "data": _jsonable(
+            {
+                "strategy_id": strategy_id,
+                "base_date": normalized_base_date,
+                "universe_index": universe_index,
+                "target_scoring_run": target_run,
+                "target_status": target_run.get("status") if target_run else None,
+                "target_is_running": bool(target_run and target_run.get("status") == "running"),
+                "latest_scoring_run": latest_run,
+                "latest_completed_scoring_run": latest_completed_run,
+            }
+        ),
+    }
 
 
 @router.get("/plans/{plan_id}")

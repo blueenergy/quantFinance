@@ -55,8 +55,8 @@ def _collections():
     return {
         "portfolio_strategy_configs": _Collection(
             [
-                {"strategy_id": "s1", "status": "enabled"},
-                {"strategy_id": "s2", "status": "enabled"},
+                {"strategy_id": "s1", "status": "enabled", "universe_index": "csi1000"},
+                {"strategy_id": "s2", "status": "enabled", "universe_index": "csi300"},
                 {"strategy_id": "disabled-s1", "status": "disabled"},
             ]
         ),
@@ -214,3 +214,45 @@ def test_list_portfolio_worker_status_returns_recent_workers(monkeypatch):
     )
 
     assert [row["worker_id"] for row in response["data"]] == ["worker-new", "worker-old"]
+
+
+def test_get_portfolio_plan_generation_watermark_uses_strategy_universe(monkeypatch):
+    collections = _collections()
+    scoring_runs = _Collection(
+        [
+            {
+                "score_date": "20250105",
+                "universe_index": "csi1000",
+                "status": "completed",
+                "updated_at": "2025-01-05T18:00:00",
+            },
+            {
+                "score_date": "20250106",
+                "universe_index": "csi1000",
+                "status": "running",
+                "updated_at": "2025-01-06T09:00:00",
+            },
+            {
+                "score_date": "20250106",
+                "universe_index": "csi300",
+                "status": "completed",
+                "updated_at": "2025-01-06T09:00:00",
+            },
+        ]
+    )
+    monkeypatch.setattr(portfolio_plans, "get_trading_db_collections", lambda: collections)
+    monkeypatch.setattr(portfolio_plans, "finance_db", {"scoring_runs": scoring_runs})
+
+    response = asyncio.run(
+        portfolio_plans.get_portfolio_plan_generation_watermark(
+            strategy_id="s1",
+            base_date="2025-01-06",
+            current_user={"id": "user-1"},
+        )
+    )
+
+    assert response["data"]["universe_index"] == "csi1000"
+    assert response["data"]["base_date"] == "20250106"
+    assert response["data"]["target_status"] == "running"
+    assert response["data"]["target_is_running"] is True
+    assert response["data"]["latest_completed_scoring_run"]["score_date"] == "20250105"
