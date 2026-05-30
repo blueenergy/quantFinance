@@ -25,6 +25,13 @@ class PaperExecuteRequest(BaseModel):
     force: bool = Field(default=False)
 
 
+class GeneratePlanRequest(BaseModel):
+    strategy_id: str
+    base_date: str
+    mode: str = Field(default="auto", pattern="^(auto|monitor|rebalance)$")
+    force: bool = Field(default=False)
+
+
 def _jsonable(value: Any) -> Any:
     if isinstance(value, ObjectId):
         return str(value)
@@ -54,10 +61,8 @@ def _require_plan(collections: Dict[str, Any], plan_id: str, current_user: Optio
     return plan
 
 
-def _require_strategy(collections: Dict[str, Any], strategy_id: str, current_user: Dict[str, Any]) -> Dict[str, Any]:
-    strategy = collections["portfolio_strategy_configs"].find_one(
-        {"strategy_id": strategy_id, "user_id": _current_user_id(current_user)}
-    )
+def _require_strategy(collections: Dict[str, Any], strategy_id: str) -> Dict[str, Any]:
+    strategy = collections["portfolio_strategy_configs"].find_one({"strategy_id": strategy_id})
     if not strategy:
         raise HTTPException(status_code=404, detail="strategy not found")
     return strategy
@@ -73,7 +78,7 @@ async def list_portfolio_strategies(
     current_user: dict = Depends(get_current_user),
 ):
     collections = get_trading_db_collections()
-    query: Dict[str, Any] = {"user_id": _current_user_id(current_user)}
+    query: Dict[str, Any] = {}
     if status:
         query["status"] = status
     rows = list(collections["portfolio_strategy_configs"].find(query).sort("strategy_id", 1))
@@ -107,6 +112,58 @@ async def list_portfolio_plans(
         query["base_date"] = date_query
     rows = list(collections["portfolio_trade_plans"].find(query).sort("base_date", -1).limit(limit))
     return {"success": True, "data": [_jsonable(row) for row in rows]}
+
+
+@router.post("/plans/generate")
+async def generate_portfolio_plan(request: GeneratePlanRequest, current_user: dict = Depends(get_current_user)):
+    collections = get_trading_db_collections()
+    user_id = _current_user_id(current_user)
+    strategy = _require_strategy(collections, request.strategy_id)
+    if strategy.get("status") == "disabled":
+        raise HTTPException(status_code=400, detail="strategy is disabled")
+    now = datetime.utcnow()
+    task = {
+        "task_id": str(uuid.uuid4()),
+        "task_type": "generate_portfolio_plan",
+        "user_id": user_id,
+        "strategy_id": request.strategy_id,
+        "base_date": request.base_date,
+        "mode": request.mode,
+        "force": request.force,
+        "status": "pending",
+        "attempts": 0,
+        "plan_id": None,
+        "error_message": None,
+        "created_at": now,
+        "updated_at": now,
+    }
+    collections["portfolio_plan_generation_tasks"].insert_one(task)
+    return {"success": True, "data": _jsonable(task)}
+
+
+@router.get("/plans/generation-tasks")
+async def list_portfolio_plan_generation_tasks(
+    status: Optional[str] = Query(default=None),
+    limit: int = Query(default=20, ge=1, le=100),
+    current_user: dict = Depends(get_current_user),
+):
+    collections = get_trading_db_collections()
+    query: Dict[str, Any] = {"user_id": _current_user_id(current_user)}
+    if status:
+        query["status"] = status
+    rows = list(collections["portfolio_plan_generation_tasks"].find(query).sort("created_at", -1).limit(limit))
+    return {"success": True, "data": _jsonable(rows)}
+
+
+@router.get("/plans/generation-tasks/{task_id}")
+async def get_portfolio_plan_generation_task(task_id: str, current_user: dict = Depends(get_current_user)):
+    collections = get_trading_db_collections()
+    task = collections["portfolio_plan_generation_tasks"].find_one(
+        {"task_id": task_id, "user_id": _current_user_id(current_user)}
+    )
+    if not task:
+        raise HTTPException(status_code=404, detail="generation task not found")
+    return {"success": True, "data": _jsonable(task)}
 
 
 @router.get("/plans/{plan_id}")
@@ -200,7 +257,7 @@ async def get_portfolio_strategy_equity(
     current_user: dict = Depends(get_current_user),
 ):
     collections = get_trading_db_collections()
-    _require_strategy(collections, strategy_id, current_user)
+    _require_strategy(collections, strategy_id)
     query: Dict[str, Any] = {"strategy_id": strategy_id, "user_id": _current_user_id(current_user)}
     if start_date or end_date:
         date_query: Dict[str, Any] = {}
@@ -220,7 +277,7 @@ async def get_portfolio_strategy_realtime_equity(
 ):
     collections = get_trading_db_collections()
     data_collections = get_data_db()
-    _require_strategy(collections, strategy_id, current_user)
+    _require_strategy(collections, strategy_id)
     snapshot = collections["portfolio_paper_positions"].find_one(
         {"strategy_id": strategy_id, "user_id": _current_user_id(current_user)},
         sort=[("as_of_date", -1)],

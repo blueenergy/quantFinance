@@ -53,7 +53,13 @@ class _Collection:
 
 def _collections():
     return {
-        "portfolio_strategy_configs": _Collection(),
+        "portfolio_strategy_configs": _Collection(
+            [
+                {"strategy_id": "s1", "status": "enabled"},
+                {"strategy_id": "s2", "status": "enabled"},
+                {"strategy_id": "disabled-s1", "status": "disabled"},
+            ]
+        ),
         "portfolio_trade_plans": _Collection(
             [
                 {"plan_id": "plan-user-1", "strategy_id": "s1", "user_id": "user-1", "base_date": "20250102", "status": "needs_review"},
@@ -65,6 +71,7 @@ def _collections():
         "portfolio_paper_positions": _Collection(),
         "portfolio_paper_executions": _Collection(),
         "portfolio_paper_equity": _Collection(),
+        "portfolio_plan_generation_tasks": _Collection(),
     }
 
 
@@ -87,6 +94,15 @@ def test_list_portfolio_plans_is_scoped_to_current_user(monkeypatch):
     assert [row["plan_id"] for row in response["data"]] == ["plan-user-1"]
 
 
+def test_list_portfolio_strategies_returns_global_catalog(monkeypatch):
+    collections = _collections()
+    monkeypatch.setattr(portfolio_plans, "get_trading_db_collections", lambda: collections)
+
+    response = asyncio.run(portfolio_plans.list_portfolio_strategies(status=None, current_user={"id": "user-1"}))
+
+    assert [row["strategy_id"] for row in response["data"]] == ["disabled-s1", "s1", "s2"]
+
+
 def test_review_plan_rejects_cross_user_access(monkeypatch):
     collections = _collections()
     monkeypatch.setattr(portfolio_plans, "get_trading_db_collections", lambda: collections)
@@ -107,3 +123,56 @@ def test_review_plan_writes_user_id(monkeypatch):
     assert response["success"] is True
     assert collections["portfolio_plan_reviews"].docs[0]["user_id"] == "user-1"
     assert collections["portfolio_trade_plans"].find_one({"plan_id": "plan-user-1"})["status"] == "approved"
+
+
+def test_generate_portfolio_plan_uses_current_user(monkeypatch):
+    collections = _collections()
+    monkeypatch.setattr(portfolio_plans, "get_trading_db_collections", lambda: collections)
+
+    response = asyncio.run(
+        portfolio_plans.generate_portfolio_plan(
+            portfolio_plans.GeneratePlanRequest(strategy_id="s1", base_date="2025-01-04", mode="auto"),
+            current_user={"id": "user-1"},
+        )
+    )
+
+    assert response["success"] is True
+    assert response["data"]["status"] == "pending"
+    assert response["data"]["user_id"] == "user-1"
+    assert response["data"]["strategy_id"] == "s1"
+    assert response["data"]["base_date"] == "2025-01-04"
+    assert response["data"]["mode"] == "auto"
+    assert collections["portfolio_plan_generation_tasks"].docs[0]["task_id"] == response["data"]["task_id"]
+
+
+def test_generate_portfolio_plan_rejects_disabled_strategy(monkeypatch):
+    collections = _collections()
+    monkeypatch.setattr(portfolio_plans, "get_trading_db_collections", lambda: collections)
+
+    with pytest.raises(portfolio_plans.HTTPException) as exc:
+        asyncio.run(
+            portfolio_plans.generate_portfolio_plan(
+                portfolio_plans.GeneratePlanRequest(strategy_id="disabled-s1", base_date="2025-01-04", mode="auto"),
+                current_user={"id": "user-1"},
+            )
+        )
+
+    assert exc.value.status_code == 400
+
+
+def test_get_portfolio_plan_generation_task_is_scoped_to_current_user(monkeypatch):
+    collections = _collections()
+    collections["portfolio_plan_generation_tasks"].docs.extend(
+        [
+            {"task_id": "task-1", "user_id": "user-1", "status": "completed"},
+            {"task_id": "task-2", "user_id": "user-2", "status": "completed"},
+        ]
+    )
+    monkeypatch.setattr(portfolio_plans, "get_trading_db_collections", lambda: collections)
+
+    response = asyncio.run(portfolio_plans.get_portfolio_plan_generation_task("task-1", current_user={"id": "user-1"}))
+
+    assert response["data"]["task_id"] == "task-1"
+    with pytest.raises(portfolio_plans.HTTPException) as exc:
+        asyncio.run(portfolio_plans.get_portfolio_plan_generation_task("task-2", current_user={"id": "user-1"}))
+    assert exc.value.status_code == 404
