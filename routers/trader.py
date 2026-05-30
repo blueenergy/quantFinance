@@ -135,25 +135,137 @@ def create_execution(
         if "timestamp" not in execution:
             execution["timestamp"] = time.time()
         
-        # Insert execution record
-        result = executions_coll.insert_one(execution)
-        
-        # Update signal status to 'executed'
+        broker_order_id = execution.get("broker_order_id") or execution.get("qmt_order_id")
         order_id = execution.get("order_id")
+        execution_status = execution.get("status") or "filled"
+        if broker_order_id:
+            execution["broker_order_id"] = broker_order_id
+            execution.setdefault("qmt_order_id", broker_order_id)
+        execution_key = {
+            "user_id": user_id,
+            "order_id": order_id,
+            "status": execution_status,
+        }
+        if broker_order_id:
+            execution_key["broker_order_id"] = broker_order_id
+        if execution.get("filled_size") is not None:
+            execution_key["filled_size"] = execution.get("filled_size")
+
+        existing = executions_coll.find_one(execution_key) if order_id else None
+        if existing:
+            executions_coll.update_one({"_id": existing["_id"]}, {"$set": execution})
+            execution_id = str(existing["_id"])
+        else:
+            result = executions_coll.insert_one(execution)
+            execution_id = str(result.inserted_id)
+
+        # Update signal status to the broker lifecycle status.
         if order_id:
+            signal_update = {
+                "status": execution_status,
+                "updated_at": execution["timestamp"],
+            }
+            if execution_status in {"filled", "executed", "rejected", "cancelled", "canceled", "failed"}:
+                signal_update["executed_at"] = execution["timestamp"]
+            if execution.get("filled_size") is not None:
+                signal_update["filled_qty"] = execution.get("filled_size")
+            if execution.get("filled_price") is not None:
+                signal_update["avg_price"] = execution.get("filled_price")
             signals_coll.update_one(
                 {"order_id": order_id, "user_id": user_id},
-                {"$set": {"status": "executed", "executed_at": execution["timestamp"]}}
+                {"$set": signal_update}
             )
         
         return {
             "success": True,
             "message": "Execution recorded",
-            "execution_id": str(result.inserted_id)
+            "execution_id": execution_id
         }
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to create execution: {str(e)}")
+
+
+@router.get("/trader/live-signals", summary="List live trading signals")
+def list_live_signals(
+    securities_account_id: Optional[str] = Query(None),
+    status: Optional[str] = Query(None),
+    limit: int = Query(50, ge=1, le=200),
+    current_user: dict = Depends(get_current_active_user)
+):
+    try:
+        collections = get_db_collections()
+        query: Dict[str, Any] = {"user_id": current_user["id"], "mode": "live"}
+        if securities_account_id:
+            query["securities_account_id"] = securities_account_id
+        if status:
+            query["status"] = status
+        rows = list(collections["trade_signals"].find(query).sort("created_at", -1).limit(limit))
+        return {"success": True, "data": [serialize_doc(doc) for doc in rows], "count": len(rows)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to list live signals: {str(e)}")
+
+
+@router.get("/trader/executions", summary="List trade executions")
+def list_executions(
+    securities_account_id: Optional[str] = Query(None),
+    status: Optional[str] = Query(None),
+    limit: int = Query(50, ge=1, le=200),
+    current_user: dict = Depends(get_current_active_user)
+):
+    try:
+        collections = get_db_collections()
+        query: Dict[str, Any] = {"user_id": current_user["id"]}
+        if securities_account_id:
+            query["securities_account_id"] = securities_account_id
+        if status:
+            query["status"] = status
+        rows = list(collections["trade_executions"].find(query).sort("timestamp", -1).limit(limit))
+        return {"success": True, "data": [serialize_doc(doc) for doc in rows], "count": len(rows)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to list executions: {str(e)}")
+
+
+@router.post("/trader/heartbeat", summary="Record quantTrader heartbeat")
+def record_trader_heartbeat(
+    heartbeat: Dict[str, Any] = Body(...),
+    current_user: dict = Depends(get_current_active_user)
+):
+    try:
+        collections = get_db_collections()
+        user_id = current_user["id"]
+        now = time.time()
+        worker_id = heartbeat.get("worker_id") or f"quantTrader:{heartbeat.get('securities_account_id') or heartbeat.get('account_id') or user_id}"
+        doc = {
+            **heartbeat,
+            "worker_id": worker_id,
+            "worker_type": "quantTrader",
+            "user_id": user_id,
+            "last_seen_at": now,
+            "status": heartbeat.get("status") or "running",
+        }
+        collections["worker_status"].update_one(
+            {"worker_id": worker_id, "user_id": user_id},
+            {"$set": doc, "$setOnInsert": {"created_at": now}},
+            upsert=True,
+        )
+        return {"success": True, "data": serialize_doc(doc)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to record heartbeat: {str(e)}")
+
+
+@router.get("/trader/heartbeat", summary="List quantTrader heartbeat status")
+def list_trader_heartbeats(
+    limit: int = Query(20, ge=1, le=100),
+    current_user: dict = Depends(get_current_active_user)
+):
+    try:
+        collections = get_db_collections()
+        query = {"user_id": current_user["id"], "worker_type": "quantTrader"}
+        rows = list(collections["worker_status"].find(query).sort("last_seen_at", -1).limit(limit))
+        return {"success": True, "data": [serialize_doc(doc) for doc in rows], "count": len(rows)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to list heartbeats: {str(e)}")
 
 
 @router.post("/trader/positions/sync", summary="Sync positions from broker")

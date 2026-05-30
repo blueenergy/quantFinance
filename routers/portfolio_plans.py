@@ -12,7 +12,12 @@ from pydantic import BaseModel, Field
 
 from auth import get_current_user
 from db import db as finance_db
-from db import get_data_db, get_trading_db_collections
+from db import get_data_db, get_db_collections, get_trading_db_collections
+from services.live_trade_signals import (
+    active_signal_query_for_order_ids,
+    build_portfolio_plan_live_signal,
+    summarize_signal_statuses,
+)
 
 
 router = APIRouter(prefix="/portfolio-plans", tags=["portfolio-plans"])
@@ -24,6 +29,11 @@ class ReviewRequest(BaseModel):
 
 class PaperExecuteRequest(BaseModel):
     force: bool = Field(default=False)
+
+
+class PublishLiveSignalsRequest(BaseModel):
+    securities_account_id: str
+    dry_run: bool = Field(default=True)
 
 
 class GeneratePlanRequest(BaseModel):
@@ -97,6 +107,183 @@ def _latest_available_score_watermark(stock_scores, universe_index: str) -> Dict
         "latest_available_score_count": count,
         "latest_available_score_source": "stock_scores",
         "latest_available_score_scope": source_scope,
+    }
+
+
+def _require_securities_account(collections: Dict[str, Any], securities_account_id: str, user_id: str) -> Dict[str, Any]:
+    query_ids: List[Any] = [securities_account_id]
+    try:
+        query_ids.insert(0, ObjectId(securities_account_id))
+    except Exception:
+        pass
+    account = None
+    for query_id in query_ids:
+        account = collections["securities_accounts"].find_one({"_id": query_id, "user_id": user_id})
+        if account:
+            break
+    if not account:
+        raise HTTPException(status_code=404, detail="securities account not found")
+    account["_id"] = str(account.get("_id"))
+    return account
+
+
+def _account_live_enabled(account: Dict[str, Any]) -> bool:
+    return bool(
+        account.get("live_trading_enabled")
+        or account.get("live_enabled")
+        or account.get("allow_live_trading")
+    )
+
+
+def _numeric(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _latest_account_snapshot(finance_collections: Dict[str, Any], account: Dict[str, Any], user_id: str) -> Dict[str, Any]:
+    return finance_collections["trader_accounts"].find_one(
+        {"user_id": user_id, "securities_account_id": str(account.get("_id"))},
+        sort=[("synced_at", -1)],
+    ) or {}
+
+
+def _position_snapshot(finance_collections: Dict[str, Any], signal: Dict[str, Any], user_id: str) -> Dict[str, Any]:
+    return finance_collections["trader_positions"].find_one(
+        {
+            "user_id": user_id,
+            "securities_account_id": signal.get("securities_account_id"),
+            "symbol": signal.get("symbol"),
+        },
+        sort=[("synced_at", -1)],
+    ) or {}
+
+
+def _daily_live_signal_amount(finance_collections: Dict[str, Any], account: Dict[str, Any], user_id: str) -> float:
+    today_prefix = datetime.utcnow().date().isoformat()
+    rows = finance_collections["trade_signals"].find(
+        {"user_id": user_id, "securities_account_id": str(account.get("_id")), "mode": "live"}
+    )
+    total = 0.0
+    for row in rows:
+        created_at = row.get("created_at")
+        if isinstance(created_at, datetime):
+            is_today = created_at.date() == datetime.utcnow().date()
+        else:
+            is_today = str(created_at or "").startswith(today_prefix)
+        if is_today and str(row.get("status") or "") not in {"cancelled", "canceled", "rejected", "failed"}:
+            total += abs(int(row.get("size", 0) or 0)) * _numeric(row.get("price"))
+    return total
+
+
+def _load_stock_guard_docs(data_collections: Dict[str, Any], symbols: List[str]) -> Dict[str, Dict[str, Any]]:
+    if not symbols:
+        return {}
+    stock_info_rows = data_collections["stock_info"].find({"symbol": {"$in": symbols}})
+    realtime_rows = data_collections["volume_price_realtime_latest"].find({"symbol": {"$in": symbols}})
+    docs = {row.get("symbol"): dict(row) for row in stock_info_rows if row.get("symbol")}
+    for row in realtime_rows:
+        symbol = row.get("symbol")
+        if symbol:
+            docs.setdefault(symbol, {}).update(row)
+    return docs
+
+
+def _buy_blockers_from_market_doc(signal: Dict[str, Any], market_doc: Dict[str, Any]) -> List[str]:
+    blockers: List[str] = []
+    price = _numeric(signal.get("price"))
+    if price <= 0:
+        blockers.append("missing_price")
+    name = str(market_doc.get("name") or market_doc.get("stock_name") or "")
+    if market_doc.get("is_st") or "ST" in name.upper():
+        blockers.append("st_stock")
+    if market_doc.get("is_suspended") or market_doc.get("suspended") or market_doc.get("paused"):
+        blockers.append("suspended")
+    limit_up = _numeric(market_doc.get("limit_up") or market_doc.get("up_limit"))
+    last_price = _numeric(market_doc.get("close") or market_doc.get("last_price"))
+    if limit_up > 0 and last_price >= limit_up:
+        blockers.append("limit_up")
+    return blockers
+
+
+def _build_live_publish_risk_report(
+    *,
+    finance_collections: Dict[str, Any],
+    data_collections: Dict[str, Any],
+    account: Dict[str, Any],
+    signals: List[Dict[str, Any]],
+    user_id: str,
+) -> Dict[str, Any]:
+    account_snapshot = _latest_account_snapshot(finance_collections, account, user_id)
+    available_cash = _numeric(account_snapshot.get("available_cash") or account_snapshot.get("cash"))
+    total_assets = _numeric(account_snapshot.get("total_assets") or account_snapshot.get("total_asset"))
+    risk_limits = account.get("risk_limits") or {}
+    max_order_amount = _numeric(risk_limits.get("max_order_amount") or account.get("max_order_amount"), float("inf"))
+    max_daily_amount = _numeric(risk_limits.get("max_daily_amount") or account.get("max_daily_amount"), float("inf"))
+    max_position_pct = _numeric(risk_limits.get("max_position_pct") or account.get("max_position_pct"), 0.0)
+    daily_used_amount = _daily_live_signal_amount(finance_collections, account, user_id)
+    market_docs = _load_stock_guard_docs(data_collections, [signal["symbol"] for signal in signals])
+
+    cash_reserved = 0.0
+    day_reserved = 0.0
+    items = []
+    for signal in signals:
+        amount = abs(int(signal.get("size", 0) or 0)) * _numeric(signal.get("price"))
+        blockers: List[str] = []
+        if not _account_live_enabled(account):
+            blockers.append("live_trading_disabled")
+        if not account.get("broker") or not account.get("account_id"):
+            blockers.append("account_binding_missing")
+        if max_order_amount != float("inf") and amount > max_order_amount:
+            blockers.append("max_order_amount_exceeded")
+        if max_daily_amount != float("inf") and daily_used_amount + day_reserved + amount > max_daily_amount:
+            blockers.append("max_daily_amount_exceeded")
+        if signal.get("action") == "buy":
+            blockers.extend(_buy_blockers_from_market_doc(signal, market_docs.get(signal["symbol"], {})))
+            if available_cash and cash_reserved + amount > available_cash:
+                blockers.append("insufficient_cash")
+            if total_assets > 0 and max_position_pct > 0:
+                position = _position_snapshot(finance_collections, signal, user_id)
+                current_market_value = _numeric(position.get("market_value"))
+                if (current_market_value + amount) / total_assets * 100 > max_position_pct:
+                    blockers.append("max_position_pct_exceeded")
+            cash_reserved += amount
+        elif signal.get("action") == "sell":
+            position = _position_snapshot(finance_collections, signal, user_id)
+            available_qty = int(position.get("available_qty") or position.get("can_use_volume") or position.get("qty") or 0)
+            if int(signal.get("size", 0) or 0) > available_qty:
+                blockers.append("insufficient_available_position")
+        day_reserved += amount
+        items.append(
+            {
+                "order_id": signal.get("order_id"),
+                "symbol": signal.get("symbol"),
+                "action": signal.get("action"),
+                "size": signal.get("size"),
+                "price": signal.get("price"),
+                "estimated_amount": amount,
+                "blockers": sorted(set(blockers)),
+            }
+        )
+
+    return {
+        "account": {
+            "securities_account_id": str(account.get("_id")),
+            "broker": account.get("broker"),
+            "account_id": account.get("account_id"),
+            "live_trading_enabled": _account_live_enabled(account),
+            "available_cash": available_cash,
+        },
+        "limits": {
+            "max_order_amount": None if max_order_amount == float("inf") else max_order_amount,
+            "max_daily_amount": None if max_daily_amount == float("inf") else max_daily_amount,
+            "max_position_pct": max_position_pct or None,
+            "daily_used_amount": daily_used_amount,
+            "new_signal_amount": day_reserved,
+        },
+        "items": items,
+        "blocked_count": sum(1 for item in items if item["blockers"]),
     }
 
 
@@ -332,6 +519,89 @@ async def execute_portfolio_plan_paper(
     _require_plan(collections, plan_id, current_user)
     result = _apply_paper_execution(collections, data_collections, plan_id, force=request.force, user_id=_current_user_id(current_user))
     return {"success": True, "data": _jsonable(result)}
+
+
+@router.post("/plans/{plan_id}/publish-live-signals")
+async def publish_portfolio_plan_live_signals(
+    plan_id: str,
+    request: PublishLiveSignalsRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    trading_collections = get_trading_db_collections()
+    finance_collections = get_db_collections()
+    data_collections = get_data_db()
+    user_id = _current_user_id(current_user)
+    plan = _require_plan(trading_collections, plan_id, current_user)
+    if plan.get("status") != "approved":
+        raise HTTPException(status_code=400, detail="plan must be approved before publishing live signals")
+    account = _require_securities_account(finance_collections, request.securities_account_id, user_id)
+    items = list(
+        trading_collections["portfolio_trade_plan_items"]
+        .find({"plan_id": plan_id, "user_id": user_id})
+        .sort("rank", 1)
+    )
+    now = datetime.utcnow()
+    signals = []
+    skipped_items = []
+    for item in items:
+        try:
+            signal = build_portfolio_plan_live_signal(plan=plan, item=item, account=account, now=now)
+        except Exception as exc:
+            skipped_items.append({"symbol": item.get("symbol"), "reason": str(exc)})
+            continue
+        if signal is not None:
+            signals.append(signal.to_mongo())
+
+    order_ids = [signal["order_id"] for signal in signals]
+    existing_signals = list(
+        finance_collections["trade_signals"].find(active_signal_query_for_order_ids(user_id, order_ids))
+    ) if order_ids else []
+    existing_order_ids = {row.get("order_id") for row in existing_signals}
+    new_signals = [signal for signal in signals if signal.get("order_id") not in existing_order_ids]
+    risk_report = _build_live_publish_risk_report(
+        finance_collections=finance_collections,
+        data_collections=data_collections,
+        account=account,
+        signals=new_signals,
+        user_id=user_id,
+    )
+    blocked = [item for item in risk_report["items"] if item["blockers"]]
+    if blocked and not request.dry_run:
+        raise HTTPException(status_code=409, detail={"message": "live signal risk check failed", "risk_report": risk_report})
+
+    inserted_count = 0
+    if not request.dry_run and new_signals:
+        finance_collections["trade_signals"].insert_many(new_signals)
+        inserted_count = len(new_signals)
+        trading_collections["portfolio_trade_plans"].update_one(
+            {"plan_id": plan_id, "user_id": user_id},
+            {
+                "$set": {
+                    "live_signals_published_at": now,
+                    "live_signal_count": len(signals),
+                    "live_signal_inserted_count": inserted_count,
+                    "live_signal_status_summary": {"pending": inserted_count, **summarize_signal_statuses(existing_signals)},
+                }
+            },
+        )
+
+    return {
+        "success": True,
+        "data": _jsonable(
+            {
+                "plan_id": plan_id,
+                "dry_run": request.dry_run,
+                "signals": signals,
+                "new_signals": new_signals,
+                "existing_signals": existing_signals,
+                "skipped_items": skipped_items,
+                "risk_report": risk_report,
+                "inserted_count": inserted_count,
+                "existing_count": len(existing_signals),
+                "blocked": bool(blocked),
+            }
+        ),
+    }
 
 
 @router.get("/strategies/{strategy_id}/equity")

@@ -1,4 +1,5 @@
 from datetime import datetime
+from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException
 from bson import ObjectId
 from pymongo.collection import Collection
@@ -16,6 +17,39 @@ def _encrypt_password(raw: str) -> str:
     # Placeholder: replace with KMS/Fernet integration later
     return raw
 
+
+def _account_response(d: dict) -> SecuritiesAccountResponse:
+    return SecuritiesAccountResponse(
+        id=str(d["_id"]),
+        broker=d["broker"],
+        account_id=d["account_id"],
+        account_type=d.get("account_type", "real"),
+        created_at=d.get("created_at", datetime.utcnow()),
+        updated_at=d.get("updated_at"),
+        initial_cash=d.get("initial_cash"),
+        live_trading_enabled=bool(d.get("live_trading_enabled", False)),
+        risk_limits=d.get("risk_limits"),
+    )
+
+
+def _normalize_risk_limits(raw: Optional[dict]) -> dict:
+    if not raw:
+        return {}
+    allowed_fields = ("max_order_amount", "max_daily_amount", "max_position_pct")
+    limits = {}
+    for field in allowed_fields:
+        value = raw.get(field)
+        if value in (None, ""):
+            continue
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail=f"{field} 必须是数字")
+        if number < 0:
+            raise HTTPException(status_code=400, detail=f"{field} 不能小于 0")
+        limits[field] = number
+    return limits
+
 @router.get("/securities_accounts", response_model=list[SecuritiesAccountResponse])
 def list_accounts(current_user: dict = Depends(get_current_active_user)):
     collections = get_db_collections()
@@ -23,17 +57,7 @@ def list_accounts(current_user: dict = Depends(get_current_active_user)):
     docs = col.find({"user_id": str(current_user["id"])})
     out = []
     for d in docs:
-        out.append(
-            SecuritiesAccountResponse(
-                id=str(d["_id"]),
-                broker=d["broker"],
-                account_id=d["account_id"],
-                account_type=d.get("account_type", "real"),
-                created_at=d.get("created_at", datetime.utcnow()),
-                updated_at=d.get("updated_at"),
-                initial_cash=d.get("initial_cash"),
-            )
-        )
+        out.append(_account_response(d))
     
     # 调试：打印返回的账户数据
     print(f"\n=== GET /securities_accounts ===")
@@ -78,6 +102,8 @@ def create_account(payload: SecuritiesAccountCreate, current_user: dict = Depend
         "broker": broker,
         "account_id": account_id,
         "account_type": account_type,
+        "live_trading_enabled": bool(payload.live_trading_enabled) if account_type == "real" else False,
+        "risk_limits": _normalize_risk_limits(payload.risk_limits),
         "created_at": datetime.utcnow(),
         "updated_at": None,
     }
@@ -133,15 +159,7 @@ def create_account(payload: SecuritiesAccountCreate, current_user: dict = Depend
             "synced_at": datetime.utcnow(),
         })
     
-    return SecuritiesAccountResponse(
-        id=securities_account_id,
-        broker=doc["broker"],
-        account_id=doc["account_id"],
-        account_type=account_type,
-        created_at=doc["created_at"],
-        updated_at=None,
-        initial_cash=doc.get("initial_cash"),
-    )
+    return _account_response({**doc, "_id": securities_account_id})
 
 @router.put("/securities_accounts/{id}")
 def update_account(id: str, payload: SecuritiesAccountUpdate, current_user: dict = Depends(get_current_active_user)):
@@ -164,6 +182,13 @@ def update_account(id: str, payload: SecuritiesAccountUpdate, current_user: dict
         update["account_id"] = payload.account_id
     if payload.account_type is not None:
         update["account_type"] = payload.account_type
+    effective_account_type = payload.account_type or account.get("account_type", "real")
+    if payload.live_trading_enabled is not None:
+        update["live_trading_enabled"] = bool(payload.live_trading_enabled) if effective_account_type == "real" else False
+    if payload.risk_limits is not None:
+        update["risk_limits"] = _normalize_risk_limits(payload.risk_limits)
+    if effective_account_type != "real":
+        update["live_trading_enabled"] = False
     
     if not update:
         return {"success": True}

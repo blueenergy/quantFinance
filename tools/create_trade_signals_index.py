@@ -33,7 +33,7 @@ def create_trade_signals_index():
     signals_coll = db["trade_signals"]
     
     print("Creating unique index on trade_signals...")
-    print("Index keys: (user_id, symbol, strategy, timestamp, action)")
+    print("Index keys: (user_id, order_id)")
     print("")
     
     # Check existing indexes
@@ -43,18 +43,13 @@ def create_trade_signals_index():
         print(f"  - {idx['name']}: {idx.get('key', {})}")
     print("")
     
-    # Create compound unique index
-    # Round timestamp to nearest minute to handle floating point precision
-    index_name = "unique_signal_per_minute"
+    index_name = "unique_live_order_id_per_user"
     
     try:
         signals_coll.create_index(
             [
                 ("user_id", ASCENDING),
-                ("symbol", ASCENDING),
-                ("strategy", ASCENDING),
-                ("timestamp", ASCENDING),  # Unix timestamp (seconds)
-                ("action", ASCENDING),
+                ("order_id", ASCENDING),
             ],
             name=index_name,
             unique=True,
@@ -63,9 +58,9 @@ def create_trade_signals_index():
         print(f"✅ Created unique index: {index_name}")
         print("")
         print("This will prevent duplicate signals from:")
-        print("  - Same strategy processing same bar multiple times")
-        print("  - Worker restart re-processing same minute")
-        print("  - Strategy logic bugs causing multiple signals")
+        print("  - Same approved portfolio plan being published more than once")
+        print("  - quantTrader retry/restart seeing duplicate live orders")
+        print("  - Strategy logic bugs reusing the same executable order_id")
         print("")
         print("⚠️  IMPORTANT:")
         print("  - Existing duplicates will NOT be removed")
@@ -86,10 +81,7 @@ db.trade_signals.aggregate([
     $group: {
       _id: {
         user_id: "$user_id",
-        symbol: "$symbol", 
-        strategy: "$strategy",
-        timestamp: "$timestamp",
-        action: "$action"
+        order_id: "$order_id"
       },
       count: { $sum: 1 },
       ids: { $push: "$_id" }
@@ -122,10 +114,7 @@ def find_duplicates():
             "$group": {
                 "_id": {
                     "user_id": "$user_id",
-                    "symbol": "$symbol",
-                    "strategy": "$strategy",
-                    "timestamp": "$timestamp",
-                    "action": "$action"
+                    "order_id": "$order_id"
                 },
                 "count": {"$sum": 1},
                 "ids": {"$push": "$_id"},

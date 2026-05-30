@@ -125,18 +125,24 @@ class SecuritiesAccountCreate(BaseModel):
     account_type: str = "real"
     password: Optional[str] = None  # 模拟账户不需要密码
     initial_cash: Optional[float] = None  # 模拟账户初始资金，默认100万
+    live_trading_enabled: bool = False
+    risk_limits: Optional[Dict[str, Any]] = None
 
 class SecuritiesAccountUpdate(BaseModel):
     broker: Optional[str] = None
     account_id: Optional[str] = None
     password: Optional[str] = None
     account_type: Optional[str] = None
+    live_trading_enabled: Optional[bool] = None
+    risk_limits: Optional[Dict[str, Any]] = None
 
 class SecuritiesAccountResponse(SecuritiesAccountBase):
     id: str
     created_at: datetime
     updated_at: Optional[datetime] = None
     initial_cash: Optional[float] = None  # 模拟账户显示初始资金
+    live_trading_enabled: bool = False
+    risk_limits: Optional[Dict[str, Any]] = None
 
 
 class WorkerNodeRegisterRequest(BaseModel):
