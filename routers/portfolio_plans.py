@@ -82,6 +82,24 @@ def _normalize_yyyymmdd(value: Optional[str]) -> Optional[str]:
     return None
 
 
+def _latest_available_score_watermark(stock_scores, universe_index: str) -> Dict[str, Any]:
+    query: Dict[str, Any] = {"index_codes": universe_index}
+    row = stock_scores.find_one(query, sort=[("score_date", -1)], projection={"_id": 0, "score_date": 1})
+    source_scope = "index_codes"
+    if not row:
+        query = {}
+        row = stock_scores.find_one(query, sort=[("score_date", -1)], projection={"_id": 0, "score_date": 1})
+        source_scope = "global"
+    score_date = str(row.get("score_date")) if row and row.get("score_date") else None
+    count = stock_scores.count_documents({**query, "score_date": score_date}) if score_date else 0
+    return {
+        "latest_available_score_date": score_date,
+        "latest_available_score_count": count,
+        "latest_available_score_source": "stock_scores",
+        "latest_available_score_scope": source_scope,
+    }
+
+
 @router.get("/strategies")
 async def list_portfolio_strategies(
     status: Optional[str] = Query(default=None),
@@ -214,6 +232,7 @@ async def get_portfolio_plan_generation_watermark(
         {**universe_query, "status": "completed"},
         sort=[("score_date", -1), ("updated_at", -1)],
     )
+    available_score_watermark = _latest_available_score_watermark(finance_db["stock_scores"], universe_index)
     return {
         "success": True,
         "data": _jsonable(
@@ -226,6 +245,7 @@ async def get_portfolio_plan_generation_watermark(
                 "target_is_running": bool(target_run and target_run.get("status") == "running"),
                 "latest_scoring_run": latest_run,
                 "latest_completed_scoring_run": latest_completed_run,
+                **available_score_watermark,
             }
         ),
     }

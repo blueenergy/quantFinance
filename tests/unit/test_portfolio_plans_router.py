@@ -37,6 +37,9 @@ class _Collection:
                 doc.update(update.get("$set", {}))
                 return
 
+    def count_documents(self, query=None):
+        return len(self.find(query or {}))
+
     def _matches(self, doc, query):
         for key, expected in query.items():
             value = doc.get(key)
@@ -44,6 +47,10 @@ class _Collection:
                 if "$gte" in expected and not (value >= expected["$gte"]):
                     return False
                 if "$lte" in expected and not (value <= expected["$lte"]):
+                    return False
+                continue
+            if isinstance(value, list):
+                if expected not in value:
                     return False
                 continue
             if value != expected:
@@ -241,7 +248,15 @@ def test_get_portfolio_plan_generation_watermark_uses_strategy_universe(monkeypa
         ]
     )
     monkeypatch.setattr(portfolio_plans, "get_trading_db_collections", lambda: collections)
-    monkeypatch.setattr(portfolio_plans, "finance_db", {"scoring_runs": scoring_runs})
+    stock_scores = _Collection(
+        [
+            {"score_date": "20250105", "symbol": "000001", "index_codes": ["csi1000"]},
+            {"score_date": "20250106", "symbol": "000001", "index_codes": ["csi1000"]},
+            {"score_date": "20250106", "symbol": "000002", "index_codes": ["csi1000"]},
+            {"score_date": "20250106", "symbol": "000300", "index_codes": ["csi300"]},
+        ]
+    )
+    monkeypatch.setattr(portfolio_plans, "finance_db", {"scoring_runs": scoring_runs, "stock_scores": stock_scores})
 
     response = asyncio.run(
         portfolio_plans.get_portfolio_plan_generation_watermark(
@@ -256,3 +271,34 @@ def test_get_portfolio_plan_generation_watermark_uses_strategy_universe(monkeypa
     assert response["data"]["target_status"] == "running"
     assert response["data"]["target_is_running"] is True
     assert response["data"]["latest_completed_scoring_run"]["score_date"] == "20250105"
+    assert response["data"]["latest_available_score_date"] == "20250106"
+    assert response["data"]["latest_available_score_count"] == 2
+    assert response["data"]["latest_available_score_source"] == "stock_scores"
+    assert response["data"]["latest_available_score_scope"] == "index_codes"
+
+
+def test_get_portfolio_plan_generation_watermark_falls_back_to_global_scores(monkeypatch):
+    collections = _collections()
+    scoring_runs = _Collection()
+    stock_scores = _Collection(
+        [
+            {"score_date": "20250105", "symbol": "000001"},
+            {"score_date": "20250107", "symbol": "000002"},
+            {"score_date": "20250107", "symbol": "000003"},
+        ]
+    )
+    monkeypatch.setattr(portfolio_plans, "get_trading_db_collections", lambda: collections)
+    monkeypatch.setattr(portfolio_plans, "finance_db", {"scoring_runs": scoring_runs, "stock_scores": stock_scores})
+
+    response = asyncio.run(
+        portfolio_plans.get_portfolio_plan_generation_watermark(
+            strategy_id="s1",
+            base_date="2025-01-06",
+            current_user={"id": "user-1"},
+        )
+    )
+
+    assert response["data"]["target_scoring_run"] is None
+    assert response["data"]["latest_available_score_date"] == "20250107"
+    assert response["data"]["latest_available_score_count"] == 2
+    assert response["data"]["latest_available_score_scope"] == "global"
