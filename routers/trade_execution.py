@@ -913,11 +913,14 @@ def get_all_trade_activities(
             if date_query:
                 signal_query.update(date_query)
             
+            pending_signal_statuses = {"pending", "retry_pending", "submitted", ""}
             signals = list(signals_coll.find(signal_query).sort("timestamp", -1))
             
             for signal_doc in signals:
                 signal_time = add_display_time_fields(dict(signal_doc))
                 raw_status = str(signal_doc.get("status", "pending")).lower()
+                if status_filter == "pending" and raw_status not in pending_signal_statuses:
+                    continue
                 status_map = {
                     "pending": "PENDING",
                     "retry_pending": "RETRY",
