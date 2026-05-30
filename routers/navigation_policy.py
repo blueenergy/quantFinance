@@ -36,6 +36,7 @@ KNOWN_MAIN_TABS: List[tuple] = [
     ("watchlist", False),
     ("backtest", False),
     ("strategy-lab", False),
+    ("portfolio-research", False),
     ("portfolio-plans", False),
     ("strategies", False),
     ("strategy-workers", False),

@@ -121,6 +121,9 @@ def get_trading_db_collections() -> Dict[str, Collection]:
         "portfolio_paper_equity": trading_db["portfolio_paper_equity"],
         "portfolio_plan_generation_tasks": trading_db["portfolio_plan_generation_tasks"],
         "portfolio_worker_status": trading_db["portfolio_worker_status"],
+        "portfolio_research_jobs": trading_db["portfolio_research_jobs"],
+        "portfolio_research_results": trading_db["portfolio_research_results"],
+        "portfolio_research_reviews": trading_db["portfolio_research_reviews"],
     }
 
 def get_analyzer_db():
