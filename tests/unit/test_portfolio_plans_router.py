@@ -109,6 +109,7 @@ def _finance_collections():
             ]
         ),
         "trade_signals": _Collection(),
+        "trade_executions": _Collection(),
         "trader_accounts": _Collection([{"user_id": "user-1", "securities_account_id": "acct-1", "available_cash": 100000, "synced_at": 10}]),
         "trader_positions": _Collection([{"user_id": "user-1", "securities_account_id": "acct-1", "symbol": "600000", "can_use_volume": 500}]),
     }
@@ -423,6 +424,104 @@ def test_publish_live_signals_write_is_idempotent(monkeypatch):
     assert second["data"]["inserted_count"] == 0
     assert second["data"]["existing_count"] == 1
     assert len(finance["trade_signals"].docs) == 1
+
+
+def test_publish_live_signals_blocks_after_paper_execution(monkeypatch):
+    collections = _collections()
+    collections["portfolio_trade_plans"].docs[0]["status"] = "approved"
+    collections["portfolio_paper_executions"].docs.append(
+        {"plan_id": "plan-user-1", "user_id": "user-1", "symbol": "000001"}
+    )
+    finance = _finance_collections()
+    monkeypatch.setattr(portfolio_plans, "get_trading_db_collections", lambda: collections)
+    monkeypatch.setattr(portfolio_plans, "get_db_collections", lambda: finance)
+
+    with pytest.raises(portfolio_plans.HTTPException) as exc:
+        asyncio.run(
+            portfolio_plans.publish_portfolio_plan_live_signals(
+                "plan-user-1",
+                portfolio_plans.PublishLiveSignalsRequest(securities_account_id="acct-1", dry_run=True),
+                current_user={"id": "user-1"},
+            )
+        )
+
+    assert exc.value.status_code == 400
+    assert "paper executions" in exc.value.detail
+
+
+def test_execute_paper_blocks_after_live_signal_publish(monkeypatch):
+    collections = _collections()
+    collections["portfolio_trade_plans"].docs[0]["status"] = "approved"
+    finance = _finance_collections()
+    finance["trade_signals"].docs.append(
+        {
+            "user_id": "user-1",
+            "plan_id": "plan-user-1",
+            "source": "portfolio_plan",
+            "mode": "live",
+            "order_id": "live-order-1",
+        }
+    )
+    monkeypatch.setattr(portfolio_plans, "get_db_collections", lambda: finance)
+
+    with pytest.raises(portfolio_plans.HTTPException) as exc:
+        portfolio_plans._apply_paper_execution(
+            collections,
+            data_collections={},
+            plan_id="plan-user-1",
+            user_id="user-1",
+        )
+
+    assert exc.value.status_code == 400
+    assert "live signals" in exc.value.detail
+
+
+def test_plan_live_executions_are_scoped_to_plan_order_ids(monkeypatch):
+    collections = _collections()
+    finance = _finance_collections()
+    finance["trade_signals"].docs.extend(
+        [
+            {
+                "user_id": "user-1",
+                "plan_id": "plan-user-1",
+                "strategy_id": "s1",
+                "source": "portfolio_plan",
+                "mode": "live",
+                "order_id": "plan-order-1",
+                "created_at": 1,
+            },
+            {
+                "user_id": "user-1",
+                "plan_id": "other-plan",
+                "strategy_id": "other-strategy",
+                "source": "portfolio_plan",
+                "mode": "live",
+                "order_id": "other-order",
+                "created_at": 2,
+            },
+        ]
+    )
+    finance["trade_executions"].docs.extend(
+        [
+            {"user_id": "user-1", "order_id": "plan-order-1", "strategy_id": "s1", "timestamp": 10},
+            {"user_id": "user-1", "order_id": "other-order", "strategy_id": "other-strategy", "timestamp": 11},
+            {"user_id": "user-1", "order_id": "manual-order", "strategy_id": "manual", "timestamp": 12},
+        ]
+    )
+    monkeypatch.setattr(portfolio_plans, "get_trading_db_collections", lambda: collections)
+    monkeypatch.setattr(portfolio_plans, "get_db_collections", lambda: finance)
+
+    response = asyncio.run(
+        portfolio_plans.get_portfolio_plan_live_executions(
+            "plan-user-1",
+            current_user={"id": "user-1"},
+        )
+    )
+
+    assert response["success"] is True
+    assert [row["order_id"] for row in response["data"]["signals"]] == ["plan-order-1"]
+    assert [row["order_id"] for row in response["data"]["executions"]] == ["plan-order-1"]
+    assert response["data"]["executions"][0]["execution_time"] == "1970-01-01 08:00:10"
 
 
 def test_publish_live_signals_blocks_when_live_switch_is_off(monkeypatch):

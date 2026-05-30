@@ -4,6 +4,7 @@ from datetime import datetime, timedelta
 from db import get_db_collections, get_data_db
 from utils.stock_utils import serialize_doc
 from utils.symbol_utils import normalize_symbol, strip_exchange_suffix
+from utils.time_display import add_display_time_fields
 from auth import get_current_active_user
 import time
 
@@ -340,6 +341,7 @@ def get_all_trade_executions(
     start_date: Optional[str] = Query(None, description="开始日期 (YYYY-MM-DD)"),
     end_date: Optional[str] = Query(None, description="结束日期 (YYYY-MM-DD)"),
     days: Optional[int] = Query(None, description="最近N天"),
+    plan_id: Optional[str] = Query(None, description="只返回指定 portfolio plan 发布的实盘成交"),
     current_user: dict = Depends(get_current_active_user),
 ):
     """获取当前登录用户的交易执行记录，按时间倒序排列，支持日期范围筛选"""
@@ -352,6 +354,21 @@ def get_all_trade_executions(
         # 构建查询条件（按用户 + 日期）
         user_id = current_user["id"]
         query: Dict[str, Any] = {"user_id": user_id}
+        if plan_id:
+            signals = list(
+                collections["trade_signals"].find(
+                    {"user_id": user_id, "plan_id": plan_id, "mode": "live"},
+                    {"_id": 0, "order_id": 1},
+                )
+            )
+            order_ids = [row.get("order_id") for row in signals if row.get("order_id")]
+            if not order_ids:
+                return {
+                    "success": True,
+                    "data": [],
+                    "count": 0
+                }
+            query["order_id"] = {"$in": order_ids}
         
         # 处理日期筛选
         if days:
@@ -404,7 +421,7 @@ def get_all_trade_executions(
         
         # 查询并排序
         cursor = collection.find(query).sort("timestamp", -1).skip(skip).limit(limit)
-        trades = [serialize_doc(doc) for doc in cursor]
+        trades = [add_display_time_fields(serialize_doc(doc)) for doc in cursor]
         
         # 添加股票名称
         trades = enrich_trades_with_stock_names(trades, stock_info_collection)
@@ -448,7 +465,7 @@ def get_trade_executions_by_symbol(
         
         # 查询并排序
         cursor = collection.find(query).sort("timestamp", -1).skip(skip).limit(limit)
-        trades = _group_executions_by_order([serialize_doc(doc) for doc in cursor])
+        trades = _group_executions_by_order([add_display_time_fields(serialize_doc(doc)) for doc in cursor])
         # 过滤掉未成交的订单（filled_size 为 0 的废单）
         trades = [t for t in trades if t.get("filled_size", 0) != 0]
         
@@ -483,7 +500,7 @@ def get_trade_executions_by_date(
         
         # 查询并排序
         cursor = collection.find(query).sort("timestamp", -1).skip(skip).limit(limit)
-        trades = [serialize_doc(doc) for doc in cursor]
+        trades = [add_display_time_fields(serialize_doc(doc)) for doc in cursor]
         
         # 添加股票名称
         trades = enrich_trades_with_stock_names(trades, stock_info_collection)
@@ -851,6 +868,7 @@ def get_all_trade_activities(
             executions = [e for e in executions if e.get("filled_size", 0) != 0]
             
             for exec_doc in executions:
+                exec_time = add_display_time_fields(dict(exec_doc))
                 raw_status = str(exec_doc.get("status", "filled")).lower()
                 if raw_status in ("filled",):
                     status = "FILLED"
@@ -876,6 +894,8 @@ def get_all_trade_activities(
                     "quantity": exec_doc.get("filled_size", exec_doc.get("size", exec_doc.get("quantity", 0))),
                     "strategy": exec_doc.get("strategy_name", exec_doc.get("strategy", "")),
                     "timestamp": exec_doc.get("timestamp", 0),
+                    "execution_time": exec_time.get("execution_time"),
+                    "timestamp_iso": exec_time.get("timestamp_iso"),
                     "order_id": exec_doc.get("order_id", ""),
                     "source": "trade_execution",
                     "date": exec_doc.get("date", "")
@@ -896,6 +916,7 @@ def get_all_trade_activities(
             signals = list(signals_coll.find(signal_query).sort("timestamp", -1))
             
             for signal_doc in signals:
+                signal_time = add_display_time_fields(dict(signal_doc))
                 raw_status = str(signal_doc.get("status", "pending")).lower()
                 status_map = {
                     "pending": "PENDING",
@@ -929,6 +950,8 @@ def get_all_trade_activities(
                     "quantity": signal_doc.get("size", 0),
                     "strategy": signal_doc.get("strategy", ""),
                     "timestamp": signal_doc.get("timestamp", 0),
+                    "execution_time": signal_time.get("execution_time"),
+                    "timestamp_iso": signal_time.get("timestamp_iso"),
                     "order_id": signal_doc.get("order_id", ""),
                     "source": "trade_signal",
                     "error_message": signal_doc.get("error_message"),
@@ -1092,6 +1115,11 @@ def create_trader_execution(
 
     # 默认实盘模式
     execution_record.setdefault("mode", "live")
+    signal = signals_coll.find_one({"order_id": order_id, "user_id": user_id})
+    if signal:
+        for field in ("plan_id", "strategy_id", "source", "securities_account_id", "account_id", "broker"):
+            if signal.get(field) is not None:
+                execution_record.setdefault(field, signal.get(field))
 
     insert_result = executions_coll.insert_one(execution_record)
 

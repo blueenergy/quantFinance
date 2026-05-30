@@ -16,6 +16,7 @@ import time
 from auth import get_current_active_user
 from db import get_db_collections, get_data_db
 from utils.stock_utils import serialize_doc
+from utils.time_display import add_display_time_fields
 from bson import ObjectId
 
 router = APIRouter()
@@ -138,6 +139,11 @@ def create_execution(
         broker_order_id = execution.get("broker_order_id") or execution.get("qmt_order_id")
         order_id = execution.get("order_id")
         execution_status = execution.get("status") or "filled"
+        signal = signals_coll.find_one({"order_id": order_id, "user_id": user_id}) if order_id else None
+        if signal:
+            for field in ("plan_id", "strategy_id", "source", "securities_account_id", "account_id", "broker"):
+                if signal.get(field) is not None:
+                    execution.setdefault(field, signal.get(field))
         if broker_order_id:
             execution["broker_order_id"] = broker_order_id
             execution.setdefault("qmt_order_id", broker_order_id)
@@ -210,18 +216,29 @@ def list_live_signals(
 def list_executions(
     securities_account_id: Optional[str] = Query(None),
     status: Optional[str] = Query(None),
+    plan_id: Optional[str] = Query(None),
     limit: int = Query(50, ge=1, le=200),
     current_user: dict = Depends(get_current_active_user)
 ):
     try:
         collections = get_db_collections()
-        query: Dict[str, Any] = {"user_id": current_user["id"]}
+        user_id = current_user["id"]
+        query: Dict[str, Any] = {"user_id": user_id}
         if securities_account_id:
             query["securities_account_id"] = securities_account_id
         if status:
             query["status"] = status
+        if plan_id:
+            signal_query: Dict[str, Any] = {"user_id": user_id, "plan_id": plan_id, "mode": "live"}
+            if securities_account_id:
+                signal_query["securities_account_id"] = securities_account_id
+            signals = list(collections["trade_signals"].find(signal_query, {"_id": 0, "order_id": 1}))
+            order_ids = [row.get("order_id") for row in signals if row.get("order_id")]
+            if not order_ids:
+                return {"success": True, "data": [], "count": 0}
+            query["order_id"] = {"$in": order_ids}
         rows = list(collections["trade_executions"].find(query).sort("timestamp", -1).limit(limit))
-        return {"success": True, "data": [serialize_doc(doc) for doc in rows], "count": len(rows)}
+        return {"success": True, "data": [add_display_time_fields(serialize_doc(doc)) for doc in rows], "count": len(rows)}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to list executions: {str(e)}")
 

@@ -13,6 +13,7 @@ from pydantic import BaseModel, Field
 from auth import get_current_user
 from db import db as finance_db
 from db import get_data_db, get_db_collections, get_trading_db_collections
+from utils.time_display import add_display_time_fields
 from services.live_trade_signals import (
     active_signal_query_for_order_ids,
     build_portfolio_plan_live_signal,
@@ -70,6 +71,19 @@ def _require_plan(collections: Dict[str, Any], plan_id: str, current_user: Optio
     if not plan:
         raise HTTPException(status_code=404, detail="plan not found")
     return plan
+
+
+def _plan_has_live_signals(finance_collections: Dict[str, Any], plan_id: str, user_id: str) -> bool:
+    return bool(
+        finance_collections["trade_signals"].find_one(
+            {
+                "user_id": user_id,
+                "plan_id": plan_id,
+                "mode": "live",
+                "source": "portfolio_plan",
+            }
+        )
+    )
 
 
 def _require_strategy(collections: Dict[str, Any], strategy_id: str) -> Dict[str, Any]:
@@ -508,6 +522,41 @@ async def get_portfolio_plan_executions(plan_id: str, current_user: dict = Depen
     return {"success": True, "data": _jsonable(rows)}
 
 
+@router.get("/plans/{plan_id}/live-executions")
+async def get_portfolio_plan_live_executions(plan_id: str, current_user: dict = Depends(get_current_user)):
+    trading_collections = get_trading_db_collections()
+    finance_collections = get_db_collections()
+    _require_plan(trading_collections, plan_id, current_user)
+    user_id = _current_user_id(current_user)
+
+    signal_query = {
+        "user_id": user_id,
+        "plan_id": plan_id,
+        "mode": "live",
+        "source": "portfolio_plan",
+    }
+    signals = [add_display_time_fields(row) for row in finance_collections["trade_signals"].find(signal_query).sort("created_at", 1)]
+    order_ids = [row.get("order_id") for row in signals if row.get("order_id")]
+    execution_query = {"user_id": user_id, "order_id": {"$in": order_ids}} if order_ids else None
+    executions = (
+        [add_display_time_fields(row) for row in finance_collections["trade_executions"].find(execution_query).sort("timestamp", -1)]
+        if execution_query
+        else []
+    )
+    return {
+        "success": True,
+        "data": _jsonable(
+            {
+                "plan_id": plan_id,
+                "signals": signals,
+                "executions": executions,
+                "signal_count": len(signals),
+                "execution_count": len(executions),
+            }
+        ),
+    }
+
+
 @router.post("/plans/{plan_id}/execute-paper")
 async def execute_portfolio_plan_paper(
     plan_id: str,
@@ -534,6 +583,8 @@ async def publish_portfolio_plan_live_signals(
     plan = _require_plan(trading_collections, plan_id, current_user)
     if plan.get("status") != "approved":
         raise HTTPException(status_code=400, detail="plan must be approved before publishing live signals")
+    if plan.get("paper_executed_at") or trading_collections["portfolio_paper_executions"].find_one({"plan_id": plan_id, "user_id": user_id}):
+        raise HTTPException(status_code=400, detail="plan already has paper executions; cannot publish live signals")
     account = _require_securities_account(finance_collections, request.securities_account_id, user_id)
     items = list(
         trading_collections["portfolio_trade_plan_items"]
@@ -710,6 +761,8 @@ def _apply_paper_execution(collections: Dict[str, Any], data_collections: Dict[s
     plan = _require_plan(collections, plan_id, {"id": user_id} if user_id else None)
     if plan.get("status") != "approved" and not force:
         raise HTTPException(status_code=400, detail="plan must be approved before paper execution")
+    if user_id and _plan_has_live_signals(get_db_collections(), plan_id, user_id) and not force:
+        raise HTTPException(status_code=400, detail="plan already has live signals; cannot execute paper trading")
     if collections["portfolio_paper_executions"].find_one({"plan_id": plan_id}) and not force:
         raise HTTPException(status_code=400, detail="plan already has paper executions")
 
