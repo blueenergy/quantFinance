@@ -166,6 +166,21 @@ async def get_portfolio_plan_generation_task(task_id: str, current_user: dict = 
     return {"success": True, "data": _jsonable(task)}
 
 
+@router.get("/workers/status")
+async def list_portfolio_worker_status(
+    worker_type: Optional[str] = Query(default="portfolio_plan_generator"),
+    limit: int = Query(default=20, ge=1, le=100),
+    current_user: dict = Depends(get_current_user),
+):
+    _current_user_id(current_user)
+    collections = get_trading_db_collections()
+    query: Dict[str, Any] = {}
+    if worker_type:
+        query["worker_type"] = worker_type
+    rows = list(collections["portfolio_worker_status"].find(query).sort("last_seen_at", -1).limit(limit))
+    return {"success": True, "data": _jsonable(rows)}
+
+
 @router.get("/plans/{plan_id}")
 async def get_portfolio_plan(plan_id: str, current_user: dict = Depends(get_current_user)):
     collections = get_trading_db_collections()

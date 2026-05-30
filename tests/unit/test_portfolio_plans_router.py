@@ -72,6 +72,7 @@ def _collections():
         "portfolio_paper_executions": _Collection(),
         "portfolio_paper_equity": _Collection(),
         "portfolio_plan_generation_tasks": _Collection(),
+        "portfolio_worker_status": _Collection(),
     }
 
 
@@ -176,3 +177,40 @@ def test_get_portfolio_plan_generation_task_is_scoped_to_current_user(monkeypatc
     with pytest.raises(portfolio_plans.HTTPException) as exc:
         asyncio.run(portfolio_plans.get_portfolio_plan_generation_task("task-2", current_user={"id": "user-1"}))
     assert exc.value.status_code == 404
+
+
+def test_list_portfolio_worker_status_returns_recent_workers(monkeypatch):
+    collections = _collections()
+    collections["portfolio_worker_status"].docs.extend(
+        [
+            {
+                "worker_id": "worker-old",
+                "worker_type": "portfolio_plan_generator",
+                "status": "idle",
+                "last_seen_at": "2025-01-01T09:00:00",
+            },
+            {
+                "worker_id": "worker-new",
+                "worker_type": "portfolio_plan_generator",
+                "status": "completed",
+                "last_seen_at": "2025-01-01T10:00:00",
+            },
+            {
+                "worker_id": "other-worker",
+                "worker_type": "other",
+                "status": "idle",
+                "last_seen_at": "2025-01-01T11:00:00",
+            },
+        ]
+    )
+    monkeypatch.setattr(portfolio_plans, "get_trading_db_collections", lambda: collections)
+
+    response = asyncio.run(
+        portfolio_plans.list_portfolio_worker_status(
+            worker_type="portfolio_plan_generator",
+            limit=20,
+            current_user={"id": "user-1"},
+        )
+    )
+
+    assert [row["worker_id"] for row in response["data"]] == ["worker-new", "worker-old"]
