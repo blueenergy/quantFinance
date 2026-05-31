@@ -8,7 +8,7 @@ import uuid
 
 from bson import ObjectId
 from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from auth import get_current_user
 from db import db as finance_db
@@ -23,6 +23,125 @@ from services.live_trade_signals import (
 
 router = APIRouter(prefix="/portfolio-plans", tags=["portfolio-plans"])
 ALLOWED_UNIVERSE_INDICES = {"hs300", "a500", "csi500", "csi1000", "star50"}
+GROWTH_CYCLE_PARAMETER_SCHEMA = {
+    "universe_index": {"type": "enum", "options": sorted(ALLOWED_UNIVERSE_INDICES)},
+    "index_benchmark_symbol": {"type": "string"},
+    "growth_weight": {"type": "number", "min": 0, "max": 1},
+    "cycle_weight": {"type": "number", "min": 0, "max": 1},
+    "top_n": {"type": "integer", "min": 1},
+    "rebalance_days": {"type": "integer", "min": 1},
+    "construction_mode": {"type": "enum", "options": ["top_n", "industry_capped", "industry_neutral"]},
+    "max_industry_weight": {"type": "number", "min": 0, "max": 1, "nullable": True},
+    "lot_size": {"type": "integer", "min": 1},
+    "transaction_cost": {"type": "number", "min": 0},
+    "execution_price": {"type": "enum", "options": ["next_open"]},
+    "cash_buffer": {"type": "number", "min": 0, "max": 1},
+    "initial_capital": {"type": "number", "min": 0},
+    "candidate_pool_enabled": {"type": "boolean"},
+    "candidate_pool_multiplier": {"type": "integer", "min": 1},
+    "min_buy_lots": {"type": "integer", "min": 1},
+}
+DEFAULT_STRATEGY_TEMPLATES = (
+    {
+        "strategy_template_id": "growth_cycle",
+        "strategy_type": "template",
+        "name": "成长周期指数增强",
+        "algorithm": "growth_cycle_index_enhanced",
+        "score_type": "growth_cycle_weighted",
+        "parameter_schema": GROWTH_CYCLE_PARAMETER_SCHEMA,
+        "status": "enabled",
+        "version": 1,
+    },
+)
+BUILTIN_PARAMETER_PRESETS = (
+    {
+        "preset_id": "growth_cycle_csi1000_top10_10d",
+        "strategy_template_id": "growth_cycle",
+        "user_id": None,
+        "name": "中证1000 Top10 10日",
+        "description": "中证1000成长周期指数增强，10日调仓，持仓10只。",
+        "is_default": True,
+        "priority": 10,
+        "params": {
+            "universe_index": "csi1000",
+            "index_benchmark_symbol": "000852.SH",
+            "growth_weight": 0.3,
+            "cycle_weight": 0.7,
+            "top_n": 10,
+            "rebalance_days": 10,
+            "construction_mode": "top_n",
+            "max_industry_weight": None,
+            "lot_size": 100,
+            "transaction_cost": 0.001,
+            "execution_price": "next_open",
+            "cash_buffer": 0.03,
+            "initial_capital": 1_000_000.0,
+            "candidate_pool_enabled": True,
+            "candidate_pool_multiplier": 3,
+            "min_buy_lots": 1,
+        },
+        "status": "recommended",
+        "source": "system",
+    },
+    {
+        "preset_id": "growth_cycle_csi500_top10_10d",
+        "strategy_template_id": "growth_cycle",
+        "user_id": None,
+        "name": "中证500 Top10 10日",
+        "description": "中证500成长周期指数增强，10日调仓，持仓10只。",
+        "is_default": False,
+        "priority": 20,
+        "params": {
+            "universe_index": "csi500",
+            "index_benchmark_symbol": "000905.SH",
+            "growth_weight": 0.3,
+            "cycle_weight": 0.7,
+            "top_n": 10,
+            "rebalance_days": 10,
+            "construction_mode": "top_n",
+            "max_industry_weight": None,
+            "lot_size": 100,
+            "transaction_cost": 0.001,
+            "execution_price": "next_open",
+            "cash_buffer": 0.03,
+            "initial_capital": 1_000_000.0,
+            "candidate_pool_enabled": True,
+            "candidate_pool_multiplier": 3,
+            "min_buy_lots": 1,
+        },
+        "status": "recommended",
+        "source": "system",
+    },
+    {
+        "preset_id": "growth_cycle_a500_top15_10d",
+        "strategy_template_id": "growth_cycle",
+        "user_id": None,
+        "name": "中证A500 Top15 10日",
+        "description": "中证A500成长周期指数增强，10日调仓，持仓15只。",
+        "is_default": False,
+        "priority": 30,
+        "params": {
+            "universe_index": "a500",
+            "index_benchmark_symbol": "000510.SH",
+            "growth_weight": 0.3,
+            "cycle_weight": 0.7,
+            "top_n": 15,
+            "rebalance_days": 10,
+            "construction_mode": "top_n",
+            "max_industry_weight": None,
+            "lot_size": 100,
+            "transaction_cost": 0.001,
+            "execution_price": "next_open",
+            "cash_buffer": 0.03,
+            "initial_capital": 1_000_000.0,
+            "candidate_pool_enabled": True,
+            "candidate_pool_multiplier": 3,
+            "min_buy_lots": 1,
+        },
+        "status": "recommended",
+        "source": "system",
+    },
+)
 
 
 class ReviewRequest(BaseModel):
@@ -39,11 +158,12 @@ class PublishLiveSignalsRequest(BaseModel):
 
 
 class GeneratePlanRequest(BaseModel):
-    strategy_id: str
+    model_config = ConfigDict(extra="forbid")
+
+    strategy_template_id: str
     base_date: str
     mode: str = Field(default="auto", pattern="^(auto|monitor|rebalance)$")
     force: bool = Field(default=False)
-    initial_capital_override: Optional[float] = Field(default=None, gt=0)
     preset_id: Optional[str] = None
     params_override: Dict[str, Any] = Field(default_factory=dict)
 
@@ -77,6 +197,55 @@ def _current_user_id(current_user: Dict[str, Any]) -> str:
     return str(user_id)
 
 
+def _ensure_default_strategy_templates(collections: Dict[str, Any]) -> None:
+    strategy_configs = collections["portfolio_strategy_configs"]
+    param_presets = collections["portfolio_strategy_param_presets"]
+    now = datetime.utcnow()
+    for template in DEFAULT_STRATEGY_TEMPLATES:
+        template_id = template["strategy_template_id"]
+        if strategy_configs.find_one({"strategy_template_id": template_id}):
+            strategy_configs.update_one(
+                {"strategy_template_id": template_id},
+                {
+                    "$set": {**template, "updated_at": now},
+                    "$unset": {
+                        "universe_index": "",
+                        "index_benchmark_symbol": "",
+                        "growth_weight": "",
+                        "cycle_weight": "",
+                        "top_n": "",
+                        "rebalance_days": "",
+                        "construction_mode": "",
+                        "max_industry_weight": "",
+                        "lot_size": "",
+                        "transaction_cost": "",
+                        "execution_price": "",
+                        "cash_buffer": "",
+                        "initial_capital": "",
+                        "candidate_pool_enabled": "",
+                        "candidate_pool_multiplier": "",
+                        "min_buy_lots": "",
+                    },
+                },
+            )
+        else:
+            strategy_configs.insert_one({**template, "created_at": now, "updated_at": now})
+    for preset in BUILTIN_PARAMETER_PRESETS:
+        preset_id = preset["preset_id"]
+        if param_presets.find_one({"preset_id": preset_id}):
+            param_presets.update_one({"preset_id": preset_id}, {"$set": {**preset, "updated_at": now}})
+        else:
+            param_presets.insert_one({**preset, "created_at": now, "updated_at": now})
+    param_presets.update_one(
+        {
+            "preset_id": "growth_cycle_default",
+            "strategy_template_id": "growth_cycle",
+            "source": "system",
+        },
+        {"$set": {"status": "disabled", "updated_at": now}},
+    )
+
+
 def _require_plan(collections: Dict[str, Any], plan_id: str, current_user: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     query: Dict[str, Any] = {"plan_id": plan_id}
     if current_user is not None:
@@ -100,10 +269,11 @@ def _plan_has_live_signals(finance_collections: Dict[str, Any], plan_id: str, us
     )
 
 
-def _require_strategy(collections: Dict[str, Any], strategy_id: str) -> Dict[str, Any]:
-    strategy = collections["portfolio_strategy_configs"].find_one({"strategy_id": strategy_id})
+def _require_strategy(collections: Dict[str, Any], strategy_template_id: str) -> Dict[str, Any]:
+    _ensure_default_strategy_templates(collections)
+    strategy = collections["portfolio_strategy_configs"].find_one({"strategy_template_id": strategy_template_id})
     if not strategy:
-        raise HTTPException(status_code=404, detail="strategy not found")
+        raise HTTPException(status_code=404, detail="strategy template not found")
     return strategy
 
 
@@ -134,6 +304,13 @@ def _validate_params_override(params: Dict[str, Any]) -> None:
             raise HTTPException(status_code=400, detail="growth_weight and cycle_weight must be between 0 and 1")
         if abs((growth + cycle) - 1) > 1e-6:
             raise HTTPException(status_code=400, detail="growth_weight and cycle_weight must add up to 1")
+    if params.get("initial_capital") is not None:
+        try:
+            initial_capital = float(params["initial_capital"])
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="initial_capital must be a number")
+        if initial_capital <= 0:
+            raise HTTPException(status_code=400, detail="initial_capital must be greater than 0")
 
 
 def _reviewer(current_user: Dict[str, Any]) -> str:
@@ -237,13 +414,20 @@ def _daily_live_signal_amount(finance_collections: Dict[str, Any], account: Dict
 def _load_stock_guard_docs(data_collections: Dict[str, Any], symbols: List[str]) -> Dict[str, Dict[str, Any]]:
     if not symbols:
         return {}
-    stock_info_rows = data_collections["stock_info"].find({"symbol": {"$in": symbols}})
-    realtime_rows = data_collections["volume_price_realtime_latest"].find({"symbol": {"$in": symbols}})
+    symbol_set = {str(symbol) for symbol in symbols if symbol}
+    base_symbol_set = {symbol.split(".", 1)[0] for symbol in symbol_set}
+    lookup_symbols = list(symbol_set | base_symbol_set)
+    stock_info_rows = data_collections["stock_info"].find({"symbol": {"$in": lookup_symbols}})
+    realtime_rows = data_collections["volume_price_realtime_latest"].find({"symbol": {"$in": lookup_symbols}})
     docs = {row.get("symbol"): dict(row) for row in stock_info_rows if row.get("symbol")}
     for row in realtime_rows:
         symbol = row.get("symbol")
         if symbol:
             docs.setdefault(symbol, {}).update(row)
+    for symbol in symbol_set:
+        base_symbol = symbol.split(".", 1)[0]
+        if symbol not in docs and base_symbol in docs:
+            docs[symbol] = docs[base_symbol]
     return docs
 
 
@@ -262,6 +446,19 @@ def _buy_blockers_from_market_doc(signal: Dict[str, Any], market_doc: Dict[str, 
     if limit_up > 0 and last_price >= limit_up:
         blockers.append("limit_up")
     return blockers
+
+
+def _attach_signal_names(data_collections: Dict[str, Any], signals: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    missing = [signal for signal in signals if signal.get("symbol") and not (signal.get("name") or signal.get("stock_name"))]
+    if not missing:
+        return signals
+    market_docs = _load_stock_guard_docs(data_collections, [signal["symbol"] for signal in missing])
+    for signal in missing:
+        market_doc = market_docs.get(signal.get("symbol")) or {}
+        name = market_doc.get("name") or market_doc.get("stock_name")
+        if name:
+            signal["name"] = name
+    return signals
 
 
 def _build_live_publish_risk_report(
@@ -350,10 +547,11 @@ async def list_portfolio_strategies(
     current_user: dict = Depends(get_current_user),
 ):
     collections = get_trading_db_collections()
+    _ensure_default_strategy_templates(collections)
     query: Dict[str, Any] = {}
     if status:
         query["status"] = status
-    rows = list(collections["portfolio_strategy_configs"].find(query).sort("strategy_id", 1))
+    rows = list(collections["portfolio_strategy_configs"].find(query).sort("strategy_template_id", 1))
     return {"success": True, "data": [_jsonable(row) for row in rows]}
 
 
@@ -364,13 +562,17 @@ async def list_portfolio_parameter_presets(
     current_user: dict = Depends(get_current_user),
 ):
     collections = get_trading_db_collections()
+    _ensure_default_strategy_templates(collections)
     user_id = _current_user_id(current_user)
     query: Dict[str, Any] = {"$or": [{"user_id": user_id}, {"user_id": None}]}
     if strategy_template_id:
         query["strategy_template_id"] = strategy_template_id
     if status:
         query["status"] = status
-    rows = list(collections["portfolio_strategy_param_presets"].find(query).sort("created_at", -1))
+    else:
+        query["status"] = {"$in": ["draft", "enabled", "recommended"]}
+    rows = list(collections["portfolio_strategy_param_presets"].find(query))
+    rows.sort(key=lambda row: (0 if row.get("is_default") else 1, int(row.get("priority") or 9999), str(row.get("created_at") or "")))
     return {"success": True, "data": [_jsonable(row) for row in rows]}
 
 
@@ -400,7 +602,7 @@ async def create_portfolio_parameter_preset(request: ParamPresetRequest, current
 
 @router.get("/plans")
 async def list_portfolio_plans(
-    strategy_id: Optional[str] = Query(default=None),
+    strategy_template_id: Optional[str] = Query(default=None),
     status: Optional[str] = Query(default=None),
     plan_type: Optional[str] = Query(default=None),
     start_date: Optional[str] = Query(default=None),
@@ -410,8 +612,8 @@ async def list_portfolio_plans(
 ):
     collections = get_trading_db_collections()
     query: Dict[str, Any] = {"user_id": _current_user_id(current_user)}
-    if strategy_id:
-        query["strategy_id"] = strategy_id
+    if strategy_template_id:
+        query["strategy_template_id"] = strategy_template_id
     if status:
         query["status"] = status
     if plan_type:
@@ -431,13 +633,13 @@ async def list_portfolio_plans(
 async def generate_portfolio_plan(request: GeneratePlanRequest, current_user: dict = Depends(get_current_user)):
     collections = get_trading_db_collections()
     user_id = _current_user_id(current_user)
-    strategy = _require_strategy(collections, request.strategy_id)
+    strategy = _require_strategy(collections, request.strategy_template_id)
     if strategy.get("status") == "disabled":
         raise HTTPException(status_code=400, detail="strategy is disabled")
     params_override = dict(request.params_override or {})
     if request.preset_id:
         preset = _require_param_preset(collections, request.preset_id, user_id)
-        if preset.get("strategy_template_id") != request.strategy_id:
+        if preset.get("strategy_template_id") != request.strategy_template_id:
             raise HTTPException(status_code=400, detail="parameter preset does not belong to selected strategy")
         params_override = {**dict(preset.get("params") or {}), **params_override}
     _validate_params_override(params_override)
@@ -446,11 +648,10 @@ async def generate_portfolio_plan(request: GeneratePlanRequest, current_user: di
         "task_id": str(uuid.uuid4()),
         "task_type": "generate_portfolio_plan",
         "user_id": user_id,
-        "strategy_id": request.strategy_id,
+        "strategy_template_id": request.strategy_template_id,
         "base_date": request.base_date,
         "mode": request.mode,
         "force": request.force,
-        "initial_capital_override": request.initial_capital_override,
         "preset_id": request.preset_id,
         "params_override": params_override,
         "status": "pending",
@@ -506,13 +707,13 @@ async def list_portfolio_worker_status(
 
 @router.get("/data-watermarks/plan-generation")
 async def get_portfolio_plan_generation_watermark(
-    strategy_id: Optional[str] = Query(default=None),
+    strategy_template_id: Optional[str] = Query(default=None),
     base_date: Optional[str] = Query(default=None),
     current_user: dict = Depends(get_current_user),
 ):
     _current_user_id(current_user)
     collections = get_trading_db_collections()
-    strategy = _require_strategy(collections, strategy_id) if strategy_id else {}
+    strategy = _require_strategy(collections, strategy_template_id) if strategy_template_id else {}
     universe_index = str(strategy.get("universe_index") or "csi1000")
     normalized_base_date = _normalize_yyyymmdd(base_date)
 
@@ -532,7 +733,7 @@ async def get_portfolio_plan_generation_watermark(
         "success": True,
         "data": _jsonable(
             {
-                "strategy_id": strategy_id,
+                "strategy_template_id": strategy_template_id,
                 "base_date": normalized_base_date,
                 "universe_index": universe_index,
                 "target_scoring_run": target_run,
@@ -593,7 +794,7 @@ def _review_plan(plan_id: str, decision: str, comment: str, current_user: Dict[s
     user_id = _current_user_id(current_user)
     review = {
         "plan_id": plan_id,
-        "strategy_id": plan.get("strategy_id"),
+        "strategy_template_id": plan.get("strategy_template_id"),
         "user_id": user_id,
         "decision": decision,
         "reviewer": _reviewer(current_user),
@@ -620,6 +821,7 @@ async def get_portfolio_plan_executions(plan_id: str, current_user: dict = Depen
 async def get_portfolio_plan_live_executions(plan_id: str, current_user: dict = Depends(get_current_user)):
     trading_collections = get_trading_db_collections()
     finance_collections = get_db_collections()
+    data_collections = get_data_db()
     _require_plan(trading_collections, plan_id, current_user)
     user_id = _current_user_id(current_user)
 
@@ -629,7 +831,7 @@ async def get_portfolio_plan_live_executions(plan_id: str, current_user: dict = 
         "mode": "live",
         "source": "portfolio_plan",
     }
-    signals = [add_display_time_fields(row) for row in finance_collections["trade_signals"].find(signal_query).sort("created_at", 1)]
+    signals = _attach_signal_names(data_collections, [add_display_time_fields(row) for row in finance_collections["trade_signals"].find(signal_query).sort("created_at", 1)])
     order_ids = [row.get("order_id") for row in signals if row.get("order_id")]
     execution_query = {"user_id": user_id, "order_id": {"$in": order_ids}} if order_ids else None
     executions = (
@@ -749,16 +951,16 @@ async def publish_portfolio_plan_live_signals(
     }
 
 
-@router.get("/strategies/{strategy_id}/equity")
+@router.get("/strategies/{strategy_template_id}/equity")
 async def get_portfolio_strategy_equity(
-    strategy_id: str,
+    strategy_template_id: str,
     start_date: Optional[str] = Query(default=None),
     end_date: Optional[str] = Query(default=None),
     current_user: dict = Depends(get_current_user),
 ):
     collections = get_trading_db_collections()
-    _require_strategy(collections, strategy_id)
-    query: Dict[str, Any] = {"strategy_id": strategy_id, "user_id": _current_user_id(current_user)}
+    _require_strategy(collections, strategy_template_id)
+    query: Dict[str, Any] = {"strategy_template_id": strategy_template_id, "user_id": _current_user_id(current_user)}
     if start_date or end_date:
         date_query: Dict[str, Any] = {}
         if start_date:
@@ -770,16 +972,16 @@ async def get_portfolio_strategy_equity(
     return {"success": True, "data": _jsonable(rows)}
 
 
-@router.get("/strategies/{strategy_id}/realtime-equity")
+@router.get("/strategies/{strategy_template_id}/realtime-equity")
 async def get_portfolio_strategy_realtime_equity(
-    strategy_id: str,
+    strategy_template_id: str,
     current_user: dict = Depends(get_current_user),
 ):
     collections = get_trading_db_collections()
     data_collections = get_data_db()
-    _require_strategy(collections, strategy_id)
+    _require_strategy(collections, strategy_template_id)
     snapshot = collections["portfolio_paper_positions"].find_one(
-        {"strategy_id": strategy_id, "user_id": _current_user_id(current_user)},
+        {"strategy_template_id": strategy_template_id, "user_id": _current_user_id(current_user)},
         sort=[("as_of_date", -1)],
     )
     if not snapshot:
@@ -822,7 +1024,7 @@ async def get_portfolio_strategy_realtime_equity(
     cash = float(snapshot.get("cash", 0) or 0)
     realtime_equity = cash + market_value
     latest_equity = collections["portfolio_paper_equity"].find_one(
-        {"strategy_id": strategy_id, "user_id": _current_user_id(current_user)},
+        {"strategy_template_id": strategy_template_id, "user_id": _current_user_id(current_user)},
         sort=[("date", -1)],
     ) or {}
     base_equity = float(latest_equity.get("equity", snapshot.get("equity", 0)) or 0)
@@ -836,7 +1038,7 @@ async def get_portfolio_strategy_realtime_equity(
         "success": True,
         "data": _jsonable(
             {
-                "strategy_id": strategy_id,
+                "strategy_template_id": strategy_template_id,
                 "as_of_date": snapshot.get("as_of_date"),
                 "cash": cash,
                 "market_value": market_value,
@@ -860,13 +1062,13 @@ def _apply_paper_execution(collections: Dict[str, Any], data_collections: Dict[s
     if collections["portfolio_paper_executions"].find_one({"plan_id": plan_id}) and not force:
         raise HTTPException(status_code=400, detail="plan already has paper executions")
 
-    strategy_id = plan.get("strategy_id")
+    strategy_template_id = plan.get("strategy_template_id")
     user_id = plan.get("user_id")
     execute_date = plan.get("execute_date")
-    if not strategy_id or not execute_date:
-        raise HTTPException(status_code=400, detail="plan is missing strategy_id or execute_date")
+    if not strategy_template_id or not execute_date:
+        raise HTTPException(status_code=400, detail="plan is missing strategy_template_id or execute_date")
 
-    previous_query = {"strategy_id": strategy_id, "as_of_date": {"$lte": plan.get("base_date")}}
+    previous_query = {"strategy_template_id": strategy_template_id, "as_of_date": {"$lte": plan.get("base_date")}}
     if user_id:
         previous_query["user_id"] = user_id
     previous = collections["portfolio_paper_positions"].find_one(
@@ -874,7 +1076,8 @@ def _apply_paper_execution(collections: Dict[str, Any], data_collections: Dict[s
         sort=[("as_of_date", -1)],
     ) or {}
     positions = {row.get("symbol"): dict(row) for row in previous.get("positions", []) if row.get("symbol")}
-    cash = float(previous.get("cash", plan.get("config_snapshot", {}).get("initial_capital", 1_000_000.0)))
+    params_snapshot = plan.get("params_snapshot") or {}
+    cash = float(previous.get("cash", params_snapshot.get("initial_capital", 1_000_000.0)))
     items = list(collections["portfolio_trade_plan_items"].find({"plan_id": plan_id}).sort("rank", 1))
     symbols = [item.get("symbol") for item in items if item.get("symbol")]
     execution_symbols = sorted(
@@ -922,7 +1125,7 @@ def _apply_paper_execution(collections: Dict[str, Any], data_collections: Dict[s
             quantity = delta
             amount = quantity * price
             if amount > cash:
-                lot_size = int(plan.get("config_snapshot", {}).get("lot_size", 100))
+                lot_size = int(params_snapshot.get("lot_size", 100))
                 quantity = (int(cash // price) // max(1, lot_size)) * max(1, lot_size)
                 amount = quantity * price
                 partial = True
@@ -954,7 +1157,7 @@ def _apply_paper_execution(collections: Dict[str, Any], data_collections: Dict[s
     if executions:
         collections["portfolio_paper_executions"].insert_many(executions)
     snapshot = {
-        "strategy_id": strategy_id,
+        "strategy_template_id": strategy_template_id,
         "user_id": user_id,
         "as_of_date": execute_date,
         "plan_id": plan_id,
@@ -964,15 +1167,15 @@ def _apply_paper_execution(collections: Dict[str, Any], data_collections: Dict[s
         "positions": position_rows,
         "updated_at": now,
     }
-    position_query = {"strategy_id": strategy_id, "as_of_date": execute_date}
-    equity_query = {"strategy_id": strategy_id, "date": execute_date}
+    position_query = {"strategy_template_id": strategy_template_id, "as_of_date": execute_date}
+    equity_query = {"strategy_template_id": strategy_template_id, "date": execute_date}
     if user_id:
         position_query["user_id"] = user_id
         equity_query["user_id"] = user_id
     collections["portfolio_paper_positions"].replace_one(position_query, snapshot, upsert=True)
     collections["portfolio_paper_equity"].replace_one(
         equity_query,
-        {"strategy_id": strategy_id, "user_id": user_id, "date": execute_date, "plan_id": plan_id, "equity": equity, "cash": cash, "market_value": market_value, "updated_at": now},
+        {"strategy_template_id": strategy_template_id, "user_id": user_id, "date": execute_date, "plan_id": plan_id, "equity": equity, "cash": cash, "market_value": market_value, "updated_at": now},
         upsert=True,
     )
     collections["portfolio_trade_plans"].update_one({"plan_id": plan_id}, {"$set": {"status": status, "paper_executed_at": now}})
@@ -1076,7 +1279,7 @@ def _execution_doc(plan: Dict[str, Any], item: Dict[str, Any], action: str, quan
     return {
         "execution_id": str(uuid.uuid4()),
         "plan_id": plan["plan_id"],
-        "strategy_id": plan["strategy_id"],
+        "strategy_template_id": plan["strategy_template_id"],
         "user_id": plan.get("user_id"),
         "symbol": item.get("symbol"),
         "name": item.get("name", ""),

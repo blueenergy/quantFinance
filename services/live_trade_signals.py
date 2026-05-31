@@ -27,8 +27,9 @@ class LiveTradeSignal(BaseModel):
     is_executable: bool = Field(default=True)
     source: str
     plan_id: str
-    strategy_id: str
+    strategy_template_id: str
     symbol: str
+    name: str = Field(default="")
     action: str
     size: int
     price: Optional[float] = None
@@ -66,7 +67,7 @@ class LiveTradeSignal(BaseModel):
         doc = self.model_dump()
         doc["timestamp"] = self.created_at.timestamp()
         doc["datetime"] = self.created_at
-        doc["strategy"] = self.strategy_id
+        doc["strategy"] = self.strategy_template_id
         return doc
 
 
@@ -129,8 +130,9 @@ def build_portfolio_plan_live_signal(
         broker=str(account.get("broker") or ""),
         source=LIVE_SIGNAL_SOURCE_PORTFOLIO_PLAN,
         plan_id=str(plan["plan_id"]),
-        strategy_id=str(plan["strategy_id"]),
+        strategy_template_id=str(plan["strategy_template_id"]),
         symbol=symbol,
+        name=str(item.get("name") or ""),
         action=action,
         size=size,
         price=price,

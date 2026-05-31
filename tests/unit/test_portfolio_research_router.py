@@ -101,7 +101,8 @@ def test_publish_portfolio_research_result_creates_parameter_preset(monkeypatch)
             "best_row": {"risk_adjusted_score": 1.2},
             "data_watermark": {"stock_scores_max_date": "20250131"},
             "candidate_strategy_config": {
-                "strategy_id": "research_strategy",
+                "preset_id": "research_strategy",
+                "strategy_template_id": "growth_cycle",
                 "name": "Research Strategy",
                 "status": "draft",
                 "top_n": 10,
@@ -137,7 +138,7 @@ def test_publish_portfolio_research_result_rejects_duplicate_preset(monkeypatch)
             "result_id": "result-1",
             "job_id": "job-1",
             "user_id": "user-1",
-            "candidate_strategy_config": {"strategy_id": "research_strategy"},
+            "candidate_strategy_config": {"preset_id": "research_strategy", "strategy_template_id": "growth_cycle"},
         }
     )
 

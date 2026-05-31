@@ -22,6 +22,31 @@ from bson import ObjectId
 router = APIRouter()
 
 
+def _attach_stock_names(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    missing = [row for row in rows if row.get("symbol") and not (row.get("name") or row.get("stock_name"))]
+    if not missing:
+        return rows
+    symbols = {str(row.get("symbol")) for row in missing}
+    base_symbols = {symbol.split(".", 1)[0] for symbol in symbols}
+    try:
+        stock_info = get_data_db()["stock_info"]
+        stock_rows = list(stock_info.find({"symbol": {"$in": list(symbols | base_symbols)}}))
+    except Exception:
+        return rows
+    names = {}
+    for stock in stock_rows:
+        symbol = str(stock.get("symbol") or "")
+        name = stock.get("name") or stock.get("stock_name")
+        if symbol and name:
+            names[symbol] = name
+    for row in missing:
+        symbol = str(row.get("symbol") or "")
+        name = names.get(symbol) or names.get(symbol.split(".", 1)[0])
+        if name:
+            row["name"] = name
+    return rows
+
+
 @router.get("/trader/signals", summary="Get pending trading signals")
 def get_pending_signals(
     limit: int = Query(50, ge=1, le=200, description="Maximum number of signals"),
@@ -141,7 +166,7 @@ def create_execution(
         execution_status = execution.get("status") or "filled"
         signal = signals_coll.find_one({"order_id": order_id, "user_id": user_id}) if order_id else None
         if signal:
-            for field in ("plan_id", "strategy_id", "source", "securities_account_id", "account_id", "broker"):
+            for field in ("plan_id", "strategy_template_id", "source", "securities_account_id", "account_id", "broker"):
                 if signal.get(field) is not None:
                     execution.setdefault(field, signal.get(field))
         if broker_order_id:
@@ -206,7 +231,7 @@ def list_live_signals(
             query["securities_account_id"] = securities_account_id
         if status:
             query["status"] = status
-        rows = list(collections["trade_signals"].find(query).sort("created_at", -1).limit(limit))
+        rows = _attach_stock_names(list(collections["trade_signals"].find(query).sort("created_at", -1).limit(limit)))
         return {"success": True, "data": [serialize_doc(doc) for doc in rows], "count": len(rows)}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to list live signals: {str(e)}")

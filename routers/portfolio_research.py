@@ -250,9 +250,9 @@ async def publish_portfolio_research_result(
         raise HTTPException(status_code=400, detail="candidate strategy config is missing")
 
     now = datetime.utcnow()
-    requested_id = request.preset_id or candidate.get("preset_id") or candidate.get("strategy_id") or f"research_{result_id[:8]}"
+    requested_id = request.preset_id or candidate.get("preset_id") or f"research_{result_id[:8]}"
     preset_id = _unique_preset_id(collections, str(requested_id), request.create_new_version)
-    strategy_template_id = str(candidate.get("strategy_template_id") or candidate.get("template_id") or "growth_cycle_index_enhanced")
+    strategy_template_id = str(candidate.get("strategy_template_id") or candidate.get("template_id") or "growth_cycle")
     preset = {
         "preset_id": preset_id,
         "strategy_template_id": strategy_template_id,
@@ -315,25 +315,26 @@ async def publish_portfolio_research_result(
     return {"success": True, "data": _jsonable({"preset": preset, "review": review})}
 
 
-@router.post("/strategies/{strategy_id}/disable")
-async def disable_portfolio_research_strategy(strategy_id: str, current_user: dict = Depends(get_current_user)):
+@router.post("/parameter-presets/{preset_id}/disable")
+async def disable_portfolio_research_preset(preset_id: str, current_user: dict = Depends(get_current_user)):
     collections = get_trading_db_collections()
     user_id = _current_user_id(current_user)
-    strategy = collections["portfolio_strategy_configs"].find_one({"strategy_id": strategy_id})
-    if not strategy:
-        raise HTTPException(status_code=404, detail="strategy not found")
-    if strategy.get("source") != "portfolio_research":
-        raise HTTPException(status_code=400, detail="only portfolio research strategies can be disabled here")
+    preset = collections["portfolio_strategy_param_presets"].find_one({"preset_id": preset_id, "user_id": user_id})
+    if not preset:
+        raise HTTPException(status_code=404, detail="parameter preset not found")
+    if preset.get("source") != "portfolio_research":
+        raise HTTPException(status_code=400, detail="only portfolio research presets can be disabled here")
     now = datetime.utcnow()
-    collections["portfolio_strategy_configs"].update_one(
-        {"strategy_id": strategy_id},
+    collections["portfolio_strategy_param_presets"].update_one(
+        {"preset_id": preset_id, "user_id": user_id},
         {"$set": {"status": "disabled", "disabled_by": user_id, "disabled_at": now, "updated_at": now}},
     )
     review = {
         "review_id": str(uuid.uuid4()),
-        "job_id": strategy.get("research_job_id"),
-        "research_result_id": strategy.get("research_result_id"),
-        "strategy_id": strategy_id,
+        "job_id": preset.get("research_job_id"),
+        "research_result_id": preset.get("research_result_id"),
+        "preset_id": preset_id,
+        "strategy_template_id": preset.get("strategy_template_id"),
         "decision": "disabled",
         "reviewer": _reviewer(current_user),
         "user_id": user_id,

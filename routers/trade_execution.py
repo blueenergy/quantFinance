@@ -1120,7 +1120,7 @@ def create_trader_execution(
     execution_record.setdefault("mode", "live")
     signal = signals_coll.find_one({"order_id": order_id, "user_id": user_id})
     if signal:
-        for field in ("plan_id", "strategy_id", "source", "securities_account_id", "account_id", "broker"):
+        for field in ("plan_id", "strategy_template_id", "source", "securities_account_id", "account_id", "broker"):
             if signal.get(field) is not None:
                 execution_record.setdefault(field, signal.get(field))
 

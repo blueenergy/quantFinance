@@ -45,6 +45,10 @@ class _Collection:
 
     def _matches(self, doc, query):
         for key, expected in query.items():
+            if key == "$or":
+                if not any(self._matches(doc, branch) for branch in expected):
+                    return False
+                continue
             value = doc.get(key)
             if isinstance(expected, dict):
                 if "$in" in expected and value not in expected["$in"]:
@@ -67,15 +71,22 @@ def _collections():
     return {
         "portfolio_strategy_configs": _Collection(
             [
-                {"strategy_id": "s1", "status": "enabled", "universe_index": "csi1000"},
-                {"strategy_id": "s2", "status": "enabled", "universe_index": "csi300"},
-                {"strategy_id": "disabled-s1", "status": "disabled"},
+                {"strategy_template_id": "s1", "status": "enabled", "universe_index": "csi1000"},
+                {"strategy_template_id": "s2", "status": "enabled", "universe_index": "csi300"},
+                {"strategy_template_id": "disabled-s1", "status": "disabled"},
             ]
         ),
         "portfolio_trade_plans": _Collection(
             [
-                {"plan_id": "plan-user-1", "strategy_id": "s1", "user_id": "user-1", "base_date": "20250102", "status": "needs_review"},
-                {"plan_id": "plan-user-2", "strategy_id": "s2", "user_id": "user-2", "base_date": "20250103", "status": "needs_review"},
+                {"plan_id": "plan-user-1", "strategy_template_id": "s1", "user_id": "user-1", "base_date": "20250102", "status": "needs_review"},
+                {
+                    "plan_id": "plan-template-1",
+                    "strategy_template_id": "s1",
+                    "user_id": "user-1",
+                    "base_date": "20250104",
+                    "status": "generated",
+                },
+                {"plan_id": "plan-user-2", "strategy_template_id": "s2", "user_id": "user-2", "base_date": "20250103", "status": "needs_review"},
             ]
         ),
         "portfolio_trade_plan_items": _Collection(),
@@ -139,7 +150,7 @@ def test_list_portfolio_plans_is_scoped_to_current_user(monkeypatch):
 
     response = asyncio.run(
         portfolio_plans.list_portfolio_plans(
-            strategy_id=None,
+            strategy_template_id=None,
             status=None,
             plan_type=None,
             start_date=None,
@@ -149,7 +160,26 @@ def test_list_portfolio_plans_is_scoped_to_current_user(monkeypatch):
         )
     )
 
-    assert [row["plan_id"] for row in response["data"]] == ["plan-user-1"]
+    assert [row["plan_id"] for row in response["data"]] == ["plan-template-1", "plan-user-1"]
+
+
+def test_list_portfolio_plans_filters_by_template(monkeypatch):
+    collections = _collections()
+    monkeypatch.setattr(portfolio_plans, "get_trading_db_collections", lambda: collections)
+
+    response = asyncio.run(
+        portfolio_plans.list_portfolio_plans(
+            strategy_template_id="s1",
+            status=None,
+            plan_type=None,
+            start_date=None,
+            end_date=None,
+            limit=50,
+            current_user={"id": "user-1"},
+        )
+    )
+
+    assert [row["plan_id"] for row in response["data"]] == ["plan-template-1", "plan-user-1"]
 
 
 def test_list_portfolio_strategies_returns_global_catalog(monkeypatch):
@@ -158,7 +188,7 @@ def test_list_portfolio_strategies_returns_global_catalog(monkeypatch):
 
     response = asyncio.run(portfolio_plans.list_portfolio_strategies(status=None, current_user={"id": "user-1"}))
 
-    assert [row["strategy_id"] for row in response["data"]] == ["disabled-s1", "s1", "s2"]
+    assert [row["strategy_template_id"] for row in response["data"]] == ["disabled-s1", "growth_cycle", "s1", "s2"]
 
 
 def test_review_plan_rejects_cross_user_access(monkeypatch):
@@ -190,12 +220,11 @@ def test_generate_portfolio_plan_uses_current_user(monkeypatch):
     response = asyncio.run(
         portfolio_plans.generate_portfolio_plan(
             portfolio_plans.GeneratePlanRequest(
-                strategy_id="s1",
+                strategy_template_id="s1",
                 base_date="2025-01-04",
                 mode="auto",
-                initial_capital_override=250_000,
                 preset_id="preset-1",
-                params_override={"cash_buffer": 0.05},
+                params_override={"cash_buffer": 0.05, "initial_capital": 250_000},
             ),
             current_user={"id": "user-1"},
         )
@@ -204,12 +233,17 @@ def test_generate_portfolio_plan_uses_current_user(monkeypatch):
     assert response["success"] is True
     assert response["data"]["status"] == "pending"
     assert response["data"]["user_id"] == "user-1"
-    assert response["data"]["strategy_id"] == "s1"
+    assert response["data"]["strategy_template_id"] == "s1"
     assert response["data"]["base_date"] == "2025-01-04"
     assert response["data"]["mode"] == "auto"
-    assert response["data"]["initial_capital_override"] == 250_000
+    assert "initial_capital_override" not in response["data"]
     assert response["data"]["preset_id"] == "preset-1"
-    assert response["data"]["params_override"] == {"top_n": 20, "rebalance_days": 20, "cash_buffer": 0.05}
+    assert response["data"]["params_override"] == {
+        "top_n": 20,
+        "rebalance_days": 20,
+        "cash_buffer": 0.05,
+        "initial_capital": 250_000,
+    }
     assert collections["portfolio_plan_generation_tasks"].docs[0]["task_id"] == response["data"]["task_id"]
 
 
@@ -220,7 +254,7 @@ def test_generate_portfolio_plan_rejects_disabled_strategy(monkeypatch):
     with pytest.raises(portfolio_plans.HTTPException) as exc:
         asyncio.run(
             portfolio_plans.generate_portfolio_plan(
-                portfolio_plans.GeneratePlanRequest(strategy_id="disabled-s1", base_date="2025-01-04", mode="auto"),
+                portfolio_plans.GeneratePlanRequest(strategy_template_id="disabled-s1", base_date="2025-01-04", mode="auto"),
                 current_user={"id": "user-1"},
             )
         )
@@ -320,7 +354,7 @@ def test_get_portfolio_plan_generation_watermark_uses_strategy_universe(monkeypa
 
     response = asyncio.run(
         portfolio_plans.get_portfolio_plan_generation_watermark(
-            strategy_id="s1",
+            strategy_template_id="s1",
             base_date="2025-01-06",
             current_user={"id": "user-1"},
         )
@@ -352,7 +386,7 @@ def test_get_portfolio_plan_generation_watermark_falls_back_to_global_scores(mon
 
     response = asyncio.run(
         portfolio_plans.get_portfolio_plan_generation_watermark(
-            strategy_id="s1",
+            strategy_template_id="s1",
             base_date="2025-01-06",
             current_user={"id": "user-1"},
         )
@@ -505,7 +539,7 @@ def test_plan_live_executions_are_scoped_to_plan_order_ids(monkeypatch):
             {
                 "user_id": "user-1",
                 "plan_id": "plan-user-1",
-                "strategy_id": "s1",
+                "strategy_template_id": "s1",
                 "source": "portfolio_plan",
                 "mode": "live",
                 "order_id": "plan-order-1",
@@ -514,7 +548,7 @@ def test_plan_live_executions_are_scoped_to_plan_order_ids(monkeypatch):
             {
                 "user_id": "user-1",
                 "plan_id": "other-plan",
-                "strategy_id": "other-strategy",
+                "strategy_template_id": "other-strategy",
                 "source": "portfolio_plan",
                 "mode": "live",
                 "order_id": "other-order",
@@ -524,9 +558,9 @@ def test_plan_live_executions_are_scoped_to_plan_order_ids(monkeypatch):
     )
     finance["trade_executions"].docs.extend(
         [
-            {"user_id": "user-1", "order_id": "plan-order-1", "strategy_id": "s1", "timestamp": 10},
-            {"user_id": "user-1", "order_id": "other-order", "strategy_id": "other-strategy", "timestamp": 11},
-            {"user_id": "user-1", "order_id": "manual-order", "strategy_id": "manual", "timestamp": 12},
+            {"user_id": "user-1", "order_id": "plan-order-1", "strategy_template_id": "s1", "timestamp": 10},
+            {"user_id": "user-1", "order_id": "other-order", "strategy_template_id": "other-strategy", "timestamp": 11},
+            {"user_id": "user-1", "order_id": "manual-order", "strategy_template_id": "manual", "timestamp": 12},
         ]
     )
     monkeypatch.setattr(portfolio_plans, "get_trading_db_collections", lambda: collections)
