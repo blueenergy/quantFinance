@@ -110,6 +110,28 @@ def _unique_strategy_id(collections: Dict[str, Any], requested: str, create_new_
     return candidate
 
 
+def _resolve_artifact_path(html_path: str) -> Optional[Path]:
+    candidates = [Path(html_path)]
+    filename = Path(html_path).name
+    for base_dir in (
+        os.getenv("PORTFOLIO_RESEARCH_REPORT_DIR"),
+        "/app/reports/portfolio-research",
+        "reports/portfolio-research",
+    ):
+        if base_dir:
+            candidates.append(Path(base_dir) / filename)
+
+    seen = set()
+    for candidate in candidates:
+        key = str(candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        if candidate.exists() and candidate.is_file():
+            return candidate
+    return None
+
+
 @router.post("/jobs")
 async def create_portfolio_research_job(request: CreateResearchJobRequest, current_user: dict = Depends(get_current_user)):
     collections = get_trading_db_collections()
@@ -201,8 +223,8 @@ async def get_portfolio_research_artifact(job_id: str, current_user: dict = Depe
     html_path = (result.get("artifact") or {}).get("html_path")
     if not html_path:
         raise HTTPException(status_code=404, detail="artifact not found")
-    path = Path(html_path)
-    if not path.exists() or not path.is_file():
+    path = _resolve_artifact_path(str(html_path))
+    if path is None:
         raise HTTPException(status_code=404, detail="artifact file not found")
     return FileResponse(str(path), media_type="text/html")
 

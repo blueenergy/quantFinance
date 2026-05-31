@@ -79,6 +79,9 @@ jobs:
           log_step "Pulling quant-api image"
           timeout 300 docker pull "$IMAGE"
 
+          log_step "Preparing shared directories"
+          mkdir -p /home/deployuser/quantFinance/logs /home/deployuser/shared/portfolio-research
+
           log_step "Stopping existing containers"
           timeout 30 docker stop -t 20 quant-mcp-actions 2>/dev/null || true
           timeout 30 docker rm quant-mcp-actions 2>/dev/null || true
@@ -101,11 +104,13 @@ jobs:
             -e ENABLE_EMBEDDED_SCHEDULER=false \
             -e ENABLE_MCP_SERVER=false \
             -e API_WORKERS=2 \
+            -e PORTFOLIO_RESEARCH_REPORT_DIR=/app/reports/portfolio-research \
             --log-driver json-file \
             --log-opt max-size=50m \
             --log-opt max-file=3 \
             -v /home/deployuser/quantFinance/.env:/app/.env:ro \
             -v /home/deployuser/quantFinance/logs:/app/logs \
+            -v /home/deployuser/shared/portfolio-research:/app/reports/portfolio-research \
             "$IMAGE"
 
           log_step "Starting quant-mcp-read"

@@ -149,3 +149,15 @@ def test_publish_portfolio_research_result_rejects_duplicate_strategy(monkeypatc
         )
 
     assert exc.value.status_code == 409
+
+
+def test_resolve_artifact_path_falls_back_to_report_dir(monkeypatch, tmp_path):
+    report_dir = tmp_path / "portfolio-research"
+    report_dir.mkdir()
+    report = report_dir / "job-1_result.html"
+    report.write_text("<html>ok</html>", encoding="utf-8")
+    monkeypatch.setenv("PORTFOLIO_RESEARCH_REPORT_DIR", str(report_dir))
+
+    path = portfolio_research._resolve_artifact_path("reports/portfolio-research/job-1_result.html")
+
+    assert path == report

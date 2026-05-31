@@ -34,10 +34,13 @@ services:
       - ENABLE_EMBEDDED_SCHEDULER=false
       - ENABLE_MCP_SERVER=false
       - API_WORKERS=${API_WORKERS:-2}
+      - PORTFOLIO_RESEARCH_REPORT_DIR=/app/reports/portfolio-research
     extra_hosts:
       - "host.docker.internal:host-gateway"
     networks:
       - quant-network
+    volumes:
+      - ../shared/portfolio-research:/app/reports/portfolio-research
     logging:
       driver: json-file
       options:
@@ -350,11 +353,13 @@ services:
       - TUSHARE_TOKEN=${TUSHARE_TOKEN}
       - MAX_WORKERS=${SCORING_MAX_WORKERS:-6}
       - TZ=Asia/Shanghai
+      - PORTFOLIO_RESEARCH_REPORT_DIR=/app/reports/portfolio-research
     extra_hosts:
       - "host.docker.internal:host-gateway"
     restart: unless-stopped
     volumes:
       - ../stock-scoring-system/logs:/app/logs
+      - ../shared/portfolio-research:/app/reports/portfolio-research
     logging:
       driver: json-file
       options:
