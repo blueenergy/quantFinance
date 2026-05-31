@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -15,7 +17,7 @@ from pydantic import BaseModel, Field
 from pymongo import ASCENDING, DESCENDING
 
 from auth import get_current_user
-from db import get_trading_db_collections
+from db import get_db_collections, get_trading_db_collections
 
 
 router = APIRouter(prefix="/portfolio-research", tags=["portfolio-research"])
@@ -88,13 +90,53 @@ def _ensure_research_indexes(collections: Dict[str, Any]) -> None:
     collections["portfolio_research_reviews"].create_index([("research_result_id", ASCENDING), ("created_at", DESCENDING)])
     collections["portfolio_strategy_param_presets"].create_index([("preset_id", ASCENDING)], unique=True)
     collections["portfolio_strategy_param_presets"].create_index([("strategy_template_id", ASCENDING), ("status", ASCENDING)])
+    collections["portfolio_strategy_param_presets"].create_index(
+        [("user_id", ASCENDING), ("strategy_template_id", ASCENDING), ("params_hash", ASCENDING), ("status", ASCENDING)]
+    )
 
 
-def _job_summary(job: Dict[str, Any], result: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+def _as_list(value: Any) -> List[str]:
+    if isinstance(value, list):
+        return [str(item) for item in value if item]
+    if value:
+        return [str(value)]
+    return []
+
+
+def _latest_stock_score_date(stock_scores: Any, job: Dict[str, Any]) -> Optional[str]:
+    params = job.get("params") or {}
+    end_date = str(params.get("end_date") or job.get("end_date") or "").replace("-", "")
+    if not end_date:
+        return None
+    query: Dict[str, Any] = {"score_date": {"$lte": end_date}}
+    universes = _as_list(params.get("universe_index") or job.get("universe_index"))
+    if universes:
+        query["index_codes"] = {"$in": universes}
+    row = stock_scores.find_one(query, {"_id": 0, "score_date": 1}, sort=[("score_date", DESCENDING)])
+    return str(row["score_date"]) if row and row.get("score_date") else None
+
+
+def _normalized_watermark(job: Dict[str, Any], result: Optional[Dict[str, Any]], stock_scores: Any = None) -> Dict[str, Any]:
+    watermark = dict((result or {}).get("data_watermark") or job.get("data_watermark") or {})
+    if "backtest_score_max_date" not in watermark and watermark.get("stock_scores_max_date"):
+        # Older research results used stock_scores_max_date for the backtestable dataset max date.
+        watermark["backtest_score_max_date"] = watermark.get("stock_scores_max_date")
+        latest_score = _latest_stock_score_date(stock_scores, job) if stock_scores is not None else None
+        if latest_score:
+            watermark["stock_scores_max_date"] = latest_score
+    return watermark
+
+
+def _job_summary(job: Dict[str, Any], result: Optional[Dict[str, Any]] = None, stock_scores: Any = None) -> Dict[str, Any]:
     row = dict(job)
+    row["data_watermark"] = _normalized_watermark(job, result, stock_scores)
     if result:
         row["best_row"] = result.get("best_row")
         row["candidate_strategy_config"] = result.get("candidate_strategy_config")
+        row["published_preset_id"] = result.get("published_preset_id")
+        row["published_status"] = result.get("published_status")
+        row["published_at"] = result.get("published_at")
+        row["publish_action"] = result.get("publish_action")
     return row
 
 
@@ -128,6 +170,8 @@ RESEARCH_RESULT_SUMMARY_PROJECTION = {
     "candidate_strategy_config": 1,
     "published_preset_id": 1,
     "published_status": 1,
+    "published_at": 1,
+    "publish_action": 1,
 }
 
 
@@ -143,6 +187,48 @@ def _unique_preset_id(collections: Dict[str, Any], requested: str, create_new_ve
     if collections["portfolio_strategy_param_presets"].find_one({"preset_id": candidate}):
         candidate = f"{preset_id}_{suffix}_{uuid.uuid4().hex[:6]}"
     return candidate
+
+
+PRESET_PARAM_KEYS = {
+    "universe_index",
+    "index_benchmark_symbol",
+    "score_type",
+    "score_column",
+    "growth_weight",
+    "cycle_weight",
+    "top_n",
+    "rebalance_days",
+    "construction_mode",
+    "max_industry_weight",
+    "lot_size",
+    "transaction_cost",
+    "execution_price",
+    "cash_buffer",
+    "initial_capital",
+    "candidate_pool_enabled",
+}
+
+
+def _preset_params_from_candidate(candidate: Dict[str, Any]) -> Dict[str, Any]:
+    return {key: value for key, value in candidate.items() if key in PRESET_PARAM_KEYS}
+
+
+def _params_hash(params: Dict[str, Any]) -> str:
+    payload = json.dumps(params, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def _research_evidence(job: Dict[str, Any], result: Dict[str, Any], status: str, comment: str) -> Dict[str, Any]:
+    return {
+        "research_job_id": job["job_id"],
+        "research_result_id": result["result_id"],
+        "status": status,
+        "comment": comment,
+        "best_row": result.get("best_row"),
+        "data_window": {"start_date": job.get("start_date"), "end_date": job.get("end_date")},
+        "data_watermark_snapshot": result.get("data_watermark"),
+        "attached_at": datetime.utcnow(),
+    }
 
 
 def _resolve_artifact_path(html_path: str) -> Optional[Path]:
@@ -219,7 +305,8 @@ async def list_portfolio_research_jobs(
         row.get("result_id"): row
         for row in collections["portfolio_research_results"].find({"result_id": {"$in": result_ids}}, RESEARCH_RESULT_SUMMARY_PROJECTION)
     } if result_ids else {}
-    return {"success": True, "data": _jsonable([_job_summary(job, results.get(job.get("result_id"))) for job in jobs])}
+    stock_scores = get_db_collections()["stock_scores"]
+    return {"success": True, "data": _jsonable([_job_summary(job, results.get(job.get("result_id")), stock_scores) for job in jobs])}
 
 
 @router.get("/jobs/{job_id}")
@@ -232,7 +319,8 @@ async def get_portfolio_research_job(job_id: str, current_user: dict = Depends(g
     result = None
     if job.get("result_id"):
         result = collections["portfolio_research_results"].find_one({"result_id": job["result_id"], "user_id": user_id}, RESEARCH_RESULT_SUMMARY_PROJECTION)
-    return {"success": True, "data": _jsonable(_job_summary(job, result))}
+    stock_scores = get_db_collections()["stock_scores"]
+    return {"success": True, "data": _jsonable(_job_summary(job, result, stock_scores))}
 
 
 @router.get("/jobs/{job_id}/results")
@@ -275,6 +363,8 @@ async def publish_portfolio_research_result(
     result = collections["portfolio_research_results"].find_one({"result_id": result_id, "user_id": user_id})
     if not result:
         raise HTTPException(status_code=404, detail="research result not found")
+    if result.get("published_preset_id"):
+        raise HTTPException(status_code=409, detail="research result has already been published")
     job = collections["portfolio_research_jobs"].find_one({"job_id": result.get("job_id"), "user_id": user_id})
     if not job or job.get("status") != "completed":
         raise HTTPException(status_code=400, detail="research job is not completed")
@@ -283,38 +373,74 @@ async def publish_portfolio_research_result(
         raise HTTPException(status_code=400, detail="candidate strategy config is missing")
 
     now = datetime.utcnow()
+    strategy_template_id = str(candidate.get("strategy_template_id") or candidate.get("template_id") or "growth_cycle_index_enhanced")
+    preset_params = _preset_params_from_candidate(candidate)
+    params_hash = _params_hash(preset_params)
+    existing_preset = collections["portfolio_strategy_param_presets"].find_one(
+        {
+            "user_id": user_id,
+            "strategy_template_id": strategy_template_id,
+            "status": {"$in": ["draft", "enabled", "recommended"]},
+            "$or": [{"params_hash": params_hash}, {"params": preset_params}],
+        }
+    )
+    if existing_preset:
+        preset_id = existing_preset["preset_id"]
+        evidence = _research_evidence(job, result, existing_preset.get("status") or request.status, request.comment)
+        collections["portfolio_strategy_param_presets"].update_one(
+            {"preset_id": preset_id, "user_id": user_id},
+            {
+                "$set": {
+                    "params_hash": params_hash,
+                    "updated_at": now,
+                    "latest_evidence": evidence,
+                    "latest_research_job_id": job["job_id"],
+                    "latest_research_result_id": result_id,
+                },
+                "$push": {"evidence": evidence},
+            },
+        )
+        review = {
+            "review_id": str(uuid.uuid4()),
+            "job_id": job["job_id"],
+            "research_result_id": result_id,
+            "preset_id": preset_id,
+            "strategy_template_id": strategy_template_id,
+            "decision": "evidence_attached",
+            "status": existing_preset.get("status") or request.status,
+            "comment": request.comment,
+            "reviewer": _reviewer(current_user),
+            "user_id": user_id,
+            "created_at": now,
+        }
+        collections["portfolio_research_reviews"].insert_one(review)
+        collections["portfolio_research_results"].update_one(
+            {"result_id": result_id},
+            {
+                "$set": {
+                    "published_preset_id": preset_id,
+                    "published_status": existing_preset.get("status") or request.status,
+                    "published_at": now,
+                    "publish_action": "evidence_attached",
+                }
+            },
+        )
+        return {
+            "success": True,
+            "data": _jsonable({"preset": existing_preset, "review": review, "attached_to_existing": True}),
+        }
+
     requested_id = request.preset_id or candidate.get("preset_id") or f"research_{result_id[:8]}"
     preset_id = _unique_preset_id(collections, str(requested_id), request.create_new_version)
-    strategy_template_id = str(candidate.get("strategy_template_id") or candidate.get("template_id") or "growth_cycle")
+    evidence = _research_evidence(job, result, request.status, request.comment)
     preset = {
         "preset_id": preset_id,
         "strategy_template_id": strategy_template_id,
         "user_id": user_id,
         "name": request.name or candidate.get("name") or preset_id,
         "description": request.comment,
-        "params": {
-            key: value
-            for key, value in candidate.items()
-            if key
-            in {
-                "universe_index",
-                "index_benchmark_symbol",
-                "score_type",
-                "score_column",
-                "growth_weight",
-                "cycle_weight",
-                "top_n",
-                "rebalance_days",
-                "construction_mode",
-                "max_industry_weight",
-                "lot_size",
-                "transaction_cost",
-                "execution_price",
-                "cash_buffer",
-                "initial_capital",
-                "candidate_pool_enabled",
-            }
-        },
+        "params": preset_params,
+        "params_hash": params_hash,
         "status": request.status,
         "is_default": False,
         "priority": 100,
@@ -324,6 +450,10 @@ async def publish_portfolio_research_result(
         "backtest_summary": result.get("best_row"),
         "data_window": {"start_date": job.get("start_date"), "end_date": job.get("end_date")},
         "data_watermark_snapshot": result.get("data_watermark"),
+        "evidence": [evidence],
+        "latest_evidence": evidence,
+        "latest_research_job_id": job["job_id"],
+        "latest_research_result_id": result_id,
         "created_by": user_id,
         "created_at": now,
         "updated_at": now,
@@ -345,9 +475,16 @@ async def publish_portfolio_research_result(
     collections["portfolio_research_reviews"].insert_one(review)
     collections["portfolio_research_results"].update_one(
         {"result_id": result_id},
-        {"$set": {"published_preset_id": preset_id, "published_status": request.status, "published_at": now}},
+        {
+            "$set": {
+                "published_preset_id": preset_id,
+                "published_status": request.status,
+                "published_at": now,
+                "publish_action": "preset_published",
+            }
+        },
     )
-    return {"success": True, "data": _jsonable({"preset": preset, "review": review})}
+    return {"success": True, "data": _jsonable({"preset": preset, "review": review, "attached_to_existing": False})}
 
 
 @router.post("/parameter-presets/{preset_id}/disable")

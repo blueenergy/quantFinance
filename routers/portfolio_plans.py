@@ -43,7 +43,7 @@ GROWTH_CYCLE_PARAMETER_SCHEMA = {
 }
 DEFAULT_STRATEGY_TEMPLATES = (
     {
-        "strategy_template_id": "growth_cycle",
+        "strategy_template_id": "growth_cycle_index_enhanced",
         "strategy_type": "template",
         "name": "成长周期指数增强",
         "algorithm": "growth_cycle_index_enhanced",
@@ -99,6 +99,18 @@ def _jsonable(value: Any) -> Any:
     if isinstance(value, dict):
         return {key: _jsonable(item) for key, item in value.items()}
     return value
+
+
+def _with_preset_evidence_summary(row: Dict[str, Any]) -> Dict[str, Any]:
+    evidence = row.get("evidence") or []
+    if not isinstance(evidence, list):
+        evidence = []
+    latest = row.get("latest_evidence") or (evidence[-1] if evidence else None)
+    return {
+        **row,
+        "evidence_count": len(evidence),
+        "latest_evidence": latest,
+    }
 
 
 def _current_user_id(current_user: Dict[str, Any]) -> str:
@@ -492,7 +504,7 @@ async def list_portfolio_parameter_presets(
         query["status"] = status
     else:
         query["status"] = {"$in": ["draft", "enabled", "recommended"]}
-    rows = list(collections["portfolio_strategy_param_presets"].find(query))
+    rows = [_with_preset_evidence_summary(row) for row in collections["portfolio_strategy_param_presets"].find(query)]
     rows.sort(key=lambda row: (0 if row.get("is_default") else 1, int(row.get("priority") or 9999), str(row.get("created_at") or "")))
     return {"success": True, "data": [_jsonable(row) for row in rows]}
 

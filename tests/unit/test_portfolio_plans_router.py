@@ -188,7 +188,7 @@ def test_list_portfolio_strategies_returns_global_catalog(monkeypatch):
 
     response = asyncio.run(portfolio_plans.list_portfolio_strategies(status=None, current_user={"id": "user-1"}))
 
-    assert [row["strategy_template_id"] for row in response["data"]] == ["disabled-s1", "growth_cycle", "s1", "s2"]
+    assert [row["strategy_template_id"] for row in response["data"]] == ["disabled-s1", "growth_cycle_index_enhanced", "s1", "s2"]
 
 
 def test_review_plan_rejects_cross_user_access(monkeypatch):

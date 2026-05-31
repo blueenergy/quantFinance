@@ -39,18 +39,36 @@ class _Collection:
         for doc in self.docs:
             if self._matches(doc, query):
                 doc.update(update.get("$set", {}))
+                for key, value in update.get("$push", {}).items():
+                    doc.setdefault(key, []).append(value)
                 return
 
     def _matches(self, doc, query):
         for key, expected in query.items():
-            value = doc.get(key)
+            if key == "$or":
+                if not any(self._matches(doc, item) for item in expected):
+                    return False
+                continue
+            value = self._value(doc, key)
             if isinstance(expected, dict):
                 if "$in" in expected and value not in expected["$in"]:
+                    return False
+                if any(key.startswith("$") for key in expected):
+                    continue
+                if value != expected:
                     return False
                 continue
             if value != expected:
                 return False
         return True
+
+    def _value(self, doc, key):
+        value = doc
+        for part in key.split("."):
+            if not isinstance(value, dict):
+                return None
+            value = value.get(part)
+        return value
 
 
 def _collections():
@@ -102,7 +120,7 @@ def test_publish_portfolio_research_result_creates_parameter_preset(monkeypatch)
             "data_watermark": {"stock_scores_max_date": "20250131"},
             "candidate_strategy_config": {
                 "preset_id": "research_strategy",
-                "strategy_template_id": "growth_cycle",
+                "strategy_template_id": "growth_cycle_index_enhanced",
                 "name": "Research Strategy",
                 "status": "draft",
                 "top_n": 10,
@@ -138,7 +156,7 @@ def test_publish_portfolio_research_result_rejects_duplicate_preset(monkeypatch)
             "result_id": "result-1",
             "job_id": "job-1",
             "user_id": "user-1",
-            "candidate_strategy_config": {"preset_id": "research_strategy", "strategy_template_id": "growth_cycle"},
+            "candidate_strategy_config": {"preset_id": "research_strategy", "strategy_template_id": "growth_cycle_index_enhanced"},
         }
     )
 
@@ -152,6 +170,87 @@ def test_publish_portfolio_research_result_rejects_duplicate_preset(monkeypatch)
         )
 
     assert exc.value.status_code == 409
+
+
+def test_publish_portfolio_research_result_rejects_already_published_result(monkeypatch):
+    collections = _collections()
+    monkeypatch.setattr(portfolio_research, "get_trading_db_collections", lambda: collections)
+    collections["portfolio_research_jobs"].insert_one({"job_id": "job-1", "user_id": "user-1", "status": "completed"})
+    collections["portfolio_research_results"].insert_one(
+        {
+            "result_id": "result-1",
+            "job_id": "job-1",
+            "user_id": "user-1",
+            "published_preset_id": "published-preset",
+            "candidate_strategy_config": {"preset_id": "research_strategy"},
+        }
+    )
+
+    with pytest.raises(portfolio_research.HTTPException) as exc:
+        asyncio.run(
+            portfolio_research.publish_portfolio_research_result(
+                "result-1",
+                portfolio_research.PublishResearchResultRequest(status="enabled"),
+                current_user={"id": "user-1"},
+            )
+        )
+
+    assert exc.value.status_code == 409
+
+
+def test_publish_portfolio_research_result_attaches_duplicate_params_as_evidence(monkeypatch):
+    collections = _collections()
+    monkeypatch.setattr(portfolio_research, "get_trading_db_collections", lambda: collections)
+    params = {"top_n": 10, "rebalance_days": 20}
+    collections["portfolio_strategy_param_presets"].insert_one(
+        {
+            "preset_id": "existing-preset",
+            "user_id": "user-1",
+            "strategy_template_id": "growth_cycle_index_enhanced",
+            "status": "enabled",
+            "params": params,
+        }
+    )
+    collections["portfolio_research_jobs"].insert_one(
+        {
+            "job_id": "job-2",
+            "user_id": "user-1",
+            "status": "completed",
+            "start_date": "20240101",
+            "end_date": "20250131",
+        }
+    )
+    collections["portfolio_research_results"].insert_one(
+        {
+            "result_id": "result-2",
+            "job_id": "job-2",
+            "user_id": "user-1",
+            "best_row": {"risk_adjusted_score": 1.3},
+            "candidate_strategy_config": {
+                "preset_id": "new-preset-id",
+                "strategy_template_id": "growth_cycle_index_enhanced",
+                **params,
+            },
+        }
+    )
+
+    response = asyncio.run(
+        portfolio_research.publish_portfolio_research_result(
+            "result-2",
+            portfolio_research.PublishResearchResultRequest(status="enabled"),
+            current_user={"id": "user-1", "username": "alice"},
+        )
+    )
+
+    assert response["data"]["attached_to_existing"] is True
+    assert len(collections["portfolio_strategy_param_presets"].docs) == 1
+    preset = collections["portfolio_strategy_param_presets"].find_one({"preset_id": "existing-preset"})
+    assert preset["latest_research_result_id"] == "result-2"
+    assert preset["evidence"][0]["data_window"] == {"start_date": "20240101", "end_date": "20250131"}
+    assert collections["portfolio_research_reviews"].docs[0]["decision"] == "evidence_attached"
+    result = collections["portfolio_research_results"].find_one({"result_id": "result-2"})
+    assert result["published_preset_id"] == "existing-preset"
+    assert result["publish_action"] == "evidence_attached"
 
 
 def test_resolve_artifact_path_falls_back_to_report_dir(monkeypatch, tmp_path):
