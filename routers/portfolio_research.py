@@ -98,6 +98,39 @@ def _job_summary(job: Dict[str, Any], result: Optional[Dict[str, Any]] = None) -
     return row
 
 
+RESEARCH_JOB_LIST_PROJECTION = {
+    "_id": 0,
+    "job_id": 1,
+    "user_id": 1,
+    "name": 1,
+    "strategy_family": 1,
+    "universe_index": 1,
+    "start_date": 1,
+    "end_date": 1,
+    "params": 1,
+    "status": 1,
+    "attempts": 1,
+    "result_id": 1,
+    "error_message": 1,
+    "created_at": 1,
+    "updated_at": 1,
+    "started_at": 1,
+    "completed_at": 1,
+    "data_watermark": 1,
+}
+
+
+RESEARCH_RESULT_SUMMARY_PROJECTION = {
+    "_id": 0,
+    "result_id": 1,
+    "job_id": 1,
+    "best_row": 1,
+    "candidate_strategy_config": 1,
+    "published_preset_id": 1,
+    "published_status": 1,
+}
+
+
 def _unique_preset_id(collections: Dict[str, Any], requested: str, create_new_version: bool) -> str:
     preset_id = requested
     existing = collections["portfolio_strategy_param_presets"].find_one({"preset_id": preset_id})
@@ -180,11 +213,11 @@ async def list_portfolio_research_jobs(
     query: Dict[str, Any] = {"user_id": user_id}
     if status:
         query["status"] = status
-    jobs = list(collections["portfolio_research_jobs"].find(query).sort("created_at", -1).limit(limit))
+    jobs = list(collections["portfolio_research_jobs"].find(query, RESEARCH_JOB_LIST_PROJECTION).sort("created_at", -1).limit(limit))
     result_ids = [job.get("result_id") for job in jobs if job.get("result_id")]
     results = {
         row.get("result_id"): row
-        for row in collections["portfolio_research_results"].find({"result_id": {"$in": result_ids}})
+        for row in collections["portfolio_research_results"].find({"result_id": {"$in": result_ids}}, RESEARCH_RESULT_SUMMARY_PROJECTION)
     } if result_ids else {}
     return {"success": True, "data": _jsonable([_job_summary(job, results.get(job.get("result_id"))) for job in jobs])}
 
@@ -193,12 +226,12 @@ async def list_portfolio_research_jobs(
 async def get_portfolio_research_job(job_id: str, current_user: dict = Depends(get_current_user)):
     collections = get_trading_db_collections()
     user_id = _current_user_id(current_user)
-    job = collections["portfolio_research_jobs"].find_one({"job_id": job_id, "user_id": user_id})
+    job = collections["portfolio_research_jobs"].find_one({"job_id": job_id, "user_id": user_id}, RESEARCH_JOB_LIST_PROJECTION)
     if not job:
         raise HTTPException(status_code=404, detail="research job not found")
     result = None
     if job.get("result_id"):
-        result = collections["portfolio_research_results"].find_one({"result_id": job["result_id"], "user_id": user_id})
+        result = collections["portfolio_research_results"].find_one({"result_id": job["result_id"], "user_id": user_id}, RESEARCH_RESULT_SUMMARY_PROJECTION)
     return {"success": True, "data": _jsonable(_job_summary(job, result))}
 
 
@@ -283,6 +316,8 @@ async def publish_portfolio_research_result(
             }
         },
         "status": request.status,
+        "is_default": False,
+        "priority": 100,
         "source": "portfolio_research",
         "research_job_id": job["job_id"],
         "research_result_id": result_id,

@@ -53,97 +53,6 @@ DEFAULT_STRATEGY_TEMPLATES = (
         "version": 1,
     },
 )
-BUILTIN_PARAMETER_PRESETS = (
-    {
-        "preset_id": "growth_cycle_csi1000_top10_10d",
-        "strategy_template_id": "growth_cycle",
-        "user_id": None,
-        "name": "中证1000 Top10 10日",
-        "description": "中证1000成长周期指数增强，10日调仓，持仓10只。",
-        "is_default": True,
-        "priority": 10,
-        "params": {
-            "universe_index": "csi1000",
-            "index_benchmark_symbol": "000852.SH",
-            "growth_weight": 0.3,
-            "cycle_weight": 0.7,
-            "top_n": 10,
-            "rebalance_days": 10,
-            "construction_mode": "top_n",
-            "max_industry_weight": None,
-            "lot_size": 100,
-            "transaction_cost": 0.001,
-            "execution_price": "next_open",
-            "cash_buffer": 0.03,
-            "initial_capital": 1_000_000.0,
-            "candidate_pool_enabled": True,
-            "candidate_pool_multiplier": 3,
-            "min_buy_lots": 1,
-        },
-        "status": "recommended",
-        "source": "system",
-    },
-    {
-        "preset_id": "growth_cycle_csi500_top10_10d",
-        "strategy_template_id": "growth_cycle",
-        "user_id": None,
-        "name": "中证500 Top10 10日",
-        "description": "中证500成长周期指数增强，10日调仓，持仓10只。",
-        "is_default": False,
-        "priority": 20,
-        "params": {
-            "universe_index": "csi500",
-            "index_benchmark_symbol": "000905.SH",
-            "growth_weight": 0.3,
-            "cycle_weight": 0.7,
-            "top_n": 10,
-            "rebalance_days": 10,
-            "construction_mode": "top_n",
-            "max_industry_weight": None,
-            "lot_size": 100,
-            "transaction_cost": 0.001,
-            "execution_price": "next_open",
-            "cash_buffer": 0.03,
-            "initial_capital": 1_000_000.0,
-            "candidate_pool_enabled": True,
-            "candidate_pool_multiplier": 3,
-            "min_buy_lots": 1,
-        },
-        "status": "recommended",
-        "source": "system",
-    },
-    {
-        "preset_id": "growth_cycle_a500_top15_10d",
-        "strategy_template_id": "growth_cycle",
-        "user_id": None,
-        "name": "中证A500 Top15 10日",
-        "description": "中证A500成长周期指数增强，10日调仓，持仓15只。",
-        "is_default": False,
-        "priority": 30,
-        "params": {
-            "universe_index": "a500",
-            "index_benchmark_symbol": "000510.SH",
-            "growth_weight": 0.3,
-            "cycle_weight": 0.7,
-            "top_n": 15,
-            "rebalance_days": 10,
-            "construction_mode": "top_n",
-            "max_industry_weight": None,
-            "lot_size": 100,
-            "transaction_cost": 0.001,
-            "execution_price": "next_open",
-            "cash_buffer": 0.03,
-            "initial_capital": 1_000_000.0,
-            "candidate_pool_enabled": True,
-            "candidate_pool_multiplier": 3,
-            "min_buy_lots": 1,
-        },
-        "status": "recommended",
-        "source": "system",
-    },
-)
-
-
 class ReviewRequest(BaseModel):
     comment: str = Field(default="")
 
@@ -174,6 +83,8 @@ class ParamPresetRequest(BaseModel):
     params: Dict[str, Any]
     status: str = Field(default="draft", pattern="^(draft|enabled|recommended|disabled)$")
     description: str = Field(default="")
+    is_default: bool = Field(default=False)
+    priority: int = Field(default=100)
     backtest_summary: Dict[str, Any] = Field(default_factory=dict)
     data_window: Dict[str, Any] = Field(default_factory=dict)
 
@@ -199,7 +110,6 @@ def _current_user_id(current_user: Dict[str, Any]) -> str:
 
 def _ensure_default_strategy_templates(collections: Dict[str, Any]) -> None:
     strategy_configs = collections["portfolio_strategy_configs"]
-    param_presets = collections["portfolio_strategy_param_presets"]
     now = datetime.utcnow()
     for template in DEFAULT_STRATEGY_TEMPLATES:
         template_id = template["strategy_template_id"]
@@ -230,20 +140,6 @@ def _ensure_default_strategy_templates(collections: Dict[str, Any]) -> None:
             )
         else:
             strategy_configs.insert_one({**template, "created_at": now, "updated_at": now})
-    for preset in BUILTIN_PARAMETER_PRESETS:
-        preset_id = preset["preset_id"]
-        if param_presets.find_one({"preset_id": preset_id}):
-            param_presets.update_one({"preset_id": preset_id}, {"$set": {**preset, "updated_at": now}})
-        else:
-            param_presets.insert_one({**preset, "created_at": now, "updated_at": now})
-    param_presets.update_one(
-        {
-            "preset_id": "growth_cycle_default",
-            "strategy_template_id": "growth_cycle",
-            "source": "system",
-        },
-        {"$set": {"status": "disabled", "updated_at": now}},
-    )
 
 
 def _require_plan(collections: Dict[str, Any], plan_id: str, current_user: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -254,6 +150,31 @@ def _require_plan(collections: Dict[str, Any], plan_id: str, current_user: Optio
     if not plan:
         raise HTTPException(status_code=404, detail="plan not found")
     return plan
+
+
+PLAN_LIST_PROJECTION = {
+    "_id": 0,
+    "plan_id": 1,
+    "strategy_template_id": 1,
+    "user_id": 1,
+    "preset_id": 1,
+    "params_hash": 1,
+    "params_snapshot": 1,
+    "strategy_name": 1,
+    "base_date": 1,
+    "score_date": 1,
+    "execute_date": 1,
+    "plan_type": 1,
+    "status": 1,
+    "summary": 1,
+    "created_at": 1,
+    "updated_at": 1,
+    "reviewed_at": 1,
+    "paper_executed_at": 1,
+    "live_signals_published_at": 1,
+    "live_signal_count": 1,
+    "live_signal_status_summary": 1,
+}
 
 
 def _plan_has_live_signals(finance_collections: Dict[str, Any], plan_id: str, user_id: str) -> bool:
@@ -581,6 +502,7 @@ async def create_portfolio_parameter_preset(request: ParamPresetRequest, current
     collections = get_trading_db_collections()
     user_id = _current_user_id(current_user)
     _require_strategy(collections, request.strategy_template_id)
+    _validate_params_override(request.params)
     now = datetime.utcnow()
     doc = {
         "preset_id": str(uuid.uuid4()),
@@ -590,6 +512,8 @@ async def create_portfolio_parameter_preset(request: ParamPresetRequest, current
         "description": request.description,
         "params": request.params,
         "status": request.status,
+        "is_default": request.is_default,
+        "priority": request.priority,
         "source": "manual",
         "backtest_summary": request.backtest_summary,
         "data_window": request.data_window,
@@ -625,7 +549,7 @@ async def list_portfolio_plans(
         if end_date:
             date_query["$lte"] = end_date.replace("-", "")
         query["base_date"] = date_query
-    rows = list(collections["portfolio_trade_plans"].find(query).sort("base_date", -1).limit(limit))
+    rows = list(collections["portfolio_trade_plans"].find(query, PLAN_LIST_PROJECTION).sort("base_date", -1).limit(limit))
     return {"success": True, "data": [_jsonable(row) for row in rows]}
 
 
