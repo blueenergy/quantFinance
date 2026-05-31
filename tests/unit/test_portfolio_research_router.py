@@ -56,6 +56,7 @@ class _Collection:
 def _collections():
     return {
         "portfolio_strategy_configs": _Collection(),
+        "portfolio_strategy_param_presets": _Collection(),
         "portfolio_research_jobs": _Collection(),
         "portfolio_research_results": _Collection(),
         "portfolio_research_reviews": _Collection(),
@@ -86,7 +87,7 @@ def test_create_portfolio_research_job(monkeypatch):
     assert job["params"]["rebalance_interval_days"] == [20]
 
 
-def test_publish_portfolio_research_result_creates_strategy(monkeypatch):
+def test_publish_portfolio_research_result_creates_parameter_preset(monkeypatch):
     collections = _collections()
     monkeypatch.setattr(portfolio_research, "get_trading_db_collections", lambda: collections)
     collections["portfolio_research_jobs"].insert_one(
@@ -118,17 +119,18 @@ def test_publish_portfolio_research_result_creates_strategy(monkeypatch):
     )
 
     assert response["success"] is True
-    strategy = collections["portfolio_strategy_configs"].find_one({"strategy_id": "research_strategy"})
-    assert strategy["status"] == "enabled"
-    assert strategy["source"] == "portfolio_research"
-    assert strategy["research_job_id"] == "job-1"
-    assert collections["portfolio_research_reviews"].docs[0]["decision"] == "published"
+    preset = collections["portfolio_strategy_param_presets"].find_one({"preset_id": "research_strategy"})
+    assert preset["status"] == "enabled"
+    assert preset["source"] == "portfolio_research"
+    assert preset["research_job_id"] == "job-1"
+    assert preset["params"]["top_n"] == 10
+    assert collections["portfolio_research_reviews"].docs[0]["decision"] == "preset_published"
 
 
-def test_publish_portfolio_research_result_rejects_duplicate_strategy(monkeypatch):
+def test_publish_portfolio_research_result_rejects_duplicate_preset(monkeypatch):
     collections = _collections()
     monkeypatch.setattr(portfolio_research, "get_trading_db_collections", lambda: collections)
-    collections["portfolio_strategy_configs"].insert_one({"strategy_id": "research_strategy"})
+    collections["portfolio_strategy_param_presets"].insert_one({"preset_id": "research_strategy"})
     collections["portfolio_research_jobs"].insert_one({"job_id": "job-1", "user_id": "user-1", "status": "completed"})
     collections["portfolio_research_results"].insert_one(
         {

@@ -41,7 +41,7 @@ class CreateResearchJobRequest(BaseModel):
 
 class PublishResearchResultRequest(BaseModel):
     status: str = Field(default="draft", pattern="^(draft|enabled)$")
-    strategy_id: Optional[str] = None
+    preset_id: Optional[str] = None
     name: Optional[str] = None
     create_new_version: bool = Field(default=False)
     comment: str = Field(default="")
@@ -86,6 +86,8 @@ def _ensure_research_indexes(collections: Dict[str, Any]) -> None:
     collections["portfolio_research_results"].create_index([("user_id", ASCENDING), ("created_at", DESCENDING)])
     collections["portfolio_research_reviews"].create_index([("job_id", ASCENDING), ("created_at", DESCENDING)])
     collections["portfolio_research_reviews"].create_index([("research_result_id", ASCENDING), ("created_at", DESCENDING)])
+    collections["portfolio_strategy_param_presets"].create_index([("preset_id", ASCENDING)], unique=True)
+    collections["portfolio_strategy_param_presets"].create_index([("strategy_template_id", ASCENDING), ("status", ASCENDING)])
 
 
 def _job_summary(job: Dict[str, Any], result: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -96,17 +98,17 @@ def _job_summary(job: Dict[str, Any], result: Optional[Dict[str, Any]] = None) -
     return row
 
 
-def _unique_strategy_id(collections: Dict[str, Any], requested: str, create_new_version: bool) -> str:
-    strategy_id = requested
-    existing = collections["portfolio_strategy_configs"].find_one({"strategy_id": strategy_id})
+def _unique_preset_id(collections: Dict[str, Any], requested: str, create_new_version: bool) -> str:
+    preset_id = requested
+    existing = collections["portfolio_strategy_param_presets"].find_one({"preset_id": preset_id})
     if not existing:
-        return strategy_id
+        return preset_id
     if not create_new_version:
-        raise HTTPException(status_code=409, detail="strategy_id already exists")
+        raise HTTPException(status_code=409, detail="preset_id already exists")
     suffix = datetime.utcnow().strftime("v%Y%m%d%H%M%S")
-    candidate = f"{strategy_id}_{suffix}"
-    if collections["portfolio_strategy_configs"].find_one({"strategy_id": candidate}):
-        candidate = f"{strategy_id}_{suffix}_{uuid.uuid4().hex[:6]}"
+    candidate = f"{preset_id}_{suffix}"
+    if collections["portfolio_strategy_param_presets"].find_one({"preset_id": candidate}):
+        candidate = f"{preset_id}_{suffix}_{uuid.uuid4().hex[:6]}"
     return candidate
 
 
@@ -248,31 +250,57 @@ async def publish_portfolio_research_result(
         raise HTTPException(status_code=400, detail="candidate strategy config is missing")
 
     now = datetime.utcnow()
-    requested_id = request.strategy_id or candidate.get("strategy_id")
-    strategy_id = _unique_strategy_id(collections, str(requested_id), request.create_new_version)
-    candidate.update(
-        {
-            "strategy_id": strategy_id,
-            "name": request.name or candidate.get("name") or strategy_id,
-            "status": request.status,
-            "source": "portfolio_research",
-            "research_job_id": job["job_id"],
-            "research_result_id": result_id,
-            "published_by": user_id,
-            "published_at": now,
-            "research_metrics_snapshot": result.get("best_row"),
-            "data_watermark_snapshot": result.get("data_watermark"),
-            "updated_at": now,
-        }
-    )
-    candidate.setdefault("created_at", now)
-    collections["portfolio_strategy_configs"].insert_one(candidate)
+    requested_id = request.preset_id or candidate.get("preset_id") or candidate.get("strategy_id") or f"research_{result_id[:8]}"
+    preset_id = _unique_preset_id(collections, str(requested_id), request.create_new_version)
+    strategy_template_id = str(candidate.get("strategy_template_id") or candidate.get("template_id") or "growth_cycle_index_enhanced")
+    preset = {
+        "preset_id": preset_id,
+        "strategy_template_id": strategy_template_id,
+        "user_id": user_id,
+        "name": request.name or candidate.get("name") or preset_id,
+        "description": request.comment,
+        "params": {
+            key: value
+            for key, value in candidate.items()
+            if key
+            in {
+                "universe_index",
+                "index_benchmark_symbol",
+                "score_type",
+                "score_column",
+                "growth_weight",
+                "cycle_weight",
+                "top_n",
+                "rebalance_days",
+                "construction_mode",
+                "max_industry_weight",
+                "lot_size",
+                "transaction_cost",
+                "execution_price",
+                "cash_buffer",
+                "initial_capital",
+                "candidate_pool_enabled",
+            }
+        },
+        "status": request.status,
+        "source": "portfolio_research",
+        "research_job_id": job["job_id"],
+        "research_result_id": result_id,
+        "backtest_summary": result.get("best_row"),
+        "data_window": {"start_date": job.get("start_date"), "end_date": job.get("end_date")},
+        "data_watermark_snapshot": result.get("data_watermark"),
+        "created_by": user_id,
+        "created_at": now,
+        "updated_at": now,
+    }
+    collections["portfolio_strategy_param_presets"].insert_one(preset)
     review = {
         "review_id": str(uuid.uuid4()),
         "job_id": job["job_id"],
         "research_result_id": result_id,
-        "strategy_id": strategy_id,
-        "decision": "published",
+        "preset_id": preset_id,
+        "strategy_template_id": strategy_template_id,
+        "decision": "preset_published",
         "status": request.status,
         "comment": request.comment,
         "reviewer": _reviewer(current_user),
@@ -282,9 +310,9 @@ async def publish_portfolio_research_result(
     collections["portfolio_research_reviews"].insert_one(review)
     collections["portfolio_research_results"].update_one(
         {"result_id": result_id},
-        {"$set": {"published_strategy_id": strategy_id, "published_status": request.status, "published_at": now}},
+        {"$set": {"published_preset_id": preset_id, "published_status": request.status, "published_at": now}},
     )
-    return {"success": True, "data": _jsonable({"strategy": candidate, "review": review})}
+    return {"success": True, "data": _jsonable({"preset": preset, "review": review})}
 
 
 @router.post("/strategies/{strategy_id}/disable")

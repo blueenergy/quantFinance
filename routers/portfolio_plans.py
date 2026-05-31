@@ -22,6 +22,7 @@ from services.live_trade_signals import (
 
 
 router = APIRouter(prefix="/portfolio-plans", tags=["portfolio-plans"])
+ALLOWED_UNIVERSE_INDICES = {"hs300", "a500", "csi500", "csi1000", "star50"}
 
 
 class ReviewRequest(BaseModel):
@@ -43,6 +44,18 @@ class GeneratePlanRequest(BaseModel):
     mode: str = Field(default="auto", pattern="^(auto|monitor|rebalance)$")
     force: bool = Field(default=False)
     initial_capital_override: Optional[float] = Field(default=None, gt=0)
+    preset_id: Optional[str] = None
+    params_override: Dict[str, Any] = Field(default_factory=dict)
+
+
+class ParamPresetRequest(BaseModel):
+    strategy_template_id: str
+    name: str
+    params: Dict[str, Any]
+    status: str = Field(default="draft", pattern="^(draft|enabled|recommended|disabled)$")
+    description: str = Field(default="")
+    backtest_summary: Dict[str, Any] = Field(default_factory=dict)
+    data_window: Dict[str, Any] = Field(default_factory=dict)
 
 
 def _jsonable(value: Any) -> Any:
@@ -92,6 +105,35 @@ def _require_strategy(collections: Dict[str, Any], strategy_id: str) -> Dict[str
     if not strategy:
         raise HTTPException(status_code=404, detail="strategy not found")
     return strategy
+
+
+def _require_param_preset(collections: Dict[str, Any], preset_id: str, user_id: str) -> Dict[str, Any]:
+    preset = collections["portfolio_strategy_param_presets"].find_one({"preset_id": preset_id})
+    if not preset:
+        raise HTTPException(status_code=404, detail="parameter preset not found")
+    if preset.get("user_id") not in {None, user_id}:
+        raise HTTPException(status_code=404, detail="parameter preset not found")
+    if preset.get("status") == "disabled":
+        raise HTTPException(status_code=400, detail="parameter preset is disabled")
+    return preset
+
+
+def _validate_params_override(params: Dict[str, Any]) -> None:
+    universe = params.get("universe_index")
+    if universe is not None and universe not in ALLOWED_UNIVERSE_INDICES:
+        raise HTTPException(status_code=400, detail="unsupported universe_index")
+    has_growth = params.get("growth_weight") is not None
+    has_cycle = params.get("cycle_weight") is not None
+    if has_growth or has_cycle:
+        try:
+            growth = float(params.get("growth_weight", 0))
+            cycle = float(params.get("cycle_weight", 0))
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="growth_weight and cycle_weight must be numbers")
+        if growth < 0 or cycle < 0 or growth > 1 or cycle > 1:
+            raise HTTPException(status_code=400, detail="growth_weight and cycle_weight must be between 0 and 1")
+        if abs((growth + cycle) - 1) > 1e-6:
+            raise HTTPException(status_code=400, detail="growth_weight and cycle_weight must add up to 1")
 
 
 def _reviewer(current_user: Dict[str, Any]) -> str:
@@ -315,6 +357,47 @@ async def list_portfolio_strategies(
     return {"success": True, "data": [_jsonable(row) for row in rows]}
 
 
+@router.get("/parameter-presets")
+async def list_portfolio_parameter_presets(
+    strategy_template_id: Optional[str] = Query(default=None),
+    status: Optional[str] = Query(default=None),
+    current_user: dict = Depends(get_current_user),
+):
+    collections = get_trading_db_collections()
+    user_id = _current_user_id(current_user)
+    query: Dict[str, Any] = {"$or": [{"user_id": user_id}, {"user_id": None}]}
+    if strategy_template_id:
+        query["strategy_template_id"] = strategy_template_id
+    if status:
+        query["status"] = status
+    rows = list(collections["portfolio_strategy_param_presets"].find(query).sort("created_at", -1))
+    return {"success": True, "data": [_jsonable(row) for row in rows]}
+
+
+@router.post("/parameter-presets")
+async def create_portfolio_parameter_preset(request: ParamPresetRequest, current_user: dict = Depends(get_current_user)):
+    collections = get_trading_db_collections()
+    user_id = _current_user_id(current_user)
+    _require_strategy(collections, request.strategy_template_id)
+    now = datetime.utcnow()
+    doc = {
+        "preset_id": str(uuid.uuid4()),
+        "strategy_template_id": request.strategy_template_id,
+        "user_id": user_id,
+        "name": request.name,
+        "description": request.description,
+        "params": request.params,
+        "status": request.status,
+        "source": "manual",
+        "backtest_summary": request.backtest_summary,
+        "data_window": request.data_window,
+        "created_at": now,
+        "updated_at": now,
+    }
+    collections["portfolio_strategy_param_presets"].insert_one(doc)
+    return {"success": True, "data": _jsonable(doc)}
+
+
 @router.get("/plans")
 async def list_portfolio_plans(
     strategy_id: Optional[str] = Query(default=None),
@@ -351,6 +434,13 @@ async def generate_portfolio_plan(request: GeneratePlanRequest, current_user: di
     strategy = _require_strategy(collections, request.strategy_id)
     if strategy.get("status") == "disabled":
         raise HTTPException(status_code=400, detail="strategy is disabled")
+    params_override = dict(request.params_override or {})
+    if request.preset_id:
+        preset = _require_param_preset(collections, request.preset_id, user_id)
+        if preset.get("strategy_template_id") != request.strategy_id:
+            raise HTTPException(status_code=400, detail="parameter preset does not belong to selected strategy")
+        params_override = {**dict(preset.get("params") or {}), **params_override}
+    _validate_params_override(params_override)
     now = datetime.utcnow()
     task = {
         "task_id": str(uuid.uuid4()),
@@ -361,6 +451,8 @@ async def generate_portfolio_plan(request: GeneratePlanRequest, current_user: di
         "mode": request.mode,
         "force": request.force,
         "initial_capital_override": request.initial_capital_override,
+        "preset_id": request.preset_id,
+        "params_override": params_override,
         "status": "pending",
         "attempts": 0,
         "plan_id": None,

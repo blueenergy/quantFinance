@@ -85,6 +85,17 @@ def _collections():
         "portfolio_paper_equity": _Collection(),
         "portfolio_plan_generation_tasks": _Collection(),
         "portfolio_worker_status": _Collection(),
+        "portfolio_strategy_param_presets": _Collection(
+            [
+                {
+                    "preset_id": "preset-1",
+                    "strategy_template_id": "s1",
+                    "user_id": "user-1",
+                    "status": "enabled",
+                    "params": {"top_n": 20, "rebalance_days": 20},
+                }
+            ]
+        ),
     }
 
 
@@ -183,6 +194,8 @@ def test_generate_portfolio_plan_uses_current_user(monkeypatch):
                 base_date="2025-01-04",
                 mode="auto",
                 initial_capital_override=250_000,
+                preset_id="preset-1",
+                params_override={"cash_buffer": 0.05},
             ),
             current_user={"id": "user-1"},
         )
@@ -195,6 +208,8 @@ def test_generate_portfolio_plan_uses_current_user(monkeypatch):
     assert response["data"]["base_date"] == "2025-01-04"
     assert response["data"]["mode"] == "auto"
     assert response["data"]["initial_capital_override"] == 250_000
+    assert response["data"]["preset_id"] == "preset-1"
+    assert response["data"]["params_override"] == {"top_n": 20, "rebalance_days": 20, "cash_buffer": 0.05}
     assert collections["portfolio_plan_generation_tasks"].docs[0]["task_id"] == response["data"]["task_id"]
 
 
