@@ -178,7 +178,12 @@ def test_generate_portfolio_plan_uses_current_user(monkeypatch):
 
     response = asyncio.run(
         portfolio_plans.generate_portfolio_plan(
-            portfolio_plans.GeneratePlanRequest(strategy_id="s1", base_date="2025-01-04", mode="auto"),
+            portfolio_plans.GeneratePlanRequest(
+                strategy_id="s1",
+                base_date="2025-01-04",
+                mode="auto",
+                initial_capital_override=250_000,
+            ),
             current_user={"id": "user-1"},
         )
     )
@@ -189,6 +194,7 @@ def test_generate_portfolio_plan_uses_current_user(monkeypatch):
     assert response["data"]["strategy_id"] == "s1"
     assert response["data"]["base_date"] == "2025-01-04"
     assert response["data"]["mode"] == "auto"
+    assert response["data"]["initial_capital_override"] == 250_000
     assert collections["portfolio_plan_generation_tasks"].docs[0]["task_id"] == response["data"]["task_id"]
 
 

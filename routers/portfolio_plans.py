@@ -42,6 +42,7 @@ class GeneratePlanRequest(BaseModel):
     base_date: str
     mode: str = Field(default="auto", pattern="^(auto|monitor|rebalance)$")
     force: bool = Field(default=False)
+    initial_capital_override: Optional[float] = Field(default=None, gt=0)
 
 
 def _jsonable(value: Any) -> Any:
@@ -359,6 +360,7 @@ async def generate_portfolio_plan(request: GeneratePlanRequest, current_user: di
         "base_date": request.base_date,
         "mode": request.mode,
         "force": request.force,
+        "initial_capital_override": request.initial_capital_override,
         "status": "pending",
         "attempts": 0,
         "plan_id": None,
