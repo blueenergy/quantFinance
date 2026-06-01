@@ -13,7 +13,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 
 LIVE_SIGNAL_SOURCE_PORTFOLIO_PLAN = "portfolio_plan"
 TERMINAL_SIGNAL_STATUSES = {"filled", "executed", "rejected", "cancelled", "canceled", "partial_cancelled", "failed"}
-ACTIVE_SIGNAL_STATUSES = {"pending", "retry_pending", "submitted", "partial_filled"}
+ACTIVE_SIGNAL_STATUSES = {"pending", "retry_pending", "submitted", "partial_filled", "cancel_requested"}
 PRICE_TICK = Decimal("0.01")
 
 

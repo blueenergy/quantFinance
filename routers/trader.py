@@ -75,7 +75,7 @@ def get_pending_signals(
         
         # Status filter
         if include_submitted:
-            query["status"] = {"$in": ["pending", "retry_pending", "submitted"]}
+            query["status"] = {"$in": ["pending", "retry_pending", "submitted", "partial_filled", "cancel_requested"]}
         else:
             query["status"] = {"$in": ["pending", "retry_pending"]}
         
