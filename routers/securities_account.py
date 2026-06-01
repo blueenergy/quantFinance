@@ -29,6 +29,7 @@ def _account_response(d: dict) -> SecuritiesAccountResponse:
         initial_cash=d.get("initial_cash"),
         live_trading_enabled=bool(d.get("live_trading_enabled", False)),
         risk_limits=d.get("risk_limits"),
+        fee_model=d.get("fee_model"),
     )
 
 
@@ -49,6 +50,31 @@ def _normalize_risk_limits(raw: Optional[dict]) -> dict:
             raise HTTPException(status_code=400, detail=f"{field} 不能小于 0")
         limits[field] = number
     return limits
+
+
+def _normalize_fee_model(raw: Optional[dict]) -> dict:
+    if not raw:
+        return {}
+    allowed_fields = (
+        "buy_commission_rate",
+        "sell_commission_rate",
+        "min_commission",
+        "stamp_tax_rate",
+        "transfer_fee_rate",
+    )
+    model = {}
+    for field in allowed_fields:
+        value = raw.get(field)
+        if value in (None, ""):
+            continue
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail=f"{field} 必须是数字")
+        if number < 0:
+            raise HTTPException(status_code=400, detail=f"{field} 不能小于 0")
+        model[field] = number
+    return model
 
 @router.get("/securities_accounts", response_model=list[SecuritiesAccountResponse])
 def list_accounts(current_user: dict = Depends(get_current_active_user)):
@@ -104,6 +130,7 @@ def create_account(payload: SecuritiesAccountCreate, current_user: dict = Depend
         "account_type": account_type,
         "live_trading_enabled": bool(payload.live_trading_enabled) if account_type == "real" else False,
         "risk_limits": _normalize_risk_limits(payload.risk_limits),
+        "fee_model": _normalize_fee_model(payload.fee_model),
         "created_at": datetime.utcnow(),
         "updated_at": None,
     }
@@ -187,6 +214,8 @@ def update_account(id: str, payload: SecuritiesAccountUpdate, current_user: dict
         update["live_trading_enabled"] = bool(payload.live_trading_enabled) if effective_account_type == "real" else False
     if payload.risk_limits is not None:
         update["risk_limits"] = _normalize_risk_limits(payload.risk_limits)
+    if payload.fee_model is not None:
+        update["fee_model"] = _normalize_fee_model(payload.fee_model)
     if effective_account_type != "real":
         update["live_trading_enabled"] = False
     

@@ -34,6 +34,7 @@ Executable live signals must include:
 - `price_ceiling`: highest acceptable buy limit price when available.
 - `effective_limit_price`: initial protected limit price sent to the trader.
 - `valid_until`: first execution window expiry; later iterations may cancel or reprice.
+- `fee_model`: optional account fee model used only when broker execution reports do not include real fees. It may include `buy_commission_rate`, `sell_commission_rate`, `min_commission`, `stamp_tax_rate`, and `transfer_fee_rate`; estimated execution fees must be marked with `estimated_fee=true`.
 - `status`: initial value is `pending`.
 - `created_at`: signal creation time.
 

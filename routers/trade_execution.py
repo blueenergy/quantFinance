@@ -283,7 +283,11 @@ def _compute_realized_pnl_for_group(trades: List[Dict[str, Any]]) -> Dict[str, A
             or t.get("target_price")
             or 0.0
         )
-        commission = t.get("commission", 0.0) or 0.0
+        commission = (
+            t.get("total_fee")
+            if t.get("total_fee") is not None
+            else (t.get("commission", 0.0) or 0.0)
+        )
 
         if not qty or not price:
             continue

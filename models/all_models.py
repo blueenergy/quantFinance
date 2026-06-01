@@ -127,6 +127,7 @@ class SecuritiesAccountCreate(BaseModel):
     initial_cash: Optional[float] = None  # 模拟账户初始资金，默认100万
     live_trading_enabled: bool = False
     risk_limits: Optional[Dict[str, Any]] = None
+    fee_model: Optional[Dict[str, Any]] = None
 
 class SecuritiesAccountUpdate(BaseModel):
     broker: Optional[str] = None
@@ -135,6 +136,7 @@ class SecuritiesAccountUpdate(BaseModel):
     account_type: Optional[str] = None
     live_trading_enabled: Optional[bool] = None
     risk_limits: Optional[Dict[str, Any]] = None
+    fee_model: Optional[Dict[str, Any]] = None
 
 class SecuritiesAccountResponse(SecuritiesAccountBase):
     id: str
@@ -143,6 +145,7 @@ class SecuritiesAccountResponse(SecuritiesAccountBase):
     initial_cash: Optional[float] = None  # 模拟账户显示初始资金
     live_trading_enabled: bool = False
     risk_limits: Optional[Dict[str, Any]] = None
+    fee_model: Optional[Dict[str, Any]] = None
 
 
 class WorkerNodeRegisterRequest(BaseModel):

@@ -35,6 +35,11 @@ class CreateResearchJobRequest(BaseModel):
     rebalance_interval_days: Optional[List[int]] = None
     active_caps: List[float] = Field(default_factory=lambda: [0.2, 0.25, 0.3, 0.4])
     transaction_cost: float = Field(default=0.001, ge=0)
+    buy_commission_rate: Optional[float] = Field(default=None, ge=0)
+    sell_commission_rate: Optional[float] = Field(default=None, ge=0)
+    min_commission: Optional[float] = Field(default=None, ge=0)
+    stamp_tax_rate: Optional[float] = Field(default=None, ge=0)
+    transfer_fee_rate: Optional[float] = Field(default=None, ge=0)
     index_benchmark_symbol: str = Field(default="000852.SH")
     cash_buffer: float = Field(default=0.03, ge=0, le=1)
     initial_capital: float = Field(default=1_000_000.0, gt=0)
@@ -202,6 +207,11 @@ PRESET_PARAM_KEYS = {
     "max_industry_weight",
     "lot_size",
     "transaction_cost",
+    "buy_commission_rate",
+    "sell_commission_rate",
+    "min_commission",
+    "stamp_tax_rate",
+    "transfer_fee_rate",
     "execution_price",
     "cash_buffer",
     "initial_capital",

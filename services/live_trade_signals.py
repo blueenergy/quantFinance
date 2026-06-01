@@ -58,6 +58,7 @@ class LiveTradeSignal(BaseModel):
     reference_price: Optional[float] = None
     reference_price_source: str = Field(default="estimated_price")
     max_slippage_bps: int = Field(default=100)
+    fee_model: Dict[str, Any] = Field(default_factory=dict)
     price_floor: Optional[float] = None
     price_ceiling: Optional[float] = None
     effective_limit_price: Optional[float] = None
@@ -208,6 +209,7 @@ def build_portfolio_plan_live_signal(
         plan_item_rank=plan_item_rank,
         reference_price=reference_price,
         max_slippage_bps=max_slippage_bps,
+        fee_model=account.get("fee_model") or {},
         price_floor=price_floor,
         price_ceiling=price_ceiling,
         effective_limit_price=effective_limit_price,
