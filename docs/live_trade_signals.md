@@ -19,12 +19,21 @@ Executable live signals must include:
 - `is_executable`: must be `true`.
 - `source`: signal source, for example `portfolio_plan` or `strategy_live`.
 - `plan_id`: source portfolio plan id when applicable.
-- `strategy_id`: strategy identifier.
+- `strategy_template_id`: portfolio strategy template id.
 - `symbol`: traded symbol.
 - `action`: `buy` or `sell`.
 - `size`: positive share quantity.
 - `price`: limit price when available.
 - `order_type`: `limit` or `market`.
+- `execution_phase`: `sell` or `buy`; sell signals are executed before buy signals.
+- `execution_priority`: lower values run earlier inside the same phase.
+- `plan_item_rank`: source plan item rank, kept for audit and execution ordering.
+- `reference_price`: publish-time price anchor used for execution protection.
+- `max_slippage_bps`: maximum tolerated slippage in basis points.
+- `price_floor`: lowest acceptable sell limit price when available.
+- `price_ceiling`: highest acceptable buy limit price when available.
+- `effective_limit_price`: initial protected limit price sent to the trader.
+- `valid_until`: first execution window expiry; later iterations may cancel or reprice.
 - `status`: initial value is `pending`.
 - `created_at`: signal creation time.
 
@@ -66,6 +75,7 @@ Rules:
 - `dry_run=false` writes only new signals after the risk report passes.
 - Account live trading is default-off. The securities account must explicitly set one of `live_trading_enabled`, `live_enabled`, or `allow_live_trading`.
 - Basic gates cover account binding, available cash, sellable quantity, order/day limits, single-symbol position percentage when configured, missing prices, ST, suspended, and limit-up buy blocks when data is available.
+- Published signals include execution phase, priority, reference price, and slippage guard fields so `quantTrader` can execute sells first and avoid unbounded market orders.
 
 `live_trading_enabled` and `risk_limits` are managed on the securities account settings page. Simulated accounts always publish with live trading disabled.
 
@@ -79,3 +89,19 @@ pending -> submitted -> partial_filled -> filled
 ```
 
 `trade_executions` writes are idempotent by `user_id + order_id + status + broker_order_id + filled_size`, so polling the same broker state does not create duplicate execution records.
+
+## Execution Ordering And Price Guards
+
+Portfolio-plan signals are published with this first-level execution policy:
+
+```text
+sell phase -> buy phase
+```
+
+Within the same phase, `execution_priority` and `plan_item_rank` keep the order deterministic. For sell orders, the backend also provides a protected limit reference:
+
+```text
+price_floor = reference_price * (1 - max_slippage_bps / 10000)
+```
+
+`quantTrader` should use `effective_limit_price` or recompute the protected limit before sending the broker order. If no reference price is available for a live sell order, the trader should reject or retry the signal rather than submit an unprotected market sell.

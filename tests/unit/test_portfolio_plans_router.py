@@ -448,6 +448,17 @@ def test_publish_live_signals_dry_run_builds_contract(monkeypatch):
     assert signal["source"] == "portfolio_plan"
     assert signal["status"] == "pending"
     assert signal["securities_account_id"] == "acct-1"
+    assert signal["execution_phase"] == "buy"
+    assert signal["execution_priority"] == 1
+    assert signal["plan_item_rank"] == 1
+    assert signal["reference_price"] == 10.0
+    assert signal["max_slippage_bps"] == 100
+    assert signal["price_ceiling"] == 10.1
+    assert signal["effective_limit_price"] == 10.1
+    sell_signal = response["data"]["signals"][1]
+    assert sell_signal["execution_phase"] == "sell"
+    assert sell_signal["execution_priority"] == -9998
+    assert sell_signal["price_floor"] == 11.88
     assert response["data"]["risk_report"]["blocked_count"] == 0
 
 
@@ -479,6 +490,54 @@ def test_publish_live_signals_write_is_idempotent(monkeypatch):
     assert second["data"]["inserted_count"] == 0
     assert second["data"]["existing_count"] == 1
     assert len(finance["trade_signals"].docs) == 1
+
+
+def test_publish_live_signals_rounds_protected_prices_to_tick(monkeypatch):
+    collections = _collections()
+    collections["portfolio_trade_plans"].docs[0]["status"] = "approved"
+    collections["portfolio_trade_plan_items"].docs.extend(
+        [
+            {
+                "plan_id": "plan-user-1",
+                "user_id": "user-1",
+                "symbol": "000001",
+                "action": "buy",
+                "delta_shares": 100,
+                "target_shares": 100,
+                "estimated_price": 10.005,
+                "rank": 1,
+            },
+            {
+                "plan_id": "plan-user-1",
+                "user_id": "user-1",
+                "symbol": "600000",
+                "action": "sell",
+                "delta_shares": -100,
+                "target_shares": 0,
+                "estimated_price": 10.005,
+                "rank": 2,
+            },
+        ]
+    )
+    finance = _finance_collections()
+    monkeypatch.setattr(portfolio_plans, "get_trading_db_collections", lambda: collections)
+    monkeypatch.setattr(portfolio_plans, "get_db_collections", lambda: finance)
+    monkeypatch.setattr(portfolio_plans, "get_data_db", _data_collections)
+
+    response = asyncio.run(
+        portfolio_plans.publish_portfolio_plan_live_signals(
+            "plan-user-1",
+            portfolio_plans.PublishLiveSignalsRequest(securities_account_id="acct-1", dry_run=True),
+            current_user={"id": "user-1"},
+        )
+    )
+
+    buy_signal = response["data"]["signals"][0]
+    sell_signal = response["data"]["signals"][1]
+    assert buy_signal["price_ceiling"] == 10.11
+    assert buy_signal["effective_limit_price"] == 10.11
+    assert sell_signal["price_floor"] == 9.9
+    assert sell_signal["effective_limit_price"] == 9.9
 
 
 def test_publish_live_signals_blocks_after_paper_execution(monkeypatch):

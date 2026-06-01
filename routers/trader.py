@@ -79,9 +79,18 @@ def get_pending_signals(
         else:
             query["status"] = {"$in": ["pending", "retry_pending"]}
         
-        # Fetch signals sorted by timestamp
+        # Fetch signals sorted by timestamp, then apply execution intent ordering
+        # locally for backwards-compatible documents that may not have phase fields.
         cursor = signals_coll.find(query).sort("timestamp", 1).limit(limit)
         signals = [serialize_doc(doc) for doc in cursor]
+        signals.sort(
+            key=lambda row: (
+                0 if str(row.get("execution_phase") or row.get("action") or "").lower() == "sell" else 1,
+                int(row.get("execution_priority") or 1000),
+                float(row.get("timestamp") or 0),
+                str(row.get("order_id") or ""),
+            )
+        )
         
         return {
             "success": True,
@@ -196,7 +205,7 @@ def create_execution(
                 "status": execution_status,
                 "updated_at": execution["timestamp"],
             }
-            if execution_status in {"filled", "executed", "rejected", "cancelled", "canceled", "failed"}:
+            if execution_status in {"filled", "executed", "rejected", "cancelled", "canceled", "partial_cancelled", "failed"}:
                 signal_update["executed_at"] = execution["timestamp"]
             if execution.get("filled_size") is not None:
                 signal_update["filled_qty"] = execution.get("filled_size")
