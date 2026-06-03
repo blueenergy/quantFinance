@@ -33,6 +33,7 @@ KNOWN_MAIN_TABS: List[tuple] = [
     ("history", False),
     ("strategy-pool", False),
     ("ranking", False),
+    ("entropy-ranking", False),
     ("watchlist", False),
     ("backtest", False),
     ("strategy-lab", False),
