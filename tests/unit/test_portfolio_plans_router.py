@@ -94,6 +94,7 @@ def _collections():
         "portfolio_paper_positions": _Collection(),
         "portfolio_paper_executions": _Collection(),
         "portfolio_paper_equity": _Collection(),
+        "portfolio_live_equity": _Collection(),
         "portfolio_plan_generation_tasks": _Collection(),
         "portfolio_worker_status": _Collection(),
         "portfolio_strategy_param_presets": _Collection(
@@ -804,6 +805,30 @@ def test_paper_executed_plan_suppresses_live_context(monkeypatch):
     context = response["data"]["live_execution_context"]
     assert context["has_live_signals"] is False
     assert context["signal_count"] == 0
+
+
+def test_plan_live_equity_returns_sorted_rows(monkeypatch):
+    collections = _collections()
+    collections["portfolio_live_equity"].docs.extend(
+        [
+            {"user_id": "user-1", "plan_id": "plan-user-1", "date": "20250605", "equity": 100200},
+            {"user_id": "user-1", "plan_id": "plan-user-1", "date": "20250604", "equity": 100000},
+            {"user_id": "user-2", "plan_id": "plan-user-1", "date": "20250604", "equity": 1},
+        ]
+    )
+    monkeypatch.setattr(portfolio_plans, "get_trading_db_collections", lambda: collections)
+
+    response = asyncio.run(
+        portfolio_plans.get_portfolio_plan_live_equity(
+            "plan-user-1",
+            start_date=None,
+            end_date=None,
+            current_user={"id": "user-1"},
+        )
+    )
+
+    assert [row["date"] for row in response["data"]] == ["20250604", "20250605"]
+    assert [row["equity"] for row in response["data"]] == [100000, 100200]
 
 
 def test_publish_live_signals_blocks_when_live_switch_is_off(monkeypatch):

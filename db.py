@@ -53,6 +53,7 @@ def get_db_collections() -> Dict[str, Collection]:
         # Position and account management (from quantTrader)
         "trader_positions": db["trader_positions"],  # 实时持仓快照
         "trader_accounts": db["trader_accounts"],  # 账户资金信息
+        "trader_account_equity": db["trader_account_equity"],  # 账户级每日资金曲线
         "position_snapshots": db["position_snapshots"],  # 历史持仓快照（每日）
         # Intraday T+0 opportunity discovery
         "intraday_t0_mock_positions": db["intraday_t0_mock_positions"],
@@ -120,6 +121,7 @@ def get_trading_db_collections() -> Dict[str, Collection]:
         "portfolio_paper_positions": trading_db["portfolio_paper_positions"],
         "portfolio_paper_executions": trading_db["portfolio_paper_executions"],
         "portfolio_paper_equity": trading_db["portfolio_paper_equity"],
+        "portfolio_live_equity": trading_db["portfolio_live_equity"],
         "portfolio_plan_generation_tasks": trading_db["portfolio_plan_generation_tasks"],
         "portfolio_worker_status": trading_db["portfolio_worker_status"],
         "portfolio_strategy_param_presets": trading_db["portfolio_strategy_param_presets"],

@@ -6,6 +6,10 @@ from utils.stock_utils import serialize_doc
 from utils.symbol_utils import normalize_symbol, strip_exchange_suffix
 from utils.time_display import add_display_time_fields
 from auth import get_current_active_user
+from services.trade_ledger import (
+    compute_realized_pnl_for_group,
+    group_executions_by_order,
+)
 import time
 
 router = APIRouter()
@@ -242,100 +246,10 @@ def enrich_trades_with_stock_names(trades: List[Dict], stock_info_collection) ->
     return trades
 
 
-def _compute_realized_pnl_for_group(trades: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """基于一组同一股票+策略的执行记录，按时间顺序计算持仓与已实现盈亏.
-
-    使用简单的加权平均成本法:
-      - BUY: 更新持仓和平均成本
-      - SELL: 以当前平均成本计算本次卖出的已实现盈亏
-
-    返回字典包含:
-      - net_quantity: 最终净持仓数量
-      - realized_pnl: 已实现盈亏
-      - avg_cost: 当前持仓的平均成本价(如果 net_quantity 为 0 则为 0)
-
-    注意: 这里只计算已实现盈亏和平均成本，不直接计算未平仓浮动盈亏。
-    """
-    if not trades:
-        return {"net_quantity": 0, "realized_pnl": 0.0, "avg_cost": 0.0}
-
-    # 按时间顺序排序
-    sorted_trades = sorted(trades, key=lambda t: t.get("timestamp", 0))
-
-    position_qty = 0
-    avg_cost = 0.0
-    realized_pnl = 0.0
-
-    for t in sorted_trades:
-        side_raw = (t.get("side") or t.get("action", "")).upper()
-        if side_raw not in ("BUY", "SELL"):
-            continue
-
-        qty = (
-            t.get("filled_size")
-            or t.get("quantity")
-            or t.get("size")
-            or 0
-        )
-        price = (
-            t.get("filled_price")
-            or t.get("price")
-            or t.get("target_price")
-            or 0.0
-        )
-        commission = (
-            t.get("total_fee")
-            if t.get("total_fee") is not None
-            else (t.get("commission", 0.0) or 0.0)
-        )
-
-        if not qty or not price:
-            continue
-
-        if side_raw == "BUY":
-            # 买入: 更新平均成本和持仓, 手续费计入成本
-            total_cost = avg_cost * position_qty + price * qty + commission
-            position_qty += qty
-            if position_qty > 0:
-                avg_cost = total_cost / position_qty
-        else:  # SELL
-            if position_qty <= 0:
-                # 当前系统视角下没有可用持仓: 不计算已实现盈亏，也不引入负持仓
-                sell_qty = 0
-            else:
-                sell_qty = min(qty, position_qty)
-                # 卖出: 以当前平均成本计算已实现盈亏, 并扣除本次卖出的手续费
-                realized_pnl += (price - avg_cost) * sell_qty - commission
-                position_qty -= sell_qty
-
-            if position_qty <= 0:
-                position_qty = 0
-                avg_cost = 0.0
-
-    return {
-        "net_quantity": position_qty,
-        "realized_pnl": round(realized_pnl, 2),
-        "avg_cost": round(avg_cost, 4) if position_qty > 0 else 0.0,
-    }
-
-
-def _group_executions_by_order(executions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """按 order_id 聚合执行记录，避免同一订单被重复统计。
-
-    当前实现: 对于每个 order_id，保留 timestamp 最大的一条记录作为该订单的代表快照。
-    这样可以在券商重复回放相同执行回报时，防止在统计和视图中重复计算。
-    """
-    if not executions:
-        return []
-
-    grouped: Dict[str, Dict[str, Any]] = {}
-    for doc in executions:
-        order_id = doc.get("order_id") or str(doc.get("_id"))
-        current = grouped.get(order_id)
-        if (not current) or (doc.get("timestamp", 0) > current.get("timestamp", 0)):
-            grouped[order_id] = doc
-
-    return list(grouped.values())
+# 持仓重建与已实现盈亏计算已下沉到 services.trade_ledger，供 router 与后台服务复用。
+# 保留下划线别名以兼容既有调用与单元测试。
+_compute_realized_pnl_for_group = compute_realized_pnl_for_group
+_group_executions_by_order = group_executions_by_order
 
 
 @router.get("/trade-executions/", summary="获取当前用户的交易执行记录")

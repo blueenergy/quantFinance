@@ -337,6 +337,29 @@ def market_insight_focus_review_task():
         _release_scheduler_job_lock(job_id)
 
 
+def equity_snapshot_eod_task():
+    """Persist account-level and live plan-level EOD equity snapshots."""
+    from db import get_data_db, get_db_collections, get_trading_db_collections
+    from services.live_equity import ensure_live_equity_indexes, snapshot_account_equity, snapshot_live_plan_equity
+
+    job_id = "equity_snapshot_eod"
+    if not _acquire_scheduler_job_lock(job_id):
+        log.info("[EquitySnapshot] Another scheduler instance owns the lock, skipping.")
+        return
+    try:
+        finance_collections = get_db_collections()
+        trading_collections = get_trading_db_collections()
+        data_collections = get_data_db()
+        ensure_live_equity_indexes(finance_collections, trading_collections)
+        account_result = snapshot_account_equity(finance_collections)
+        plan_result = snapshot_live_plan_equity(trading_collections, finance_collections, data_collections)
+        log.info("[EquitySnapshot] account=%s live_plan=%s", account_result, plan_result)
+    except Exception as exc:
+        log.error("[EquitySnapshot] failed: %s", exc, exc_info=True)
+    finally:
+        _release_scheduler_job_lock(job_id)
+
+
 def hot_stock_poll_task(source: str):
     """热股分析任务 - 基于最新 THS / DC 热榜数据检查并提交分析。"""
     from db import get_db_collections, get_analyzer_db
@@ -394,6 +417,7 @@ TASK_MAP = {
     ),
     'market_insight_focus_review_1530': market_insight_focus_review_task,
     'strategy_lab_loop_tick': strategy_lab_loop_tick_task,
+    'equity_snapshot_eod': equity_snapshot_eod_task,
 }
 
 # Default trigger configurations
@@ -471,6 +495,14 @@ DEFAULT_SCHEDULES = {
         'name': "Strategy Lab 自动迭代推进",
         'type': "interval",
         'seconds': 45,
+        'is_active': True,
+    },
+    'equity_snapshot_eod': {
+        'name': "实盘资金曲线盘后快照 (16:00)",
+        'type': "cron",
+        'hour': 16,
+        'minute': 0,
+        'day_of_week': 'mon-fri',
         'is_active': True,
     },
 }

@@ -18,6 +18,7 @@ from db import get_db_collections, get_data_db
 from utils.stock_utils import serialize_doc
 from utils.time_display import add_display_time_fields
 from bson import ObjectId
+from services.live_equity import list_account_equity
 
 router = APIRouter()
 
@@ -739,3 +740,25 @@ def get_account(
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to fetch account: {str(e)}")
+
+
+@router.get("/trader/account/equity", summary="Get account equity curve")
+def get_account_equity(
+    securities_account_id: Optional[str] = Query(None, description="Filter by securities account ID"),
+    start_date: Optional[str] = Query(None, description="Start date YYYYMMDD or YYYY-MM-DD"),
+    end_date: Optional[str] = Query(None, description="End date YYYYMMDD or YYYY-MM-DD"),
+    current_user: dict = Depends(get_current_active_user),
+):
+    """Get persisted account-level daily equity snapshots."""
+    try:
+        collections = get_db_collections()
+        rows = list_account_equity(
+            collections,
+            user_id=current_user["id"],
+            securities_account_id=securities_account_id,
+            start_date=start_date,
+            end_date=end_date,
+        )
+        return {"success": True, "data": [serialize_doc(row) for row in rows]}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch account equity: {str(e)}")

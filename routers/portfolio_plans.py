@@ -19,6 +19,7 @@ from services.live_trade_signals import (
     build_portfolio_plan_live_signal,
     summarize_signal_statuses,
 )
+from services.live_equity import compute_live_plan_realtime_equity, list_live_plan_equity
 
 
 router = APIRouter(prefix="/portfolio-plans", tags=["portfolio-plans"])
@@ -1024,6 +1025,42 @@ async def get_portfolio_plan_live_executions(plan_id: str, current_user: dict = 
             }
         ),
     }
+
+
+@router.get("/plans/{plan_id}/live-equity")
+async def get_portfolio_plan_live_equity(
+    plan_id: str,
+    start_date: Optional[str] = Query(default=None),
+    end_date: Optional[str] = Query(default=None),
+    current_user: dict = Depends(get_current_user),
+):
+    collections = get_trading_db_collections()
+    _require_plan(collections, plan_id, current_user)
+    rows = list_live_plan_equity(
+        collections,
+        user_id=_current_user_id(current_user),
+        plan_id=plan_id,
+        start_date=start_date,
+        end_date=end_date,
+    )
+    return {"success": True, "data": _jsonable(rows)}
+
+
+@router.get("/plans/{plan_id}/live-realtime-equity")
+async def get_portfolio_plan_live_realtime_equity(plan_id: str, current_user: dict = Depends(get_current_user)):
+    trading_collections = get_trading_db_collections()
+    finance_collections = get_db_collections()
+    data_collections = get_data_db()
+    plan = _require_plan(trading_collections, plan_id, current_user)
+    row = compute_live_plan_realtime_equity(
+        trading_collections,
+        finance_collections,
+        data_collections,
+        user_id=_current_user_id(current_user),
+        plan_id=plan_id,
+        plan=plan,
+    )
+    return {"success": True, "data": _jsonable(row)}
 
 
 @router.post("/plans/{plan_id}/execute-paper")
