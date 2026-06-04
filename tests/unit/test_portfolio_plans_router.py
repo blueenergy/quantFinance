@@ -140,6 +140,7 @@ def _finance_collections():
 def _data_collections():
     return {
         "stock_info": _Collection([{"symbol": "000001", "name": "平安银行"}, {"symbol": "600000", "name": "浦发银行"}]),
+        "volume_price": _Collection(),
         "volume_price_realtime_latest": _Collection([{"symbol": "000001", "close": 10.0}, {"symbol": "600000", "close": 12.0}]),
     }
 
@@ -636,6 +637,171 @@ def test_plan_live_executions_are_scoped_to_plan_order_ids(monkeypatch):
     assert [row["order_id"] for row in response["data"]["signals"]] == ["plan-order-1"]
     assert [row["order_id"] for row in response["data"]["executions"]] == ["plan-order-1"]
     assert response["data"]["executions"][0]["execution_time"] == "1970-01-01 08:00:10"
+
+
+def test_plan_detail_enriches_strategy_and_account_positions_separately(monkeypatch):
+    collections = _collections()
+    collections["portfolio_trade_plans"].docs[0]["status"] = "approved"
+    collections["portfolio_trade_plan_items"].docs.append(
+        {
+            "plan_id": "plan-user-1",
+            "user_id": "user-1",
+            "strategy_template_id": "s1",
+            "symbol": "000001",
+            "action": "buy",
+            "current_shares": 0,
+            "target_shares": 100,
+            "delta_shares": 100,
+            "rank": 1,
+        }
+    )
+    finance = _finance_collections()
+    finance["trade_signals"].docs.append(
+        {
+            "user_id": "user-1",
+            "plan_id": "plan-user-1",
+            "strategy_template_id": "s1",
+            "source": "portfolio_plan",
+            "mode": "live",
+            "order_id": "plan-order-1",
+            "symbol": "000001",
+            "action": "buy",
+            "size": 100,
+            "status": "filled",
+            "securities_account_id": "acct-1",
+        }
+    )
+    finance["trade_executions"].docs.extend(
+        [
+            {
+                "user_id": "user-1",
+                "strategy_template_id": "s1",
+                "securities_account_id": "acct-1",
+                "order_id": "plan-order-1",
+                "symbol": "000001",
+                "action": "buy",
+                "filled_size": 100,
+                "mode": "live",
+            },
+            {
+                "user_id": "user-1",
+                "strategy_template_id": "other-strategy",
+                "securities_account_id": "acct-1",
+                "order_id": "other-strategy-order",
+                "symbol": "000001",
+                "action": "buy",
+                "filled_size": 200,
+                "mode": "live",
+            },
+            {
+                "user_id": "user-1",
+                "securities_account_id": "acct-1",
+                "order_id": "manual-order",
+                "symbol": "000001",
+                "action": "buy",
+                "filled_size": 300,
+                "mode": "live",
+            },
+        ]
+    )
+    finance["trader_positions"].docs.append(
+        {
+            "user_id": "user-1",
+            "securities_account_id": "acct-1",
+            "symbol": "000001.SZ",
+            "qty": 600,
+            "can_use_volume": 500,
+        }
+    )
+    monkeypatch.setattr(portfolio_plans, "get_trading_db_collections", lambda: collections)
+    monkeypatch.setattr(portfolio_plans, "get_db_collections", lambda: finance)
+    monkeypatch.setattr(portfolio_plans, "get_data_db", _data_collections)
+
+    response = asyncio.run(portfolio_plans.get_portfolio_plan("plan-user-1", current_user={"id": "user-1"}))
+
+    item = response["data"]["items"][0]
+    assert item["plan_current_shares"] == 0
+    assert item["current_shares"] == 100
+    assert item["strategy_current_shares"] == 100
+    assert item["account_current_shares"] == 600
+    assert item["account_available_shares"] == 500
+    assert item["live_filled_qty"] == 100
+    assert item["live_remaining_qty"] == 0
+    assert item["live_status"] == "filled"
+    assert response["data"]["live_execution_context"]["has_live_signals"] is True
+    assert response["data"]["live_execution_context"]["signal_count"] == 1
+
+
+def test_plan_detail_without_live_signals_marks_live_context_false(monkeypatch):
+    collections = _collections()
+    collections["portfolio_trade_plan_items"].docs.append(
+        {
+            "plan_id": "plan-user-1",
+            "user_id": "user-1",
+            "strategy_template_id": "s1",
+            "symbol": "000001",
+            "action": "buy",
+            "current_shares": 0,
+            "target_shares": 100,
+            "delta_shares": 100,
+            "rank": 1,
+        }
+    )
+    finance = _finance_collections()
+    monkeypatch.setattr(portfolio_plans, "get_trading_db_collections", lambda: collections)
+    monkeypatch.setattr(portfolio_plans, "get_db_collections", lambda: finance)
+    monkeypatch.setattr(portfolio_plans, "get_data_db", _data_collections)
+
+    response = asyncio.run(portfolio_plans.get_portfolio_plan("plan-user-1", current_user={"id": "user-1"}))
+
+    item = response["data"]["items"][0]
+    assert item["current_shares"] == 0
+    assert item["live_filled_qty"] == 0
+    assert item["account_current_shares"] is None
+    assert response["data"]["live_execution_context"]["has_live_signals"] is False
+    assert response["data"]["live_execution_context"]["signal_count"] == 0
+
+
+def test_paper_executed_plan_suppresses_live_context(monkeypatch):
+    collections = _collections()
+    collections["portfolio_trade_plans"].docs[0]["status"] = "executed_paper"
+    collections["portfolio_trade_plan_items"].docs.append(
+        {
+            "plan_id": "plan-user-1",
+            "user_id": "user-1",
+            "strategy_template_id": "s1",
+            "symbol": "000001",
+            "action": "buy",
+            "current_shares": 0,
+            "target_shares": 100,
+            "delta_shares": 100,
+            "rank": 1,
+        }
+    )
+    finance = _finance_collections()
+    finance["trade_signals"].docs.append(
+        {
+            "user_id": "user-1",
+            "plan_id": "plan-user-1",
+            "strategy_template_id": "s1",
+            "source": "portfolio_plan",
+            "mode": "live",
+            "order_id": "stale-live-order",
+            "symbol": "000001",
+            "status": "filled",
+            "securities_account_id": "acct-1",
+        }
+    )
+    monkeypatch.setattr(portfolio_plans, "get_trading_db_collections", lambda: collections)
+    monkeypatch.setattr(portfolio_plans, "get_db_collections", lambda: finance)
+    monkeypatch.setattr(portfolio_plans, "get_data_db", _data_collections)
+
+    response = asyncio.run(portfolio_plans.get_portfolio_plan("plan-user-1", current_user={"id": "user-1"}))
+
+    context = response["data"]["live_execution_context"]
+    assert context["has_live_signals"] is False
+    assert context["signal_count"] == 0
+    assert context["suppressed_by_paper_execution"] is True
 
 
 def test_publish_live_signals_blocks_when_live_switch_is_off(monkeypatch):

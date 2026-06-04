@@ -319,6 +319,192 @@ def _numeric(value: Any, default: float = 0.0) -> float:
         return default
 
 
+def _int_value(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _symbol_key(value: Any) -> str:
+    return str(value or "").split(".", 1)[0]
+
+
+def _execution_signed_size(row: Dict[str, Any]) -> int:
+    size = _int_value(row.get("filled_size", row.get("filled_qty", row.get("quantity", row.get("size", 0)))))
+    action = str(row.get("action") or row.get("side") or "").lower()
+    if action in {"sell", "s"}:
+        return -abs(size)
+    if action in {"buy", "b"}:
+        return abs(size)
+    return size
+
+
+def _execution_qty(row: Dict[str, Any]) -> int:
+    return abs(_int_value(row.get("filled_size", row.get("filled_qty", row.get("quantity", row.get("size", 0))))))
+
+
+def _build_live_plan_item_context(
+    *,
+    finance_collections: Dict[str, Any],
+    plan: Dict[str, Any],
+    items: List[Dict[str, Any]],
+    user_id: str,
+) -> Dict[str, Dict[str, Any]]:
+    strategy_template_id = plan.get("strategy_template_id")
+    symbols = {_symbol_key(item.get("symbol")) for item in items if item.get("symbol")}
+    if not symbols:
+        return {}
+
+    signal_query = {
+        "user_id": user_id,
+        "plan_id": plan.get("plan_id"),
+        "mode": "live",
+        "source": "portfolio_plan",
+    }
+    plan_signals = list(finance_collections["trade_signals"].find(signal_query))
+    order_ids = [row.get("order_id") for row in plan_signals if row.get("order_id")]
+    account_ids = {str(row.get("securities_account_id")) for row in plan_signals if row.get("securities_account_id")}
+
+    plan_executions: List[Dict[str, Any]] = []
+    if order_ids:
+        plan_executions = list(
+            finance_collections["trade_executions"].find(
+                {"user_id": user_id, "order_id": {"$in": order_ids}}
+            )
+        )
+
+    strategy_executions: List[Dict[str, Any]] = []
+    account_positions: List[Dict[str, Any]] = []
+    if account_ids:
+        strategy_executions = list(
+            finance_collections["trade_executions"].find(
+                {
+                    "user_id": user_id,
+                    "strategy_template_id": strategy_template_id,
+                    "mode": "live",
+                    "securities_account_id": {"$in": sorted(account_ids)},
+                }
+            )
+        )
+        account_positions = list(
+            finance_collections["trader_positions"].find(
+                {"user_id": user_id, "securities_account_id": {"$in": sorted(account_ids)}}
+            )
+        )
+
+    context: Dict[str, Dict[str, Any]] = {
+        symbol: {
+            "strategy_current_shares": 0,
+            "live_filled_qty": 0,
+            "live_remaining_qty": 0,
+            "live_status": None,
+            "account_current_shares": None,
+            "account_available_shares": None,
+        }
+        for symbol in symbols
+    }
+
+    for row in strategy_executions:
+        symbol = _symbol_key(row.get("symbol"))
+        if symbol in context:
+            context[symbol]["strategy_current_shares"] += _execution_signed_size(row)
+
+    signal_by_symbol: Dict[str, List[Dict[str, Any]]] = {}
+    for signal in plan_signals:
+        symbol = _symbol_key(signal.get("symbol"))
+        if symbol in context:
+            signal_by_symbol.setdefault(symbol, []).append(signal)
+
+    for row in plan_executions:
+        symbol = _symbol_key(row.get("symbol"))
+        if symbol in context:
+            context[symbol]["live_filled_qty"] += _execution_qty(row)
+
+    terminal_statuses = {"filled", "cancelled", "canceled", "rejected", "failed", "partial_cancelled"}
+    for symbol, signals in signal_by_symbol.items():
+        target_qty = sum(_int_value(signal.get("size")) for signal in signals)
+        filled_qty = context[symbol]["live_filled_qty"]
+        context[symbol]["live_remaining_qty"] = max(0, target_qty - filled_qty)
+        statuses = [str(signal.get("status") or "") for signal in signals if signal.get("status")]
+        if statuses:
+            if all(status == "filled" for status in statuses):
+                live_status = "filled"
+            elif any(status in {"partial_filled", "partial_cancelled"} for status in statuses) or filled_qty:
+                live_status = "partial_filled"
+            elif any(status not in terminal_statuses for status in statuses):
+                live_status = "active"
+            else:
+                live_status = statuses[-1]
+            context[symbol]["live_status"] = live_status
+
+    for pos in account_positions:
+        symbol = _symbol_key(pos.get("symbol"))
+        if symbol not in context:
+            continue
+        qty = _int_value(pos.get("qty", pos.get("quantity", pos.get("volume", pos.get("shares", 0)))))
+        available = _int_value(pos.get("can_use_volume", pos.get("available_qty", qty)))
+        current = context[symbol]
+        current["account_current_shares"] = (current["account_current_shares"] or 0) + qty
+        current["account_available_shares"] = (current["account_available_shares"] or 0) + available
+
+    return context
+
+
+def _attach_live_plan_item_context(
+    *,
+    finance_collections: Dict[str, Any],
+    plan: Dict[str, Any],
+    items: List[Dict[str, Any]],
+    user_id: str,
+) -> List[Dict[str, Any]]:
+    context = _build_live_plan_item_context(
+        finance_collections=finance_collections,
+        plan=plan,
+        items=items,
+        user_id=user_id,
+    )
+    enriched = []
+    for item in items:
+        symbol_context = context.get(_symbol_key(item.get("symbol"))) or {}
+        original_current = _int_value(item.get("current_shares"))
+        strategy_current = _int_value(symbol_context.get("strategy_current_shares"), original_current)
+        enriched.append(
+            {
+                **item,
+                "plan_current_shares": original_current,
+                "current_shares": strategy_current,
+                "strategy_current_shares": strategy_current,
+                "account_current_shares": symbol_context.get("account_current_shares"),
+                "account_available_shares": symbol_context.get("account_available_shares"),
+                "live_filled_qty": _int_value(symbol_context.get("live_filled_qty")),
+                "live_remaining_qty": _int_value(symbol_context.get("live_remaining_qty")),
+                "live_status": symbol_context.get("live_status"),
+            }
+        )
+    return enriched
+
+
+def _live_execution_context(finance_collections: Dict[str, Any], plan: Dict[str, Any], user_id: str) -> Dict[str, Any]:
+    if plan.get("status") in {"executed_paper", "partially_executed"}:
+        return {
+            "has_live_signals": False,
+            "signal_count": 0,
+            "suppressed_by_paper_execution": True,
+        }
+    query = {
+        "user_id": user_id,
+        "plan_id": plan.get("plan_id"),
+        "mode": "live",
+        "source": "portfolio_plan",
+    }
+    signal_count = finance_collections["trade_signals"].count_documents(query)
+    return {
+        "has_live_signals": signal_count > 0,
+        "signal_count": signal_count,
+    }
+
+
 def _latest_account_snapshot(finance_collections: Dict[str, Any], account: Dict[str, Any], user_id: str) -> Dict[str, Any]:
     return finance_collections["trader_accounts"].find_one(
         {"user_id": user_id, "securities_account_id": str(account.get("_id"))},
@@ -705,12 +891,21 @@ async def get_portfolio_plan_generation_watermark(
 @router.get("/plans/{plan_id}")
 async def get_portfolio_plan(plan_id: str, current_user: dict = Depends(get_current_user)):
     collections = get_trading_db_collections()
+    finance_collections = get_db_collections()
     data_collections = get_data_db()
     plan = _require_plan(collections, plan_id, current_user)
     owner_query = {"plan_id": plan_id, "user_id": _current_user_id(current_user)}
     items = list(collections["portfolio_trade_plan_items"].find(owner_query).sort("rank", 1))
+    user_id = _current_user_id(current_user)
+    items = _attach_live_plan_item_context(
+        finance_collections=finance_collections,
+        plan=plan,
+        items=items,
+        user_id=user_id,
+    )
     reviews = list(collections["portfolio_plan_reviews"].find(owner_query).sort("created_at", -1))
     execution_status = _paper_execution_status(collections, data_collections, plan, items)
+    live_execution_context = _live_execution_context(finance_collections, plan, user_id)
     return {
         "success": True,
         "data": {
@@ -718,6 +913,7 @@ async def get_portfolio_plan(plan_id: str, current_user: dict = Depends(get_curr
             "items": _jsonable(items),
             "reviews": _jsonable(reviews),
             "execution_status": _jsonable(execution_status),
+            "live_execution_context": _jsonable(live_execution_context),
         },
     }
 
@@ -725,8 +921,16 @@ async def get_portfolio_plan(plan_id: str, current_user: dict = Depends(get_curr
 @router.get("/plans/{plan_id}/items")
 async def get_portfolio_plan_items(plan_id: str, current_user: dict = Depends(get_current_user)):
     collections = get_trading_db_collections()
-    _require_plan(collections, plan_id, current_user)
-    items = list(collections["portfolio_trade_plan_items"].find({"plan_id": plan_id, "user_id": _current_user_id(current_user)}).sort("rank", 1))
+    finance_collections = get_db_collections()
+    plan = _require_plan(collections, plan_id, current_user)
+    user_id = _current_user_id(current_user)
+    items = list(collections["portfolio_trade_plan_items"].find({"plan_id": plan_id, "user_id": user_id}).sort("rank", 1))
+    items = _attach_live_plan_item_context(
+        finance_collections=finance_collections,
+        plan=plan,
+        items=items,
+        user_id=user_id,
+    )
     return {"success": True, "data": _jsonable(items)}
 
 
