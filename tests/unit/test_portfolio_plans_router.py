@@ -728,6 +728,7 @@ def test_plan_detail_enriches_strategy_and_account_positions_separately(monkeypa
     assert item["live_filled_qty"] == 100
     assert item["live_remaining_qty"] == 0
     assert item["live_status"] == "filled"
+    assert response["data"]["execution_mode"] == "live"
     assert response["data"]["live_execution_context"]["has_live_signals"] is True
     assert response["data"]["live_execution_context"]["signal_count"] == 1
 
@@ -758,6 +759,7 @@ def test_plan_detail_without_live_signals_marks_live_context_false(monkeypatch):
     assert item["current_shares"] == 0
     assert item["live_filled_qty"] == 0
     assert item["account_current_shares"] is None
+    assert response["data"]["execution_mode"] == "not_executed"
     assert response["data"]["live_execution_context"]["has_live_signals"] is False
     assert response["data"]["live_execution_context"]["signal_count"] == 0
 
@@ -798,10 +800,10 @@ def test_paper_executed_plan_suppresses_live_context(monkeypatch):
 
     response = asyncio.run(portfolio_plans.get_portfolio_plan("plan-user-1", current_user={"id": "user-1"}))
 
+    assert response["data"]["execution_mode"] == "paper"
     context = response["data"]["live_execution_context"]
     assert context["has_live_signals"] is False
     assert context["signal_count"] == 0
-    assert context["suppressed_by_paper_execution"] is True
 
 
 def test_publish_live_signals_blocks_when_live_switch_is_off(monkeypatch):

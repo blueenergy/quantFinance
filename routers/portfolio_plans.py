@@ -485,23 +485,36 @@ def _attach_live_plan_item_context(
     return enriched
 
 
-def _live_execution_context(finance_collections: Dict[str, Any], plan: Dict[str, Any], user_id: str) -> Dict[str, Any]:
+def _plan_execution_context(finance_collections: Dict[str, Any], plan: Dict[str, Any], user_id: str) -> Dict[str, Any]:
+    """Single source of truth for how a plan is being executed.
+
+    Returns an ``execution_mode`` of ``paper``, ``live`` or ``not_executed``
+    so the UI never has to infer the layout from scattered fields.
+    """
     if plan.get("status") in {"executed_paper", "partially_executed"}:
         return {
+            "execution_mode": "paper",
             "has_live_signals": False,
             "signal_count": 0,
-            "suppressed_by_paper_execution": True,
         }
-    query = {
-        "user_id": user_id,
-        "plan_id": plan.get("plan_id"),
-        "mode": "live",
-        "source": "portfolio_plan",
-    }
-    signal_count = finance_collections["trade_signals"].count_documents(query)
+    signal_count = finance_collections["trade_signals"].count_documents(
+        {
+            "user_id": user_id,
+            "plan_id": plan.get("plan_id"),
+            "mode": "live",
+            "source": "portfolio_plan",
+        }
+    )
+    if signal_count > 0:
+        return {
+            "execution_mode": "live",
+            "has_live_signals": True,
+            "signal_count": signal_count,
+        }
     return {
-        "has_live_signals": signal_count > 0,
-        "signal_count": signal_count,
+        "execution_mode": "not_executed",
+        "has_live_signals": False,
+        "signal_count": 0,
     }
 
 
@@ -905,7 +918,7 @@ async def get_portfolio_plan(plan_id: str, current_user: dict = Depends(get_curr
     )
     reviews = list(collections["portfolio_plan_reviews"].find(owner_query).sort("created_at", -1))
     execution_status = _paper_execution_status(collections, data_collections, plan, items)
-    live_execution_context = _live_execution_context(finance_collections, plan, user_id)
+    execution_context = _plan_execution_context(finance_collections, plan, user_id)
     return {
         "success": True,
         "data": {
@@ -913,7 +926,8 @@ async def get_portfolio_plan(plan_id: str, current_user: dict = Depends(get_curr
             "items": _jsonable(items),
             "reviews": _jsonable(reviews),
             "execution_status": _jsonable(execution_status),
-            "live_execution_context": _jsonable(live_execution_context),
+            "execution_mode": execution_context["execution_mode"],
+            "live_execution_context": _jsonable(execution_context),
         },
     }
 
