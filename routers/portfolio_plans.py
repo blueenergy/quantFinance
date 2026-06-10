@@ -258,6 +258,36 @@ def _validate_params_override(params: Dict[str, Any]) -> None:
             raise HTTPException(status_code=400, detail="initial_capital must be greater than 0")
 
 
+def _append_plan_operation_log(
+    collections: Dict[str, Any],
+    *,
+    plan_id: str,
+    user_id: str,
+    operation_type: str,
+    status: str,
+    message: str = "",
+    task_id: Optional[str] = None,
+    symbol: Optional[str] = None,
+    payload: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    now = datetime.utcnow()
+    doc = {
+        "log_id": str(uuid.uuid4()),
+        "plan_id": plan_id,
+        "user_id": user_id,
+        "task_id": task_id,
+        "operation_type": operation_type,
+        "operation_symbol": symbol,
+        "status": status,
+        "message": message,
+        "payload": payload or {},
+        "created_at": now,
+        "updated_at": now,
+    }
+    collections["portfolio_plan_operation_logs"].insert_one(doc)
+    return doc
+
+
 def _reviewer(current_user: Dict[str, Any]) -> str:
     return str(current_user.get("username") or current_user.get("email") or current_user.get("id") or "unknown")
 
@@ -825,7 +855,13 @@ PLAN_RESELECT_STATUSES = {"draft", "generated", "needs_review"}
 
 
 def _enqueue_plan_regeneration(
-    collections: Dict[str, Any], plan: Dict[str, Any], user_id: str, excluded_symbols: List[str]
+    collections: Dict[str, Any],
+    plan: Dict[str, Any],
+    user_id: str,
+    excluded_symbols: List[str],
+    *,
+    operation_type: str,
+    operation_symbol: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Re-run plan generation in place with an updated exclusion set.
 
@@ -845,6 +881,8 @@ def _enqueue_plan_regeneration(
         "preset_id": plan.get("preset_id"),
         "params_override": plan.get("params_override") or {},
         "excluded_symbols": excluded_symbols,
+        "operation_type": operation_type,
+        "operation_symbol": operation_symbol,
         "status": "pending",
         "attempts": 0,
         "plan_id": plan["plan_id"],
@@ -857,6 +895,17 @@ def _enqueue_plan_regeneration(
     collections["portfolio_trade_plans"].update_one(
         {"plan_id": plan["plan_id"], "user_id": user_id},
         {"$set": {"excluded_symbols": excluded_symbols, "updated_at": now}},
+    )
+    _append_plan_operation_log(
+        collections,
+        plan_id=plan["plan_id"],
+        user_id=user_id,
+        operation_type=operation_type,
+        status="enqueued",
+        message=f"operation enqueued: {operation_type}",
+        task_id=task["task_id"],
+        symbol=operation_symbol,
+        payload={"excluded_symbols": excluded_symbols},
     )
     return task
 
@@ -872,7 +921,14 @@ async def reject_portfolio_plan_item(plan_id: str, symbol: str, current_user: di
             detail=f"plan is {plan.get('status')}; can only reselect while in {sorted(PLAN_RESELECT_STATUSES)}",
         )
     excluded = sorted({*(plan.get("excluded_symbols") or []), str(symbol)})
-    task = _enqueue_plan_regeneration(collections, plan, user_id, excluded)
+    task = _enqueue_plan_regeneration(
+        collections,
+        plan,
+        user_id,
+        excluded,
+        operation_type="reject_symbol",
+        operation_symbol=str(symbol),
+    )
     return {"success": True, "data": _jsonable({"task": task, "excluded_symbols": excluded})}
 
 
@@ -886,8 +942,28 @@ async def restore_portfolio_plan_item(plan_id: str, symbol: str, current_user: d
             status_code=409,
             detail=f"plan is {plan.get('status')}; can only reselect while in {sorted(PLAN_RESELECT_STATUSES)}",
         )
+    symbol = str(symbol)
+    if symbol not in set(plan.get("excluded_symbols") or []):
+        log = _append_plan_operation_log(
+            collections,
+            plan_id=plan_id,
+            user_id=user_id,
+            operation_type="restore_symbol",
+            status="noop",
+            message=f"symbol {symbol} is not in excluded list",
+            symbol=symbol,
+            payload={"excluded_symbols": plan.get("excluded_symbols") or []},
+        )
+        return {"success": True, "data": _jsonable({"task": None, "excluded_symbols": plan.get("excluded_symbols") or [], "operation_log": log})}
     excluded = sorted(s for s in (plan.get("excluded_symbols") or []) if s != str(symbol))
-    task = _enqueue_plan_regeneration(collections, plan, user_id, excluded)
+    task = _enqueue_plan_regeneration(
+        collections,
+        plan,
+        user_id,
+        excluded,
+        operation_type="restore_symbol",
+        operation_symbol=symbol,
+    )
     return {"success": True, "data": _jsonable({"task": task, "excluded_symbols": excluded})}
 
 
@@ -1004,6 +1080,24 @@ async def get_portfolio_plan(plan_id: str, current_user: dict = Depends(get_curr
     }
 
 
+@router.get("/plans/{plan_id}/operation-logs")
+async def get_portfolio_plan_operation_logs(
+    plan_id: str,
+    limit: int = Query(default=100, ge=1, le=500),
+    current_user: dict = Depends(get_current_user),
+):
+    collections = get_trading_db_collections()
+    user_id = _current_user_id(current_user)
+    _require_plan(collections, plan_id, current_user)
+    rows = list(
+        collections["portfolio_plan_operation_logs"]
+        .find({"plan_id": plan_id, "user_id": user_id}, {"_id": 0})
+        .sort("created_at", -1)
+        .limit(limit)
+    )
+    return {"success": True, "data": _jsonable(rows)}
+
+
 @router.get("/plans/{plan_id}/items")
 async def get_portfolio_plan_items(plan_id: str, current_user: dict = Depends(get_current_user)):
     collections = get_trading_db_collections()
@@ -1059,6 +1153,27 @@ async def get_portfolio_plan_executions(plan_id: str, current_user: dict = Depen
     collections = get_trading_db_collections()
     _require_plan(collections, plan_id, current_user)
     rows = list(collections["portfolio_paper_executions"].find({"plan_id": plan_id, "user_id": _current_user_id(current_user)}).sort("created_at", 1))
+    return {"success": True, "data": _jsonable(rows)}
+
+
+@router.get("/plans/{plan_id}/equity")
+async def get_portfolio_plan_equity(
+    plan_id: str,
+    start_date: Optional[str] = Query(default=None),
+    end_date: Optional[str] = Query(default=None),
+    current_user: dict = Depends(get_current_user),
+):
+    collections = get_trading_db_collections()
+    _require_plan(collections, plan_id, current_user)
+    query: Dict[str, Any] = {"plan_id": plan_id, "user_id": _current_user_id(current_user)}
+    if start_date or end_date:
+        date_query: Dict[str, Any] = {}
+        if start_date:
+            date_query["$gte"] = start_date.replace("-", "")
+        if end_date:
+            date_query["$lte"] = end_date.replace("-", "")
+        query["date"] = date_query
+    rows = list(collections["portfolio_paper_equity"].find(query).sort("date", 1))
     return {"success": True, "data": _jsonable(rows)}
 
 
@@ -1340,26 +1455,31 @@ def _apply_paper_execution(collections: Dict[str, Any], data_collections: Dict[s
         raise HTTPException(status_code=400, detail="plan must be approved before paper execution")
     if user_id and _plan_has_live_signals(get_db_collections(), plan_id, user_id) and not force:
         raise HTTPException(status_code=400, detail="plan already has live signals; cannot execute paper trading")
-    if collections["portfolio_paper_executions"].find_one({"plan_id": plan_id}) and not force:
+    execution_query = {"plan_id": plan_id}
+    if user_id:
+        execution_query["user_id"] = user_id
+    if collections["portfolio_paper_executions"].find_one(execution_query) and not force:
         raise HTTPException(status_code=400, detail="plan already has paper executions")
 
     strategy_template_id = plan.get("strategy_template_id")
     user_id = plan.get("user_id")
-    execute_date = plan.get("execute_date")
-    if not strategy_template_id or not execute_date:
-        raise HTTPException(status_code=400, detail="plan is missing strategy_template_id or execute_date")
+    execute_date = (
+        str(plan.get("execute_date") or "").replace("-", "")
+        or str(plan.get("base_date") or "").replace("-", "")
+        or datetime.now().strftime("%Y%m%d")
+    )
+    if not strategy_template_id:
+        raise HTTPException(status_code=400, detail="plan is missing strategy_template_id")
 
-    previous_query = {"strategy_template_id": strategy_template_id, "as_of_date": {"$lte": plan.get("base_date")}}
-    if user_id:
-        previous_query["user_id"] = user_id
-    previous = collections["portfolio_paper_positions"].find_one(
-        previous_query,
-        sort=[("as_of_date", -1)],
-    ) or {}
-    positions = {row.get("symbol"): dict(row) for row in previous.get("positions", []) if row.get("symbol")}
+    # Plan-level paper execution: every plan runs in an isolated paper account.
+    # We intentionally do not inherit previous strategy snapshots.
+    positions: Dict[str, Dict[str, Any]] = {}
     params_snapshot = plan.get("params_snapshot") or {}
-    cash = float(previous.get("cash", params_snapshot.get("initial_capital", 1_000_000.0)))
-    items = list(collections["portfolio_trade_plan_items"].find({"plan_id": plan_id}).sort("rank", 1))
+    cash = float(params_snapshot.get("initial_capital", 1_000_000.0))
+    item_query = {"plan_id": plan_id}
+    if user_id:
+        item_query["user_id"] = user_id
+    items = list(collections["portfolio_trade_plan_items"].find(item_query).sort("rank", 1))
     symbols = [item.get("symbol") for item in items if item.get("symbol")]
     execution_symbols = sorted(
         {
@@ -1385,7 +1505,7 @@ def _apply_paper_execution(collections: Dict[str, Any], data_collections: Dict[s
     partial = False
 
     if force:
-        collections["portfolio_paper_executions"].delete_many({"plan_id": plan_id})
+        collections["portfolio_paper_executions"].delete_many(execution_query)
 
     for item in items:
         symbol = item.get("symbol")
@@ -1448,8 +1568,8 @@ def _apply_paper_execution(collections: Dict[str, Any], data_collections: Dict[s
         "positions": position_rows,
         "updated_at": now,
     }
-    position_query = {"strategy_template_id": strategy_template_id, "as_of_date": execute_date}
-    equity_query = {"strategy_template_id": strategy_template_id, "date": execute_date}
+    position_query = {"plan_id": plan_id, "as_of_date": execute_date}
+    equity_query = {"plan_id": plan_id, "date": execute_date}
     if user_id:
         position_query["user_id"] = user_id
         equity_query["user_id"] = user_id
@@ -1459,7 +1579,10 @@ def _apply_paper_execution(collections: Dict[str, Any], data_collections: Dict[s
         {"strategy_template_id": strategy_template_id, "user_id": user_id, "date": execute_date, "plan_id": plan_id, "equity": equity, "cash": cash, "market_value": market_value, "updated_at": now},
         upsert=True,
     )
-    collections["portfolio_trade_plans"].update_one({"plan_id": plan_id}, {"$set": {"status": status, "paper_executed_at": now}})
+    plan_update_query = {"plan_id": plan_id}
+    if user_id:
+        plan_update_query["user_id"] = user_id
+    collections["portfolio_trade_plans"].update_one(plan_update_query, {"$set": {"status": status, "paper_executed_at": now}})
     return {"plan_id": plan_id, "status": status, "executions": executions, "position_snapshot": snapshot}
 
 
