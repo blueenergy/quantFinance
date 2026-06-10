@@ -908,7 +908,7 @@ async def get_single_score_detail(
             # 组装列表展示友好字段
             details_payload = {}
             name_map = {
-                'cycle': '周期评分',
+                'cycle': '动量评分',
                 'growth': '成长评分',
                 'fundamental': '基本面评分',
                 'value': '价值评分',
@@ -1000,9 +1000,9 @@ async def get_score_categories():
     """
     categories = {
         "cycle_score": {
-            "name": "经济周期评分",
+            "name": "动量评分",
             "weight": 0.25,
-            "description": "基于月K线走势,评估股票在经济周期中的位置",
+            "description": "基于多周期价量趋势(均线斜率/价格位置/波动率)评估个股动量强弱",
             "factors": ["价格相对历史高低点位置", "近期价格趋势", "波动率分析"]
         },
         "fundamental_score": {
