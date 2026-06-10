@@ -28,6 +28,9 @@ _STOCK_SCORE_LIST_PROJECTION = {
     "growth_score": 1,
     "technical_score": 1,
     "money_flow_score": 1,
+    # Read-only industry relative-strength (cycle_v2); reference only, not part
+    # of composite. Absent on docs not yet backfilled -> rendered as "—".
+    "industry_rs_score": 1,
 }
 
 # 与 stock-scoring-system data_manager.SCORE_INDEX_LABEL_CODES 一致；按 index_codes 查榜
@@ -46,6 +49,7 @@ SCORE_SORT_FIELDS: Dict[str, str] = {
     "value": "value_score",
     "technical": "technical_score",
     "money_flow": "money_flow_score",
+    "industry_rs": "industry_rs_score",
 }
 
 
@@ -673,6 +677,7 @@ async def get_stock_rankings_by_index(
                 "growth_score": safe_round(stock.get("growth_score", 0), 2),
                 "technical_score": safe_round(stock.get("technical_score", 0), 2),
                 "money_flow_score": safe_round(stock.get("money_flow_score", 0), 2),
+                "industry_rs_score": stock.get("industry_rs_score"),
                 "score_date": stock.get("score_date", ""),
             }
             row.update(dict(RETURN_SINCE_EMPTY))
@@ -738,6 +743,7 @@ async def get_stock_rankings(
                     "growth_score": 1,
                     "technical_score": 1,
                     "money_flow_score": 1,
+                    "industry_rs_score": 1,
                     "score_date": 1
                 }},
                 {"$sort": {"composite_score": -1}},
@@ -757,6 +763,7 @@ async def get_stock_rankings(
                     "growth_score": 1,
                     "technical_score": 1,
                     "money_flow_score": 1,
+                    "industry_rs_score": 1,
                     "score_date": 1
                 }},
             ]
@@ -817,6 +824,7 @@ async def get_stock_rankings(
                 'growth_score': safe_round(stock.get('growth_score', 0), 2),
                 'technical_score': safe_round(stock.get('technical_score', 0), 2),
                 'money_flow_score': safe_round(stock.get('money_flow_score', 0), 2),
+                'industry_rs_score': stock.get('industry_rs_score'),
                 'score_date': stock.get('score_date', '')
             }
             row.update(dict(RETURN_SINCE_EMPTY))
@@ -1237,7 +1245,8 @@ async def get_selected_stock_rankings(
                             'fundamental_score': safe_round(doc.get('fundamental_score', 0), 2),
                             'value_score': safe_round(doc.get('value_score', 0), 2),
                             'technical_score': safe_round(doc.get('technical_score', 0), 2),
-                            'money_flow_score': safe_round(doc.get('money_flow_score', 0), 2)
+                            'money_flow_score': safe_round(doc.get('money_flow_score', 0), 2),
+                            'industry_rs_score': doc.get('industry_rs_score')
                         }
                 info = None
                 for k in _symbol_key_variants(sym):
@@ -1349,6 +1358,7 @@ async def get_selected_stock_rankings(
                 'growth_score': safe_round(stock.get('growth_score', 0), 2),
                 'technical_score': safe_round(stock.get('technical_score', 0), 2),
                 'money_flow_score': safe_round(stock.get('money_flow_score', 0), 2),
+                'industry_rs_score': stock.get('industry_rs_score'),
                 'score_date': stock.get('score_date', date if date else '')
             }
             formatted_stock.update(dict(RETURN_SINCE_EMPTY))
