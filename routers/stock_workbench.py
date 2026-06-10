@@ -12,6 +12,22 @@ from services.analysis_history import build_user_analysis_history_payload
 router = APIRouter()
 
 
+def _to_float(value: Any) -> Optional[float]:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number
+
+
+def _first_float(*values: Any) -> Optional[float]:
+    for value in values:
+        number = _to_float(value)
+        if number is not None:
+            return number
+    return None
+
+
 def _find_first(collection, candidates: List[str], projection: Optional[Dict[str, int]] = None) -> Optional[Dict[str, Any]]:
     for field in ("symbol", "ts_code", "con_code"):
         doc = collection.find_one({field: {"$in": candidates}}, projection)
@@ -29,6 +45,71 @@ def _latest_score(symbol: str) -> Optional[Dict[str, Any]]:
     )
 
 
+def _latest_daily_quote(data: Any, candidates: List[str], trade_date: Any = None) -> Optional[Dict[str, Any]]:
+    volume_price = data["volume_price"]
+    query: Dict[str, Any] = {"symbol": {"$in": candidates}}
+    if trade_date:
+        same_day = volume_price.find_one(
+            {**query, "trade_date": trade_date},
+            sort=[("trade_date", -1), ("_id", -1)],
+        )
+        if same_day:
+            return same_day
+        query["trade_date"] = {"$lt": trade_date}
+
+    return volume_price.find_one(query, sort=[("trade_date", -1), ("_id", -1)])
+
+
+def _attach_display_pct_change(data: Any, quote: Optional[Dict[str, Any]], candidates: List[str]) -> Optional[Dict[str, Any]]:
+    """Normalize workbench quote change to the common A-share close/pre-close basis."""
+    if not quote:
+        return quote
+
+    close = _first_float(quote.get("close"), quote.get("price"), quote.get("latest_price"))
+    quote_trade_date = quote.get("trade_date")
+    previous_close = _first_float(
+        quote.get("pre_close"),
+        quote.get("prev_close"),
+        quote.get("previous_close"),
+        quote.get("yesterday_close"),
+    )
+    previous_close_source = "quote.pre_close" if previous_close is not None else None
+
+    daily_quote = None
+    if previous_close is None:
+        try:
+            daily_quote = _latest_daily_quote(data, candidates, quote_trade_date)
+            if daily_quote:
+                if quote_trade_date and daily_quote.get("trade_date") == quote_trade_date:
+                    previous_close = _first_float(
+                        daily_quote.get("pre_close"),
+                        daily_quote.get("prev_close"),
+                        daily_quote.get("previous_close"),
+                    )
+                    previous_close_source = "daily.pre_close"
+                else:
+                    previous_close = _first_float(daily_quote.get("close"))
+                    previous_close_source = "previous_daily.close"
+        except Exception:
+            previous_close = None
+            previous_close_source = None
+
+    if close is not None and previous_close and previous_close > 0:
+        quote["display_pct_chg"] = (close - previous_close) / previous_close * 100.0
+        quote["display_pct_chg_source"] = previous_close_source or "computed_from_pre_close"
+        quote["display_pre_close"] = previous_close
+        return quote
+
+    fallback_pct = _first_float(quote.get("pct_chg"), quote.get("pct_change"), quote.get("change_percent"))
+    if fallback_pct is not None:
+        quote["display_pct_chg"] = fallback_pct
+        quote["display_pct_chg_source"] = "quote_pct_field"
+    else:
+        quote["display_pct_chg"] = None
+        quote["display_pct_chg_source"] = "unavailable"
+    return quote
+
+
 def _latest_quote(symbol: str) -> Optional[Dict[str, Any]]:
     data = get_data_db()
     candidates = _symbol_candidates(symbol)
@@ -38,14 +119,14 @@ def _latest_quote(symbol: str) -> Optional[Dict[str, Any]]:
     )
     if quote:
         quote["source"] = "realtime"
-        return quote
+        return _attach_display_pct_change(data, quote, candidates)
 
-    quote = data["volume_price"].find_one(
-        {"symbol": {"$in": candidates}},
-        sort=[("trade_date", -1), ("_id", -1)],
-    )
+    quote = _latest_daily_quote(data, candidates)
     if quote:
         quote["source"] = "daily"
+        if quote.get("display_pct_chg") is None:
+            quote["display_pct_chg"] = _first_float(quote.get("pct_chg"), quote.get("pct_change"))
+            quote["display_pct_chg_source"] = "daily.pct_chg"
     return quote
 
 
