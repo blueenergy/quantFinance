@@ -967,6 +967,44 @@ async def restore_portfolio_plan_item(plan_id: str, symbol: str, current_user: d
     return {"success": True, "data": _jsonable({"task": task, "excluded_symbols": excluded})}
 
 
+@router.post("/plans/{plan_id}/ai-risk-review")
+async def rerun_portfolio_plan_ai_risk(plan_id: str, current_user: dict = Depends(get_current_user)):
+    """Manually re-run the rule-based AI risk pass on an existing plan.
+
+    Enqueues an ``ai_risk_review`` task processed by the plan worker, which
+    recomputes ``ai_risk`` on each buy/hold item in place. Advisory only — it
+    never changes selection or status.
+    """
+    collections = get_trading_db_collections()
+    user_id = _current_user_id(current_user)
+    plan = _require_plan(collections, plan_id, current_user)
+    now = datetime.utcnow()
+    task = {
+        "task_id": str(uuid.uuid4()),
+        "task_type": "ai_risk_review",
+        "user_id": user_id,
+        "strategy_template_id": plan.get("strategy_template_id"),
+        "base_date": plan.get("base_date"),
+        "plan_id": plan_id,
+        "operation_type": "ai_risk_review",
+        "status": "pending",
+        "attempts": 0,
+        "created_at": now,
+        "updated_at": now,
+    }
+    collections["portfolio_plan_generation_tasks"].insert_one(task)
+    _append_plan_operation_log(
+        collections,
+        plan_id=plan_id,
+        user_id=user_id,
+        operation_type="ai_risk_review",
+        status="enqueued",
+        message="ai risk review enqueued",
+        task_id=task["task_id"],
+    )
+    return {"success": True, "data": _jsonable({"task": task})}
+
+
 @router.get("/plans/generation-tasks")
 async def list_portfolio_plan_generation_tasks(
     status: Optional[str] = Query(default=None),
