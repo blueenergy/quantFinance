@@ -362,6 +362,64 @@ async def get_portfolio_research_artifact(job_id: str, current_user: dict = Depe
     return FileResponse(str(path), media_type="text/html")
 
 
+def _resolve_combo_file(combos_dir: Optional[str], file_rel: Optional[str]) -> Optional[Path]:
+    """Resolve a per-combo detail JSON, mirroring the artifact path fallbacks.
+
+    ``file_rel`` is the manifest-relative path (``<base>_combos/<key>.json``); we also
+    try the recorded absolute ``combos_dir`` and the report-dir fallbacks so the file is
+    found whether the API runs on the host or inside the container mount.
+    """
+    candidates: List[Path] = []
+    if combos_dir and file_rel:
+        candidates.append(Path(combos_dir) / Path(file_rel).name)
+    for base_dir in (
+        os.getenv("PORTFOLIO_RESEARCH_REPORT_DIR"),
+        "/app/reports/portfolio-research",
+        "reports/portfolio-research",
+    ):
+        if base_dir and file_rel:
+            candidates.append(Path(base_dir) / file_rel)
+
+    seen = set()
+    for candidate in candidates:
+        key = str(candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        if candidate.exists() and candidate.is_file():
+            return candidate
+    return None
+
+
+@router.get("/jobs/{job_id}/combos")
+async def list_portfolio_research_combos(job_id: str, current_user: dict = Depends(get_current_user)):
+    collections = get_trading_db_collections()
+    user_id = _current_user_id(current_user)
+    result = collections["portfolio_research_results"].find_one({"job_id": job_id, "user_id": user_id})
+    if not result:
+        raise HTTPException(status_code=404, detail="research result not found")
+    combos = (result.get("artifact") or {}).get("combos") or []
+    return {"success": True, "data": _jsonable(combos)}
+
+
+@router.get("/jobs/{job_id}/combos/{combo_key}")
+async def get_portfolio_research_combo_detail(job_id: str, combo_key: str, current_user: dict = Depends(get_current_user)):
+    collections = get_trading_db_collections()
+    user_id = _current_user_id(current_user)
+    result = collections["portfolio_research_results"].find_one({"job_id": job_id, "user_id": user_id})
+    if not result:
+        raise HTTPException(status_code=404, detail="research result not found")
+    artifact = result.get("artifact") or {}
+    combos = artifact.get("combos") or []
+    entry = next((c for c in combos if c.get("combo_key") == combo_key), None)
+    if not entry:
+        raise HTTPException(status_code=404, detail="combo detail not found")
+    path = _resolve_combo_file(artifact.get("combos_dir"), entry.get("file"))
+    if path is None:
+        raise HTTPException(status_code=404, detail="combo detail file not found")
+    return FileResponse(str(path), media_type="application/json")
+
+
 @router.post("/results/{result_id}/publish")
 async def publish_portfolio_research_result(
     result_id: str,
