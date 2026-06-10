@@ -190,6 +190,7 @@ PLAN_LIST_PROJECTION = {
     "plan_type": 1,
     "status": 1,
     "summary": 1,
+    "excluded_symbols": 1,
     "created_at": 1,
     "updated_at": 1,
     "reviewed_at": 1,
@@ -818,6 +819,76 @@ async def generate_portfolio_plan(request: GeneratePlanRequest, current_user: di
     }
     collections["portfolio_plan_generation_tasks"].insert_one(task)
     return {"success": True, "data": _jsonable(task)}
+
+
+PLAN_RESELECT_STATUSES = {"draft", "generated", "needs_review"}
+
+
+def _enqueue_plan_regeneration(
+    collections: Dict[str, Any], plan: Dict[str, Any], user_id: str, excluded_symbols: List[str]
+) -> Dict[str, Any]:
+    """Re-run plan generation in place with an updated exclusion set.
+
+    Reuses the plan's own base_date / preset / params so params_hash (hence
+    plan_id) is unchanged and the worker replaces the same plan. The exclusion
+    set is threaded separately and intentionally does not affect params_hash.
+    """
+    now = datetime.utcnow()
+    task = {
+        "task_id": str(uuid.uuid4()),
+        "task_type": "generate_portfolio_plan",
+        "user_id": user_id,
+        "strategy_template_id": plan["strategy_template_id"],
+        "base_date": plan["base_date"],
+        "mode": "auto",
+        "force": True,
+        "preset_id": plan.get("preset_id"),
+        "params_override": plan.get("params_override") or {},
+        "excluded_symbols": excluded_symbols,
+        "status": "pending",
+        "attempts": 0,
+        "plan_id": plan["plan_id"],
+        "created_at": now,
+        "updated_at": now,
+    }
+    collections["portfolio_plan_generation_tasks"].insert_one(task)
+    # Reflect the intent immediately so the UI shows the pending exclusion before
+    # the worker rewrites the plan.
+    collections["portfolio_trade_plans"].update_one(
+        {"plan_id": plan["plan_id"], "user_id": user_id},
+        {"$set": {"excluded_symbols": excluded_symbols, "updated_at": now}},
+    )
+    return task
+
+
+@router.post("/plans/{plan_id}/items/{symbol}/reject")
+async def reject_portfolio_plan_item(plan_id: str, symbol: str, current_user: dict = Depends(get_current_user)):
+    collections = get_trading_db_collections()
+    user_id = _current_user_id(current_user)
+    plan = _require_plan(collections, plan_id, current_user)
+    if plan.get("status") not in PLAN_RESELECT_STATUSES:
+        raise HTTPException(
+            status_code=409,
+            detail=f"plan is {plan.get('status')}; can only reselect while in {sorted(PLAN_RESELECT_STATUSES)}",
+        )
+    excluded = sorted({*(plan.get("excluded_symbols") or []), str(symbol)})
+    task = _enqueue_plan_regeneration(collections, plan, user_id, excluded)
+    return {"success": True, "data": _jsonable({"task": task, "excluded_symbols": excluded})}
+
+
+@router.post("/plans/{plan_id}/items/{symbol}/restore")
+async def restore_portfolio_plan_item(plan_id: str, symbol: str, current_user: dict = Depends(get_current_user)):
+    collections = get_trading_db_collections()
+    user_id = _current_user_id(current_user)
+    plan = _require_plan(collections, plan_id, current_user)
+    if plan.get("status") not in PLAN_RESELECT_STATUSES:
+        raise HTTPException(
+            status_code=409,
+            detail=f"plan is {plan.get('status')}; can only reselect while in {sorted(PLAN_RESELECT_STATUSES)}",
+        )
+    excluded = sorted(s for s in (plan.get("excluded_symbols") or []) if s != str(symbol))
+    task = _enqueue_plan_regeneration(collections, plan, user_id, excluded)
+    return {"success": True, "data": _jsonable({"task": task, "excluded_symbols": excluded})}
 
 
 @router.get("/plans/generation-tasks")
