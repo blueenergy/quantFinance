@@ -247,6 +247,32 @@ pipelines:
         universe_period_filter:
           field: list_date
           op: lte_period
+    # ── Data contract (Phase 3, report-period model) ───────────────────────────
+    # Completeness is measured by report period (quarter-ends whose disclosure
+    # deadline has passed), not trading day. A period is "present" when its
+    # row count reaches per_period_min_coverage_pct of stocks listed by then.
+    # Deep coverage starts ~2018 (pre-2018 is sparse); monitor financial_income
+    # as the representative sheet.
+    contract:
+      source: tushare
+      storage: { database: quant_data, collection: financial_income, date_field: end_date, symbol_field: ts_code }
+      window: { start: "20180101", end: rolling }
+      completeness:
+        kind: report_periods
+        per_period_min_coverage_pct: 80.0
+        universe: { database: quant_data, collection: stock_info, match_key: ts_code, list_date_field: list_date }
+      sla:
+        max_lag_trading_days: 1     # here a "unit" is a report period: ≤1 period behind
+        min_coverage_pct: 99.0      # fraction of mature periods that must be present
+        min_symbols_latest_day: 0
+      on_violation:
+        auto_repair: true
+        repair_task: run_financial_sync
+        repair_args: ["--all", "--period-range", "{start}:{end}"]
+        max_repair_window_days: 730   # group up to ~2y of quarter-ends per backfill
+      alert:
+        channels: [email, data_pulse]
+        "on": [repair_failed, still_violated]
 
   - id: moneyflow
     label: 资金流向
@@ -288,6 +314,26 @@ pipelines:
       collection: earnings
       field: trade_date
       field_kind: date_string
+    # ── Data contract (Phase 3, run-recency model) ─────────────────────────────
+    # Earnings is announcement-driven and only partially disclosed, so coverage
+    # is undefined. Instead the contract checks that the sync ran recently
+    # (pipeline_tasks/job_status updated_at) and re-runs it when overdue.
+    contract:
+      source: tushare
+      storage: { database: quant_data, collection: earnings_forecast, date_field: ann_date, symbol_field: ts_code }
+      window: { start: "20180101", end: rolling }
+      completeness:
+        kind: run_recency
+      sla:
+        max_run_lag_days: 3        # alert/repair if earnings_sync hasn't run in 3 days
+      on_violation:
+        auto_repair: true
+        repair_task: run_earnings_sync
+        repair_args: ["--days", "7"]
+        max_repair_window_days: 30
+      alert:
+        channels: [email, data_pulse]
+        "on": [repair_failed, still_violated]
 
   - id: cn_macro_sync
     label: 国内宏观数据
