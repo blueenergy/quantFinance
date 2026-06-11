@@ -754,6 +754,97 @@ def expected_latest_trade_date_hint() -> str:
     return d.strftime("%Y%m%d")
 
 
+def build_data_contract_health() -> Dict[str, Any]:
+    """Read finance.data_contract_state for the data-pulse contract panel.
+
+    Combines the cold-start bootstrap marker (``__bootstrap__``) with the latest
+    per-contract health snapshot written by the quant-data-engine reconciler.
+    Catalog order is preserved so dependency order (stock_info first) is visible,
+    and contracts with a ``contract`` block but no state doc yet are reported as
+    ``pending`` — i.e. not yet reached during an in-progress bootstrap.
+    """
+    BEIJING = timezone(timedelta(hours=8))
+
+    def _iso(dt: Any) -> Optional[str]:
+        if not isinstance(dt, datetime):
+            return None
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(BEIJING).isoformat()
+
+    coll = db["data_contract_state"]
+    try:
+        marker = coll.find_one({"contract_id": "__bootstrap__"}) or {}
+    except Exception:
+        marker = {}
+    bootstrap = {
+        "done": bool(marker.get("completed_at")),
+        "completed_at": _iso(marker.get("completed_at")),
+        "contracts": list(marker.get("contracts") or []),
+    }
+
+    contract_entries = [
+        (e.get("id"), e.get("label") or e.get("id"), e.get("contract"))
+        for e in load_pipelines_catalog()
+        if isinstance(e, dict) and isinstance(e.get("contract"), dict) and e.get("id")
+    ]
+
+    try:
+        state_docs = list(coll.find({"contract_id": {"$ne": "__bootstrap__"}}))
+    except Exception:
+        state_docs = []
+    state_by_id = {d.get("contract_id"): d for d in state_docs}
+
+    counts = {"ok": 0, "repaired": 0, "violated": 0, "failed": 0,
+              "unknown": 0, "pending": 0}
+    contracts: List[Dict[str, Any]] = []
+    for cid, label, cblock in contract_entries:
+        kind = (cblock.get("completeness") or {}).get("kind") or "calendar_trading_days"
+        d = state_by_id.get(cid)
+        if not d:
+            counts["pending"] += 1
+            contracts.append({
+                "contract_id": cid, "label": label, "status": "pending",
+                "kind": kind, "last_reconcile_at": None,
+            })
+            continue
+        status = d.get("status") or "unknown"
+        counts[status] = counts.get(status, 0) + 1
+        contracts.append({
+            "contract_id": cid,
+            "label": d.get("label") or label,
+            "status": status,
+            "kind": kind,
+            "coverage_pct": d.get("coverage_pct"),
+            "lag_trading_days": d.get("lag_trading_days"),
+            "expected_days": d.get("expected_days"),
+            "present_days": d.get("present_days"),
+            "missing_days": d.get("missing_days"),
+            "latest_actual": d.get("latest_actual"),
+            "latest_expected": d.get("latest_expected"),
+            "doc_count": d.get("doc_count"),
+            "min_docs": d.get("min_docs"),
+            "run_lag_days": d.get("run_lag_days"),
+            "last_run_date": d.get("last_run_date"),
+            "symbols_latest_day": d.get("symbols_latest_day"),
+            "repair": d.get("repair"),
+            "violations": d.get("violations") or [],
+            "note": d.get("note"),
+            "last_reconcile_at": _iso(d.get("last_reconcile_at")),
+            "last_alert_at": _iso(d.get("last_alert_at")),
+        })
+
+    total = len(contract_entries)
+    healthy = counts["ok"] + counts["repaired"]
+    summary = {
+        "total": total,
+        "healthy": healthy,
+        "healthy_pct": round(100.0 * healthy / total, 1) if total else 0.0,
+        **counts,
+    }
+    return {"bootstrap": bootstrap, "summary": summary, "contracts": contracts}
+
+
 __all__ = [
     "load_pipelines_catalog",
     "normalize_job_status_doc",
@@ -762,6 +853,7 @@ __all__ = [
     "build_sync_health_from_catalog",
     "build_freshness_rows",
     "build_data_monitoring_overview",
+    "build_data_contract_health",
     "expected_latest_trade_date_hint",
     "query_coverage_gaps",
     "resolve_coverage_gap_config",

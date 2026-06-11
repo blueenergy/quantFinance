@@ -16,6 +16,7 @@ from fastapi import APIRouter, HTTPException, Query
 
 from db import db, get_data_db
 from services.data_monitoring import (
+    build_data_contract_health,
     build_data_monitoring_overview,
     build_pipeline_dag,
     build_pipelines_status_rows,
@@ -25,8 +26,10 @@ from services.data_monitoring import (
 router = APIRouter(prefix="/data-pulse", tags=["data-pulse"])
 _DATA_PULSE_OVERVIEW_CACHE_TTL_SECONDS = 60
 _DATA_PULSE_NEWS_CACHE_TTL_SECONDS = 60
+_DATA_PULSE_CONTRACTS_CACHE_TTL_SECONDS = 30
 _data_pulse_overview_cache: Dict[str, Any] = {"expires_at": 0.0, "payload": None}
 _data_pulse_news_cache: Dict[str, Any] = {"key": None, "expires_at": 0.0, "payload": None}
+_data_pulse_contracts_cache: Dict[str, Any] = {"expires_at": 0.0, "payload": None}
 
 
 def _get_international_news_doc():
@@ -218,6 +221,29 @@ async def get_data_pulse_overview():
     _data_pulse_overview_cache.update({
         "payload": payload,
         "expires_at": now + _DATA_PULSE_OVERVIEW_CACHE_TTL_SECONDS,
+    })
+    return payload
+
+
+@router.get("/contracts")
+async def get_data_contract_health():
+    """Contract health + cold-start bootstrap progress for the data-pulse panel.
+
+    Source of truth is ``finance.data_contract_state`` written by the
+    quant-data-engine reconciler (incl. the ``__bootstrap__`` marker).
+    """
+    now = time.time()
+    if (
+        _data_pulse_contracts_cache.get("payload") is not None
+        and float(_data_pulse_contracts_cache.get("expires_at") or 0) > now
+    ):
+        return _data_pulse_contracts_cache["payload"]
+
+    health = build_data_contract_health()
+    payload = {"success": True, **health}
+    _data_pulse_contracts_cache.update({
+        "payload": payload,
+        "expires_at": now + _DATA_PULSE_CONTRACTS_CACHE_TTL_SECONDS,
     })
     return payload
 
