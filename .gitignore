@@ -86,3 +86,6 @@ dashboard/node_modules/
 *.db
 celerybeat-schedule
 celerybeat_schedule
+
+# Shared lib checked out by CI at build time (not committed here)
+/data-access-lib/

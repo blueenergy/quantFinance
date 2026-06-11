@@ -18,9 +18,27 @@ from db import data_db, db
 _CATALOG_PATH = Path(__file__).resolve().parent.parent / "config" / "data_pipelines_catalog.yaml"
 
 
+def _resolve_catalog_path() -> str:
+    """Locate the catalog: env override > shared library > repo-local config.
+
+    The shared ``stock_data_access`` library bundles the canonical catalog, so
+    quantFinance and the quant-data-engine executor read an identical copy with
+    no runtime file mount. The repo-local path remains a fallback for
+    pre-library setups.
+    """
+    env_path = os.environ.get("DATA_PIPELINES_CATALOG")
+    if env_path:
+        return env_path
+    try:
+        from stock_data_access import catalog_path as _lib_catalog_path
+
+        return str(_lib_catalog_path())
+    except Exception:
+        return str(_CATALOG_PATH)
+
+
 def load_pipelines_catalog() -> List[Dict[str, Any]]:
-    path = os.environ.get("DATA_PIPELINES_CATALOG", str(_CATALOG_PATH))
-    p = Path(path)
+    p = Path(_resolve_catalog_path())
     if not p.is_file():
         return []
     with open(p, "r", encoding="utf-8") as f:
