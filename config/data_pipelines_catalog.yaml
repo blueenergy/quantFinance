@@ -152,6 +152,19 @@ pipelines:
       collection: index_prices
       field: trade_date
       field_kind: date_string
+    contract:
+      source: tushare
+      storage: { database: quant_data, collection: index_prices, date_field: trade_date, symbol_field: ts_code }
+      window: { start: "20050104", end: rolling }   # index_prices earliest ≈ 2005
+      sla: { max_lag_trading_days: 1, min_coverage_pct: 99.5, min_symbols_latest_day: 0 }
+      on_violation:
+        auto_repair: true
+        repair_task: run_index_daily
+        repair_args: ["--core", "--start", "{start}", "--end", "{end}"]
+        max_repair_window_days: 60
+      alert:
+        channels: [email, data_pulse]
+        "on": [repair_failed, still_violated]
 
   - id: index_constituents
     label: 指数成分股
@@ -180,6 +193,19 @@ pipelines:
       collection: etf_daily
       field: trade_date
       field_kind: date_string
+    contract:
+      source: tushare
+      storage: { database: quant_data, collection: etf_daily, date_field: trade_date, symbol_field: ts_code }
+      window: { start: "20070104", end: rolling }   # etf_daily earliest ≈ 2007
+      sla: { max_lag_trading_days: 1, min_coverage_pct: 99.0, min_symbols_latest_day: 0 }
+      on_violation:
+        auto_repair: true
+        repair_task: run_etf_daily
+        repair_args: ["--all", "--start", "{start}", "--end", "{end}"]   # 全市场按日回填
+        max_repair_window_days: 60
+      alert:
+        channels: [email, data_pulse]
+        "on": [repair_failed, still_violated]
 
   - id: etf_share_size
     label: ETF份额规模
@@ -235,6 +261,19 @@ pipelines:
       collection: money_flow
       field: trade_date
       field_kind: date_string
+    contract:
+      source: tushare
+      storage: { database: quant_data, collection: money_flow, date_field: trade_date, symbol_field: ts_code }
+      window: { start: "20240102", end: rolling }   # Tushare moneyflow available from 2024
+      sla: { max_lag_trading_days: 2, min_coverage_pct: 99.0, min_symbols_latest_day: 0 }
+      on_violation:
+        auto_repair: true
+        repair_task: run_moneyflow_sync
+        repair_args: ["--start", "{start}", "--end", "{end}"]
+        max_repair_window_days: 30
+      alert:
+        channels: [email, data_pulse]
+        "on": [repair_failed, still_violated]
 
   - id: earnings_sync
     label: 业绩数据
