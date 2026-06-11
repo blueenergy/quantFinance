@@ -241,7 +241,8 @@ services:
       # Trigger market insight event generation after realtime sector strength is materialized.
       - MARKET_INSIGHT_TRIGGER_URL=${MARKET_INSIGHT_TRIGGER_URL:-http://127.0.0.1:3001/api/market-insights/generate-internal}
       - MARKET_INSIGHT_TRIGGER_KEY=${MARKET_INSIGHT_TRIGGER_KEY:-${HERMES_QUANT_INTERNAL_KEY:-}}
-      - DATA_PIPELINES_CATALOG=/app/config/data_pipelines_catalog.yaml
+      # Pipeline catalog ships inside the image (bundled via data-access-lib);
+      # no env override or host mount needed.
       # Optional per-task cron overrides for daily_market_sync.sh jobs
       - CRON_STOCK_DAILY=${CRON_STOCK_DAILY:-}
       - CRON_INDEX_DAILY=${CRON_INDEX_DAILY:-}
@@ -258,7 +259,6 @@ services:
     volumes:
       - ../quant-data-engine/logs:/app/logs
       - ../quant-data-engine/src/quant_data_engine:/app/src/quant_data_engine
-      - ./config/data_pipelines_catalog.yaml:/app/config/data_pipelines_catalog.yaml:ro
     logging:
       driver: json-file
       options:
