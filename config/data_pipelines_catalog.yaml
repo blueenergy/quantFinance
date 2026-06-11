@@ -42,6 +42,31 @@ pipelines:
       collection: stock_info
       field: list_date
       field_kind: date_string
+    # ── Data contract: reference snapshot ──────────────────────────────────────
+    # stock_info is the listed-universe reference other contracts depend on
+    # (e.g. financial_sync's per-period coverage). It is a full snapshot, not a
+    # date series, so completeness = "collection holds >= min_docs rows".
+    # On a fresh system this is empty => violated => repaired by run_stock_info_sync
+    # (no date args), which is why it must reconcile first in --bootstrap.
+    contract:
+      source: tushare
+      storage:
+        database: quant_data
+        collection: stock_info
+      completeness:
+        kind: snapshot
+        min_docs: 4000          # 全市场约 5500 只；低于此判定快照缺失
+      window:
+        start: "20100101"       # snapshot 模型不使用，占位以通过解析
+        end: rolling
+      sla: {}
+      on_violation:
+        auto_repair: true
+        repair_task: run_stock_info_sync
+        repair_args: []         # 显式空参：run_stock_info_sync 自动探测最新交易日
+      alert:
+        channels: [email, data_pulse]
+        "on": [repair_failed, still_violated]
 
   - id: stock_daily
     label: 股票日线
@@ -255,6 +280,9 @@ pipelines:
     # as the representative sheet.
     contract:
       source: tushare
+      # Per-period coverage is measured against the stock_info universe, so that
+      # reference snapshot must be filled first on a cold start.
+      depends_on: [stock_info]
       storage: { database: quant_data, collection: financial_income, date_field: end_date, symbol_field: ts_code }
       window: { start: "20180101", end: rolling }
       completeness:
