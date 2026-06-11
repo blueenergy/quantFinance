@@ -704,10 +704,15 @@ def build_freshness_rows() -> List[Dict[str, Any]]:
                 if not coll:
                     continue
                 label = sheet.get("label") or str(coll)
+                sheet_fr = {
+                    **fr,
+                    "field": sheet.get("field", fr.get("field")),
+                    "field_kind": sheet.get("field_kind", fr.get("field_kind", "date_string")),
+                }
                 _append_freshness_row_for_collection(
                     out,
                     p,
-                    fr,
+                    sheet_fr,
                     database=database,
                     collection=str(coll),
                     display_label=str(label),

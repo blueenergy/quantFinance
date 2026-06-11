@@ -234,7 +234,24 @@ pipelines:
     schedule_hint: "Supercronic 工作日 19:40 → daily_market_sync.sh cn_macro_sync（shibor/LPR/PMI/CPI/PPI/M2/社融/GDP）"
     freshness:
       database: quant_data
-      collection: cn_macro
+      field: date
+      field_kind: date_string
+      freshness_sheets:
+        - { label: 国内利率, collection: cn_macro_rates, field: date }
+        - { label: 月度宏观, collection: cn_macro_monthly, field: month }
+        - { label: 季度GDP, collection: cn_macro_quarterly, field: quarter }
+
+  - id: us_rates_sync
+    label: 美国利率数据
+    job_status_key: us_rates_sync
+    group: layer0
+    depends_on: []
+    trigger_on_complete: false
+    run_mode: cron
+    schedule_hint: "Supercronic 工作日 06:35 → daily_market_sync.sh us_rates_sync（TYCR/TRYCR/TBR/TLTR/TRLTR）"
+    freshness:
+      database: quant_data
+      collection: us_rates_daily
       field: date
       field_kind: date_string
 
