@@ -56,6 +56,32 @@ pipelines:
       collection: volume_price
       field: trade_date
       field_kind: date_string
+    # ── Data contract (Phase 1) ────────────────────────────────────────────────
+    # Declarative desired-state for the quant-data-engine reconciler
+    # (run_data_contract_reconcile). Compares desired vs actual coverage and,
+    # when --apply is set and auto_repair is true, backfills via repair_task.
+    contract:
+      source: tushare
+      storage:
+        database: quant_data
+        collection: volume_price
+        date_field: trade_date
+        symbol_field: symbol
+      window:
+        start: "20100101"     # 商定的历史起点
+        end: rolling          # rolling = 跟到最新交易日
+      sla:
+        max_lag_trading_days: 1    # 落后超过 1 个交易日 => 违约
+        min_coverage_pct: 99.0     # 窗口内应有交易日缺失超过 1% => 违约
+        min_symbols_latest_day: 4000   # 最新交易日个股数低于此 => 违约（0 关闭）
+      on_violation:
+        auto_repair: true
+        repair_task: run_stock_daily
+        repair_mode: by-date
+        max_repair_window_days: 30   # 单次回填最大日历跨度，限频护栏
+      alert:
+        channels: [email, data_pulse]
+        "on": [repair_failed, still_violated]   # quoted: bare `on` is YAML boolean True
 
   - id: a_daily_realtime_sync
     label: A股实时日K同步
