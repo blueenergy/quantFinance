@@ -829,6 +829,8 @@ def build_data_contract_health() -> Dict[str, Any]:
             "symbols_latest_day": d.get("symbols_latest_day"),
             "repair": d.get("repair"),
             "violations": d.get("violations") or [],
+            "missing_ranges": d.get("missing_ranges") or [],
+            "missing_ranges_truncated": bool(d.get("missing_ranges_truncated")),
             "note": d.get("note"),
             "last_reconcile_at": _iso(d.get("last_reconcile_at")),
             "last_alert_at": _iso(d.get("last_alert_at")),
