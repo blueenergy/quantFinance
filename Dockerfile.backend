@@ -22,8 +22,8 @@ COPY requirements.txt .
 # Install all deps in one layer (heavy, but fully cached after first build)
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Shared data-access-lib (canonical pipeline catalog source). Provided at build
-# time by the CI "Checkout data-access-lib" step (path: data-access-lib).
+# Shared data-access-lib (canonical pipeline catalog source). Available as a git
+# submodule, so it is present for both local builds and CI automatically.
 # Non-editable install so the bundled catalog yaml lands in site-packages and is
 # carried over to the runtime stage — image stays self-contained, no host mount.
 COPY data-access-lib /tmp/data-access-lib
