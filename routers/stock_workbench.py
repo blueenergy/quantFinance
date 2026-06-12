@@ -113,7 +113,7 @@ def _quote_section(symbol: str) -> Dict[str, Any]:
         data["volume_price"],
         candidates,
         date_field="trade_date",
-        limit=30,
+        limit=160,
         projection={
             "_id": 0,
             "symbol": 1,
