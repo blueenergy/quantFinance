@@ -348,6 +348,77 @@ def _analysis_history(user_id: Any, symbol: str, limit: int = 5) -> Dict[str, An
     }
 
 
+def _user_id_candidates(user_id: Any) -> List[Any]:
+    values = [user_id, str(user_id)]
+    return list(dict.fromkeys(value for value in values if value is not None))
+
+
+def _symbol_matches_any(value: Any, candidates: List[str]) -> bool:
+    norm = str(value or "").upper()
+    if not norm:
+        return False
+    candidate_set = {str(item).upper() for item in candidates}
+    candidate_set.update(item.split(".", 1)[0] for item in candidate_set)
+    return norm in candidate_set or norm.split(".", 1)[0] in candidate_set
+
+
+def _trading_status(signals: List[Dict[str, Any]], positions: List[Dict[str, Any]], in_watchlist: bool) -> Dict[str, Any]:
+    latest = signals[0] if signals else None
+    return _section_status(
+        found=bool(in_watchlist or signals or positions),
+        as_of=(latest or {}).get("created_at") or (latest or {}).get("timestamp") or (latest or {}).get("updated_at"),
+        expected_freshness="随用户自选、持仓和交易信号更新",
+        source="finance.user_watchlists/watchlist_strategies/trader_positions/trade_signals",
+    )
+
+
+def _trading_section(user_id: Any, symbol: str) -> Dict[str, Any]:
+    collections = get_db_collections()
+    candidates = _symbol_candidates(symbol)
+    user_ids = _user_id_candidates(user_id)
+
+    watchlist_doc = collections["user_watchlists"].find_one({"user_id": {"$in": user_ids}}) or {}
+    watchlist_symbols = watchlist_doc.get("symbols") or []
+    in_watchlist = any(_symbol_matches_any(item, candidates) for item in watchlist_symbols)
+
+    strategies = list(
+        collections["watchlist_strategies"].find(
+            {"user_id": {"$in": user_ids}, "symbol": {"$in": candidates}},
+            {"_id": 0},
+            sort=[("updated_at", -1)],
+            limit=20,
+        )
+    )
+    positions = list(
+        collections["trader_positions"].find(
+            {"user_id": {"$in": user_ids}, "symbol": {"$in": candidates}},
+            {"_id": 0},
+            sort=[("updated_at", -1), ("timestamp", -1)],
+            limit=10,
+        )
+    )
+    signals = list(
+        collections["trade_signals"].find(
+            {"user_id": {"$in": user_ids}, "symbol": {"$in": candidates}},
+            {"_id": 0},
+            sort=[("created_at", -1), ("timestamp", -1)],
+            limit=10,
+        )
+    )
+
+    return {
+        "symbol": symbol,
+        "watchlist": {
+            "in_watchlist": in_watchlist,
+            "symbol_count": len(watchlist_symbols),
+        },
+        "watchlist_strategies": strategies,
+        "positions": positions,
+        "recent_signals": signals,
+        "data_status": _trading_status(signals, positions, in_watchlist),
+    }
+
+
 def _section_status(
     *,
     found: bool,
@@ -505,6 +576,11 @@ def get_stock_workbench(
                 source="quant_data.financial_* + quant_data.earnings_*",
             ),
             "ai": _ai_status(deep_analysis),
+            "trading": _section_status(
+                found=False,
+                expected_freshness="进入 AI 与交易页签后按需加载",
+                source="finance.user_watchlists/watchlist_strategies/trader_positions/trade_signals",
+            ),
         },
     }
 
@@ -588,4 +664,16 @@ def get_stock_workbench_ai(
                 "data_status": _ai_status(deep_analysis),
             }
         ),
+    }
+
+
+@router.get("/{symbol}/workbench/trading")
+def get_stock_workbench_trading(
+    symbol: str,
+    current_user: Dict[str, Any] = Depends(get_current_active_user),
+):
+    """User trading context section for the single-stock research workbench."""
+    return {
+        "success": True,
+        "data": _json_safe(_trading_section(current_user.get("id"), symbol)),
     }

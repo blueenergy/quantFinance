@@ -9,6 +9,7 @@ from routers.stock_workbench import (
     _quote_status,
     _score_history,
     _score_status,
+    _trading_section,
 )
 
 
@@ -246,3 +247,29 @@ def test_analysis_history_wraps_recent_rows(monkeypatch):
 
     assert history["rows"] == [rows[0]]
     assert history["total"] == 2
+
+
+def test_trading_section_merges_user_context(monkeypatch):
+    collections = {
+        "user_watchlists": _Collection(
+            [{"user_id": "u1", "symbols": ["000001.SZ", "600519.SH"]}]
+        ),
+        "watchlist_strategies": _Collection(
+            [{"user_id": "u1", "symbol": "000001.SZ", "strategy_key": "dragon", "updated_at": 2}]
+        ),
+        "trader_positions": _Collection(
+            [{"user_id": "u1", "symbol": "000001.SZ", "quantity": 100, "updated_at": 3}]
+        ),
+        "trade_signals": _Collection(
+            [{"user_id": "u1", "symbol": "000001.SZ", "action": "buy", "timestamp": 4}]
+        ),
+    }
+    monkeypatch.setattr("routers.stock_workbench.get_db_collections", lambda: collections)
+
+    section = _trading_section("u1", "000001.SZ")
+
+    assert section["watchlist"]["in_watchlist"] is True
+    assert section["watchlist_strategies"][0]["strategy_key"] == "dragon"
+    assert section["positions"][0]["quantity"] == 100
+    assert section["recent_signals"][0]["action"] == "buy"
+    assert section["data_status"]["found"] is True
