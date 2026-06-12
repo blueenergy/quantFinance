@@ -371,6 +371,16 @@ def _score_status(score: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     )
 
 
+def _financial_status(indicators: List[Dict[str, Any]]) -> Dict[str, Any]:
+    latest = indicators[0] if indicators else {}
+    return _section_status(
+        found=bool(indicators),
+        as_of=latest.get("end_date") or latest.get("period") or latest.get("ann_date"),
+        expected_freshness="财报披露后同步，通常按季更新",
+        source="quant_data.financial_* + quant_data.earnings_*",
+    )
+
+
 def _ai_status(deep_analysis: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     return _section_status(
         found=bool(deep_analysis),
@@ -378,6 +388,81 @@ def _ai_status(deep_analysis: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         expected_freshness="用户手动触发后更新",
         source="finance.analysis_history",
     )
+
+
+def _financials_section(symbol: str, periods: int = 8) -> Dict[str, Any]:
+    data = get_data_db()
+    candidates = _symbol_candidates(symbol)
+    income = _recent_docs_for_symbol(
+        data["financial_income"],
+        candidates,
+        date_field="end_date",
+        limit=periods,
+        projection={"_id": 0},
+    )
+    balance = _recent_docs_for_symbol(
+        data["financial_balance"],
+        candidates,
+        date_field="end_date",
+        limit=periods,
+        projection={"_id": 0},
+    )
+    cashflow = _recent_docs_for_symbol(
+        data["financial_cashflow"],
+        candidates,
+        date_field="end_date",
+        limit=periods,
+        projection={"_id": 0},
+    )
+    indicators = _recent_docs_for_symbol(
+        data["financial_indicator"],
+        candidates,
+        date_field="end_date",
+        limit=periods,
+        projection={"_id": 0},
+    )
+    earnings_forecast = _recent_docs_for_symbol(
+        data["earnings_forecast"],
+        candidates,
+        date_field="ann_date",
+        limit=3,
+        projection={"_id": 0},
+    )
+    earnings_express = _recent_docs_for_symbol(
+        data["earnings_express"],
+        candidates,
+        date_field="ann_date",
+        limit=3,
+        projection={"_id": 0},
+    )
+    earnings_disclosure = _recent_docs_for_symbol(
+        data["earnings_disclosure"],
+        candidates,
+        date_field="ann_date",
+        limit=3,
+        projection={"_id": 0},
+    )
+    earnings_report_rc = _recent_docs_for_symbol(
+        data["earnings_report_rc"],
+        candidates,
+        date_field="ann_date",
+        limit=3,
+        projection={"_id": 0},
+    )
+    return {
+        "symbol": symbol,
+        "income": income,
+        "balance": balance,
+        "cashflow": cashflow,
+        "indicators": indicators,
+        "earnings": {
+            "forecast": earnings_forecast,
+            "express": earnings_express,
+            "disclosure": earnings_disclosure,
+            "report_rc": earnings_report_rc,
+        },
+        "data_status": _financial_status(indicators or income),
+    }
 
 
 @router.get("/{symbol}/workbench")
@@ -402,6 +487,11 @@ def get_stock_workbench(
         "sections": {
             "quote": _quote_status(quote),
             "scores": _score_status(score),
+            "financials": _section_status(
+                found=False,
+                expected_freshness="进入财务业绩页签后按需加载",
+                source="quant_data.financial_* + quant_data.earnings_*",
+            ),
             "ai": _ai_status(deep_analysis),
         },
     }
@@ -451,6 +541,18 @@ def get_stock_workbench_scores(
                 "data_status": _score_status(score),
             }
         ),
+    }
+
+
+@router.get("/{symbol}/workbench/financials")
+def get_stock_workbench_financials(
+    symbol: str,
+    current_user: Dict[str, Any] = Depends(get_current_active_user),
+):
+    """Financial performance section for the single-stock research workbench."""
+    return {
+        "success": True,
+        "data": _json_safe(_financials_section(symbol)),
     }
 
 

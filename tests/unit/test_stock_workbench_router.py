@@ -3,6 +3,7 @@ import pytest
 from routers.stock_workbench import (
     _ai_status,
     _attach_display_pct_change,
+    _financials_section,
     _quote_section,
     _quote_status,
     _score_history,
@@ -188,3 +189,42 @@ def test_quote_section_merges_market_money_flow_and_daily_basic(monkeypatch):
     assert section["daily_basic"]["pe_ttm"] == 8.2
     assert section["money_flow"]["net_mf_amount"] == 1234.5
     assert section["data_status"]["found"] is True
+
+
+def test_financials_section_merges_statements_and_earnings(monkeypatch):
+    data = {
+        "financial_income": _Collection(
+            [{"ts_code": "000001.SZ", "end_date": "20260331", "revenue": 100.0}]
+        ),
+        "financial_balance": _Collection(
+            [{"ts_code": "000001.SZ", "end_date": "20260331", "total_assets": 1000.0}]
+        ),
+        "financial_cashflow": _Collection(
+            [{"ts_code": "000001.SZ", "end_date": "20260331", "n_cashflow_act": 20.0}]
+        ),
+        "financial_indicator": _Collection(
+            [{"ts_code": "000001.SZ", "end_date": "20260331", "roe": 12.3}]
+        ),
+        "earnings_forecast": _Collection(
+            [{"ts_code": "000001.SZ", "ann_date": "20260401", "type": "预增"}]
+        ),
+        "earnings_express": _Collection(
+            [{"ts_code": "000001.SZ", "ann_date": "20260402", "revenue": 101.0}]
+        ),
+        "earnings_disclosure": _Collection(
+            [{"ts_code": "000001.SZ", "ann_date": "20260403", "pre_date": "20260425"}]
+        ),
+        "earnings_report_rc": _Collection(
+            [{"ts_code": "000001.SZ", "ann_date": "20260404", "organ_name": "券商"}]
+        ),
+    }
+    monkeypatch.setattr("routers.stock_workbench.get_data_db", lambda: data)
+
+    section = _financials_section("000001.SZ")
+
+    assert section["income"][0]["revenue"] == 100.0
+    assert section["balance"][0]["total_assets"] == 1000.0
+    assert section["cashflow"][0]["n_cashflow_act"] == 20.0
+    assert section["indicators"][0]["roe"] == 12.3
+    assert section["earnings"]["forecast"][0]["type"] == "预增"
+    assert section["data_status"]["as_of"] == "20260331"
