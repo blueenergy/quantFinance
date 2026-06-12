@@ -2,6 +2,7 @@ import pytest
 
 from routers.stock_workbench import (
     _ai_status,
+    _analysis_evaluation_summary,
     _analysis_history,
     _attach_display_pct_change,
     _financials_section,
@@ -247,6 +248,66 @@ def test_analysis_history_wraps_recent_rows(monkeypatch):
 
     assert history["rows"] == [rows[0]]
     assert history["total"] == 2
+
+
+def test_analysis_evaluation_summary_counts_accuracy(monkeypatch):
+    history = {
+        "rows": [
+            {
+                "id": "h1",
+                "created_at": "2026-06-10",
+                "analysis_mode": "multi_expert_v1",
+                "analysis": {"investment_advice": "关注"},
+            },
+            {
+                "id": "h2",
+                "created_at": "2026-06-09",
+                "analysis": {"investment_advice": "观望"},
+            },
+            {
+                "id": "h3",
+                "created_at": "2026-06-08",
+                "analysis": {"investment_advice": "回避"},
+            },
+        ],
+        "total": 3,
+    }
+    analyzer = {
+        "analysis_evaluations": _Collection(
+            [
+                {
+                    "history_id": "h1",
+                    "evaluation_status": "completed",
+                    "evaluated_at": "2026-06-12",
+                    "llm_review": {
+                        "outcome_accuracy": "accurate",
+                        "reasoning_quality": "strong",
+                        "summary": "方向兑现",
+                    },
+                },
+                {
+                    "history_id": "h2",
+                    "evaluation_status": "completed",
+                    "evaluated_at": "2026-06-11",
+                    "llm_review": {
+                        "outcome_accuracy": "mixed",
+                        "reasoning_quality": "partial",
+                    },
+                },
+            ]
+        )
+    }
+    monkeypatch.setattr("routers.stock_workbench.get_analyzer_db", lambda: analyzer)
+
+    summary = _analysis_evaluation_summary(history)
+
+    assert summary["evaluated_count"] == 2
+    assert summary["pending_count"] == 1
+    assert summary["accuracy_counts"] == {"accurate": 1, "mixed": 1}
+    assert summary["accuracy_rate"] == pytest.approx(50.0)
+    assert summary["hit_rate"] == pytest.approx(75.0)
+    assert summary["latest_evaluations"][0]["title"] == "关注"
+    assert summary["data_status"]["as_of"] == "2026-06-12"
 
 
 def test_trading_section_merges_user_context(monkeypatch):

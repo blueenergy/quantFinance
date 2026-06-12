@@ -5,7 +5,7 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Depends
 
 from auth import get_current_active_user
-from db import get_data_db, get_db_collections
+from db import get_analyzer_db, get_data_db, get_db_collections
 from routers.stock import _json_safe, _symbol_candidates
 from services.analysis_history import build_user_analysis_history_payload
 
@@ -348,6 +348,112 @@ def _analysis_history(user_id: Any, symbol: str, limit: int = 5) -> Dict[str, An
     }
 
 
+def _accuracy_label(value: Any) -> str:
+    return {
+        "accurate": "准确",
+        "mixed": "部分准确",
+        "inaccurate": "不准确",
+    }.get(str(value or ""), str(value or "未评估"))
+
+
+def _analysis_history_title(row: Dict[str, Any]) -> str:
+    analysis = row.get("analysis") if isinstance(row.get("analysis"), dict) else {}
+    return (
+        analysis.get("final_conclusion")
+        or analysis.get("investment_advice")
+        or analysis.get("long_term_forecast")
+        or analysis.get("mid_term_forecast")
+        or analysis.get("short_term_forecast")
+        or row.get("stock_name")
+        or "历史分析"
+    )
+
+
+def _analysis_evaluation_summary(history: Dict[str, Any]) -> Dict[str, Any]:
+    rows = history.get("rows") if isinstance(history, dict) else []
+    rows = rows if isinstance(rows, list) else []
+    history_ids = [str(row.get("id")) for row in rows if row.get("id")]
+    if not history_ids:
+        return {
+            "total_analyses": history.get("total") if isinstance(history, dict) else 0,
+            "recent_analyses": 0,
+            "evaluated_count": 0,
+            "pending_count": 0,
+            "accuracy_counts": {},
+            "accuracy_rate": None,
+            "latest_evaluations": [],
+            "data_status": _section_status(
+                found=False,
+                expected_freshness="用户手动触发评估后更新",
+                source="quant_analyzer.analysis_evaluations",
+            ),
+        }
+
+    eval_rows = list(
+        get_analyzer_db()["analysis_evaluations"].find(
+            {"history_id": {"$in": history_ids}},
+            {"_id": 0},
+        )
+    )
+    evaluations_by_history_id = {
+        str(doc.get("history_id")): doc for doc in eval_rows if doc.get("history_id")
+    }
+    accuracy_counts: Dict[str, int] = {}
+    latest_evaluations: List[Dict[str, Any]] = []
+    latest_as_of = None
+
+    for row in rows:
+        history_id = str(row.get("id") or "")
+        doc = evaluations_by_history_id.get(history_id)
+        if not doc:
+            continue
+        review = doc.get("llm_review") if isinstance(doc.get("llm_review"), dict) else {}
+        accuracy = review.get("outcome_accuracy")
+        if accuracy:
+            accuracy_counts[accuracy] = accuracy_counts.get(accuracy, 0) + 1
+        as_of = doc.get("evaluated_at") or doc.get("updated_at") or doc.get("created_at")
+        if as_of and (latest_as_of is None or str(as_of) > str(latest_as_of)):
+            latest_as_of = as_of
+        latest_evaluations.append(
+            {
+                "history_id": history_id,
+                "analysis_created_at": row.get("created_at"),
+                "analysis_mode": row.get("analysis_mode"),
+                "title": _analysis_history_title(row),
+                "evaluation_status": doc.get("evaluation_status"),
+                "evaluated_at": as_of,
+                "outcome_accuracy": accuracy,
+                "outcome_accuracy_label": _accuracy_label(accuracy),
+                "reasoning_quality": review.get("reasoning_quality"),
+                "risk_calibration": review.get("risk_calibration"),
+                "summary": review.get("summary"),
+                "short_review": review.get("short_review"),
+                "price_windows": doc.get("price_windows") or {},
+            }
+        )
+
+    evaluated_count = len(evaluations_by_history_id)
+    accurate_count = accuracy_counts.get("accurate", 0)
+    mixed_count = accuracy_counts.get("mixed", 0)
+    mature_count = sum(accuracy_counts.values())
+    return {
+        "total_analyses": history.get("total") if isinstance(history, dict) else len(rows),
+        "recent_analyses": len(rows),
+        "evaluated_count": evaluated_count,
+        "pending_count": max(0, len(history_ids) - evaluated_count),
+        "accuracy_counts": accuracy_counts,
+        "accuracy_rate": round(accurate_count / mature_count * 100, 2) if mature_count else None,
+        "hit_rate": round((accurate_count + mixed_count * 0.5) / mature_count * 100, 2) if mature_count else None,
+        "latest_evaluations": latest_evaluations,
+        "data_status": _section_status(
+            found=bool(evaluated_count),
+            as_of=latest_as_of,
+            expected_freshness="用户手动触发评估后更新",
+            source="quant_analyzer.analysis_evaluations",
+        ),
+    }
+
+
 def _user_id_candidates(user_id: Any) -> List[Any]:
     values = [user_id, str(user_id)]
     return list(dict.fromkeys(value for value in values if value is not None))
@@ -653,6 +759,11 @@ def get_stock_workbench_ai(
     history = _analysis_history(current_user.get("id"), symbol)
     analysis_rows = history["rows"]
     deep_analysis = analysis_rows[0] if analysis_rows else None
+    evaluation_summary = _analysis_evaluation_summary(history)
+    status = _ai_status(deep_analysis)
+    if evaluation_summary["data_status"]["found"]:
+        status["found"] = True
+        status["as_of"] = status["as_of"] or evaluation_summary["data_status"]["as_of"]
     return {
         "success": True,
         "data": _json_safe(
@@ -661,7 +772,8 @@ def get_stock_workbench_ai(
                 "deep_analysis": deep_analysis,
                 "analysis_history": analysis_rows,
                 "analysis_history_total": history["total"],
-                "data_status": _ai_status(deep_analysis),
+                "evaluation_summary": evaluation_summary,
+                "data_status": status,
             }
         ),
     }
