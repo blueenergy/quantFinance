@@ -339,6 +339,15 @@ def _latest_deep_analysis(user_id: Any, symbol: str) -> Optional[Dict[str, Any]]
     return None
 
 
+def _analysis_history(user_id: Any, symbol: str, limit: int = 5) -> Dict[str, Any]:
+    payload = build_user_analysis_history_payload(user_id, symbol=symbol, page=1, limit=limit)
+    rows = payload.get("data") if isinstance(payload, dict) else []
+    return {
+        "rows": rows if isinstance(rows, list) else [],
+        "total": payload.get("total") if isinstance(payload, dict) else 0,
+    }
+
+
 def _section_status(
     *,
     found: bool,
@@ -565,13 +574,17 @@ def get_stock_workbench_ai(
     current_user: Dict[str, Any] = Depends(get_current_active_user),
 ):
     """AI analysis section for the single-stock research workbench."""
-    deep_analysis = _latest_deep_analysis(current_user.get("id"), symbol)
+    history = _analysis_history(current_user.get("id"), symbol)
+    analysis_rows = history["rows"]
+    deep_analysis = analysis_rows[0] if analysis_rows else None
     return {
         "success": True,
         "data": _json_safe(
             {
                 "symbol": symbol,
                 "deep_analysis": deep_analysis,
+                "analysis_history": analysis_rows,
+                "analysis_history_total": history["total"],
                 "data_status": _ai_status(deep_analysis),
             }
         ),

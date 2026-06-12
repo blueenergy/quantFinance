@@ -2,6 +2,7 @@ import pytest
 
 from routers.stock_workbench import (
     _ai_status,
+    _analysis_history,
     _attach_display_pct_change,
     _financials_section,
     _quote_section,
@@ -228,3 +229,20 @@ def test_financials_section_merges_statements_and_earnings(monkeypatch):
     assert section["indicators"][0]["roe"] == 12.3
     assert section["earnings"]["forecast"][0]["type"] == "预增"
     assert section["data_status"]["as_of"] == "20260331"
+
+
+def test_analysis_history_wraps_recent_rows(monkeypatch):
+    rows = [
+        {"id": "new", "created_at": "2026-06-10", "analysis": {"investment_advice": "关注"}},
+        {"id": "old", "created_at": "2026-06-09", "analysis": {"investment_advice": "观望"}},
+    ]
+
+    def fake_payload(user_id, *, symbol=None, page=1, limit=50):
+        return {"success": True, "data": rows[:limit], "total": 2, "page": page, "limit": limit}
+
+    monkeypatch.setattr("routers.stock_workbench.build_user_analysis_history_payload", fake_payload)
+
+    history = _analysis_history("u1", "000001.SZ", limit=1)
+
+    assert history["rows"] == [rows[0]]
+    assert history["total"] == 2
