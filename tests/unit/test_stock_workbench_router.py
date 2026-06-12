@@ -1,6 +1,6 @@
 import pytest
 
-from routers.stock_workbench import _attach_display_pct_change
+from routers.stock_workbench import _ai_status, _attach_display_pct_change, _quote_status, _score_history, _score_status
 
 
 class _Collection:
@@ -13,6 +13,22 @@ class _Collection:
             for field, direction in reversed(sort):
                 rows.sort(key=lambda row: row.get(field) or "", reverse=direction < 0)
         return rows[0] if rows else None
+
+    def find(self, query=None, projection=None, sort=None, limit=0):
+        rows = [dict(doc) for doc in self.docs if self._matches(doc, query or {})]
+        if sort:
+            for field, direction in reversed(sort):
+                rows.sort(key=lambda row: row.get(field) or "", reverse=direction < 0)
+        if limit:
+            rows = rows[:limit]
+        if projection:
+            include_keys = {key for key, value in projection.items() if value}
+            exclude_id = projection.get("_id") == 0
+            if include_keys:
+                rows = [{key: row.get(key) for key in include_keys if key in row} for row in rows]
+            if exclude_id:
+                rows = [{key: value for key, value in row.items() if key != "_id"} for row in rows]
+        return rows
 
     def _matches(self, doc, query):
         for key, expected in query.items():
@@ -75,3 +91,42 @@ def test_display_pct_change_uses_pct_field_when_pre_close_unavailable():
 
     assert normalized["display_pct_chg"] == pytest.approx(0.41)
     assert normalized["display_pct_chg_source"] == "quote_pct_field"
+
+
+def test_section_status_helpers_expose_freshness_contract():
+    quote_status = _quote_status({"trade_date": "20260610", "source": "daily"})
+    score_status = _score_status({"score_date": "20260609"})
+    ai_status = _ai_status({"created_at": "2026-06-10T12:00:00"})
+
+    assert quote_status["found"] is True
+    assert quote_status["as_of"] == "20260610"
+    assert quote_status["source"] == "daily"
+    assert score_status["as_of"] == "20260609"
+    assert score_status["source"] == "finance.stock_scores"
+    assert ai_status["expected_freshness"] == "用户手动触发后更新"
+
+
+def test_score_history_orders_recent_and_omits_sentiment(monkeypatch):
+    scores = _Collection(
+        [
+            {
+                "_id": 1,
+                "symbol": "000001.SZ",
+                "score_date": "20260609",
+                "technical_score": 60,
+                "sentiment_score": 99,
+            },
+            {
+                "_id": 2,
+                "symbol": "000001.SZ",
+                "score_date": "20260610",
+                "technical_score": 70,
+                "sentiment_score": 100,
+            },
+        ]
+    )
+    monkeypatch.setattr("routers.stock_workbench.get_db_collections", lambda: {"stock_scores": scores})
+
+    history = _score_history("000001.SZ", limit=1)
+
+    assert history == [{"symbol": "000001.SZ", "score_date": "20260610", "technical_score": 70}]

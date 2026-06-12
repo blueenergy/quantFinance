@@ -45,6 +45,29 @@ def _latest_score(symbol: str) -> Optional[Dict[str, Any]]:
     )
 
 
+def _score_history(symbol: str, limit: int = 60) -> List[Dict[str, Any]]:
+    collections = get_db_collections()
+    candidates = _symbol_candidates(symbol)
+    cursor = collections["stock_scores"].find(
+        {"symbol": {"$in": candidates}},
+        {
+            "_id": 0,
+            "symbol": 1,
+            "score_date": 1,
+            "technical_score": 1,
+            "fundamental_score": 1,
+            "value_score": 1,
+            "growth_score": 1,
+            "money_flow_score": 1,
+            "cycle_score": 1,
+            "composite_score": 1,
+        },
+        sort=[("score_date", -1), ("_id", -1)],
+        limit=limit,
+    )
+    return list(cursor)
+
+
 def _latest_daily_quote(data: Any, candidates: List[str], trade_date: Any = None) -> Optional[Dict[str, Any]]:
     volume_price = data["volume_price"]
     query: Dict[str, Any] = {"symbol": {"$in": candidates}}
@@ -201,6 +224,50 @@ def _latest_deep_analysis(user_id: Any, symbol: str) -> Optional[Dict[str, Any]]
     return None
 
 
+def _section_status(
+    *,
+    found: bool,
+    as_of: Any = None,
+    source: str,
+    expected_freshness: str = "",
+    stale: bool = False,
+) -> Dict[str, Any]:
+    return {
+        "found": bool(found),
+        "as_of": as_of,
+        "stale": stale,
+        "expected_freshness": expected_freshness,
+        "source": source,
+    }
+
+
+def _quote_status(quote: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    return _section_status(
+        found=bool(quote),
+        as_of=(quote or {}).get("trade_date") or (quote or {}).get("datetime") or (quote or {}).get("trade_time"),
+        expected_freshness="盘中实时快照优先，缺失时使用最近交易日 T+1 日线",
+        source=(quote or {}).get("source") or "quant_data.volume_price",
+    )
+
+
+def _score_status(score: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    return _section_status(
+        found=bool(score),
+        as_of=(score or {}).get("score_date"),
+        expected_freshness="随评分任务刷新",
+        source="finance.stock_scores",
+    )
+
+
+def _ai_status(deep_analysis: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    return _section_status(
+        found=bool(deep_analysis),
+        as_of=(deep_analysis or {}).get("created_at"),
+        expected_freshness="用户手动触发后更新",
+        source="finance.analysis_history",
+    )
+
+
 @router.get("/{symbol}/workbench")
 def get_stock_workbench(
     symbol: str,
@@ -220,6 +287,11 @@ def get_stock_workbench(
         "quote_date": (quote or {}).get("trade_date") or (quote or {}).get("datetime") or (quote or {}).get("trade_time"),
         "score_date": (score or {}).get("score_date"),
         "analysis_created_at": (deep_analysis or {}).get("created_at"),
+        "sections": {
+            "quote": _quote_status(quote),
+            "scores": _score_status(score),
+            "ai": _ai_status(deep_analysis),
+        },
     }
 
     return {
@@ -232,6 +304,65 @@ def get_stock_workbench(
                 "score": score,
                 "deep_analysis": deep_analysis,
                 "data_status": data_status,
+            }
+        ),
+    }
+
+
+@router.get("/{symbol}/workbench/quote")
+def get_stock_workbench_quote(
+    symbol: str,
+    current_user: Dict[str, Any] = Depends(get_current_active_user),
+):
+    """Market quote section for the single-stock research workbench."""
+    quote = _latest_quote(symbol)
+    return {
+        "success": True,
+        "data": _json_safe(
+            {
+                "symbol": symbol,
+                "quote": quote,
+                "data_status": _quote_status(quote),
+            }
+        ),
+    }
+
+
+@router.get("/{symbol}/workbench/scores")
+def get_stock_workbench_scores(
+    symbol: str,
+    current_user: Dict[str, Any] = Depends(get_current_active_user),
+):
+    """Quant score section for the single-stock research workbench."""
+    score = _latest_score(symbol)
+    history = _score_history(symbol)
+    return {
+        "success": True,
+        "data": _json_safe(
+            {
+                "symbol": symbol,
+                "score": score,
+                "score_history": history,
+                "data_status": _score_status(score),
+            }
+        ),
+    }
+
+
+@router.get("/{symbol}/workbench/ai")
+def get_stock_workbench_ai(
+    symbol: str,
+    current_user: Dict[str, Any] = Depends(get_current_active_user),
+):
+    """AI analysis section for the single-stock research workbench."""
+    deep_analysis = _latest_deep_analysis(current_user.get("id"), symbol)
+    return {
+        "success": True,
+        "data": _json_safe(
+            {
+                "symbol": symbol,
+                "deep_analysis": deep_analysis,
+                "data_status": _ai_status(deep_analysis),
             }
         ),
     }
