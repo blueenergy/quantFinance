@@ -1,7 +1,20 @@
 # MongoDB Collections 数据字典
 
-> **数据库名**：`finance`  
-> **最后更新**：2026-02-26
+> **最后更新**：2026-06-12
+
+> ⚠️ **多库架构提醒**：本系统并非单库。`quantFinance/db.py` 将集合拆分到多个数据库，
+> 环境变量可覆盖默认名（见括号）：
+>
+> | 库 | 默认名（env） | 主要内容 | 本文档对应分节 |
+> |---|---|---|---|
+> | 主库 | `finance`（`MONGO_DB`） | 用户/权限、持仓账户、交易信号、策略配置、回测、AI 分析、`stock_scores` | 用户与权限 / 持仓与账户 / 交易信号 / 策略配置 / 回测 / AI 分析 |
+> | 行情&基础数据库 | `quant_data`（`DATA_DB_NAME`） | 量价 `volume_price`、`minute_bars`、`stock_info`、`financial_*`、`money_flow`、`etf_*`、连板天梯、`global_market_quotes` 等 | 市场行情数据 / 财务报告数据 / 指数与 ETF / 全球市场 / 连板天梯 |
+> | 实时快照库 | `quant_realtime`（`REALTIME_DB_NAME`） | `volume_price_realtime_latest`、`market_spectrum_realtime_daily` 等高频快照 | （散见于行情相关分节） |
+> | 执行域库 | `quant_trading`（`TRADING_DB_NAME`） | 执行域策略计划 / 模拟盘 | — |
+> | 分析器输出库 | `quant_analyzer`（`ANALYZER_DB_NAME`） | quantAnalyzer 产出（quantFinance 只读） | — |
+>
+> 下文各表的「文档数」为某次盘点快照，仅供量级参考；集合归属以 `db.py` 中
+> `get_db_collections()` / `get_data_db()` 的实际映射为准。
 
 ---
 
@@ -137,4 +150,4 @@
 | 集合 | 说明 | 文档数 |
 |------|------|--------|
 | `collect_state` | 数据采集状态（记录最后同步日期） | 1 |
-| `job_status` | 数据采集任务运行记录（`job_type`+`date` 唯一）；权威管线列表见仓库 `quantFinance/config/data_pipelines_catalog.yaml`，写入见 `quant_data_engine.utils.ingestion_job.record_ingestion_run` | — |
+| `job_status` | 数据采集任务运行记录（`job_type`+`date` 唯一）；权威管线列表见共享库 `data-access-lib/src/stock_data_access/catalogs/data_pipelines_catalog.yaml`（通过 `stock_data_access.catalog_path()` 解析，`quantFinance/config/data_pipelines_catalog.yaml` 为本地 fallback），写入见 `quant_data_engine.utils.ingestion_job.record_ingestion_run` | — |
