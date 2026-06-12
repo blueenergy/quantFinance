@@ -1,6 +1,13 @@
 import pytest
 
-from routers.stock_workbench import _ai_status, _attach_display_pct_change, _quote_status, _score_history, _score_status
+from routers.stock_workbench import (
+    _ai_status,
+    _attach_display_pct_change,
+    _quote_section,
+    _quote_status,
+    _score_history,
+    _score_status,
+)
 
 
 class _Collection:
@@ -32,6 +39,10 @@ class _Collection:
 
     def _matches(self, doc, query):
         for key, expected in query.items():
+            if key == "$or":
+                if not any(self._matches(doc, clause) for clause in expected):
+                    return False
+                continue
             value = doc.get(key)
             if isinstance(expected, dict):
                 if "$in" in expected and value not in expected["$in"]:
@@ -130,3 +141,50 @@ def test_score_history_orders_recent_and_omits_sentiment(monkeypatch):
     history = _score_history("000001.SZ", limit=1)
 
     assert history == [{"symbol": "000001.SZ", "score_date": "20260610", "technical_score": 70}]
+
+
+def test_quote_section_merges_market_money_flow_and_daily_basic(monkeypatch):
+    data = {
+        "volume_price_realtime_latest": _Collection([]),
+        "volume_price": _Collection(
+            [
+                {
+                    "_id": 1,
+                    "symbol": "000001.SZ",
+                    "trade_date": "20260610",
+                    "close": 10.0,
+                    "pct_chg": 1.2,
+                }
+            ]
+        ),
+        "financial_daily_basic": _Collection(
+            [
+                {
+                    "_id": 2,
+                    "ts_code": "000001.SZ",
+                    "trade_date": "20260610",
+                    "turnover_rate": 1.5,
+                    "pe_ttm": 8.2,
+                }
+            ]
+        ),
+        "money_flow": _Collection(
+            [
+                {
+                    "_id": 3,
+                    "ts_code": "000001.SZ",
+                    "trade_date": "20260610",
+                    "net_mf_amount": 1234.5,
+                }
+            ]
+        ),
+    }
+    monkeypatch.setattr("routers.stock_workbench.get_data_db", lambda: data)
+
+    section = _quote_section("000001.SZ")
+
+    assert section["quote"]["source"] == "daily"
+    assert section["daily_quotes"][0]["close"] == 10.0
+    assert section["daily_basic"]["pe_ttm"] == 8.2
+    assert section["money_flow"]["net_mf_amount"] == 1234.5
+    assert section["data_status"]["found"] is True

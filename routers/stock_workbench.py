@@ -83,6 +83,118 @@ def _latest_daily_quote(data: Any, candidates: List[str], trade_date: Any = None
     return volume_price.find_one(query, sort=[("trade_date", -1), ("_id", -1)])
 
 
+def _recent_docs_for_symbol(
+    collection: Any,
+    candidates: List[str],
+    *,
+    date_field: str,
+    limit: int,
+    projection: Optional[Dict[str, int]] = None,
+    fields: tuple[str, ...] = ("symbol", "ts_code"),
+) -> List[Dict[str, Any]]:
+    query = {"$or": [{field: {"$in": candidates}} for field in fields]}
+    cursor = collection.find(
+        query,
+        projection,
+        sort=[(date_field, -1), ("_id", -1)],
+        limit=limit,
+    )
+    return list(cursor)
+
+
+def _quote_section(symbol: str) -> Dict[str, Any]:
+    data = get_data_db()
+    candidates = _symbol_candidates(symbol)
+    quote = _latest_quote(symbol)
+    daily_quotes = _recent_docs_for_symbol(
+        data["volume_price"],
+        candidates,
+        date_field="trade_date",
+        limit=30,
+        projection={
+            "_id": 0,
+            "symbol": 1,
+            "trade_date": 1,
+            "open": 1,
+            "high": 1,
+            "low": 1,
+            "close": 1,
+            "pre_close": 1,
+            "pct_chg": 1,
+            "vol": 1,
+            "volume": 1,
+            "amount": 1,
+        },
+        fields=("symbol",),
+    )
+    daily_basic = _recent_docs_for_symbol(
+        data["financial_daily_basic"],
+        candidates,
+        date_field="trade_date",
+        limit=1,
+        projection={
+            "_id": 0,
+            "symbol": 1,
+            "ts_code": 1,
+            "trade_date": 1,
+            "close": 1,
+            "turnover_rate": 1,
+            "turnover_rate_f": 1,
+            "volume_ratio": 1,
+            "pe": 1,
+            "pe_ttm": 1,
+            "pb": 1,
+            "ps_ttm": 1,
+            "dv_ttm": 1,
+            "total_mv": 1,
+            "circ_mv": 1,
+        },
+    )
+    money_flow = _recent_docs_for_symbol(
+        data["money_flow"],
+        candidates,
+        date_field="trade_date",
+        limit=1,
+        projection={
+            "_id": 0,
+            "symbol": 1,
+            "ts_code": 1,
+            "trade_date": 1,
+            "buy_sm_vol": 1,
+            "buy_sm_amount": 1,
+            "sell_sm_vol": 1,
+            "sell_sm_amount": 1,
+            "buy_md_vol": 1,
+            "buy_md_amount": 1,
+            "sell_md_vol": 1,
+            "sell_md_amount": 1,
+            "buy_lg_vol": 1,
+            "buy_lg_amount": 1,
+            "sell_lg_vol": 1,
+            "sell_lg_amount": 1,
+            "buy_elg_vol": 1,
+            "buy_elg_amount": 1,
+            "sell_elg_vol": 1,
+            "sell_elg_amount": 1,
+            "net_mf_vol": 1,
+            "net_mf_amount": 1,
+        },
+    )
+    status = _quote_status(quote)
+    if not status["as_of"]:
+        status["as_of"] = (daily_quotes[0] if daily_quotes else {}).get("trade_date")
+    status["found"] = bool(quote or daily_quotes or daily_basic or money_flow)
+    status["source"] = "quant_realtime.volume_price_realtime_latest + quant_data.volume_price/money_flow/financial_daily_basic"
+    return {
+        "symbol": symbol,
+        "quote": quote,
+        "daily_quotes": daily_quotes,
+        "daily_basic": daily_basic[0] if daily_basic else None,
+        "money_flow": money_flow[0] if money_flow else None,
+        "data_status": status,
+    }
+
+
 def _attach_display_pct_change(data: Any, quote: Optional[Dict[str, Any]], candidates: List[str]) -> Optional[Dict[str, Any]]:
     """Normalize workbench quote change to the common A-share close/pre-close basis."""
     if not quote:
@@ -315,16 +427,9 @@ def get_stock_workbench_quote(
     current_user: Dict[str, Any] = Depends(get_current_active_user),
 ):
     """Market quote section for the single-stock research workbench."""
-    quote = _latest_quote(symbol)
     return {
         "success": True,
-        "data": _json_safe(
-            {
-                "symbol": symbol,
-                "quote": quote,
-                "data_status": _quote_status(quote),
-            }
-        ),
+        "data": _json_safe(_quote_section(symbol)),
     }
 
 
