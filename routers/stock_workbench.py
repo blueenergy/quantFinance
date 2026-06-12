@@ -90,16 +90,19 @@ def _recent_docs_for_symbol(
     date_field: str,
     limit: int,
     projection: Optional[Dict[str, int]] = None,
-    fields: tuple[str, ...] = ("symbol", "ts_code"),
+    fields: tuple[str, ...] = ("ts_code", "symbol"),
 ) -> List[Dict[str, Any]]:
-    query = {"$or": [{field: {"$in": candidates}} for field in fields]}
-    cursor = collection.find(
-        query,
-        projection,
-        sort=[(date_field, -1), ("_id", -1)],
-        limit=limit,
-    )
-    return list(cursor)
+    for field in fields:
+        cursor = collection.find(
+            {field: {"$in": candidates}},
+            projection,
+            sort=[(date_field, -1), ("_id", -1)],
+            limit=limit,
+        )
+        docs = list(cursor)
+        if docs:
+            return docs
+    return []
 
 
 def _quote_section(symbol: str) -> Dict[str, Any]:
