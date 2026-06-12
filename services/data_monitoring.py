@@ -385,6 +385,7 @@ def _append_freshness_row_for_collection(
         return
     field_kind = fr.get("field_kind", "date_string")
     doc_id = fr.get("document_id")
+    filt = fr.get("filter") or None
     try:
         raw = _max_freshness_value(
             database,
@@ -392,6 +393,7 @@ def _append_freshness_row_for_collection(
             field,
             field_kind,
             document_id=doc_id,
+            query=filt,
         )
     except Exception as e:
         raw = None
@@ -441,6 +443,7 @@ def _max_freshness_value(
     field: str,
     field_kind: str,
     document_id: Optional[str] = None,
+    query: Optional[Dict[str, Any]] = None,
 ) -> Optional[Any]:
     coll = _get_collection(database, collection)
     if document_id:
@@ -448,10 +451,8 @@ def _max_freshness_value(
         if not doc:
             return None
         return doc.get(field)
-    if field_kind == "datetime":
-        latest = coll.find_one({}, sort=[(field, -1)], projection={field: 1, "_id": 0})
-    else:
-        latest = coll.find_one({}, sort=[(field, -1)], projection={field: 1, "_id": 0})
+    filt = query or {}
+    latest = coll.find_one(filt, sort=[(field, -1)], projection={field: 1, "_id": 0})
     if not latest:
         return None
     return latest.get(field)
@@ -623,6 +624,7 @@ def query_coverage_gaps(
             field,
             field_kind,
             document_id=None,
+            query=cfg.get("filter") or None,
         )
         norm = _normalize_yyyymmdd(raw_for_cov)
 
