@@ -654,6 +654,105 @@ def _financials_section(symbol: str, periods: int = 40) -> Dict[str, Any]:
     }
 
 
+def _shareholder_status(holder_numbers: List[Dict[str, Any]], hk_hold: List[Dict[str, Any]]) -> Dict[str, Any]:
+    as_of = (holder_numbers[0] if holder_numbers else {}).get("end_date") or (hk_hold[0] if hk_hold else {}).get("trade_date")
+    return _section_status(
+        found=bool(holder_numbers or hk_hold),
+        as_of=as_of,
+        expected_freshness="股东户数/港股通按季披露；增减持·解禁·回购为公告驱动",
+        source="quant_data.stk_holdernumber/hk_hold/stk_holdertrade/share_float/repurchase",
+    )
+
+
+def _pct_change(curr: Any, prev: Any) -> Optional[float]:
+    c, p = _to_float(curr), _to_float(prev)
+    if c is None or p is None or p == 0:
+        return None
+    return (c - p) / abs(p) * 100.0
+
+
+def _shareholder_summary(holder_numbers: List[Dict[str, Any]], hk_hold: List[Dict[str, Any]]) -> Dict[str, Any]:
+    latest_hn = holder_numbers[0] if holder_numbers else {}
+    prev_hn = holder_numbers[1] if len(holder_numbers) > 1 else {}
+    latest_hk = hk_hold[0] if hk_hold else {}
+    prev_hk = hk_hold[1] if len(hk_hold) > 1 else {}
+    return {
+        "holder_num": _to_float(latest_hn.get("holder_num")),
+        "holder_num_date": latest_hn.get("end_date"),
+        # 户数下降通常意味着筹码集中（利多），故单独给出变化方向
+        "holder_num_chg_pct": _pct_change(latest_hn.get("holder_num"), prev_hn.get("holder_num")),
+        "northbound_ratio": _to_float(latest_hk.get("ratio")),
+        "northbound_vol": _to_float(latest_hk.get("vol")),
+        "northbound_date": latest_hk.get("trade_date"),
+        "northbound_ratio_chg": (
+            None if _to_float(latest_hk.get("ratio")) is None or _to_float(prev_hk.get("ratio")) is None
+            else _to_float(latest_hk.get("ratio")) - _to_float(prev_hk.get("ratio"))
+        ),
+    }
+
+
+def _shareholder_section(symbol: str) -> Dict[str, Any]:
+    data = get_data_db()
+    candidates = _symbol_candidates(symbol)
+
+    holder_numbers = _recent_docs_for_symbol(
+        data["stk_holdernumber"],
+        candidates,
+        date_field="end_date",
+        limit=16,
+        projection={"_id": 0, "ts_code": 1, "end_date": 1, "ann_date": 1, "holder_num": 1},
+    )
+    hk_hold = _recent_docs_for_symbol(
+        data["hk_hold"],
+        candidates,
+        date_field="trade_date",
+        limit=24,
+        projection={"_id": 0, "ts_code": 1, "trade_date": 1, "vol": 1, "ratio": 1, "exchange": 1, "name": 1},
+    )
+    holder_trades = _recent_docs_for_symbol(
+        data["stk_holdertrade"],
+        candidates,
+        date_field="ann_date",
+        limit=20,
+        projection={
+            "_id": 0, "ts_code": 1, "ann_date": 1, "holder_name": 1, "holder_type": 1,
+            "in_de": 1, "change_vol": 1, "change_ratio": 1, "after_share": 1,
+            "after_ratio": 1, "avg_price": 1,
+        },
+    )
+    share_floats = _recent_docs_for_symbol(
+        data["share_float"],
+        candidates,
+        date_field="float_date",
+        limit=12,
+        projection={
+            "_id": 0, "ts_code": 1, "ann_date": 1, "float_date": 1, "holder_name": 1,
+            "share_type": 1, "float_share": 1, "float_ratio": 1,
+        },
+    )
+    repurchases = _recent_docs_for_symbol(
+        data["repurchase"],
+        candidates,
+        date_field="ann_date",
+        limit=12,
+        projection={
+            "_id": 0, "ts_code": 1, "ann_date": 1, "end_date": 1, "proc": 1, "exp_date": 1,
+            "vol": 1, "amount": 1, "high_limit": 1, "low_limit": 1,
+        },
+    )
+
+    return {
+        "symbol": symbol,
+        "summary": _shareholder_summary(holder_numbers, hk_hold),
+        "holder_numbers": holder_numbers,
+        "hk_hold": hk_hold,
+        "holder_trades": holder_trades,
+        "share_floats": share_floats,
+        "repurchases": repurchases,
+        "data_status": _shareholder_status(holder_numbers, hk_hold),
+    }
+
+
 @router.get("/{symbol}/workbench")
 def get_stock_workbench(
     symbol: str,
@@ -686,6 +785,11 @@ def get_stock_workbench(
                 found=False,
                 expected_freshness="进入 AI 与交易页签后按需加载",
                 source="finance.user_watchlists/watchlist_strategies/trader_positions/trade_signals",
+            ),
+            "shareholders": _section_status(
+                found=False,
+                expected_freshness="进入股东筹码页签后按需加载",
+                source="quant_data.stk_holdernumber/hk_hold/stk_holdertrade/share_float/repurchase",
             ),
         },
     }
@@ -788,4 +892,16 @@ def get_stock_workbench_trading(
     return {
         "success": True,
         "data": _json_safe(_trading_section(current_user.get("id"), symbol)),
+    }
+
+
+@router.get("/{symbol}/workbench/shareholders")
+def get_stock_workbench_shareholders(
+    symbol: str,
+    current_user: Dict[str, Any] = Depends(get_current_active_user),
+):
+    """Shareholder / chips section for the single-stock research workbench."""
+    return {
+        "success": True,
+        "data": _json_safe(_shareholder_section(symbol)),
     }

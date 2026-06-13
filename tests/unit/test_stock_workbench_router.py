@@ -10,6 +10,7 @@ from routers.stock_workbench import (
     _quote_status,
     _score_history,
     _score_status,
+    _shareholder_section,
     _trading_section,
 )
 
@@ -308,6 +309,46 @@ def test_analysis_evaluation_summary_counts_accuracy(monkeypatch):
     assert summary["hit_rate"] == pytest.approx(75.0)
     assert summary["latest_evaluations"][0]["title"] == "关注"
     assert summary["data_status"]["as_of"] == "2026-06-12"
+
+
+def test_shareholder_section_merges_chips_sources_and_summary(monkeypatch):
+    data = {
+        "stk_holdernumber": _Collection(
+            [
+                {"ts_code": "000001.SZ", "end_date": "20260331", "holder_num": 9000.0},
+                {"ts_code": "000001.SZ", "end_date": "20251231", "holder_num": 10000.0},
+            ]
+        ),
+        "hk_hold": _Collection(
+            [
+                {"ts_code": "000001.SZ", "trade_date": "20260331", "vol": 5000000, "ratio": 5.5},
+                {"ts_code": "000001.SZ", "trade_date": "20251231", "vol": 4000000, "ratio": 5.0},
+            ]
+        ),
+        "stk_holdertrade": _Collection(
+            [{"ts_code": "000001.SZ", "ann_date": "20260320", "holder_name": "张三", "in_de": "IN", "change_vol": 100000}]
+        ),
+        "share_float": _Collection(
+            [{"ts_code": "000001.SZ", "ann_date": "20260101", "float_date": "20270101", "share_type": "定增", "float_share": 200000}]
+        ),
+        "repurchase": _Collection(
+            [{"ts_code": "000001.SZ", "ann_date": "20260210", "proc": "完成", "vol": 300000, "amount": 5000000.0}]
+        ),
+    }
+    monkeypatch.setattr("routers.stock_workbench.get_data_db", lambda: data)
+
+    section = _shareholder_section("000001.SZ")
+
+    assert section["summary"]["holder_num"] == 9000.0
+    # 户数从 10000 -> 9000，环比 -10%（筹码集中）
+    assert section["summary"]["holder_num_chg_pct"] == pytest.approx(-10.0)
+    assert section["summary"]["northbound_ratio"] == 5.5
+    assert section["summary"]["northbound_ratio_chg"] == pytest.approx(0.5)
+    assert section["holder_trades"][0]["holder_name"] == "张三"
+    assert section["share_floats"][0]["share_type"] == "定增"
+    assert section["repurchases"][0]["proc"] == "完成"
+    assert section["data_status"]["as_of"] == "20260331"
+    assert section["data_status"]["found"] is True
 
 
 def test_trading_section_merges_user_context(monkeypatch):
