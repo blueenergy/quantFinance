@@ -22,6 +22,7 @@ except ModuleNotFoundError:
 router = APIRouter()
 
 WORKBENCH_DAILY_KLINE_LIMIT = 360
+WORKBENCH_MONEY_FLOW_HISTORY_LIMIT = 120
 
 
 def _to_float(value: Any) -> Optional[float]:
@@ -117,6 +118,74 @@ def _recent_docs_for_symbol(
     return []
 
 
+def _amount_diff(row: Dict[str, Any], buy_key: str, sell_key: str) -> Optional[float]:
+    buy = _to_float(row.get(buy_key))
+    sell = _to_float(row.get(sell_key))
+    if buy is None and sell is None:
+        return None
+    return (buy or 0.0) - (sell or 0.0)
+
+
+def _money_flow_history_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    elg_net = _amount_diff(row, "buy_elg_amount", "sell_elg_amount")
+    lg_net = _amount_diff(row, "buy_lg_amount", "sell_lg_amount")
+    md_net = _amount_diff(row, "buy_md_amount", "sell_md_amount")
+    sm_net = _amount_diff(row, "buy_sm_amount", "sell_sm_amount")
+    main_net = (
+        (elg_net or 0.0) + (lg_net or 0.0)
+        if elg_net is not None or lg_net is not None
+        else _to_float(row.get("net_mf_amount"))
+    )
+    return {
+        "symbol": row.get("symbol") or row.get("ts_code"),
+        "ts_code": row.get("ts_code"),
+        "trade_date": row.get("trade_date"),
+        "elg_net": elg_net,
+        "lg_net": lg_net,
+        "main_net": main_net,
+        "md_net": md_net,
+        "sm_net": sm_net,
+        "net_mf_amount": _to_float(row.get("net_mf_amount")),
+        "amount": _to_float(row.get("amount")),
+        "unit": "wan_yuan",
+    }
+
+
+def _rolling_sum(rows: List[Dict[str, Any]], key: str, limit: int) -> Optional[float]:
+    values = [_to_float(row.get(key)) for row in rows[:limit]]
+    values = [value for value in values if value is not None]
+    if not values:
+        return None
+    return sum(values)
+
+
+def _money_flow_streak(rows_desc: List[Dict[str, Any]]) -> int:
+    first = _to_float((rows_desc[0] if rows_desc else {}).get("main_net"))
+    if first is None or first == 0:
+        return 0
+    sign = 1 if first > 0 else -1
+    count = 0
+    for row in rows_desc:
+        value = _to_float(row.get("main_net"))
+        if value is None or value == 0 or (value > 0) != (sign > 0):
+            break
+        count += 1
+    return count * sign
+
+
+def _money_flow_summary(history_desc: List[Dict[str, Any]]) -> Dict[str, Any]:
+    latest = history_desc[0] if history_desc else {}
+    return {
+        "main_net_today": _to_float(latest.get("main_net")),
+        "main_net_5d": _rolling_sum(history_desc, "main_net", 5),
+        "main_net_20d": _rolling_sum(history_desc, "main_net", 20),
+        "inflow_streak": _money_flow_streak(history_desc),
+        "sample_count": len(history_desc),
+        "as_of": latest.get("trade_date"),
+        "unit": "wan_yuan",
+    }
+
+
 def _quote_section(symbol: str) -> Dict[str, Any]:
     data = get_data_db()
     candidates = _symbol_candidates(symbol)
@@ -169,12 +238,13 @@ def _quote_section(symbol: str) -> Dict[str, Any]:
         data["money_flow"],
         candidates,
         date_field="trade_date",
-        limit=1,
+        limit=WORKBENCH_MONEY_FLOW_HISTORY_LIMIT,
         projection={
             "_id": 0,
             "symbol": 1,
             "ts_code": 1,
             "trade_date": 1,
+            "amount": 1,
             "buy_sm_vol": 1,
             "buy_sm_amount": 1,
             "sell_sm_vol": 1,
@@ -194,7 +264,10 @@ def _quote_section(symbol: str) -> Dict[str, Any]:
             "net_mf_vol": 1,
             "net_mf_amount": 1,
         },
+        fields=("symbol", "ts_code"),
     )
+    money_flow_history_desc = [_money_flow_history_row(row) for row in money_flow]
+    money_flow_history = sorted(money_flow_history_desc, key=lambda row: str(row.get("trade_date") or ""))
     status = _quote_status(quote)
     if not status["as_of"]:
         status["as_of"] = (daily_quotes[0] if daily_quotes else {}).get("trade_date")
@@ -206,6 +279,8 @@ def _quote_section(symbol: str) -> Dict[str, Any]:
         "daily_quotes": daily_quotes,
         "daily_basic": daily_basic[0] if daily_basic else None,
         "money_flow": money_flow[0] if money_flow else None,
+        "money_flow_history": money_flow_history,
+        "money_flow_summary": _money_flow_summary(money_flow_history_desc),
         "data_status": status,
     }
 

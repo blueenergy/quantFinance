@@ -491,9 +491,89 @@ async def get_kline(
 
 _MEMBER = data_db["sw_index_member"]
 _DAILY_BASIC = data_db["financial_daily_basic"]
+_MONEY_FLOW = data_db["money_flow"]
 
 _MEMBER_LEVEL_KEYS = ("l1_code", "l2_code", "l3_code")
 _MEMBER_PROJ = {"_id": 0, "con_code": 1, "name": 1, "is_new": 1, "l1_name": 1, "l2_name": 1, "l3_name": 1}
+
+
+def _to_float(value: Any) -> Optional[float]:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number
+
+
+def _amount_diff(row: Dict[str, Any], buy_key: str, sell_key: str) -> Optional[float]:
+    buy = _to_float(row.get(buy_key))
+    sell = _to_float(row.get(sell_key))
+    if buy is None and sell is None:
+        return None
+    return (buy or 0.0) - (sell or 0.0)
+
+
+def _main_money_flow(row: Dict[str, Any]) -> Dict[str, Any]:
+    elg_net = _amount_diff(row, "buy_elg_amount", "sell_elg_amount")
+    lg_net = _amount_diff(row, "buy_lg_amount", "sell_lg_amount")
+    main_net = (
+        (elg_net or 0.0) + (lg_net or 0.0)
+        if elg_net is not None or lg_net is not None
+        else _to_float(row.get("net_mf_amount"))
+    )
+    return {
+        "elg_net": elg_net,
+        "lg_net": lg_net,
+        "main_net": main_net,
+        "md_net": _amount_diff(row, "buy_md_amount", "sell_md_amount"),
+        "sm_net": _amount_diff(row, "buy_sm_amount", "sell_sm_amount"),
+    }
+
+
+def _rolling_sum(rows_desc: List[Dict[str, Any]], key: str, limit: int) -> Optional[float]:
+    values = [_to_float(row.get(key)) for row in rows_desc[:limit]]
+    values = [value for value in values if value is not None]
+    if not values:
+        return None
+    return sum(values)
+
+
+def _money_flow_streak(rows_desc: List[Dict[str, Any]]) -> int:
+    first = _to_float((rows_desc[0] if rows_desc else {}).get("main_net"))
+    if first is None or first == 0:
+        return 0
+    sign = 1 if first > 0 else -1
+    count = 0
+    for row in rows_desc:
+        value = _to_float(row.get("main_net"))
+        if value is None or value == 0 or (value > 0) != (sign > 0):
+            break
+        count += 1
+    return count * sign
+
+
+def _industry_money_flow_summary(rows_desc: List[Dict[str, Any]]) -> Dict[str, Any]:
+    latest = rows_desc[0] if rows_desc else {}
+    return {
+        "main_net_today": _to_float(latest.get("main_net")),
+        "main_net_5d": _rolling_sum(rows_desc, "main_net", 5),
+        "main_net_20d": _rolling_sum(rows_desc, "main_net", 20),
+        "inflow_streak": _money_flow_streak(rows_desc),
+        "sample_count": len(rows_desc),
+        "as_of": latest.get("trade_date"),
+        "unit": "wan_yuan",
+    }
+
+
+def _coverage_level(covered_count: int, member_count: int) -> str:
+    if member_count <= 0:
+        return "none"
+    ratio = covered_count / member_count
+    if ratio >= 0.8:
+        return "ok"
+    if ratio >= 0.5:
+        return "partial"
+    return "low"
 
 
 @router.get("/members")
@@ -541,6 +621,140 @@ async def get_members(
         "index_code": code,
         "count": len(members),
         "data": members,
+    }
+
+
+@router.get("/money-flow")
+async def get_industry_money_flow(
+    response: Response,
+    current_user: Dict = Depends(get_current_active_user),  # noqa: ARG001
+    index_code: str = Query(..., min_length=4, description="行业指数 index_code，如 801010.SI"),
+    src: str = Query("SW2021"),
+    days: int = Query(60, ge=5, le=120),
+    current_only: bool = Query(True, description="True 仅聚合当前成分 is_new=Y"),
+):
+    """按行业成分股 on-demand 聚合 money_flow，作为预聚合表落地前的轻量 MVP。"""
+    code = index_code.strip()
+    if not code:
+        raise HTTPException(400, "index_code required")
+
+    member_filter: Dict[str, Any] = {
+        "src": src,
+        "$or": [{k: code} for k in _MEMBER_LEVEL_KEYS],
+    }
+    if current_only:
+        member_filter["is_new"] = "Y"
+    members = list(_MEMBER.find(member_filter, _MEMBER_PROJ).sort("con_code", ASCENDING))
+    member_count = len(members)
+    if not members:
+        return {
+            "success": True,
+            "index_code": code,
+            "src": src,
+            "days": days,
+            "member_count": 0,
+            "data": [],
+            "summary": _industry_money_flow_summary([]),
+            "message": "暂无该行业成分股，无法聚合资金流。",
+        }
+
+    member_names = {row.get("con_code"): row.get("name") for row in members if row.get("con_code")}
+    codes = list(member_names.keys())
+    row_limit = min(max(days * max(member_count, 1) * 2, days), 60000)
+    projection = {
+        "_id": 0,
+        "ts_code": 1,
+        "symbol": 1,
+        "trade_date": 1,
+        "amount": 1,
+        "buy_sm_amount": 1,
+        "sell_sm_amount": 1,
+        "buy_md_amount": 1,
+        "sell_md_amount": 1,
+        "buy_lg_amount": 1,
+        "sell_lg_amount": 1,
+        "buy_elg_amount": 1,
+        "sell_elg_amount": 1,
+        "net_mf_amount": 1,
+    }
+    cursor = (
+        _MONEY_FLOW.find(
+            {"$or": [{"ts_code": {"$in": codes}}, {"symbol": {"$in": codes}}]},
+            projection,
+        )
+        .sort("trade_date", DESCENDING)
+        .limit(row_limit)
+    )
+    raw_rows = list(cursor)
+    dates_desc = sorted(
+        {str(row.get("trade_date") or "") for row in raw_rows if row.get("trade_date")},
+        reverse=True,
+    )[:days]
+    date_set = set(dates_desc)
+    grouped: Dict[str, List[Dict[str, Any]]] = {date: [] for date in dates_desc}
+    for row in raw_rows:
+        trade_date = str(row.get("trade_date") or "")
+        if trade_date in date_set:
+            grouped.setdefault(trade_date, []).append(row)
+
+    rows_desc: List[Dict[str, Any]] = []
+    for trade_date in dates_desc:
+        day_rows = grouped.get(trade_date, [])
+        seen_codes = set()
+        totals = {"elg_net": 0.0, "lg_net": 0.0, "main_net": 0.0, "md_net": 0.0, "sm_net": 0.0}
+        amount_sum = 0.0
+        stock_flows: List[Dict[str, Any]] = []
+        for raw in day_rows:
+            ts_code = raw.get("ts_code") or raw.get("symbol")
+            if not ts_code or ts_code in seen_codes:
+                continue
+            flow = _main_money_flow(raw)
+            if flow["main_net"] is None:
+                continue
+            seen_codes.add(ts_code)
+            amount = _to_float(raw.get("amount"))
+            amount_sum += amount or 0.0
+            for key in totals:
+                value = _to_float(flow.get(key))
+                if value is not None:
+                    totals[key] += value
+            stock_flows.append({
+                "con_code": ts_code,
+                "name": member_names.get(ts_code, ""),
+                "main_net": flow["main_net"],
+            })
+
+        top_inflow = sorted(stock_flows, key=lambda row: row.get("main_net") or 0, reverse=True)[:5]
+        top_outflow = sorted(stock_flows, key=lambda row: row.get("main_net") or 0)[:5]
+        covered_count = len(seen_codes)
+        rows_desc.append({
+            "index_code": code,
+            "src": src,
+            "trade_date": trade_date,
+            "member_count": member_count,
+            "covered_count": covered_count,
+            "coverage_ratio": covered_count / member_count if member_count else None,
+            "coverage_level": _coverage_level(covered_count, member_count),
+            "amount": amount_sum,
+            "main_net_ratio": totals["main_net"] / amount_sum if amount_sum else None,
+            "top_inflow": top_inflow,
+            "top_outflow": top_outflow,
+            "unit": "wan_yuan",
+            **totals,
+        })
+
+    rows = sorted(rows_desc, key=lambda row: str(row.get("trade_date") or ""))
+    response.headers["Cache-Control"] = "private, max-age=21600"
+    return {
+        "success": True,
+        "index_code": code,
+        "src": src,
+        "days": days,
+        "member_count": member_count,
+        "count": len(rows),
+        "data": rows,
+        "summary": _industry_money_flow_summary(rows_desc),
+        "unit": "wan_yuan",
     }
 
 

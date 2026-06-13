@@ -180,7 +180,26 @@ def test_quote_section_merges_market_money_flow_and_daily_basic(monkeypatch):
                     "_id": 3,
                     "ts_code": "000001.SZ",
                     "trade_date": "20260610",
+                    "buy_elg_amount": 1000.0,
+                    "sell_elg_amount": 400.0,
+                    "buy_lg_amount": 800.0,
+                    "sell_lg_amount": 300.0,
+                    "buy_md_amount": 200.0,
+                    "sell_md_amount": 250.0,
                     "net_mf_amount": 1234.5,
+                    "amount": 9000.0,
+                },
+                {
+                    "_id": 4,
+                    "ts_code": "000001.SZ",
+                    "trade_date": "20260609",
+                    "buy_elg_amount": 200.0,
+                    "sell_elg_amount": 500.0,
+                    "buy_lg_amount": 100.0,
+                    "sell_lg_amount": 300.0,
+                    "buy_md_amount": 150.0,
+                    "sell_md_amount": 100.0,
+                    "net_mf_amount": -500.0,
                 }
             ]
         ),
@@ -193,6 +212,13 @@ def test_quote_section_merges_market_money_flow_and_daily_basic(monkeypatch):
     assert section["daily_quotes"][0]["close"] == 10.0
     assert section["daily_basic"]["pe_ttm"] == 8.2
     assert section["money_flow"]["net_mf_amount"] == 1234.5
+    assert [row["trade_date"] for row in section["money_flow_history"]] == ["20260609", "20260610"]
+    assert section["money_flow_history"][-1]["main_net"] == pytest.approx(1100.0)
+    assert section["money_flow_history"][-1]["md_net"] == pytest.approx(-50.0)
+    assert section["money_flow_summary"]["main_net_today"] == pytest.approx(1100.0)
+    assert section["money_flow_summary"]["main_net_5d"] == pytest.approx(600.0)
+    assert section["money_flow_summary"]["inflow_streak"] == 1
+    assert section["money_flow_summary"]["unit"] == "wan_yuan"
     assert section["data_status"]["found"] is True
 
 

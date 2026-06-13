@@ -1,11 +1,14 @@
 """shenwan_index 路由：参数校验与无数据路径（Mongo 用假集合，不连真库）。"""
 import pandas as pd
 import pytest
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from auth import get_current_active_user
-from main import app
 from routers import shenwan_index as sm
+
+app = FastAPI()
+app.include_router(sm.router, prefix="/api/shenwan-index")
 
 
 def _authed_client() -> TestClient:
@@ -165,6 +168,104 @@ def test_tree_no_classify_returns_message(monkeypatch):
         j = r.json()
         assert j.get("data") == []
         assert "run_sw_industry_backfill" in (j.get("message") or "")
+    finally:
+        teardown_dep()
+
+
+@pytest.mark.unit
+def test_industry_money_flow_aggregates_members(monkeypatch):
+    class Curs:
+        def __init__(self, docs):
+            self._docs = list(docs)
+
+        def sort(self, field, direction):
+            self._docs.sort(key=lambda row: row.get(field) or "", reverse=direction < 0)
+            return self
+
+        def limit(self, n):
+            self._docs = self._docs[:n]
+            return self
+
+        def __iter__(self):
+            return iter(self._docs)
+
+    class FakeCollection:
+        def __init__(self, docs):
+            self.docs = list(docs)
+
+        def find(self, query=None, projection=None):
+            rows = [dict(doc) for doc in self.docs if self._match(doc, query or {})]
+            if projection:
+                include = {k for k, v in projection.items() if v}
+                if include:
+                    rows = [{k: row.get(k) for k in include if k in row} for row in rows]
+            return Curs(rows)
+
+        def _match(self, doc, query):
+            for key, expected in query.items():
+                if key == "$or":
+                    if not any(self._match(doc, clause) for clause in expected):
+                        return False
+                    continue
+                value = doc.get(key)
+                if isinstance(expected, dict):
+                    if "$in" in expected and value not in expected["$in"]:
+                        return False
+                    continue
+                if value != expected:
+                    return False
+            return True
+
+    members = [
+        {"src": "SW2021", "l1_code": "801010.SI", "is_new": "Y", "con_code": "000001.SZ", "name": "平安银行"},
+        {"src": "SW2021", "l1_code": "801010.SI", "is_new": "Y", "con_code": "000002.SZ", "name": "万科A"},
+    ]
+    flows = [
+        {
+            "ts_code": "000001.SZ",
+            "trade_date": "20260610",
+            "buy_elg_amount": 1000.0,
+            "sell_elg_amount": 400.0,
+            "buy_lg_amount": 500.0,
+            "sell_lg_amount": 200.0,
+            "amount": 3000.0,
+        },
+        {
+            "ts_code": "000002.SZ",
+            "trade_date": "20260610",
+            "buy_elg_amount": 100.0,
+            "sell_elg_amount": 300.0,
+            "buy_lg_amount": 200.0,
+            "sell_lg_amount": 400.0,
+            "amount": 2000.0,
+        },
+        {
+            "ts_code": "000001.SZ",
+            "trade_date": "20260609",
+            "net_mf_amount": -50.0,
+            "amount": 1000.0,
+        },
+    ]
+
+    c = _authed_client()
+    try:
+        monkeypatch.setattr(sm, "_MEMBER", FakeCollection(members))
+        monkeypatch.setattr(sm, "_MONEY_FLOW", FakeCollection(flows))
+        r = c.get("/api/shenwan-index/money-flow", params={"index_code": "801010.SI", "days": 5})
+        assert r.status_code == 200
+        j = r.json()
+        assert j["success"] is True
+        assert j["member_count"] == 2
+        assert j["count"] == 2
+        latest = j["data"][-1]
+        assert latest["trade_date"] == "20260610"
+        assert latest["main_net"] == pytest.approx(500.0)
+        assert latest["covered_count"] == 2
+        assert latest["coverage_level"] == "ok"
+        assert latest["top_inflow"][0]["con_code"] == "000001.SZ"
+        assert latest["top_outflow"][0]["con_code"] == "000002.SZ"
+        assert j["summary"]["main_net_today"] == pytest.approx(500.0)
+        assert j["summary"]["main_net_5d"] == pytest.approx(450.0)
     finally:
         teardown_dep()
 
