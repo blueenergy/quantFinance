@@ -218,7 +218,7 @@ def test_financials_section_merges_statements_and_earnings(monkeypatch):
             [{"ts_code": "000001.SZ", "ann_date": "20260403", "pre_date": "20260425"}]
         ),
         "earnings_report_rc": _Collection(
-            [{"ts_code": "000001.SZ", "ann_date": "20260404", "organ_name": "券商"}]
+            [{"ts_code": "000001.SZ", "report_date": "20260404", "org_name": "券商", "report_title": "业绩点评"}]
         ),
     }
     monkeypatch.setattr("routers.stock_workbench.get_data_db", lambda: data)

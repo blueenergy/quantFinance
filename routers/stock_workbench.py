@@ -634,8 +634,8 @@ def _financials_section(symbol: str, periods: int = 40) -> Dict[str, Any]:
     earnings_report_rc = _recent_docs_for_symbol(
         data["earnings_report_rc"],
         candidates,
-        date_field="ann_date",
-        limit=3,
+        date_field="report_date",
+        limit=10,
         projection={"_id": 0},
     )
     return {
