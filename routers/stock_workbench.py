@@ -128,7 +128,7 @@ def _recent_docs_for_symbol(
         cursor = collection.find(
             {field: {"$in": candidates}},
             projection,
-            sort=[(date_field, -1), ("_id", -1)],
+            sort=[(date_field, -1)],
             limit=limit,
         )
         docs = list(cursor)
