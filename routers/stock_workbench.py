@@ -1115,16 +1115,15 @@ def get_stock_workbench(
     stock = _stock_identity(symbol)
     quote = _latest_quote(symbol)
     score = _latest_score(symbol)
-    deep_analysis = _latest_deep_analysis(current_user.get("id"), symbol)
 
     data_status = {
         "stock_found": bool(stock),
         "quote_found": bool(quote),
         "score_found": bool(score),
-        "deep_analysis_found": bool(deep_analysis),
+        "deep_analysis_found": False,
         "quote_date": (quote or {}).get("trade_date") or (quote or {}).get("datetime") or (quote or {}).get("trade_time"),
         "score_date": (score or {}).get("score_date"),
-        "analysis_created_at": (deep_analysis or {}).get("created_at"),
+        "analysis_created_at": None,
         "sections": {
             "quote": _quote_status(quote),
             "nine_turn": _section_status(
@@ -1138,7 +1137,11 @@ def get_stock_workbench(
                 expected_freshness="进入财务业绩页签后按需加载",
                 source="quant_data.financial_* + quant_data.earnings_*",
             ),
-            "ai": _ai_status(deep_analysis),
+            "ai": _section_status(
+                found=False,
+                expected_freshness="进入深度分析页签后按需加载",
+                source="finance.analysis_history",
+            ),
             "trading": _section_status(
                 found=False,
                 expected_freshness="进入 AI 与交易页签后按需加载",
@@ -1160,7 +1163,7 @@ def get_stock_workbench(
                 "stock": stock,
                 "quote": quote,
                 "score": score,
-                "deep_analysis": deep_analysis,
+                "deep_analysis": None,
                 "data_status": data_status,
             }
         ),
