@@ -265,10 +265,83 @@ def test_kline_section_loads_weekly_and_monthly_on_demand(monkeypatch):
 
     assert weekly["tf"] == "1w"
     assert weekly["rows"][0]["close"] == 10.2
+    assert weekly["rows"][0]["amount_unit"] == "yuan"
+    assert weekly["rows"][0]["volume_unit"] == "shares"
     assert weekly["data_status"]["source"] == "quant_data.stock_weekly"
     assert monthly["tf"] == "1m"
     assert monthly["rows"][0]["close"] == 10.8
+    assert monthly["rows"][0]["amount_unit"] == "yuan"
+    assert monthly["rows"][0]["volume_unit"] == "shares"
     assert monthly["data_status"]["source"] == "quant_data.stock_monthly"
+
+
+def test_kline_section_adds_partial_weekly_and_monthly_rows(monkeypatch):
+    data = {
+        "volume_price": _Collection(
+            [
+                {
+                    "symbol": "000001.SZ",
+                    "trade_date": "20260617",
+                    "open": 10.6,
+                    "high": 11.1,
+                    "low": 10.5,
+                    "close": 10.9,
+                    "pre_close": 10.5,
+                    "vol": 300,
+                    "amount": 3000,
+                },
+                {
+                    "symbol": "000001.SZ",
+                    "trade_date": "20260616",
+                    "open": 10.3,
+                    "high": 10.8,
+                    "low": 10.1,
+                    "close": 10.6,
+                    "pre_close": 10.2,
+                    "vol": 200,
+                    "amount": 2000,
+                },
+                {
+                    "symbol": "000001.SZ",
+                    "trade_date": "20260615",
+                    "open": 10.0,
+                    "high": 10.4,
+                    "low": 9.9,
+                    "close": 10.3,
+                    "pre_close": 9.8,
+                    "vol": 100,
+                    "amount": 1000,
+                },
+            ]
+        ),
+        "stock_weekly": _Collection(
+            [{"ts_code": "000001.SZ", "trade_date": "20260612", "close": 10.2}]
+        ),
+        "stock_monthly": _Collection(
+            [{"ts_code": "000001.SZ", "trade_date": "20260529", "close": 9.8}]
+        ),
+    }
+    monkeypatch.setattr("routers.stock_workbench.get_data_db", lambda: data)
+
+    weekly = _kline_section("000001.SZ", "1w")
+    monthly = _kline_section("000001.SZ", "1m")
+
+    for section in (weekly, monthly):
+        partial = section["rows"][0]
+        assert partial["is_partial"] is True
+        assert partial["source"] == "dynamic_daily_aggregate"
+        assert partial["trade_date"] == "20260617"
+        assert partial["period_start"] == "20260615"
+        assert partial["open"] == pytest.approx(10.0)
+        assert partial["close"] == pytest.approx(10.9)
+        assert partial["high"] == pytest.approx(11.1)
+        assert partial["low"] == pytest.approx(9.9)
+        assert partial["vol"] == pytest.approx(600)
+        assert partial["volume_unit"] == "hands"
+        assert partial["amount"] == pytest.approx(6000000)
+        assert partial["amount_unit"] == "yuan"
+    assert weekly["rows"][1]["trade_date"] == "20260612"
+    assert monthly["rows"][1]["trade_date"] == "20260529"
 
 
 def test_money_flow_section_loads_history_on_demand(monkeypatch):

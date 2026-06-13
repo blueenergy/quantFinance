@@ -5,6 +5,7 @@ import os
 import re
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -266,6 +267,126 @@ def _recent_money_flow_docs(
     )
 
 
+def _period_key(trade_date: Any, tf: str) -> str:
+    s = str(trade_date or "")
+    if len(s) < 8:
+        return s
+    if tf == "1m":
+        return s[:6]
+    try:
+        dt = datetime.strptime(s[:8], "%Y%m%d")
+    except ValueError:
+        return s[:6]
+    iso = dt.isocalendar()
+    return f"{iso.year}W{iso.week:02d}"
+
+
+def _aggregate_partial_kline(rows: List[Dict[str, Any]], tf: str) -> Optional[Dict[str, Any]]:
+    if not rows:
+        return None
+    ordered = sorted(rows, key=lambda row: str(row.get("trade_date") or ""))
+    first = ordered[0]
+    last = ordered[-1]
+    open_price = _to_float(first.get("open"))
+    close_price = _to_float(last.get("close"))
+    highs = [_to_float(row.get("high")) for row in ordered]
+    lows = [_to_float(row.get("low")) for row in ordered]
+    volumes = [_to_float(row.get("vol") if row.get("vol") is not None else row.get("volume")) for row in ordered]
+    amounts = [_to_float(row.get("amount")) for row in ordered]
+    pre_close = _to_float(first.get("pre_close"))
+    change = (close_price - pre_close) if close_price is not None and pre_close not in (None, 0) else None
+    pct_chg = (change / pre_close * 100) if change is not None and pre_close not in (None, 0) else None
+    volume = sum(value for value in volumes if value is not None) if any(value is not None for value in volumes) else None
+    amount = sum(value for value in amounts if value is not None) if any(value is not None for value in amounts) else None
+    amount_unit = "qian_yuan"
+    if tf in ("1w", "1m") and amount is not None:
+        amount *= 1000
+        amount_unit = "yuan"
+    result = {
+        "symbol": last.get("symbol") or last.get("ts_code"),
+        "ts_code": last.get("ts_code") or last.get("symbol"),
+        "trade_date": last.get("trade_date"),
+        "open": open_price,
+        "high": max((value for value in highs if value is not None), default=None),
+        "low": min((value for value in lows if value is not None), default=None),
+        "close": close_price,
+        "pre_close": pre_close,
+        "change": change,
+        "pct_chg": pct_chg,
+        "pct_change": pct_chg,
+        "vol": volume,
+        "volume": volume,
+        "volume_unit": "hands",
+        "amount": amount,
+        "amount_unit": amount_unit,
+        "is_partial": True,
+        "partial": True,
+        "period": tf,
+        "period_start": first.get("trade_date"),
+        "period_end": last.get("trade_date"),
+        "sample_count": len(ordered),
+        "source": "dynamic_daily_aggregate",
+    }
+    return result
+
+
+def _annotate_kline_amount_unit(rows: List[Dict[str, Any]], tf: str) -> List[Dict[str, Any]]:
+    amount_unit = "qian_yuan" if tf == "1d" else "yuan"
+    volume_unit = "hands" if tf == "1d" else "shares"
+    return [
+        {
+            **row,
+            "amount_unit": row.get("amount_unit") or amount_unit,
+            "volume_unit": row.get("volume_unit") or volume_unit,
+        }
+        for row in rows
+    ]
+
+
+def _with_partial_period_kline(
+    data: Any,
+    candidates: List[str],
+    rows: List[Dict[str, Any]],
+    tf: str,
+) -> List[Dict[str, Any]]:
+    if tf not in ("1w", "1m"):
+        return rows
+    daily_rows = _recent_kline_docs(
+        data,
+        "volume_price",
+        candidates,
+        limit=80 if tf == "1w" else 120,
+        fields=("symbol",),
+    )
+    if not daily_rows:
+        return rows
+    latest_daily = daily_rows[0]
+    latest_date = str(latest_daily.get("trade_date") or "")
+    latest_key = _period_key(latest_date, tf)
+    if not latest_key:
+        return rows
+    bucket = [
+        row for row in daily_rows
+        if _period_key(row.get("trade_date"), tf) == latest_key
+    ]
+    partial = _aggregate_partial_kline(bucket, tf)
+    if not partial:
+        return rows
+
+    if not rows:
+        return [partial]
+
+    latest_row_date = str(rows[0].get("trade_date") or "")
+    latest_row_key = _period_key(latest_row_date, tf)
+    if latest_row_key == latest_key:
+        if latest_row_date >= latest_date:
+            return rows
+        return [partial, *rows[1:]]
+    if latest_row_date > latest_date:
+        return rows
+    return [partial, *rows]
+
+
 def _amount_diff(row: Dict[str, Any], buy_key: str, sell_key: str) -> Optional[float]:
     buy = _to_float(row.get(buy_key))
     sell = _to_float(row.get(sell_key))
@@ -430,6 +551,8 @@ def _kline_section(symbol: str, tf: str) -> Dict[str, Any]:
         limit=limit,
         fields=fields,
     )
+    rows = _annotate_kline_amount_unit(rows, tfc)
+    rows = _with_partial_period_kline(data, candidates, rows, tfc)
     profiler.lap("kline_query", tf=tfc, collection=collection_name, rows=len(rows), limit=limit)
     result = {
         "symbol": symbol,
