@@ -579,7 +579,7 @@ def _ai_status(deep_analysis: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     )
 
 
-def _financials_section(symbol: str, periods: int = 8) -> Dict[str, Any]:
+def _financials_section(symbol: str, periods: int = 40) -> Dict[str, Any]:
     data = get_data_db()
     candidates = _symbol_candidates(symbol)
     income = _recent_docs_for_symbol(
