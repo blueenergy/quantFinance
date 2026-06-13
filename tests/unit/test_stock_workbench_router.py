@@ -7,6 +7,7 @@ from routers.stock_workbench import (
     _attach_display_pct_change,
     _financials_section,
     _kline_section,
+    _money_flow_section,
     _nineturn_section,
     _quote_section,
     _quote_status,
@@ -268,6 +269,42 @@ def test_kline_section_loads_weekly_and_monthly_on_demand(monkeypatch):
     assert monthly["tf"] == "1m"
     assert monthly["rows"][0]["close"] == 10.8
     assert monthly["data_status"]["source"] == "quant_data.stock_monthly"
+
+
+def test_money_flow_section_loads_history_on_demand(monkeypatch):
+    data = {
+        "money_flow": _Collection(
+            [
+                {
+                    "ts_code": "000001.SZ",
+                    "trade_date": "20260612",
+                    "buy_elg_amount": 1000.0,
+                    "sell_elg_amount": 200.0,
+                    "buy_lg_amount": 500.0,
+                    "sell_lg_amount": 100.0,
+                    "amount": 9000.0,
+                },
+                {
+                    "ts_code": "000001.SZ",
+                    "trade_date": "20260611",
+                    "buy_elg_amount": 200.0,
+                    "sell_elg_amount": 300.0,
+                    "buy_lg_amount": 100.0,
+                    "sell_lg_amount": 200.0,
+                    "amount": 8000.0,
+                },
+            ]
+        )
+    }
+    monkeypatch.setattr("routers.stock_workbench.get_data_db", lambda: data)
+
+    section = _money_flow_section("000001.SZ", "1m")
+
+    assert section["tf"] == "1m"
+    assert [row["trade_date"] for row in section["history"]] == ["20260611", "20260612"]
+    assert section["history"][-1]["main_net"] == pytest.approx(1200.0)
+    assert section["summary"]["main_net_today"] == pytest.approx(1200.0)
+    assert section["data_status"]["source"] == "quant_data.money_flow"
 
 
 def test_nineturn_section_enriches_raw_tushare_signal(monkeypatch):

@@ -27,6 +27,8 @@ log = logging.getLogger(__name__)
 
 WORKBENCH_DAILY_KLINE_LIMIT = 360
 WORKBENCH_MONEY_FLOW_HISTORY_LIMIT = 120
+WORKBENCH_WEEKLY_MONEY_FLOW_HISTORY_LIMIT = 520
+WORKBENCH_MONTHLY_MONEY_FLOW_HISTORY_LIMIT = 1500
 WORKBENCH_WEEKLY_KLINE_LIMIT = 260
 WORKBENCH_MONTHLY_KLINE_LIMIT = 260
 WORKBENCH_PROFILE_ENABLED = os.getenv("WORKBENCH_PROFILE", "").strip().lower() in {"1", "true", "yes", "on"}
@@ -46,6 +48,32 @@ KLINE_PROJECTION = {
     "vol": 1,
     "volume": 1,
     "amount": 1,
+}
+
+MONEY_FLOW_PROJECTION = {
+    "_id": 0,
+    "symbol": 1,
+    "ts_code": 1,
+    "trade_date": 1,
+    "amount": 1,
+    "buy_sm_vol": 1,
+    "buy_sm_amount": 1,
+    "sell_sm_vol": 1,
+    "sell_sm_amount": 1,
+    "buy_md_vol": 1,
+    "buy_md_amount": 1,
+    "sell_md_vol": 1,
+    "sell_md_amount": 1,
+    "buy_lg_vol": 1,
+    "buy_lg_amount": 1,
+    "sell_lg_vol": 1,
+    "sell_lg_amount": 1,
+    "buy_elg_vol": 1,
+    "buy_elg_amount": 1,
+    "sell_elg_vol": 1,
+    "sell_elg_amount": 1,
+    "net_mf_vol": 1,
+    "net_mf_amount": 1,
 }
 
 
@@ -185,6 +213,19 @@ def _data_collection(data: Any, name: str) -> Any:
         return None
 
 
+def _normalize_timeframe(tf: str) -> str:
+    tfc = (tf or "1d").strip().lower()
+    if tfc in ("d",):
+        tfc = "1d"
+    elif tfc in ("w",):
+        tfc = "1w"
+    elif tfc in ("m",):
+        tfc = "1m"
+    if tfc not in ("1d", "1w", "1m"):
+        raise HTTPException(status_code=400, detail="tf must be 1d, 1w, or 1m")
+    return tfc
+
+
 def _recent_kline_docs(
     data: Any,
     collection_name: str,
@@ -203,6 +244,25 @@ def _recent_kline_docs(
         limit=limit,
         projection=KLINE_PROJECTION,
         fields=fields,
+    )
+
+
+def _recent_money_flow_docs(
+    data: Any,
+    candidates: List[str],
+    *,
+    limit: int,
+) -> List[Dict[str, Any]]:
+    collection = _data_collection(data, "money_flow")
+    if collection is None:
+        return []
+    return _recent_docs_for_symbol(
+        collection,
+        candidates,
+        date_field="trade_date",
+        limit=limit,
+        projection=MONEY_FLOW_PROJECTION,
+        fields=("symbol", "ts_code"),
     )
 
 
@@ -313,37 +373,10 @@ def _quote_section(symbol: str) -> Dict[str, Any]:
         },
     )
     profiler.lap("daily_basic", rows=len(daily_basic))
-    money_flow = _recent_docs_for_symbol(
-        data["money_flow"],
+    money_flow = _recent_money_flow_docs(
+        data,
         candidates,
-        date_field="trade_date",
         limit=WORKBENCH_MONEY_FLOW_HISTORY_LIMIT,
-        projection={
-            "_id": 0,
-            "symbol": 1,
-            "ts_code": 1,
-            "trade_date": 1,
-            "amount": 1,
-            "buy_sm_vol": 1,
-            "buy_sm_amount": 1,
-            "sell_sm_vol": 1,
-            "sell_sm_amount": 1,
-            "buy_md_vol": 1,
-            "buy_md_amount": 1,
-            "sell_md_vol": 1,
-            "sell_md_amount": 1,
-            "buy_lg_vol": 1,
-            "buy_lg_amount": 1,
-            "sell_lg_vol": 1,
-            "sell_lg_amount": 1,
-            "buy_elg_vol": 1,
-            "buy_elg_amount": 1,
-            "sell_elg_vol": 1,
-            "sell_elg_amount": 1,
-            "net_mf_vol": 1,
-            "net_mf_amount": 1,
-        },
-        fields=("symbol", "ts_code"),
     )
     profiler.lap("money_flow", rows=len(money_flow))
     money_flow_history_desc = [_money_flow_history_row(row) for row in money_flow]
@@ -377,15 +410,7 @@ def _kline_section(symbol: str, tf: str) -> Dict[str, Any]:
     profiler = _WorkbenchProfiler("kline", symbol)
     data = get_data_db()
     candidates = _symbol_candidates(symbol)
-    tfc = (tf or "1d").strip().lower()
-    if tfc in ("d",):
-        tfc = "1d"
-    elif tfc in ("w",):
-        tfc = "1w"
-    elif tfc in ("m",):
-        tfc = "1m"
-    if tfc not in ("1d", "1w", "1m"):
-        raise HTTPException(status_code=400, detail="tf must be 1d, 1w, or 1m")
+    tfc = _normalize_timeframe(tf)
 
     collection_name = {
         "1d": "volume_price",
@@ -418,6 +443,39 @@ def _kline_section(symbol: str, tf: str) -> Dict[str, Any]:
         ),
     }
     profiler.finish(tf=tfc, rows=len(rows))
+    return result
+
+
+def _money_flow_section(symbol: str, tf: str) -> Dict[str, Any]:
+    profiler = _WorkbenchProfiler("money_flow", symbol)
+    data = get_data_db()
+    candidates = _symbol_candidates(symbol)
+    tfc = _normalize_timeframe(tf)
+    limit = {
+        "1d": WORKBENCH_MONEY_FLOW_HISTORY_LIMIT,
+        "1w": WORKBENCH_WEEKLY_MONEY_FLOW_HISTORY_LIMIT,
+        "1m": WORKBENCH_MONTHLY_MONEY_FLOW_HISTORY_LIMIT,
+    }[tfc]
+    money_flow = _recent_money_flow_docs(data, candidates, limit=limit)
+    profiler.lap("money_flow_query", tf=tfc, rows=len(money_flow), limit=limit)
+    money_flow_history_desc = [_money_flow_history_row(row) for row in money_flow]
+    money_flow_history = sorted(money_flow_history_desc, key=lambda row: str(row.get("trade_date") or ""))
+    money_flow_summary = _money_flow_summary(money_flow_history_desc)
+    profiler.lap("money_flow_transform", rows=len(money_flow_history))
+    result = {
+        "symbol": symbol,
+        "tf": tfc,
+        "history": money_flow_history,
+        "summary": money_flow_summary,
+        "latest": money_flow[0] if money_flow else None,
+        "data_status": _section_status(
+            found=bool(money_flow_history),
+            as_of=(money_flow_history_desc[0] if money_flow_history_desc else {}).get("trade_date"),
+            expected_freshness="按资金流周期切换时加载",
+            source="quant_data.money_flow",
+        ),
+    }
+    profiler.finish(tf=tfc, rows=len(money_flow_history), limit=limit)
     return result
 
 
@@ -1277,6 +1335,19 @@ def get_stock_workbench_kline(
     return {
         "success": True,
         "data": _json_safe(_kline_section(symbol, tf)),
+    }
+
+
+@router.get("/{symbol}/workbench/money-flow")
+def get_stock_workbench_money_flow(
+    symbol: str,
+    tf: str = Query("1d", description="1d=日资金流, 1w=周线视图资金流, 1m=月线视图资金流"),
+    current_user: Dict[str, Any] = Depends(get_current_active_user),
+):
+    """Money-flow history for a selected stock workbench timeframe."""
+    return {
+        "success": True,
+        "data": _json_safe(_money_flow_section(symbol, tf)),
     }
 
 
