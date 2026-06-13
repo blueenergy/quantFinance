@@ -38,10 +38,14 @@ pipelines:
     run_mode: cron
     schedule_hint: "Supercronic 工作日 17:20 → daily_market_sync.sh stockinfo"
     freshness:
-      database: quant_data
-      collection: stock_info
-      field: list_date
-      field_kind: date_string
+      # list_date is the content field (IPO date of the last listed stock), not the
+      # sync timestamp. We monitor by job_status so data-pulse shows when the sync
+      # last ran rather than a static IPO date that changes only on new listings.
+      database: finance
+      collection: job_status
+      field: completed_at
+      field_kind: datetime
+      filter: { job_type: stock_info }
     # ── Data contract: reference snapshot ──────────────────────────────────────
     # stock_info is the listed-universe reference other contracts depend on
     # (e.g. financial_sync's per-period coverage). It is a full snapshot, not a
@@ -245,6 +249,22 @@ pipelines:
       collection: etf_share_size
       field: trade_date
       field_kind: date_string
+    # ── Data contract ─────────────────────────────────────────────────────────
+    # ETF share size is a daily snapshot (one row per fund per trade_date).
+    # Use calendar_trading_days to detect gaps and auto-backfill.
+    contract:
+      source: tushare
+      storage: { database: quant_data, collection: etf_share_size, date_field: trade_date, symbol_field: ts_code }
+      window: { start: "20200101", end: rolling }
+      sla: { max_lag_trading_days: 3, min_coverage_pct: 95.0, min_symbols_latest_day: 0 }
+      on_violation:
+        auto_repair: true
+        repair_task: run_etf_share_size
+        repair_args: ["--all", "--start", "{start}", "--end", "{end}"]
+        max_repair_window_days: 90
+      alert:
+        channels: [email, data_pulse]
+        "on": [repair_failed, still_violated]
 
   - id: financial_sync
     label: 财务数据
@@ -376,6 +396,10 @@ pipelines:
       collection: stk_holdernumber
       field: end_date
       field_kind: date_string
+    # ── Data contract (run-recency model) ──────────────────────────────────────
+    # 股东户数披露日不规则（月末/季末/特殊日均有），且 Tushare 全市场单次按日期
+    # 上限返回（~5000 行/页，按 ts_code 排序截断），须分页拉取。按报告期硬核对
+    # 覆盖不可靠，故用 run_recency 校验近期是否跑过并按需补跑（分页回填全量）。
     contract:
       source: tushare
       storage: { database: quant_data, collection: stk_holdernumber, date_field: end_date, symbol_field: ts_code }
@@ -406,6 +430,9 @@ pipelines:
       collection: stk_holdertrade
       field: ann_date
       field_kind: date_string
+    # ── Data contract (run-recency model) ──────────────────────────────────────
+    # 增减持/解禁/回购均为公告驱动、覆盖不可定义，故仅校验近期是否跑过并按需补跑。
+    # 一条任务写入 stk_holdertrade / share_float / repurchase 三个集合。
     contract:
       source: tushare
       storage: { database: quant_data, collection: stk_holdertrade, date_field: ann_date, symbol_field: ts_code }
@@ -436,6 +463,9 @@ pipelines:
       collection: hk_hold
       field: trade_date
       field_kind: date_string
+    # ── Data contract (run-recency model) ──────────────────────────────────────
+    # 北向持股明细自 2024-08 起改为季度披露（采样季末），日历对齐不稳定，故用
+    # run_recency 校验近期是否跑过，而非按交易日/报告期硬核对覆盖。
     contract:
       source: tushare
       storage: { database: quant_data, collection: hk_hold, date_field: trade_date, symbol_field: ts_code }
@@ -448,6 +478,41 @@ pipelines:
         auto_repair: true
         repair_task: run_hk_hold_sync
         repair_args: ["--recent-quarters", "2"]
+        max_repair_window_days: 30
+      alert:
+        channels: [email, data_pulse]
+        "on": [repair_failed, still_violated]
+
+  - id: institutional_deep_sync
+    label: 机构深度（前十大流通股东/解禁/大宗）
+    job_status_key: institutional_deep
+    group: layer0
+    depends_on: [stock_info]
+    trigger_on_complete: false
+    run_mode: on_demand
+    schedule_hint: "手动/合约修复触发 run_institutional_deep_sync；按 stock_info 小批量补齐机构深度快照"
+    freshness:
+      database: quant_data
+      collection: institutional_deep_snapshot
+      field: as_of
+      field_kind: date_string
+    # ── Data contract (run-recency model) ──────────────────────────────────────
+    # 该任务按股票逐只拉取 top10_floatholders/top10_holders、未来解禁、大宗交易，
+    # 并写入 institutional_deep_snapshot。全市场调用成本高，故合约只校验近期是否
+    # 成功跑过；auto_repair 使用 stock_info 中缺失/过期的股票小批量补齐。
+    contract:
+      source: tushare
+      depends_on: [stock_info]
+      storage: { database: quant_data, collection: institutional_deep_snapshot, date_field: as_of, symbol_field: ts_code }
+      window: { start: "20240101", end: rolling }
+      completeness:
+        kind: run_recency
+      sla:
+        max_run_lag_days: 7
+      on_violation:
+        auto_repair: true
+        repair_task: run_institutional_deep_sync
+        repair_args: ["--from-stock-info", "--stale-days", "30", "--limit", "300", "--no-analysis", "--brief"]
         max_repair_window_days: 30
       alert:
         channels: [email, data_pulse]

@@ -210,6 +210,13 @@ def get_data_db():
         "financial_balance": data_db["financial_balance"],
         "financial_cashflow": data_db["financial_cashflow"],
         "financial_indicator": data_db["financial_indicator"],
+        # Shareholder / chips data
+        "stk_holdernumber": data_db["stk_holdernumber"],
+        "hk_hold": data_db["hk_hold"],
+        "top10_floatholders": data_db["top10_floatholders"],
+        "stk_holdertrade": data_db["stk_holdertrade"],
+        "share_float": data_db["share_float"],
+        "repurchase": data_db["repurchase"],
         # Earnings data
         "earnings_forecast": data_db["earnings_forecast"],
         "earnings_express": data_db["earnings_express"],

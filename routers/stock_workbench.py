@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends
@@ -654,13 +655,18 @@ def _financials_section(symbol: str, periods: int = 40) -> Dict[str, Any]:
     }
 
 
-def _shareholder_status(holder_numbers: List[Dict[str, Any]], hk_hold: List[Dict[str, Any]]) -> Dict[str, Any]:
+def _shareholder_status(
+    holder_numbers: List[Dict[str, Any]],
+    hk_hold: List[Dict[str, Any]],
+    top10_float_change: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     as_of = (holder_numbers[0] if holder_numbers else {}).get("end_date") or (hk_hold[0] if hk_hold else {}).get("trade_date")
+    top10_found = bool((top10_float_change or {}).get("period_curr"))
     return _section_status(
-        found=bool(holder_numbers or hk_hold),
-        as_of=as_of,
+        found=bool(holder_numbers or hk_hold or top10_found),
+        as_of=as_of or (top10_float_change or {}).get("period_curr"),
         expected_freshness="股东户数/港股通按季披露；增减持·解禁·回购为公告驱动",
-        source="quant_data.stk_holdernumber/hk_hold/stk_holdertrade/share_float/repurchase",
+        source="quant_data.stk_holdernumber/hk_hold/top10_floatholders/stk_holdertrade/share_float/repurchase",
     )
 
 
@@ -671,11 +677,133 @@ def _pct_change(curr: Any, prev: Any) -> Optional[float]:
     return (c - p) / abs(p) * 100.0
 
 
-def _shareholder_summary(holder_numbers: List[Dict[str, Any]], hk_hold: List[Dict[str, Any]]) -> Dict[str, Any]:
+_INSTITUTION_PATTERNS = [
+    ("MorganStanley", "摩根士丹利", re.compile(r"MORGAN\s*STANLEY|摩根士丹利", re.I)),
+    ("JPMorgan", "摩根大通", re.compile(r"J\.?\s*P\.?\s*MORGAN|JP\s*MORGAN|摩根大通|JPM", re.I)),
+    ("GoldmanSachs", "高盛", re.compile(r"GOLDMAN|高盛", re.I)),
+    ("UBS", "瑞银/UBS", re.compile(r"\bUBS\s*AG\b|\bUBS\b|瑞银", re.I)),
+    ("Citi", "花旗", re.compile(r"花旗|CITI(GROUP|BANK|CORP|GLOBAL|SECUR)|\bCITI\b", re.I)),
+    ("BNPParibas", "法国巴黎银行", re.compile(r"BNP|PARIBAS|法巴|巴黎.*法巴", re.I)),
+    ("Barclays", "巴克莱", re.compile(r"BARCLAYS?|巴克莱", re.I)),
+    ("DeutscheBank", "德意志银行", re.compile(r"DEUTSCHE|德意志|德银", re.I)),
+    ("BlackRock", "贝莱德", re.compile(r"BLACKROCK|贝莱德", re.I)),
+    ("Fidelity", "富达", re.compile(r"FIDELITY|富达|FIL", re.I)),
+    ("HKSC", "香港中央结算有限公司", re.compile(r"香港中央结算(有限公司)?|HONG\s*KONG.*CLEARING", re.I)),
+]
+_INTL_KEYS = {key for key, _, _ in _INSTITUTION_PATTERNS if key != "HKSC"}
+
+
+def _normalize_holder_name(name: Any) -> Dict[str, str]:
+    text = str(name or "").strip()
+    for key, label, pattern in _INSTITUTION_PATTERNS:
+        if pattern.search(text):
+            return {"key": key, "label": label, "holder_name": text}
+    return {"key": "OTHER", "label": "其他", "holder_name": text}
+
+
+def _holding_amount(row: Dict[str, Any]) -> Optional[float]:
+    raw = row.get("raw") if isinstance(row.get("raw"), dict) else {}
+    return _first_float(
+        row.get("hold_amount"), row.get("hold_num"), row.get("hold_share"), row.get("shares"),
+        raw.get("hold_amount"), raw.get("hold_num"), raw.get("hold_share"), raw.get("shares"),
+    )
+
+
+def _holding_ratio(row: Dict[str, Any]) -> Optional[float]:
+    raw = row.get("raw") if isinstance(row.get("raw"), dict) else {}
+    return _first_float(
+        row.get("hold_ratio"), row.get("hold_ratio_pct"), row.get("ratio"),
+        raw.get("hold_ratio"), raw.get("hold_float_ratio"), raw.get("hold_ratio_pct"), raw.get("ratio"),
+    )
+
+
+def _group_top10_by_period(rows: List[Dict[str, Any]]) -> List[tuple[str, List[Dict[str, Any]]]]:
+    grouped: Dict[str, List[Dict[str, Any]]] = {}
+    for row in rows:
+        period = str(row.get("end_date") or row.get("period") or "")
+        if not period:
+            continue
+        grouped.setdefault(period, []).append(row)
+    out = []
+    for period in sorted(grouped.keys(), reverse=True):
+        period_rows = grouped[period]
+        period_rows.sort(
+            key=lambda item: (
+                -(_to_float(item.get("holder_rank")) or 999),
+                _holding_amount(item) or 0,
+            ),
+            reverse=True,
+        )
+        out.append((period, period_rows))
+    return out
+
+
+def _top10_float_change(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    periods = _group_top10_by_period(rows)
+    if not periods:
+        return {"period_curr": None, "period_prev": None, "intl_new": [], "hksc": None, "current_holders": []}
+    curr_period, curr_rows = periods[0]
+    prev_period, prev_rows = periods[1] if len(periods) > 1 else (None, [])
+
+    def enrich(row: Dict[str, Any]) -> Dict[str, Any]:
+        norm = _normalize_holder_name(row.get("holder_name"))
+        return {
+            **row,
+            "norm_key": norm["key"],
+            "norm_label": norm["label"],
+            "hold_amount": _holding_amount(row),
+            "hold_ratio": _holding_ratio(row),
+        }
+
+    curr = [enrich(row) for row in curr_rows]
+    prev = [enrich(row) for row in prev_rows]
+    prev_keys = {row.get("norm_key") for row in prev if row.get("norm_key") not in (None, "OTHER")}
+    prev_names = {str(row.get("holder_name") or "").strip() for row in prev}
+    intl_new = [
+        row for row in curr
+        if row.get("norm_key") in _INTL_KEYS
+        and row.get("norm_key") not in prev_keys
+        and str(row.get("holder_name") or "").strip() not in prev_names
+    ]
+
+    hksc_curr = next((row for row in curr if row.get("norm_key") == "HKSC"), None)
+    hksc_prev = next((row for row in prev if row.get("norm_key") == "HKSC"), None)
+    hksc = None
+    if hksc_curr or hksc_prev:
+        hksc = {
+            "current": hksc_curr,
+            "previous": hksc_prev,
+            "hold_amount_chg": (
+                None if not hksc_curr or not hksc_prev
+                else (_holding_amount(hksc_curr) or 0) - (_holding_amount(hksc_prev) or 0)
+            ),
+            "hold_ratio_chg": (
+                None if not hksc_curr or not hksc_prev or _holding_ratio(hksc_curr) is None or _holding_ratio(hksc_prev) is None
+                else _holding_ratio(hksc_curr) - _holding_ratio(hksc_prev)
+            ),
+        }
+
+    return {
+        "period_curr": curr_period,
+        "period_prev": prev_period,
+        "intl_new": intl_new,
+        "intl_new_count": len(intl_new),
+        "hksc": hksc,
+        "current_holders": curr,
+    }
+
+
+def _shareholder_summary(
+    holder_numbers: List[Dict[str, Any]],
+    hk_hold: List[Dict[str, Any]],
+    top10_float_change: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     latest_hn = holder_numbers[0] if holder_numbers else {}
     prev_hn = holder_numbers[1] if len(holder_numbers) > 1 else {}
     latest_hk = hk_hold[0] if hk_hold else {}
     prev_hk = hk_hold[1] if len(hk_hold) > 1 else {}
+    top10_float_change = top10_float_change or {}
+    hksc = top10_float_change.get("hksc") or {}
     return {
         "holder_num": _to_float(latest_hn.get("holder_num")),
         "holder_num_date": latest_hn.get("end_date"),
@@ -688,6 +816,10 @@ def _shareholder_summary(holder_numbers: List[Dict[str, Any]], hk_hold: List[Dic
             None if _to_float(latest_hk.get("ratio")) is None or _to_float(prev_hk.get("ratio")) is None
             else _to_float(latest_hk.get("ratio")) - _to_float(prev_hk.get("ratio"))
         ),
+        "intl_new_count": int(top10_float_change.get("intl_new_count") or 0),
+        "top10_float_period": top10_float_change.get("period_curr"),
+        "hksc_hold_ratio_chg": hksc.get("hold_ratio_chg"),
+        "hksc_hold_amount_chg": hksc.get("hold_amount_chg"),
     }
 
 
@@ -709,6 +841,17 @@ def _shareholder_section(symbol: str) -> Dict[str, Any]:
         limit=24,
         projection={"_id": 0, "ts_code": 1, "trade_date": 1, "vol": 1, "ratio": 1, "exchange": 1, "name": 1},
     )
+    top10_floatholders = _recent_docs_for_symbol(
+        data["top10_floatholders"],
+        candidates,
+        date_field="end_date",
+        limit=80,
+        projection={
+            "_id": 0, "ts_code": 1, "ann_date": 1, "end_date": 1, "holder_name": 1,
+            "hold_amount": 1, "hold_ratio": 1, "holder_rank": 1, "raw": 1,
+        },
+    )
+    top10_float_change = _top10_float_change(top10_floatholders)
     holder_trades = _recent_docs_for_symbol(
         data["stk_holdertrade"],
         candidates,
@@ -743,13 +886,15 @@ def _shareholder_section(symbol: str) -> Dict[str, Any]:
 
     return {
         "symbol": symbol,
-        "summary": _shareholder_summary(holder_numbers, hk_hold),
+        "summary": _shareholder_summary(holder_numbers, hk_hold, top10_float_change),
         "holder_numbers": holder_numbers,
         "hk_hold": hk_hold,
+        "top10_floatholders": top10_floatholders,
+        "top10_float_change": top10_float_change,
         "holder_trades": holder_trades,
         "share_floats": share_floats,
         "repurchases": repurchases,
-        "data_status": _shareholder_status(holder_numbers, hk_hold),
+        "data_status": _shareholder_status(holder_numbers, hk_hold, top10_float_change),
     }
 
 

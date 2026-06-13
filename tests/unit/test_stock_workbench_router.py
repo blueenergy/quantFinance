@@ -325,6 +325,13 @@ def test_shareholder_section_merges_chips_sources_and_summary(monkeypatch):
                 {"ts_code": "000001.SZ", "trade_date": "20251231", "vol": 4000000, "ratio": 5.0},
             ]
         ),
+        "top10_floatholders": _Collection(
+            [
+                {"ts_code": "000001.SZ", "end_date": "20260331", "holder_name": "UBSAG", "raw": {"hold_amount": 1000000, "hold_ratio": 1.2}},
+                {"ts_code": "000001.SZ", "end_date": "20260331", "holder_name": "香港中央结算有限公司", "raw": {"hold_amount": 8000000, "hold_ratio": 8.0}},
+                {"ts_code": "000001.SZ", "end_date": "20251231", "holder_name": "香港中央结算有限公司", "raw": {"hold_amount": 7000000, "hold_ratio": 7.5}},
+            ]
+        ),
         "stk_holdertrade": _Collection(
             [{"ts_code": "000001.SZ", "ann_date": "20260320", "holder_name": "张三", "in_de": "IN", "change_vol": 100000}]
         ),
@@ -344,6 +351,10 @@ def test_shareholder_section_merges_chips_sources_and_summary(monkeypatch):
     assert section["summary"]["holder_num_chg_pct"] == pytest.approx(-10.0)
     assert section["summary"]["northbound_ratio"] == 5.5
     assert section["summary"]["northbound_ratio_chg"] == pytest.approx(0.5)
+    assert section["summary"]["intl_new_count"] == 1
+    assert section["summary"]["hksc_hold_ratio_chg"] == pytest.approx(0.5)
+    assert section["top10_float_change"]["intl_new"][0]["norm_key"] == "UBS"
+    assert section["top10_float_change"]["hksc"]["hold_amount_chg"] == pytest.approx(1000000)
     assert section["holder_trades"][0]["holder_name"] == "张三"
     assert section["share_floats"][0]["share_type"] == "定增"
     assert section["repurchases"][0]["proc"] == "完成"
