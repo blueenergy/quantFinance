@@ -65,6 +65,102 @@ def test_kline_no_data_returns_message(monkeypatch):
 
 
 @pytest.mark.unit
+def test_kline_monthly_rebuilds_tail_from_daily(monkeypatch):
+    """预计算月线尾部落后时，用 sw_daily 重算最后周期并追加后续月份。"""
+
+    class Curs:
+        def __init__(self, docs):
+            self._docs = list(docs)
+
+        def sort(self, field, direction):
+            self._docs.sort(key=lambda row: row.get(field) or "", reverse=direction < 0)
+            return self
+
+        def limit(self, n):
+            self._docs = self._docs[:n]
+            return self
+
+        def __iter__(self):
+            return iter(self._docs)
+
+    class FakeCollection:
+        def __init__(self, docs):
+            self.docs = list(docs)
+
+        def find_one(self, query=None, projection=None, sort=None):
+            rows = list(self.find(query, projection))
+            if sort:
+                for field, direction in reversed(sort):
+                    rows.sort(key=lambda row: row.get(field) or "", reverse=direction < 0)
+            return rows[0] if rows else None
+
+        def find(self, query=None, projection=None):
+            rows = [dict(doc) for doc in self.docs if self._match(doc, query or {})]
+            if projection:
+                include = {k for k, v in projection.items() if v}
+                if include:
+                    rows = [{k: row.get(k) for k in include if k in row} for row in rows]
+            return Curs(rows)
+
+        def _match(self, doc, query):
+            for key, expected in query.items():
+                value = doc.get(key)
+                if isinstance(expected, dict):
+                    gte = expected.get("$gte")
+                    lte = expected.get("$lte")
+                    if gte and value < gte:
+                        return False
+                    if lte and value > lte:
+                        return False
+                    continue
+                if value != expected:
+                    return False
+            return True
+
+    stale_monthly = [
+        {
+            "ts_code": "801010.SI",
+            "trade_date": "20260424",
+            "open": 100,
+            "high": 110,
+            "low": 90,
+            "close": 105,
+            "vol": 100,
+            "amount": 1000,
+        }
+    ]
+    daily_rows = [
+        {"ts_code": "801010.SI", "trade_date": "20260401", "open": 100, "high": 110, "low": 90, "close": 102, "vol": 10, "amount": 100},
+        {"ts_code": "801010.SI", "trade_date": "20260424", "open": 103, "high": 112, "low": 99, "close": 105, "vol": 20, "amount": 200},
+        {"ts_code": "801010.SI", "trade_date": "20260430", "open": 106, "high": 120, "low": 104, "close": 118, "vol": 30, "amount": 300},
+        {"ts_code": "801010.SI", "trade_date": "20260529", "open": 119, "high": 130, "low": 115, "close": 128, "vol": 40, "amount": 400},
+        {"ts_code": "801010.SI", "trade_date": "20260612", "open": 129, "high": 140, "low": 125, "close": 136, "vol": 50, "amount": 500},
+    ]
+
+    c = _authed_client()
+    try:
+        monkeypatch.setattr(sm, "_MONTHLY", FakeCollection(stale_monthly))
+        monkeypatch.setattr(sm, "_DAILY", FakeCollection(daily_rows))
+        r = c.get(
+            "/api/shenwan-index/kline",
+            params={
+                "ts_code": "801010.SI",
+                "tf": "1m",
+                "start": "20260401",
+                "end": "20260614",
+                "limit": 50,
+            },
+        )
+        assert r.status_code == 200
+        data = r.json()["data"]
+        assert [row["trade_date"] for row in data] == ["20260430", "20260529", "20260612"]
+        assert data[0]["close"] == pytest.approx(118)
+        assert data[0]["vol"] == pytest.approx(60)
+    finally:
+        teardown_dep()
+
+
+@pytest.mark.unit
 def test_get_children_uses_industry_code_link(monkeypatch):
     """Tushare 子级 parent_code=父行 industry_code；用父 index 801050.SI 能查到 L2。"""
 

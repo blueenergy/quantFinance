@@ -250,12 +250,53 @@ def _load_daily_ohlc(
     return df
 
 
+def _period_key(trade_date: Any, tfc: str) -> str:
+    s = str(trade_date or "").replace("-", "")[:8]
+    if len(s) != 8 or not s.isdigit():
+        return s
+    if tfc == "1m":
+        return s[:6]
+    if tfc == "1w":
+        dt = datetime.strptime(s, "%Y%m%d")
+        iso = dt.isocalendar()
+        return f"{iso.year}-W{iso.week:02d}"
+    return s
+
+
+def _period_start(trade_date: Any, tfc: str) -> str:
+    s = str(trade_date or "").replace("-", "")[:8]
+    if len(s) != 8 or not s.isdigit():
+        return s
+    dt = datetime.strptime(s, "%Y%m%d")
+    if tfc == "1m":
+        return dt.replace(day=1).strftime("%Y%m%d")
+    if tfc == "1w":
+        return (dt - timedelta(days=dt.weekday())).strftime("%Y%m%d")
+    return s
+
+
+def _kline_row_from_doc(raw: Dict[str, Any]) -> Dict[str, Any]:
+    tdr = raw.get("trade_date", "")
+    rec: Dict[str, Any] = {"trade_date": str(tdr)[:8] if tdr else ""}
+    for c in ("name", "open", "high", "low", "close", "vol", "amount",
+              "change", "pct_change", "float_mv", "total_mv", "pe", "pb"):
+        v = raw.get(c)
+        if v is None or (isinstance(v, float) and pd.isna(v)):
+            continue
+        try:
+            rec[c] = float(v) if c != "name" else str(v)
+        except Exception:  # pragma: no cover
+            rec[c] = v
+    return rec
+
+
 def _agg_ohlc(df: pd.DataFrame, rule: str) -> List[Dict[str, Any]]:
     if df is None or df.empty or "trade_date" not in df.columns:
         return []
     df = df.copy()
     df["td"] = pd.to_datetime(df["trade_date"].astype(str), format="%Y%m%d", errors="coerce")
     df = df.dropna(subset=["td"]).set_index("td").sort_index()
+    df["_period_trade_date"] = df.index
     if rule == "1w":
         ohlc = df.resample("W-FRI", label="right", closed="right").agg(
             {
@@ -263,6 +304,7 @@ def _agg_ohlc(df: pd.DataFrame, rule: str) -> List[Dict[str, Any]]:
                 "high": "max",
                 "low": "min",
                 "close": "last",
+                "_period_trade_date": "last",
             }
         )
         if "vol" in df.columns:
@@ -279,6 +321,7 @@ def _agg_ohlc(df: pd.DataFrame, rule: str) -> List[Dict[str, Any]]:
                 "high": "max",
                 "low": "min",
                 "close": "last",
+                "_period_trade_date": "last",
             }
         )
         if "vol" in df.columns:
@@ -293,7 +336,11 @@ def _agg_ohlc(df: pd.DataFrame, rule: str) -> List[Dict[str, Any]]:
     ohlc = ohlc.dropna(how="all")
     out: List[Dict[str, Any]] = []
     for idx, r in ohlc.iterrows():
-        td = idx.strftime("%Y%m%d")
+        td = (
+            pd.to_datetime(r.get("_period_trade_date")).strftime("%Y%m%d")
+            if "_period_trade_date" in ohlc.columns and pd.notna(r.get("_period_trade_date"))
+            else idx.strftime("%Y%m%d")
+        )
         if pd.isna(r.get("close")):
             continue
         rec: Dict[str, Any] = {
@@ -364,20 +411,28 @@ async def get_kline(
         if pre_rows:
             pre_rows.reverse()  # ascending by trade_date
             response.headers["X-Quant-Data-Collection"] = col_name
-            ohlc_list: List[Dict[str, Any]] = []
-            for raw in pre_rows:
-                tdr = raw.get("trade_date", "")
-                rec: Dict[str, Any] = {"trade_date": str(tdr)[:8] if tdr else ""}
-                for c in ("name", "open", "high", "low", "close", "vol", "amount",
-                          "change", "pct_change", "float_mv", "total_mv", "pe", "pb"):
-                    v = raw.get(c)
-                    if v is None or (isinstance(v, float) and pd.isna(v)):
-                        continue
-                    try:
-                        rec[c] = float(v) if c != "name" else str(v)
-                    except Exception:  # pragma: no cover
-                        rec[c] = v
-                ohlc_list.append(rec)
+            ohlc_list = [_kline_row_from_doc(raw) for raw in pre_rows]
+            latest_daily = _DAILY.find_one(
+                _sw_daily_flt_ts_date_range(ts_code, start_s, end_s),
+                {"_id": 0, "trade_date": 1},
+                sort=[("trade_date", DESCENDING)],
+            )
+            latest_daily_date = str((latest_daily or {}).get("trade_date") or "")[:8]
+            last_pre_date = str(ohlc_list[-1].get("trade_date") or "")[:8] if ohlc_list else ""
+            if latest_daily_date and last_pre_date and latest_daily_date > last_pre_date:
+                rebuild_start = _period_start(last_pre_date, tfc)
+                tail_df = _load_daily_ohlc(ts_code, rebuild_start, end_s)
+                tail_rows = _agg_ohlc(tail_df, tfc)
+                if tail_rows:
+                    tail_keys = {_period_key(row.get("trade_date"), tfc) for row in tail_rows}
+                    ohlc_list = [
+                        row for row in ohlc_list
+                        if _period_key(row.get("trade_date"), tfc) not in tail_keys
+                    ]
+                    ohlc_list.extend(tail_rows)
+                    ohlc_list.sort(key=lambda row: str(row.get("trade_date") or ""))
+                    if len(ohlc_list) > int(limit):
+                        ohlc_list = ohlc_list[-int(limit):]
             return {
                 "success": True,
                 "tf": tfc,
@@ -630,7 +685,7 @@ async def get_industry_money_flow(
     current_user: Dict = Depends(get_current_active_user),  # noqa: ARG001
     index_code: str = Query(..., min_length=4, description="行业指数 index_code，如 801010.SI"),
     src: str = Query("SW2021"),
-    days: int = Query(60, ge=5, le=120),
+    days: int = Query(60, ge=5, le=1500),
     current_only: bool = Query(True, description="True 仅聚合当前成分 is_new=Y"),
 ):
     """按行业成分股 on-demand 聚合 money_flow，作为预聚合表落地前的轻量 MVP。"""
@@ -660,7 +715,7 @@ async def get_industry_money_flow(
 
     member_names = {row.get("con_code"): row.get("name") for row in members if row.get("con_code")}
     codes = list(member_names.keys())
-    row_limit = min(max(days * max(member_count, 1) * 2, days), 60000)
+    row_limit = min(max(days * max(member_count, 1) * 2, days), 800000)
     projection = {
         "_id": 0,
         "ts_code": 1,
