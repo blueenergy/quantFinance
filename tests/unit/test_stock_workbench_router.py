@@ -6,6 +6,7 @@ from routers.stock_workbench import (
     _analysis_history,
     _attach_display_pct_change,
     _financials_section,
+    _kline_section,
     _nineturn_section,
     _quote_section,
     _quote_status,
@@ -232,8 +233,8 @@ def test_quote_section_merges_market_money_flow_and_daily_basic(monkeypatch):
 
     assert section["quote"]["source"] == "daily"
     assert section["daily_quotes"][0]["close"] == 10.0
-    assert section["weekly_quotes"][0]["close"] == 10.2
-    assert section["monthly_quotes"][0]["close"] == 10.8
+    assert "weekly_quotes" not in section
+    assert "monthly_quotes" not in section
     assert section["daily_basic"]["pe_ttm"] == 8.2
     assert section["money_flow"]["net_mf_amount"] == 1234.5
     assert [row["trade_date"] for row in section["money_flow_history"]] == ["20260609", "20260610"]
@@ -244,6 +245,29 @@ def test_quote_section_merges_market_money_flow_and_daily_basic(monkeypatch):
     assert section["money_flow_summary"]["inflow_streak"] == 1
     assert section["money_flow_summary"]["unit"] == "wan_yuan"
     assert section["data_status"]["found"] is True
+
+
+def test_kline_section_loads_weekly_and_monthly_on_demand(monkeypatch):
+    data = {
+        "volume_price": _Collection([]),
+        "stock_weekly": _Collection(
+            [{"ts_code": "000001.SZ", "trade_date": "20260612", "close": 10.2}]
+        ),
+        "stock_monthly": _Collection(
+            [{"ts_code": "000001.SZ", "trade_date": "20260630", "close": 10.8}]
+        ),
+    }
+    monkeypatch.setattr("routers.stock_workbench.get_data_db", lambda: data)
+
+    weekly = _kline_section("000001.SZ", "1w")
+    monthly = _kline_section("000001.SZ", "1m")
+
+    assert weekly["tf"] == "1w"
+    assert weekly["rows"][0]["close"] == 10.2
+    assert weekly["data_status"]["source"] == "quant_data.stock_weekly"
+    assert monthly["tf"] == "1m"
+    assert monthly["rows"][0]["close"] == 10.8
+    assert monthly["data_status"]["source"] == "quant_data.stock_monthly"
 
 
 def test_nineturn_section_enriches_raw_tushare_signal(monkeypatch):

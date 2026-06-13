@@ -5,7 +5,7 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException, Query
 
 from auth import get_current_active_user
 from db import get_analyzer_db, get_data_db, get_db_collections
@@ -246,20 +246,6 @@ def _quote_section(symbol: str) -> Dict[str, Any]:
         limit=WORKBENCH_DAILY_KLINE_LIMIT,
         fields=("symbol",),
     )
-    weekly_quotes = _recent_kline_docs(
-        data,
-        "stock_weekly",
-        candidates,
-        limit=WORKBENCH_WEEKLY_KLINE_LIMIT,
-        fields=("ts_code", "symbol"),
-    )
-    monthly_quotes = _recent_kline_docs(
-        data,
-        "stock_monthly",
-        candidates,
-        limit=WORKBENCH_MONTHLY_KLINE_LIMIT,
-        fields=("ts_code", "symbol"),
-    )
     daily_basic = _recent_docs_for_symbol(
         data["financial_daily_basic"],
         candidates,
@@ -326,13 +312,55 @@ def _quote_section(symbol: str) -> Dict[str, Any]:
         "symbol": symbol,
         "quote": quote,
         "daily_quotes": daily_quotes,
-        "weekly_quotes": weekly_quotes,
-        "monthly_quotes": monthly_quotes,
         "daily_basic": daily_basic[0] if daily_basic else None,
         "money_flow": money_flow[0] if money_flow else None,
         "money_flow_history": money_flow_history,
         "money_flow_summary": _money_flow_summary(money_flow_history_desc),
         "data_status": status,
+    }
+
+
+def _kline_section(symbol: str, tf: str) -> Dict[str, Any]:
+    data = get_data_db()
+    candidates = _symbol_candidates(symbol)
+    tfc = (tf or "1d").strip().lower()
+    if tfc in ("d",):
+        tfc = "1d"
+    elif tfc in ("w",):
+        tfc = "1w"
+    elif tfc in ("m",):
+        tfc = "1m"
+    if tfc not in ("1d", "1w", "1m"):
+        raise HTTPException(status_code=400, detail="tf must be 1d, 1w, or 1m")
+
+    collection_name = {
+        "1d": "volume_price",
+        "1w": "stock_weekly",
+        "1m": "stock_monthly",
+    }[tfc]
+    limit = {
+        "1d": WORKBENCH_DAILY_KLINE_LIMIT,
+        "1w": WORKBENCH_WEEKLY_KLINE_LIMIT,
+        "1m": WORKBENCH_MONTHLY_KLINE_LIMIT,
+    }[tfc]
+    fields = ("symbol",) if tfc == "1d" else ("ts_code", "symbol")
+    rows = _recent_kline_docs(
+        data,
+        collection_name,
+        candidates,
+        limit=limit,
+        fields=fields,
+    )
+    return {
+        "symbol": symbol,
+        "tf": tfc,
+        "rows": rows,
+        "data_status": _section_status(
+            found=bool(rows),
+            as_of=(rows[0] if rows else {}).get("trade_date"),
+            expected_freshness="按周期切换时加载",
+            source=f"quant_data.{collection_name}",
+        ),
     }
 
 
@@ -1179,6 +1207,19 @@ def get_stock_workbench_quote(
     return {
         "success": True,
         "data": _json_safe(_quote_section(symbol)),
+    }
+
+
+@router.get("/{symbol}/workbench/kline")
+def get_stock_workbench_kline(
+    symbol: str,
+    tf: str = Query("1d", description="1d=日线, 1w=周线, 1m=月线"),
+    current_user: Dict[str, Any] = Depends(get_current_active_user),
+):
+    """K-line rows for a selected stock workbench timeframe."""
+    return {
+        "success": True,
+        "data": _json_safe(_kline_section(symbol, tf)),
     }
 
 
