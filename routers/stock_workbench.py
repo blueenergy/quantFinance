@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import logging
+import os
 import re
 import sys
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -20,11 +23,13 @@ except ModuleNotFoundError:
     from stock_data_access.indicators.nineturn import enrich_nineturn_signals, latest_signal_summary
 
 router = APIRouter()
+log = logging.getLogger(__name__)
 
 WORKBENCH_DAILY_KLINE_LIMIT = 360
 WORKBENCH_MONEY_FLOW_HISTORY_LIMIT = 120
 WORKBENCH_WEEKLY_KLINE_LIMIT = 260
 WORKBENCH_MONTHLY_KLINE_LIMIT = 260
+WORKBENCH_PROFILE_ENABLED = os.getenv("WORKBENCH_PROFILE", "").strip().lower() in {"1", "true", "yes", "on"}
 
 KLINE_PROJECTION = {
     "_id": 0,
@@ -42,6 +47,40 @@ KLINE_PROJECTION = {
     "volume": 1,
     "amount": 1,
 }
+
+
+class _WorkbenchProfiler:
+    def __init__(self, section: str, symbol: str):
+        self.enabled = WORKBENCH_PROFILE_ENABLED
+        self.section = section
+        self.symbol = symbol
+        self.started = time.perf_counter()
+        self.last = self.started
+        self.parts: List[str] = []
+
+    def lap(self, name: str, **extra: Any) -> None:
+        if not self.enabled:
+            return
+        now = time.perf_counter()
+        elapsed_ms = (now - self.last) * 1000
+        self.last = now
+        suffix = " ".join(f"{key}={value}" for key, value in extra.items() if value is not None)
+        self.parts.append(f"{name}={elapsed_ms:.1f}ms{(' ' + suffix) if suffix else ''}")
+
+    def finish(self, **extra: Any) -> None:
+        if not self.enabled:
+            return
+        total_ms = (time.perf_counter() - self.started) * 1000
+        suffix = " ".join(f"{key}={value}" for key, value in extra.items() if value is not None)
+        log.info(
+            "workbench_profile section=%s symbol=%s total=%.1fms parts=[%s]%s%s",
+            self.section,
+            self.symbol,
+            total_ms,
+            "; ".join(self.parts),
+            " " if suffix else "",
+            suffix,
+        )
 
 
 def _to_float(value: Any) -> Optional[float]:
@@ -236,9 +275,12 @@ def _money_flow_summary(history_desc: List[Dict[str, Any]]) -> Dict[str, Any]:
 
 
 def _quote_section(symbol: str) -> Dict[str, Any]:
+    profiler = _WorkbenchProfiler("quote", symbol)
     data = get_data_db()
     candidates = _symbol_candidates(symbol)
+    profiler.lap("setup", candidates=len(candidates))
     quote = _latest_quote(symbol)
+    profiler.lap("latest_quote", found=bool(quote))
     daily_quotes = _recent_kline_docs(
         data,
         "volume_price",
@@ -246,6 +288,7 @@ def _quote_section(symbol: str) -> Dict[str, Any]:
         limit=WORKBENCH_DAILY_KLINE_LIMIT,
         fields=("symbol",),
     )
+    profiler.lap("daily_kline", rows=len(daily_quotes))
     daily_basic = _recent_docs_for_symbol(
         data["financial_daily_basic"],
         candidates,
@@ -269,6 +312,7 @@ def _quote_section(symbol: str) -> Dict[str, Any]:
             "circ_mv": 1,
         },
     )
+    profiler.lap("daily_basic", rows=len(daily_basic))
     money_flow = _recent_docs_for_symbol(
         data["money_flow"],
         candidates,
@@ -301,26 +345,36 @@ def _quote_section(symbol: str) -> Dict[str, Any]:
         },
         fields=("symbol", "ts_code"),
     )
+    profiler.lap("money_flow", rows=len(money_flow))
     money_flow_history_desc = [_money_flow_history_row(row) for row in money_flow]
     money_flow_history = sorted(money_flow_history_desc, key=lambda row: str(row.get("trade_date") or ""))
+    money_flow_summary = _money_flow_summary(money_flow_history_desc)
+    profiler.lap("money_flow_transform", rows=len(money_flow_history))
     status = _quote_status(quote)
     if not status["as_of"]:
         status["as_of"] = (daily_quotes[0] if daily_quotes else {}).get("trade_date")
     status["found"] = bool(quote or daily_quotes or daily_basic or money_flow)
     status["source"] = "quant_realtime.volume_price_realtime_latest + quant_data.volume_price/money_flow/financial_daily_basic"
-    return {
+    result = {
         "symbol": symbol,
         "quote": quote,
         "daily_quotes": daily_quotes,
         "daily_basic": daily_basic[0] if daily_basic else None,
         "money_flow": money_flow[0] if money_flow else None,
         "money_flow_history": money_flow_history,
-        "money_flow_summary": _money_flow_summary(money_flow_history_desc),
+        "money_flow_summary": money_flow_summary,
         "data_status": status,
     }
+    profiler.finish(
+        found=status["found"],
+        daily_rows=len(daily_quotes),
+        money_flow_rows=len(money_flow),
+    )
+    return result
 
 
 def _kline_section(symbol: str, tf: str) -> Dict[str, Any]:
+    profiler = _WorkbenchProfiler("kline", symbol)
     data = get_data_db()
     candidates = _symbol_candidates(symbol)
     tfc = (tf or "1d").strip().lower()
@@ -351,7 +405,8 @@ def _kline_section(symbol: str, tf: str) -> Dict[str, Any]:
         limit=limit,
         fields=fields,
     )
-    return {
+    profiler.lap("kline_query", tf=tfc, collection=collection_name, rows=len(rows), limit=limit)
+    result = {
         "symbol": symbol,
         "tf": tfc,
         "rows": rows,
@@ -362,6 +417,8 @@ def _kline_section(symbol: str, tf: str) -> Dict[str, Any]:
             source=f"quant_data.{collection_name}",
         ),
     }
+    profiler.finish(tf=tfc, rows=len(rows))
+    return result
 
 
 def _nineturn_section(symbol: str) -> Dict[str, Any]:
