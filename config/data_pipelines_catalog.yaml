@@ -363,6 +363,96 @@ pipelines:
         channels: [email, data_pulse]
         "on": [repair_failed, still_violated]
 
+  - id: stk_holdernumber_sync
+    label: 股东户数
+    job_status_key: stk_holdernumber_sync
+    group: layer0
+    depends_on: []
+    trigger_on_complete: false   # 季度披露数据，按 on-demand / cron 独立调度
+    run_mode: on_demand
+    schedule_hint: "手动/合约修复触发 run_holdernumber_sync（季报期后回填，未接入 crontab）"
+    freshness:
+      database: quant_data
+      collection: stk_holdernumber
+      field: end_date
+      field_kind: date_string
+    contract:
+      source: tushare
+      storage: { database: quant_data, collection: stk_holdernumber, date_field: end_date, symbol_field: ts_code }
+      window: { start: "20180101", end: rolling }
+      completeness:
+        kind: run_recency
+      sla:
+        max_run_lag_days: 7
+      on_violation:
+        auto_repair: true
+        repair_task: run_holdernumber_sync
+        repair_args: ["--days", "120"]
+        max_repair_window_days: 30
+      alert:
+        channels: [email, data_pulse]
+        "on": [repair_failed, still_violated]
+
+  - id: shareholder_event_sync
+    label: 股东事件（增减持/解禁/回购）
+    job_status_key: shareholder_event_sync
+    group: layer0
+    depends_on: []
+    trigger_on_complete: false
+    run_mode: on_demand
+    schedule_hint: "手动/合约修复触发 run_shareholder_event_sync（公告驱动，未接入 crontab）"
+    freshness:
+      database: quant_data
+      collection: stk_holdertrade
+      field: ann_date
+      field_kind: date_string
+    contract:
+      source: tushare
+      storage: { database: quant_data, collection: stk_holdertrade, date_field: ann_date, symbol_field: ts_code }
+      window: { start: "20180101", end: rolling }
+      completeness:
+        kind: run_recency
+      sla:
+        max_run_lag_days: 3
+      on_violation:
+        auto_repair: true
+        repair_task: run_shareholder_event_sync
+        repair_args: ["--days", "7"]
+        max_repair_window_days: 30
+      alert:
+        channels: [email, data_pulse]
+        "on": [repair_failed, still_violated]
+
+  - id: hk_hold_sync
+    label: 沪深港股通持股
+    job_status_key: hk_hold_sync
+    group: layer0
+    depends_on: []
+    trigger_on_complete: false
+    run_mode: on_demand
+    schedule_hint: "手动/合约修复触发 run_hk_hold_sync（2024-08 后季度披露，未接入 crontab）"
+    freshness:
+      database: quant_data
+      collection: hk_hold
+      field: trade_date
+      field_kind: date_string
+    contract:
+      source: tushare
+      storage: { database: quant_data, collection: hk_hold, date_field: trade_date, symbol_field: ts_code }
+      window: { start: "20240801", end: rolling }
+      completeness:
+        kind: run_recency
+      sla:
+        max_run_lag_days: 7
+      on_violation:
+        auto_repair: true
+        repair_task: run_hk_hold_sync
+        repair_args: ["--recent-quarters", "2"]
+        max_repair_window_days: 30
+      alert:
+        channels: [email, data_pulse]
+        "on": [repair_failed, still_violated]
+
   - id: cn_macro_sync
     label: 国内宏观数据
     job_status_key: cn_macro_sync
