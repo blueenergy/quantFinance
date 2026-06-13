@@ -349,6 +349,33 @@ pipelines:
         channels: [email, data_pulse]
         "on": [repair_failed, still_violated]
 
+  - id: nineturn_sync
+    label: 神奇九转
+    job_status_key: nineturn_sync
+    group: layer0
+    depends_on: []
+    trigger_on_complete: false
+    run_mode: cron
+    schedule_hint: "Supercronic 工作日 21:30 → daily_market_sync.sh nineturn（Tushare stk_nineturn 21:00 后更新；本轮仅 daily）"
+    freshness:
+      database: quant_data
+      collection: stk_nineturn
+      field: trade_date
+      field_kind: date_string
+    contract:
+      source: tushare
+      storage: { database: quant_data, collection: stk_nineturn, date_field: trade_date, symbol_field: ts_code }
+      window: { start: "20250101", end: rolling }
+      sla: { max_lag_trading_days: 2, min_coverage_pct: 99.0, min_symbols_latest_day: 0 }
+      on_violation:
+        auto_repair: true
+        repair_task: run_nineturn_sync
+        repair_args: ["--start", "{start}", "--end", "{end}"]
+        max_repair_window_days: 30
+      alert:
+        channels: [email, data_pulse]
+        "on": [repair_failed, still_violated]
+
   - id: earnings_sync
     label: 业绩数据
     job_status_key: earnings_sync

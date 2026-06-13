@@ -6,6 +6,7 @@ from routers.stock_workbench import (
     _analysis_history,
     _attach_display_pct_change,
     _financials_section,
+    _nineturn_section,
     _quote_section,
     _quote_status,
     _score_history,
@@ -193,6 +194,52 @@ def test_quote_section_merges_market_money_flow_and_daily_basic(monkeypatch):
     assert section["daily_basic"]["pe_ttm"] == 8.2
     assert section["money_flow"]["net_mf_amount"] == 1234.5
     assert section["data_status"]["found"] is True
+
+
+def test_nineturn_section_enriches_raw_tushare_signal(monkeypatch):
+    daily_rows = []
+    for idx in range(60):
+        day = idx + 1
+        close = 100 + idx
+        daily_rows.append(
+            {
+                "symbol": "000001.SZ",
+                "trade_date": f"202604{day:02d}",
+                "open": close - 1,
+                "high": close + 2,
+                "low": close - 2,
+                "close": close,
+                "vol": 1000,
+            }
+        )
+    daily_rows[-4]["low"] = 150
+    daily_rows[-3]["low"] = 151
+    daily_rows[-2]["low"] = 149
+    daily_rows[-1]["low"] = 148
+    daily_rows[-1]["vol"] = 400
+    nineturn_rows = [
+        {
+            "ts_code": "000001.SZ",
+            "symbol": "000001.SZ",
+            "trade_date": daily_rows[-1]["trade_date"],
+            "freq": "daily",
+            "down_count": 9,
+            "nine_down_turn": "-9",
+        }
+    ]
+    data = {
+        "volume_price": _Collection(daily_rows),
+        "stk_nineturn": _Collection(nineturn_rows),
+    }
+    monkeypatch.setattr("routers.stock_workbench.get_data_db", lambda: data)
+
+    section = _nineturn_section("000001.SZ")
+
+    assert section["data_status"]["found"] is True
+    assert section["latest_signal"]["grade"] == "strong"
+    assert section["signals"][0]["perfect"] is True
+    assert section["signals"][0]["vol_filter_pass"] is True
+    assert section["signals"][0]["trend_filter_pass"] is True
 
 
 def test_financials_section_merges_statements_and_earnings(monkeypatch):

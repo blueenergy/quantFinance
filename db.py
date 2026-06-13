@@ -174,6 +174,7 @@ def get_data_db():
         "stock_weekly": data_db["stock_weekly"],
         "stock_monthly": data_db["stock_monthly"],
         "money_flow": data_db["money_flow"],
+        "stk_nineturn": data_db["stk_nineturn"],
         "minute_bars": data_db["minute_bars"],
         # Limit-up/down ladder
         "daily_limit_up": data_db["daily_limit_up"],

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import re
+import sys
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends
@@ -9,8 +11,17 @@ from auth import get_current_active_user
 from db import get_analyzer_db, get_data_db, get_db_collections
 from routers.stock import _json_safe, _symbol_candidates
 from services.analysis_history import build_user_analysis_history_payload
+try:
+    from stock_data_access.indicators.nineturn import enrich_nineturn_signals, latest_signal_summary
+except ModuleNotFoundError:
+    _stock_data_access_src = Path(__file__).resolve().parents[1] / "data-access-lib" / "src"
+    if str(_stock_data_access_src) not in sys.path:
+        sys.path.insert(0, str(_stock_data_access_src))
+    from stock_data_access.indicators.nineturn import enrich_nineturn_signals, latest_signal_summary
 
 router = APIRouter()
+
+WORKBENCH_DAILY_KLINE_LIMIT = 360
 
 
 def _to_float(value: Any) -> Optional[float]:
@@ -114,7 +125,7 @@ def _quote_section(symbol: str) -> Dict[str, Any]:
         data["volume_price"],
         candidates,
         date_field="trade_date",
-        limit=160,
+        limit=WORKBENCH_DAILY_KLINE_LIMIT,
         projection={
             "_id": 0,
             "symbol": 1,
@@ -196,6 +207,77 @@ def _quote_section(symbol: str) -> Dict[str, Any]:
         "daily_basic": daily_basic[0] if daily_basic else None,
         "money_flow": money_flow[0] if money_flow else None,
         "data_status": status,
+    }
+
+
+def _nineturn_section(symbol: str) -> Dict[str, Any]:
+    data = get_data_db()
+    candidates = _symbol_candidates(symbol)
+    daily_quotes = _recent_docs_for_symbol(
+        data["volume_price"],
+        candidates,
+        date_field="trade_date",
+        limit=WORKBENCH_DAILY_KLINE_LIMIT,
+        projection={
+            "_id": 0,
+            "symbol": 1,
+            "trade_date": 1,
+            "open": 1,
+            "high": 1,
+            "low": 1,
+            "close": 1,
+            "pre_close": 1,
+            "pct_chg": 1,
+            "vol": 1,
+            "volume": 1,
+            "amount": 1,
+        },
+        fields=("symbol",),
+    )
+    nineturn_rows = _recent_docs_for_symbol(
+        data["stk_nineturn"],
+        candidates,
+        date_field="trade_date",
+        limit=WORKBENCH_DAILY_KLINE_LIMIT,
+        projection={
+            "_id": 0,
+            "symbol": 1,
+            "ts_code": 1,
+            "trade_date": 1,
+            "freq": 1,
+            "open": 1,
+            "high": 1,
+            "low": 1,
+            "close": 1,
+            "vol": 1,
+            "amount": 1,
+            "up_count": 1,
+            "down_count": 1,
+            "nine_up_turn": 1,
+            "nine_down_turn": 1,
+        },
+    )
+    daily_quotes_asc = sorted(daily_quotes, key=lambda row: str(row.get("trade_date") or ""))
+    nineturn_rows_asc = sorted(nineturn_rows, key=lambda row: str(row.get("trade_date") or ""))
+    signals = enrich_nineturn_signals(daily_quotes_asc, nineturn_rows_asc)
+    latest_signal = latest_signal_summary(signals)
+    as_of = (
+        (nineturn_rows[0] if nineturn_rows else {}).get("trade_date")
+        or (daily_quotes[0] if daily_quotes else {}).get("trade_date")
+    )
+    return {
+        "symbol": symbol,
+        "freq": "daily",
+        "daily_quotes": daily_quotes,
+        "nine_turn_rows": nineturn_rows,
+        "signals": signals,
+        "latest_signal": latest_signal,
+        "data_status": _section_status(
+            found=bool(nineturn_rows or signals),
+            as_of=as_of,
+            expected_freshness="T+1 21:30 后",
+            source="quant_data.stk_nineturn + quant_data.volume_price",
+        ),
     }
 
 
@@ -919,6 +1001,11 @@ def get_stock_workbench(
         "analysis_created_at": (deep_analysis or {}).get("created_at"),
         "sections": {
             "quote": _quote_status(quote),
+            "nine_turn": _section_status(
+                found=False,
+                expected_freshness="进入神奇九转页签后按需加载",
+                source="quant_data.stk_nineturn + quant_data.volume_price",
+            ),
             "scores": _score_status(score),
             "financials": _section_status(
                 found=False,
@@ -963,6 +1050,18 @@ def get_stock_workbench_quote(
     return {
         "success": True,
         "data": _json_safe(_quote_section(symbol)),
+    }
+
+
+@router.get("/{symbol}/workbench/nine-turn")
+def get_stock_workbench_nine_turn(
+    symbol: str,
+    current_user: Dict[str, Any] = Depends(get_current_active_user),
+):
+    """Nine-turn signal section for the single-stock research workbench."""
+    return {
+        "success": True,
+        "data": _json_safe(_nineturn_section(symbol)),
     }
 
 
