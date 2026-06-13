@@ -163,6 +163,28 @@ def test_quote_section_merges_market_money_flow_and_daily_basic(monkeypatch):
                 }
             ]
         ),
+        "stock_weekly": _Collection(
+            [
+                {
+                    "_id": 11,
+                    "ts_code": "000001.SZ",
+                    "trade_date": "20260612",
+                    "close": 10.2,
+                    "pct_chg": 2.0,
+                }
+            ]
+        ),
+        "stock_monthly": _Collection(
+            [
+                {
+                    "_id": 12,
+                    "ts_code": "000001.SZ",
+                    "trade_date": "20260630",
+                    "close": 10.8,
+                    "pct_chg": 8.0,
+                }
+            ]
+        ),
         "financial_daily_basic": _Collection(
             [
                 {
@@ -210,6 +232,8 @@ def test_quote_section_merges_market_money_flow_and_daily_basic(monkeypatch):
 
     assert section["quote"]["source"] == "daily"
     assert section["daily_quotes"][0]["close"] == 10.0
+    assert section["weekly_quotes"][0]["close"] == 10.2
+    assert section["monthly_quotes"][0]["close"] == 10.8
     assert section["daily_basic"]["pe_ttm"] == 8.2
     assert section["money_flow"]["net_mf_amount"] == 1234.5
     assert [row["trade_date"] for row in section["money_flow_history"]] == ["20260609", "20260610"]

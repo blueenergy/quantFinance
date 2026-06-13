@@ -23,6 +23,25 @@ router = APIRouter()
 
 WORKBENCH_DAILY_KLINE_LIMIT = 360
 WORKBENCH_MONEY_FLOW_HISTORY_LIMIT = 120
+WORKBENCH_WEEKLY_KLINE_LIMIT = 260
+WORKBENCH_MONTHLY_KLINE_LIMIT = 260
+
+KLINE_PROJECTION = {
+    "_id": 0,
+    "symbol": 1,
+    "ts_code": 1,
+    "trade_date": 1,
+    "open": 1,
+    "high": 1,
+    "low": 1,
+    "close": 1,
+    "pre_close": 1,
+    "pct_chg": 1,
+    "pct_change": 1,
+    "vol": 1,
+    "volume": 1,
+    "amount": 1,
+}
 
 
 def _to_float(value: Any) -> Optional[float]:
@@ -118,6 +137,36 @@ def _recent_docs_for_symbol(
     return []
 
 
+def _data_collection(data: Any, name: str) -> Any:
+    if isinstance(data, dict):
+        return data.get(name)
+    try:
+        return data[name]
+    except Exception:
+        return None
+
+
+def _recent_kline_docs(
+    data: Any,
+    collection_name: str,
+    candidates: List[str],
+    *,
+    limit: int,
+    fields: tuple[str, ...],
+) -> List[Dict[str, Any]]:
+    collection = _data_collection(data, collection_name)
+    if collection is None:
+        return []
+    return _recent_docs_for_symbol(
+        collection,
+        candidates,
+        date_field="trade_date",
+        limit=limit,
+        projection=KLINE_PROJECTION,
+        fields=fields,
+    )
+
+
 def _amount_diff(row: Dict[str, Any], buy_key: str, sell_key: str) -> Optional[float]:
     buy = _to_float(row.get(buy_key))
     sell = _to_float(row.get(sell_key))
@@ -190,26 +239,26 @@ def _quote_section(symbol: str) -> Dict[str, Any]:
     data = get_data_db()
     candidates = _symbol_candidates(symbol)
     quote = _latest_quote(symbol)
-    daily_quotes = _recent_docs_for_symbol(
-        data["volume_price"],
+    daily_quotes = _recent_kline_docs(
+        data,
+        "volume_price",
         candidates,
-        date_field="trade_date",
         limit=WORKBENCH_DAILY_KLINE_LIMIT,
-        projection={
-            "_id": 0,
-            "symbol": 1,
-            "trade_date": 1,
-            "open": 1,
-            "high": 1,
-            "low": 1,
-            "close": 1,
-            "pre_close": 1,
-            "pct_chg": 1,
-            "vol": 1,
-            "volume": 1,
-            "amount": 1,
-        },
         fields=("symbol",),
+    )
+    weekly_quotes = _recent_kline_docs(
+        data,
+        "stock_weekly",
+        candidates,
+        limit=WORKBENCH_WEEKLY_KLINE_LIMIT,
+        fields=("ts_code", "symbol"),
+    )
+    monthly_quotes = _recent_kline_docs(
+        data,
+        "stock_monthly",
+        candidates,
+        limit=WORKBENCH_MONTHLY_KLINE_LIMIT,
+        fields=("ts_code", "symbol"),
     )
     daily_basic = _recent_docs_for_symbol(
         data["financial_daily_basic"],
@@ -277,6 +326,8 @@ def _quote_section(symbol: str) -> Dict[str, Any]:
         "symbol": symbol,
         "quote": quote,
         "daily_quotes": daily_quotes,
+        "weekly_quotes": weekly_quotes,
+        "monthly_quotes": monthly_quotes,
         "daily_basic": daily_basic[0] if daily_basic else None,
         "money_flow": money_flow[0] if money_flow else None,
         "money_flow_history": money_flow_history,
