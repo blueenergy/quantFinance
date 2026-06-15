@@ -760,6 +760,12 @@ def _get_number(row: Dict[str, Any], key: str) -> Optional[float]:
         return None
 
 
+def _format_percent_points(value: Optional[float]) -> Optional[str]:
+    if value is None:
+        return None
+    return f"{value:.2f}%"
+
+
 def _symbol_variants(ts_code: str) -> List[str]:
     symbol = str(ts_code or "").strip()
     if not symbol:
@@ -837,6 +843,121 @@ def _latest_previous_period(collection: Any, period: str) -> Optional[str]:
     return valid[-1] if valid else None
 
 
+def _foreign_holder_row(row: Dict[str, Any], norm: Dict[str, str]) -> Dict[str, Any]:
+    hold_ratio = _get_number(row, "hold_ratio")
+    return {
+        "ts_code": str(row.get("ts_code") or ""),
+        "ann_date": row.get("ann_date"),
+        "end_date": row.get("end_date"),
+        "holder_name": row.get("holder_name"),
+        "norm_key": norm["key"],
+        "norm_label": norm["label"],
+        "holder_rank": row.get("holder_rank"),
+        "hold_amount": _get_number(row, "hold_amount"),
+        # Tushare/top10_floatholders stores hold_ratio as percent points
+        # (e.g. 0.199 means 0.199%), not as a 0-1 fraction.
+        "hold_ratio": hold_ratio,
+        "hold_ratio_pct": hold_ratio,
+        "hold_ratio_display": _format_percent_points(hold_ratio),
+    }
+
+
+def _foreign_holder_matches(collection: Any, period: str, selected_keys: Optional[set[str]]) -> List[Dict[str, Any]]:
+    rows = list(collection.find(
+        {"end_date": period},
+        {
+            "_id": 0,
+            "ts_code": 1,
+            "ann_date": 1,
+            "end_date": 1,
+            "holder_name": 1,
+            "holder_rank": 1,
+            "hold_amount": 1,
+            "hold_ratio": 1,
+            "raw": 1,
+        },
+    ))
+    matches: List[Dict[str, Any]] = []
+    for row in rows:
+        norm = _normalize_foreign_holder_name(row.get("holder_name"))
+        if not norm:
+            continue
+        if selected_keys and norm["key"] not in selected_keys:
+            continue
+        matches.append(_foreign_holder_row(row, norm))
+    return matches
+
+
+def _holder_pair(row: Dict[str, Any]) -> tuple[str, str]:
+    return (str(row.get("ts_code") or ""), str(row.get("norm_key") or ""))
+
+
+def _change_status(current: Optional[Dict[str, Any]], previous: Optional[Dict[str, Any]]) -> str:
+    if current and not previous:
+        return "new"
+    if previous and not current:
+        return "exited"
+    if not current or not previous:
+        return "unknown"
+
+    cur_ratio = current.get("hold_ratio_pct")
+    prev_ratio = previous.get("hold_ratio_pct")
+    if cur_ratio is not None and prev_ratio is not None:
+        delta = cur_ratio - prev_ratio
+    else:
+        cur_amount = current.get("hold_amount")
+        prev_amount = previous.get("hold_amount")
+        if cur_amount is None or prev_amount is None:
+            return "unchanged"
+        delta = cur_amount - prev_amount
+
+    if delta > 0:
+        return "increased"
+    if delta < 0:
+        return "decreased"
+    return "unchanged"
+
+
+def _foreign_holder_changes(
+    current_rows: List[Dict[str, Any]],
+    previous_rows: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    current_map = {_holder_pair(row): row for row in current_rows}
+    previous_map = {_holder_pair(row): row for row in previous_rows}
+    changes: List[Dict[str, Any]] = []
+
+    for pair in sorted(set(current_map) | set(previous_map)):
+        current = current_map.get(pair)
+        previous = previous_map.get(pair)
+        base = current or previous or {}
+
+        amount_delta = None
+        ratio_delta = None
+        if current and previous:
+            cur_amount = current.get("hold_amount")
+            prev_amount = previous.get("hold_amount")
+            if cur_amount is not None and prev_amount is not None:
+                amount_delta = cur_amount - prev_amount
+            cur_ratio = current.get("hold_ratio_pct")
+            prev_ratio = previous.get("hold_ratio_pct")
+            if cur_ratio is not None and prev_ratio is not None:
+                ratio_delta = cur_ratio - prev_ratio
+
+        changes.append({
+            "ts_code": base.get("ts_code"),
+            "norm_key": base.get("norm_key"),
+            "norm_label": base.get("norm_label"),
+            "change_type": _change_status(current, previous),
+            "current": current,
+            "previous": previous,
+            "hold_amount_chg": amount_delta,
+            "hold_ratio_chg": ratio_delta,
+            "hold_ratio_chg_display": _format_percent_points(ratio_delta),
+        })
+
+    return changes
+
+
 def _stock_info_map(symbols: List[str]) -> Dict[str, Dict[str, Any]]:
     if not symbols:
         return {}
@@ -874,62 +995,30 @@ def _foreign_top10_floatholders_payload(
     coll = collection or data_db["top10_floatholders"]
     prices = price_collection or data_db["volume_price"]
     selected_keys = _selected_foreign_holder_keys(holders)
-    rows = list(coll.find(
-        {"end_date": normalized_period},
-        {
-            "_id": 0,
-            "ts_code": 1,
-            "ann_date": 1,
-            "end_date": 1,
-            "holder_name": 1,
-            "holder_rank": 1,
-            "hold_amount": 1,
-            "hold_ratio": 1,
-            "raw": 1,
-        },
-    ))
+    current_matches = _foreign_holder_matches(coll, normalized_period, selected_keys)
 
     previous_pairs: set[tuple[str, str]] = set()
     resolved_previous_period = previous_period.strip() if previous_period else None
+    if not resolved_previous_period:
+        resolved_previous_period = _latest_previous_period(coll, normalized_period)
+    previous_matches = (
+        _foreign_holder_matches(coll, resolved_previous_period, selected_keys)
+        if resolved_previous_period
+        else []
+    )
+    changes = _foreign_holder_changes(current_matches, previous_matches) if previous_matches else []
     warning = None
     if new_only:
-        if not resolved_previous_period:
-            resolved_previous_period = _latest_previous_period(coll, normalized_period)
-        if resolved_previous_period:
-            prev_rows = list(coll.find(
-                {"end_date": resolved_previous_period},
-                {"_id": 0, "ts_code": 1, "holder_name": 1},
-            ))
-            for row in prev_rows:
-                norm = _normalize_foreign_holder_name(row.get("holder_name"))
-                if norm:
-                    previous_pairs.add((str(row.get("ts_code") or ""), norm["key"]))
+        if previous_matches:
+            previous_pairs = {_holder_pair(row) for row in previous_matches}
         else:
             warning = "未找到上一报告期数据，new_only=true 时无法判断是否新进；返回当期命中结果。"
 
     matches: List[Dict[str, Any]] = []
-    for row in rows:
-        norm = _normalize_foreign_holder_name(row.get("holder_name"))
-        if not norm:
+    for row in current_matches:
+        if new_only and previous_pairs and _holder_pair(row) in previous_pairs:
             continue
-        if selected_keys and norm["key"] not in selected_keys:
-            continue
-
-        ts_code = str(row.get("ts_code") or "")
-        if new_only and resolved_previous_period and (ts_code, norm["key"]) in previous_pairs:
-            continue
-
-        matches.append({
-            "ts_code": ts_code,
-            "ann_date": row.get("ann_date"),
-            "end_date": row.get("end_date"),
-            "holder_name": row.get("holder_name"),
-            "norm_key": norm["key"],
-            "norm_label": norm["label"],
-            "holder_rank": row.get("holder_rank"),
-            "hold_amount": _get_number(row, "hold_amount"),
-            "hold_ratio": _get_number(row, "hold_ratio"),
-        })
+        matches.append(dict(row))
 
     missing_return_count = 0
     if return_start:
@@ -945,17 +1034,31 @@ def _foreign_top10_floatholders_payload(
                 missing_return_count += 1
                 if max_return_pct is None:
                     row["range_return"] = None
+                    row["max_return_pct"] = max_return_pct
                     filtered_matches.append(row)
                 continue
             row["range_return"] = ret
+            row["return_pct"] = ret["return_pct"]
+            row["return_pct_display"] = _format_percent_points(ret["return_pct"])
+            row["return_start_trade_date"] = ret["return_start_trade_date"]
+            row["return_end_trade_date"] = ret["return_end_trade_date"]
+            row["max_return_pct"] = max_return_pct
             if max_return_pct is None or ret["return_pct"] <= max_return_pct:
                 filtered_matches.append(row)
         matches = filtered_matches
 
-    symbols = sorted({row["ts_code"] for row in matches if row.get("ts_code")})
+    symbols = sorted({
+        str(row.get("ts_code") or "")
+        for row in matches + changes
+        if row.get("ts_code")
+    })
     info_map = _stock_info_map(symbols)
     for row in matches:
         info = info_map.get(row["ts_code"], {})
+        row["name"] = info.get("name", "")
+        row["industry"] = info.get("industry", "")
+    for row in changes:
+        info = info_map.get(row.get("ts_code"), {})
         row["name"] = info.get("name", "")
         row["industry"] = info.get("industry", "")
 
@@ -969,6 +1072,10 @@ def _foreign_top10_floatholders_payload(
     by_holder: Dict[str, int] = {}
     for row in matches:
         by_holder[row["norm_label"]] = by_holder.get(row["norm_label"], 0) + 1
+    change_summary: Dict[str, int] = {}
+    for row in changes:
+        key = row.get("change_type") or "unknown"
+        change_summary[key] = change_summary.get(key, 0) + 1
 
     return {
         "success": True,
@@ -985,6 +1092,8 @@ def _foreign_top10_floatholders_payload(
         "matched_count": len(matches),
         "returned_count": len(limited),
         "by_holder": by_holder,
+        "change_summary": change_summary,
+        "changes": changes,
         "results": limited,
         **({"warning": warning} if warning else {}),
     }

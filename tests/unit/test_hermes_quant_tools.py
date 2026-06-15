@@ -92,6 +92,8 @@ def test_foreign_top10_floatholders_matches_default_banks(monkeypatch):
     assert payload["results"][0]["ts_code"] == "000001.SZ"
     assert payload["results"][0]["name"] == "平安银行"
     assert payload["results"][0]["hold_amount"] == pytest.approx(1200000)
+    assert payload["results"][0]["hold_ratio_pct"] == pytest.approx(0.8)
+    assert payload["results"][0]["hold_ratio_display"] == "0.80%"
     assert payload["results"][1]["norm_key"] == "UBS"
 
 
@@ -171,4 +173,71 @@ def test_foreign_top10_floatholders_filters_by_range_return(monkeypatch):
     assert payload["matched_count"] == 1
     assert payload["return_filter"]["max_return_pct"] == 30
     assert payload["results"][0]["ts_code"] == "000001.SZ"
+    assert payload["results"][0]["return_pct"] == pytest.approx(25.0)
+    assert payload["results"][0]["return_pct_display"] == "25.00%"
+    assert payload["results"][0]["max_return_pct"] == 30
+    assert payload["results"][0]["return_start_trade_date"] == "20260102"
+    assert payload["results"][0]["return_end_trade_date"] == "20260615"
     assert payload["results"][0]["range_return"]["return_pct"] == pytest.approx(25.0)
+
+
+def test_foreign_top10_floatholders_reports_period_changes(monkeypatch):
+    collection = _Collection(
+        [
+            {
+                "ts_code": "000001.SZ",
+                "end_date": "20251231",
+                "holder_name": "GOLDMAN SACHS",
+                "hold_amount": 100,
+                "hold_ratio": 0.5,
+            },
+            {
+                "ts_code": "000001.SZ",
+                "end_date": "20260331",
+                "holder_name": "GOLDMAN SACHS",
+                "hold_amount": 140,
+                "hold_ratio": 0.7,
+            },
+            {
+                "ts_code": "000002.SZ",
+                "end_date": "20251231",
+                "holder_name": "UBS AG",
+                "hold_amount": 200,
+                "hold_ratio": 1.2,
+            },
+            {
+                "ts_code": "000002.SZ",
+                "end_date": "20260331",
+                "holder_name": "UBS AG",
+                "hold_amount": 150,
+                "hold_ratio": 0.8,
+            },
+            {
+                "ts_code": "000003.SZ",
+                "end_date": "20260331",
+                "holder_name": "BARCLAYS BANK PLC",
+                "hold_amount": 90,
+                "hold_ratio": 0.3,
+            },
+            {
+                "ts_code": "000004.SZ",
+                "end_date": "20251231",
+                "holder_name": "MORGAN STANLEY",
+                "hold_amount": 80,
+                "hold_ratio": 0.25,
+            },
+        ]
+    )
+    monkeypatch.setattr("routers.hermes_quant_tools._stock_info_map", lambda symbols: {})
+
+    payload = _foreign_top10_floatholders_payload(period="20260331", collection=collection)
+    changes = {(row["ts_code"], row["norm_key"]): row for row in payload["changes"]}
+
+    assert payload["previous_period"] == "20251231"
+    assert payload["change_summary"] == {"increased": 1, "decreased": 1, "new": 1, "exited": 1}
+    assert changes[("000001.SZ", "GoldmanSachs")]["change_type"] == "increased"
+    assert changes[("000001.SZ", "GoldmanSachs")]["hold_amount_chg"] == pytest.approx(40)
+    assert changes[("000001.SZ", "GoldmanSachs")]["hold_ratio_chg_display"] == "0.20%"
+    assert changes[("000002.SZ", "UBS")]["change_type"] == "decreased"
+    assert changes[("000003.SZ", "Barclays")]["change_type"] == "new"
+    assert changes[("000004.SZ", "MorganStanley")]["change_type"] == "exited"
