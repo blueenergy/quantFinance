@@ -1,0 +1,174 @@
+import pytest
+
+from routers.hermes_quant_tools import _foreign_top10_floatholders_payload
+
+
+class _Collection:
+    def __init__(self, docs=None):
+        self.docs = list(docs or [])
+
+    def find(self, query=None, projection=None, sort=None, limit=0):
+        rows = [dict(doc) for doc in self.docs if self._matches(doc, query or {})]
+        if sort:
+            for field, direction in reversed(sort):
+                rows.sort(key=lambda row: row.get(field) or "", reverse=direction < 0)
+        if limit:
+            rows = rows[:limit]
+        if projection:
+            include_keys = {key for key, value in projection.items() if value}
+            exclude_id = projection.get("_id") == 0
+            if include_keys:
+                rows = [{key: row.get(key) for key in include_keys if key in row} for row in rows]
+            if exclude_id:
+                rows = [{key: value for key, value in row.items() if key != "_id"} for row in rows]
+        return rows
+
+    def distinct(self, key, query=None):
+        return sorted({doc.get(key) for doc in self.docs if self._matches(doc, query or {}) and doc.get(key)})
+
+    def _matches(self, doc, query):
+        for key, expected in query.items():
+            if key == "$or":
+                if not any(self._matches(doc, clause) for clause in expected):
+                    return False
+                continue
+            value = doc.get(key)
+            if isinstance(expected, dict):
+                if "$in" in expected and value not in expected["$in"]:
+                    return False
+                if "$lt" in expected and not (value < expected["$lt"]):
+                    return False
+                if "$gte" in expected and not (value >= expected["$gte"]):
+                    return False
+                if "$lte" in expected and not (value <= expected["$lte"]):
+                    return False
+                continue
+            if value != expected:
+                return False
+        return True
+
+
+def test_foreign_top10_floatholders_matches_default_banks(monkeypatch):
+    collection = _Collection(
+        [
+            {
+                "ts_code": "000001.SZ",
+                "end_date": "20260331",
+                "ann_date": "20260420",
+                "holder_name": "GOLDMAN SACHS INTERNATIONAL",
+                "holder_rank": 7,
+                "raw": {"hold_amount": 1200000, "hold_ratio": 0.8},
+            },
+            {
+                "ts_code": "000002.SZ",
+                "end_date": "20260331",
+                "ann_date": "20260421",
+                "holder_name": "UBS AG",
+                "holder_rank": 9,
+                "hold_amount": 800000,
+                "hold_ratio": 0.5,
+            },
+            {
+                "ts_code": "000003.SZ",
+                "end_date": "20260331",
+                "holder_name": "香港中央结算有限公司",
+                "holder_rank": 1,
+            },
+        ]
+    )
+    monkeypatch.setattr(
+        "routers.hermes_quant_tools._stock_info_map",
+        lambda symbols: {
+            "000001.SZ": {"name": "平安银行", "industry": "银行"},
+            "000002.SZ": {"name": "万科A", "industry": "房地产"},
+        },
+    )
+
+    payload = _foreign_top10_floatholders_payload(period="20260331", collection=collection)
+
+    assert payload["success"] is True
+    assert payload["matched_count"] == 2
+    assert payload["by_holder"] == {"高盛": 1, "瑞银/UBS": 1}
+    assert payload["results"][0]["ts_code"] == "000001.SZ"
+    assert payload["results"][0]["name"] == "平安银行"
+    assert payload["results"][0]["hold_amount"] == pytest.approx(1200000)
+    assert payload["results"][1]["norm_key"] == "UBS"
+
+
+def test_foreign_top10_floatholders_filters_aliases_and_new_entries(monkeypatch):
+    collection = _Collection(
+        [
+            {
+                "ts_code": "300750.SZ",
+                "end_date": "20251231",
+                "holder_name": "MORGAN STANLEY & CO. INTERNATIONAL PLC",
+            },
+            {
+                "ts_code": "300750.SZ",
+                "end_date": "20260331",
+                "holder_name": "摩根斯坦利国际股份有限公司",
+                "holder_rank": 8,
+            },
+            {
+                "ts_code": "600519.SH",
+                "end_date": "20260331",
+                "holder_name": "BARCARLY BANK PLC",
+                "holder_rank": 10,
+            },
+        ]
+    )
+    monkeypatch.setattr("routers.hermes_quant_tools._stock_info_map", lambda symbols: {})
+
+    payload = _foreign_top10_floatholders_payload(
+        period="20260331",
+        holders="摩根斯坦利,Barcarly",
+        new_only=True,
+        collection=collection,
+    )
+
+    assert payload["previous_period"] == "20251231"
+    assert payload["matched_count"] == 1
+    assert payload["results"][0]["ts_code"] == "600519.SH"
+    assert payload["results"][0]["norm_key"] == "Barclays"
+
+
+def test_foreign_top10_floatholders_filters_by_range_return(monkeypatch):
+    holders = _Collection(
+        [
+            {
+                "ts_code": "000001.SZ",
+                "end_date": "20260331",
+                "holder_name": "高盛国际",
+                "holder_rank": 8,
+            },
+            {
+                "ts_code": "000002.SZ",
+                "end_date": "20260331",
+                "holder_name": "瑞银集团",
+                "holder_rank": 9,
+            },
+        ]
+    )
+    prices = _Collection(
+        [
+            {"symbol": "000001", "trade_date": "20260102", "close": 10.0},
+            {"symbol": "000001", "trade_date": "20260615", "close": 12.5},
+            {"symbol": "000002", "trade_date": "20260102", "close": 10.0},
+            {"symbol": "000002", "trade_date": "20260615", "close": 14.0},
+        ]
+    )
+    monkeypatch.setattr("routers.hermes_quant_tools._stock_info_map", lambda symbols: {})
+
+    payload = _foreign_top10_floatholders_payload(
+        period="20260331",
+        return_start="20260101",
+        return_end="20260615",
+        max_return_pct=30,
+        collection=holders,
+        price_collection=prices,
+    )
+
+    assert payload["matched_count"] == 1
+    assert payload["return_filter"]["max_return_pct"] == 30
+    assert payload["results"][0]["ts_code"] == "000001.SZ"
+    assert payload["results"][0]["range_return"]["return_pct"] == pytest.approx(25.0)

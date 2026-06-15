@@ -21,6 +21,7 @@ MCP 暴露面按 route tag 拆分为 wukong-quant-read 与 wukong-quant-actions�
   GET  /hermes-tools/analysis/history      — 查某股历史分析
   GET  /hermes-tools/shenwan/pe-pb           — 申万行业指数月度 PE/PB 历史分位
   GET  /hermes-tools/stock/screen            — 智能选股：多条件财务筛选 + 申万行业
+  GET  /hermes-tools/stock/foreign-top10-floatholders — 外资投行进入前十大流通股东筛选
 
   — 个人化端点（需先 user_login 获取 token 并设置 X-User-Token header）—
   POST /hermes-tools/user/login            — 用户登录，返回 JWT token
@@ -33,8 +34,9 @@ MCP 暴露面按 route tag 拆分为 wukong-quant-read 与 wukong-quant-actions�
 
 import asyncio
 import os
+import re
 from datetime import datetime, timedelta
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from bson import ObjectId
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
@@ -53,6 +55,13 @@ MCP_ACTION_TAG = "Hermes quant action tools"
 
 router = APIRouter(prefix="/hermes-tools")
 MCP_ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("MCP_ACCESS_TOKEN_EXPIRE_MINUTES", "43200"))
+
+_FOREIGN_HOLDER_PATTERNS = (
+    ("GoldmanSachs", "高盛", re.compile(r"GOLDMAN|高盛", re.I)),
+    ("MorganStanley", "摩根士丹利", re.compile(r"MORGAN\s*STANLEY|摩根士丹利|摩根斯坦利", re.I)),
+    ("UBS", "瑞银/UBS", re.compile(r"\bUBS\s*AG\b|\bUBS\b|瑞银", re.I)),
+    ("Barclays", "巴克莱/Barclays", re.compile(r"BARCLAYS?|BARCARLY|巴克莱", re.I)),
+)
 
 
 def _format_expiry(minutes: int) -> str:
@@ -702,6 +711,314 @@ async def stock_score_detail(
         "technical_score": safe_round(doc.get("technical_score", 0), 2),
         "money_flow_score": safe_round(doc.get("money_flow_score", 0), 2),
     }
+
+
+# ---------------------------------------------------------------------------
+# 外资投行前十大流通股东筛选
+# ---------------------------------------------------------------------------
+
+def _normalize_foreign_holder_name(name: Any) -> Optional[Dict[str, str]]:
+    text = str(name or "").strip()
+    if not text:
+        return None
+    for key, label, pattern in _FOREIGN_HOLDER_PATTERNS:
+        if pattern.search(text):
+            return {"key": key, "label": label, "holder_name": text}
+    return None
+
+
+def _selected_foreign_holder_keys(raw: Optional[str]) -> Optional[set[str]]:
+    if not raw:
+        return None
+    tokens = [part.strip() for part in raw.split(",") if part.strip()]
+    if not tokens or any(token.lower() in {"all", "*"} for token in tokens):
+        return None
+
+    keys: set[str] = set()
+    for token in tokens:
+        matched = _normalize_foreign_holder_name(token)
+        if matched:
+            keys.add(matched["key"])
+            continue
+        tl = token.lower()
+        for key, label, _pattern in _FOREIGN_HOLDER_PATTERNS:
+            if tl == key.lower() or token in label:
+                keys.add(key)
+                break
+    return keys
+
+
+def _get_number(row: Dict[str, Any], key: str) -> Optional[float]:
+    value = row.get(key)
+    if value is None and isinstance(row.get("raw"), dict):
+        value = row["raw"].get(key)
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _symbol_variants(ts_code: str) -> List[str]:
+    symbol = str(ts_code or "").strip()
+    if not symbol:
+        return []
+    variants = {symbol}
+    if "." in symbol:
+        variants.add(symbol.split(".", 1)[0])
+    return sorted(variants)
+
+
+def _date_query(start: Optional[str], end: Optional[str]) -> Dict[str, str]:
+    query: Dict[str, str] = {}
+    if start:
+        query["$gte"] = start
+    if end and end.lower() != "latest":
+        query["$lte"] = end
+    return query
+
+
+def _range_return_for_symbol(
+    price_collection: Any,
+    ts_code: str,
+    *,
+    start: Optional[str],
+    end: Optional[str],
+) -> Optional[Dict[str, Any]]:
+    if not start:
+        return None
+
+    date_filter = _date_query(start, end)
+    variants = _symbol_variants(ts_code)
+    if not variants:
+        return None
+
+    query: Dict[str, Any] = {
+        "$or": [
+            {"symbol": {"$in": variants}},
+            {"ts_code": {"$in": variants}},
+            {"con_code": {"$in": variants}},
+        ],
+        "trade_date": date_filter,
+    }
+    projection = {"_id": 0, "symbol": 1, "ts_code": 1, "trade_date": 1, "close": 1}
+
+    rows = list(price_collection.find(query, projection, sort=[("trade_date", 1)]))
+    valid_rows = [row for row in rows if _get_number(row, "close") not in (None, 0)]
+    if len(valid_rows) < 2:
+        return None
+
+    start_row = valid_rows[0]
+    end_row = valid_rows[-1]
+    start_close = _get_number(start_row, "close")
+    end_close = _get_number(end_row, "close")
+    if start_close in (None, 0) or end_close is None:
+        return None
+
+    return_pct = (end_close - start_close) / start_close * 100
+    return {
+        "return_start": start,
+        "return_end": end or "latest",
+        "return_start_trade_date": start_row.get("trade_date"),
+        "return_end_trade_date": end_row.get("trade_date"),
+        "return_start_close": start_close,
+        "return_end_close": end_close,
+        "return_pct": round(return_pct, 4),
+    }
+
+
+def _latest_previous_period(collection: Any, period: str) -> Optional[str]:
+    try:
+        periods = collection.distinct("end_date", {"end_date": {"$lt": period}})
+    except Exception:
+        periods = []
+    valid = sorted(str(p) for p in periods if p and str(p) < period)
+    return valid[-1] if valid else None
+
+
+def _stock_info_map(symbols: List[str]) -> Dict[str, Dict[str, Any]]:
+    if not symbols:
+        return {}
+    try:
+        collections = get_db_collections()
+        stock_info = collections.get("stock_info") if isinstance(collections, dict) else None
+        if stock_info is None:
+            return {}
+        rows = stock_info.find(
+            {"symbol": {"$in": symbols}},
+            {"_id": 0, "symbol": 1, "name": 1, "industry": 1},
+        )
+        return {row.get("symbol"): row for row in rows if row.get("symbol")}
+    except Exception:
+        return {}
+
+
+def _foreign_top10_floatholders_payload(
+    *,
+    period: str,
+    holders: Optional[str] = None,
+    new_only: bool = False,
+    previous_period: Optional[str] = None,
+    return_start: Optional[str] = None,
+    return_end: Optional[str] = None,
+    max_return_pct: Optional[float] = None,
+    limit: int = 200,
+    collection: Any = None,
+    price_collection: Any = None,
+) -> Dict[str, Any]:
+    normalized_period = period.strip()
+    if not normalized_period:
+        return {"success": False, "error": "period 不能为空，格式为 YYYYMMDD，例如 20260331"}
+
+    coll = collection or data_db["top10_floatholders"]
+    prices = price_collection or data_db["volume_price"]
+    selected_keys = _selected_foreign_holder_keys(holders)
+    rows = list(coll.find(
+        {"end_date": normalized_period},
+        {
+            "_id": 0,
+            "ts_code": 1,
+            "ann_date": 1,
+            "end_date": 1,
+            "holder_name": 1,
+            "holder_rank": 1,
+            "hold_amount": 1,
+            "hold_ratio": 1,
+            "raw": 1,
+        },
+    ))
+
+    previous_pairs: set[tuple[str, str]] = set()
+    resolved_previous_period = previous_period.strip() if previous_period else None
+    warning = None
+    if new_only:
+        if not resolved_previous_period:
+            resolved_previous_period = _latest_previous_period(coll, normalized_period)
+        if resolved_previous_period:
+            prev_rows = list(coll.find(
+                {"end_date": resolved_previous_period},
+                {"_id": 0, "ts_code": 1, "holder_name": 1},
+            ))
+            for row in prev_rows:
+                norm = _normalize_foreign_holder_name(row.get("holder_name"))
+                if norm:
+                    previous_pairs.add((str(row.get("ts_code") or ""), norm["key"]))
+        else:
+            warning = "未找到上一报告期数据，new_only=true 时无法判断是否新进；返回当期命中结果。"
+
+    matches: List[Dict[str, Any]] = []
+    for row in rows:
+        norm = _normalize_foreign_holder_name(row.get("holder_name"))
+        if not norm:
+            continue
+        if selected_keys and norm["key"] not in selected_keys:
+            continue
+
+        ts_code = str(row.get("ts_code") or "")
+        if new_only and resolved_previous_period and (ts_code, norm["key"]) in previous_pairs:
+            continue
+
+        matches.append({
+            "ts_code": ts_code,
+            "ann_date": row.get("ann_date"),
+            "end_date": row.get("end_date"),
+            "holder_name": row.get("holder_name"),
+            "norm_key": norm["key"],
+            "norm_label": norm["label"],
+            "holder_rank": row.get("holder_rank"),
+            "hold_amount": _get_number(row, "hold_amount"),
+            "hold_ratio": _get_number(row, "hold_ratio"),
+        })
+
+    missing_return_count = 0
+    if return_start:
+        filtered_matches: List[Dict[str, Any]] = []
+        for row in matches:
+            ret = _range_return_for_symbol(
+                prices,
+                row.get("ts_code") or "",
+                start=return_start.strip(),
+                end=return_end.strip() if return_end else None,
+            )
+            if ret is None:
+                missing_return_count += 1
+                if max_return_pct is None:
+                    row["range_return"] = None
+                    filtered_matches.append(row)
+                continue
+            row["range_return"] = ret
+            if max_return_pct is None or ret["return_pct"] <= max_return_pct:
+                filtered_matches.append(row)
+        matches = filtered_matches
+
+    symbols = sorted({row["ts_code"] for row in matches if row.get("ts_code")})
+    info_map = _stock_info_map(symbols)
+    for row in matches:
+        info = info_map.get(row["ts_code"], {})
+        row["name"] = info.get("name", "")
+        row["industry"] = info.get("industry", "")
+
+    matches.sort(key=lambda row: (
+        row.get("ts_code") or "",
+        row.get("holder_rank") if row.get("holder_rank") is not None else 999,
+        row.get("norm_key") or "",
+    ))
+    limited = matches[:limit]
+
+    by_holder: Dict[str, int] = {}
+    for row in matches:
+        by_holder[row["norm_label"]] = by_holder.get(row["norm_label"], 0) + 1
+
+    return {
+        "success": True,
+        "period": normalized_period,
+        "previous_period": resolved_previous_period,
+        "new_only": new_only,
+        "holders": holders or "all",
+        "return_filter": {
+            "return_start": return_start,
+            "return_end": return_end or "latest",
+            "max_return_pct": max_return_pct,
+            "missing_return_count": missing_return_count,
+        } if return_start else None,
+        "matched_count": len(matches),
+        "returned_count": len(limited),
+        "by_holder": by_holder,
+        "results": limited,
+        **({"warning": warning} if warning else {}),
+    }
+
+
+@router.get("/stock/foreign-top10-floatholders", operation_id="foreign_top10_floatholders", tags=[MCP_READ_TAG])
+async def foreign_top10_floatholders(
+    period: str = Query(..., description="报告期 YYYYMMDD，例如 20260331"),
+    holders: Optional[str] = Query(
+        None,
+        description="逗号分隔机构关键词，默认全部：高盛,摩根士丹利,瑞银,Barclays",
+    ),
+    new_only: bool = Query(False, description="是否仅返回较上一报告期新进前十大流通股东的机构"),
+    previous_period: Optional[str] = Query(None, description="上一报告期 YYYYMMDD；不填则自动取 period 前最近一期"),
+    return_start: Optional[str] = Query(None, description="区间涨幅起始交易日 YYYYMMDD，例如 20260101"),
+    return_end: Optional[str] = Query(None, description="区间涨幅结束交易日 YYYYMMDD；不填或 latest 表示最新可用交易日"),
+    max_return_pct: Optional[float] = Query(None, description="最大区间涨幅百分比，例如 30 表示涨幅不超过 30%"),
+    limit: int = Query(200, ge=1, le=1000, description="最多返回条数"),
+    _: bool = Depends(require_hermes_quant_internal_key),
+):
+    """
+    按报告期筛选高盛、摩根士丹利、瑞银、Barclays/巴克莱等外资投行进入
+    前十大流通股东的股票。数据来自 quant_data.top10_floatholders。
+    """
+    return _foreign_top10_floatholders_payload(
+        period=period,
+        holders=holders,
+        new_only=new_only,
+        previous_period=previous_period,
+        return_start=return_start,
+        return_end=return_end,
+        max_return_pct=max_return_pct,
+        limit=limit,
+    )
 
 
 # ---------------------------------------------------------------------------
