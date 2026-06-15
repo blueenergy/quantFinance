@@ -35,7 +35,9 @@ ENABLE_EMBEDDED_SCHEDULER=false \
 ENABLE_MCP_SERVER=true \
 MCP_SERVER_MODE=read \
 PORT="$READ_PORT" \
-./scripts/uvicorn-dev.sh "$@" &
+./scripts/uvicorn-dev.sh "$@" \
+  > >(sed -u "s/^/[read:$READ_PORT] /") \
+  2> >(sed -u "s/^/[read:$READ_PORT] /" >&2) &
 read_pid=$!
 
 echo "Starting MCP actions server on :$ACTIONS_PORT"
@@ -43,7 +45,9 @@ ENABLE_EMBEDDED_SCHEDULER=false \
 ENABLE_MCP_SERVER=true \
 MCP_SERVER_MODE=actions \
 PORT="$ACTIONS_PORT" \
-./scripts/uvicorn-dev.sh "$@" &
+./scripts/uvicorn-dev.sh "$@" \
+  > >(sed -u "s/^/[actions:$ACTIONS_PORT] /") \
+  2> >(sed -u "s/^/[actions:$ACTIONS_PORT] /" >&2) &
 actions_pid=$!
 
 wait -n "$read_pid" "$actions_pid"

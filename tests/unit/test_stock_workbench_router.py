@@ -558,7 +558,12 @@ def test_shareholder_section_merges_chips_sources_and_summary(monkeypatch):
         ),
         "top10_floatholders": _Collection(
             [
-                {"ts_code": "000001.SZ", "end_date": "20260331", "holder_name": "UBSAG", "raw": {"hold_amount": 1000000, "hold_ratio": 1.2}},
+                {"ts_code": "000001.SZ", "end_date": "20260331", "holder_name": "UBSAG", "raw": {"hold_amount": 948100, "hold_ratio": 0.39}},
+                {"ts_code": "000001.SZ", "end_date": "20251231", "holder_name": "UBS AG", "raw": {"hold_amount": 1900000, "hold_ratio": 0.79}},
+                {"ts_code": "000001.SZ", "end_date": "20260331", "holder_name": "BARCLAYS BANK PLC", "raw": {"hold_amount": 1000000, "hold_ratio": 1.2}},
+                {"ts_code": "000001.SZ", "end_date": "20260331", "holder_name": "GOLDMAN SACHS", "raw": {"hold_amount": 1500000, "hold_ratio": 1.5}},
+                {"ts_code": "000001.SZ", "end_date": "20251231", "holder_name": "GOLDMAN SACHS", "raw": {"hold_amount": 1200000, "hold_ratio": 1.1}},
+                {"ts_code": "000001.SZ", "end_date": "20251231", "holder_name": "MORGAN STANLEY", "raw": {"hold_amount": 900000, "hold_ratio": 0.9}},
                 {"ts_code": "000001.SZ", "end_date": "20260331", "holder_name": "香港中央结算有限公司", "raw": {"hold_amount": 8000000, "hold_ratio": 8.0}},
                 {"ts_code": "000001.SZ", "end_date": "20251231", "holder_name": "香港中央结算有限公司", "raw": {"hold_amount": 7000000, "hold_ratio": 7.5}},
             ]
@@ -583,8 +588,20 @@ def test_shareholder_section_merges_chips_sources_and_summary(monkeypatch):
     assert section["summary"]["northbound_ratio"] == 5.5
     assert section["summary"]["northbound_ratio_chg"] == pytest.approx(0.5)
     assert section["summary"]["intl_new_count"] == 1
+    assert section["summary"]["intl_change_count"] == 4
     assert section["summary"]["hksc_hold_ratio_chg"] == pytest.approx(0.5)
-    assert section["top10_float_change"]["intl_new"][0]["norm_key"] == "UBS"
+    assert section["top10_float_change"]["intl_new"][0]["norm_key"] == "Barclays"
+    changes = {row["norm_key"]: row for row in section["top10_float_change"]["intl_changes"]}
+    assert section["top10_float_change"]["intl_change_summary"] == {"new": 1, "increased": 1, "exited": 1, "decreased": 1}
+    assert changes["Barclays"]["change_type"] == "new"
+    assert changes["UBS"]["change_type"] == "decreased"
+    assert changes["UBS"]["hold_ratio_chg"] == pytest.approx(-0.4)
+    assert changes["UBS"]["hold_ratio_rel_chg_pct"] == pytest.approx(-50.6329)
+    assert changes["GoldmanSachs"]["change_type"] == "increased"
+    assert changes["GoldmanSachs"]["hold_ratio_chg"] == pytest.approx(0.4)
+    assert changes["MorganStanley"]["change_type"] == "exited"
+    assert section["top10_float_change"]["hksc"]["change_type"] == "increased"
+    assert section["top10_float_change"]["hksc"]["hold_ratio_rel_chg_pct"] == pytest.approx(6.6666667)
     assert section["top10_float_change"]["hksc"]["hold_amount_chg"] == pytest.approx(1000000)
     assert section["holder_trades"][0]["holder_name"] == "张三"
     assert section["share_floats"][0]["share_type"] == "定增"

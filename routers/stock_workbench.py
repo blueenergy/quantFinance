@@ -1191,6 +1191,61 @@ def _holding_ratio(row: Dict[str, Any]) -> Optional[float]:
     )
 
 
+def _top10_holder_change_type(current: Optional[Dict[str, Any]], previous: Optional[Dict[str, Any]]) -> str:
+    if current and not previous:
+        return "new"
+    if previous and not current:
+        return "exited"
+    if not current or not previous:
+        return "unknown"
+
+    curr_ratio = current.get("hold_ratio")
+    prev_ratio = previous.get("hold_ratio")
+    if curr_ratio is not None and prev_ratio is not None:
+        delta = curr_ratio - prev_ratio
+    else:
+        curr_amount = current.get("hold_amount")
+        prev_amount = previous.get("hold_amount")
+        if curr_amount is None or prev_amount is None:
+            return "unchanged"
+        delta = curr_amount - prev_amount
+
+    if delta > 0:
+        return "increased"
+    if delta < 0:
+        return "decreased"
+    return "unchanged"
+
+
+def _top10_holder_change(current: Optional[Dict[str, Any]], previous: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    base = current or previous or {}
+    amount_delta = None
+    ratio_delta = None
+    ratio_rel_delta = None
+    if current and previous:
+        curr_amount = current.get("hold_amount")
+        prev_amount = previous.get("hold_amount")
+        if curr_amount is not None and prev_amount is not None:
+            amount_delta = curr_amount - prev_amount
+        curr_ratio = current.get("hold_ratio")
+        prev_ratio = previous.get("hold_ratio")
+        if curr_ratio is not None and prev_ratio is not None:
+            ratio_delta = curr_ratio - prev_ratio
+            ratio_rel_delta = _pct_change(curr_ratio, prev_ratio)
+
+    return {
+        "norm_key": base.get("norm_key"),
+        "norm_label": base.get("norm_label"),
+        "holder_name": base.get("holder_name"),
+        "change_type": _top10_holder_change_type(current, previous),
+        "current": current,
+        "previous": previous,
+        "hold_amount_chg": amount_delta,
+        "hold_ratio_chg": ratio_delta,
+        "hold_ratio_rel_chg_pct": ratio_rel_delta,
+    }
+
+
 def _group_top10_by_period(rows: List[Dict[str, Any]]) -> List[tuple[str, List[Dict[str, Any]]]]:
     grouped: Dict[str, List[Dict[str, Any]]] = {}
     for row in rows:
@@ -1231,37 +1286,35 @@ def _top10_float_change(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
 
     curr = [enrich(row) for row in curr_rows]
     prev = [enrich(row) for row in prev_rows]
-    prev_keys = {row.get("norm_key") for row in prev if row.get("norm_key") not in (None, "OTHER")}
-    prev_names = {str(row.get("holder_name") or "").strip() for row in prev}
+    curr_intl = {row.get("norm_key"): row for row in curr if row.get("norm_key") in _INTL_KEYS}
+    prev_intl = {row.get("norm_key"): row for row in prev if row.get("norm_key") in _INTL_KEYS}
+    intl_changes = [
+        _top10_holder_change(curr_intl.get(key), prev_intl.get(key))
+        for key in sorted(set(curr_intl) | set(prev_intl))
+    ]
+    intl_change_summary: Dict[str, int] = {}
+    for row in intl_changes:
+        key = row.get("change_type") or "unknown"
+        intl_change_summary[key] = intl_change_summary.get(key, 0) + 1
     intl_new = [
-        row for row in curr
-        if row.get("norm_key") in _INTL_KEYS
-        and row.get("norm_key") not in prev_keys
-        and str(row.get("holder_name") or "").strip() not in prev_names
+        row.get("current") for row in intl_changes
+        if row.get("change_type") == "new" and row.get("current")
     ]
 
     hksc_curr = next((row for row in curr if row.get("norm_key") == "HKSC"), None)
     hksc_prev = next((row for row in prev if row.get("norm_key") == "HKSC"), None)
     hksc = None
     if hksc_curr or hksc_prev:
-        hksc = {
-            "current": hksc_curr,
-            "previous": hksc_prev,
-            "hold_amount_chg": (
-                None if not hksc_curr or not hksc_prev
-                else (_holding_amount(hksc_curr) or 0) - (_holding_amount(hksc_prev) or 0)
-            ),
-            "hold_ratio_chg": (
-                None if not hksc_curr or not hksc_prev or _holding_ratio(hksc_curr) is None or _holding_ratio(hksc_prev) is None
-                else _holding_ratio(hksc_curr) - _holding_ratio(hksc_prev)
-            ),
-        }
+        hksc = _top10_holder_change(hksc_curr, hksc_prev)
 
     return {
         "period_curr": curr_period,
         "period_prev": prev_period,
         "intl_new": intl_new,
         "intl_new_count": len(intl_new),
+        "intl_changes": intl_changes,
+        "intl_change_count": len([row for row in intl_changes if row.get("change_type") != "unchanged"]),
+        "intl_change_summary": intl_change_summary,
         "hksc": hksc,
         "current_holders": curr,
     }
@@ -1291,6 +1344,7 @@ def _shareholder_summary(
             else _to_float(latest_hk.get("ratio")) - _to_float(prev_hk.get("ratio"))
         ),
         "intl_new_count": int(top10_float_change.get("intl_new_count") or 0),
+        "intl_change_count": int(top10_float_change.get("intl_change_count") or 0),
         "top10_float_period": top10_float_change.get("period_curr"),
         "hksc_hold_ratio_chg": hksc.get("hold_ratio_chg"),
         "hksc_hold_amount_chg": hksc.get("hold_amount_chg"),

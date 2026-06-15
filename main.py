@@ -145,6 +145,9 @@ async def lifespan(app: FastAPI):
             stop_scheduler()
 
 app = FastAPI(lifespan=lifespan)
+_MCP_SERVER_ENABLED = os.getenv("ENABLE_MCP_SERVER", "true").strip().lower() in ("1", "true", "yes", "on")
+_MCP_SERVER_MODE = os.getenv("MCP_SERVER_MODE", "all").strip().lower()
+_MCP_ONLY_PROCESS = _MCP_SERVER_ENABLED and _MCP_SERVER_MODE in {"read", "actions"}
 
 # 应用生产环境配置
 configure_production_app(app)
@@ -184,7 +187,11 @@ app.include_router(portfolio_research_router, prefix="/api", tags=["组合研究
 app.include_router(permissions_router, prefix="/api", tags=["权限管理"])
 app.include_router(permissions_router, prefix="/api/admin", tags=["权限管理"])
 app.include_router(strategy_pool_router, prefix="/api/strategy-pool", tags=["策略池"])
-app.include_router(strategy_workers_router, prefix="/api/strategy", tags=["策略集群管理"])
+if not _MCP_ONLY_PROCESS:
+    # The strategy workers router probes REMOTE_WORKER_API during startup.
+    # MCP-only read/actions processes do not serve strategy worker APIs, so
+    # skip it to avoid unrelated local-dev DNS errors.
+    app.include_router(strategy_workers_router, prefix="/api/strategy", tags=["策略集群管理"])
 app.include_router(ladder_router, prefix="/api", tags=["连板天梯"])
 app.include_router(risk_report_router, prefix="/api", tags=["市场风险预警"])
 app.include_router(x_influencer_router, prefix="/api", tags=["X大V情报"])
@@ -211,7 +218,7 @@ app.include_router(entropy_ranking_router, prefix="/api", tags=["熵值因子排
 # 工具范围：按 MCP_SERVER_MODE 拆成 read/actions 两个工具面。
 # 扩展：往 routers/hermes_quant_tools.py 加路由即可自动出现在 MCP 工具列表
 # ---------------------------------------------------------------------------
-if os.getenv("ENABLE_MCP_SERVER", "true").strip().lower() in ("1", "true", "yes", "on"):
+if _MCP_SERVER_ENABLED:
     from fastapi import Depends
     from fastapi_mcp import FastApiMCP, AuthConfig
     from auth import require_hermes_quant_internal_key
@@ -233,7 +240,7 @@ if os.getenv("ENABLE_MCP_SERVER", "true").strip().lower() in ("1", "true", "yes"
         mcp.mount_http(mount_path=mount_path)
         _mcp_instances.append(mcp)
 
-    _mcp_mode = os.getenv("MCP_SERVER_MODE", "all").strip().lower()
+    _mcp_mode = _MCP_SERVER_MODE
 
     if _mcp_mode == "read":
         _mount_mcp_server(
