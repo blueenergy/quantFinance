@@ -406,6 +406,8 @@ services:
     profiles: [ "frontend" ] # Optional: Only start with --profile frontend
     environment:
       - BACKEND_URL=http://quant-api:3001
+      # Legacy/default MCP endpoint for /api/mcp. New MCP clients should prefer
+      # MCP_READ_URL and MCP_ACTIONS_URL.
       - MCP_URL=http://quant-mcp:3002
       - MCP_READ_URL=http://quant-mcp:3002
       - MCP_ACTIONS_URL=http://quant-mcp-actions:3003
