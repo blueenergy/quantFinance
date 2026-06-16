@@ -46,6 +46,10 @@ GROWTH_CYCLE_PARAMETER_SCHEMA = {
     "candidate_pool_enabled": {"type": "boolean"},
     "candidate_pool_multiplier": {"type": "integer", "min": 1},
     "min_buy_lots": {"type": "integer", "min": 1},
+    # When false (default) non-rebalance days only show portfolio drift and never
+    # produce executable trades; the portfolio rebalances strictly every
+    # rebalance_days. Set true to allow intra-cycle drift trading.
+    "monitor_can_trade": {"type": "boolean"},
 }
 DEFAULT_STRATEGY_TEMPLATES = (
     {
@@ -158,6 +162,7 @@ def _ensure_default_strategy_templates(collections: Dict[str, Any]) -> None:
                         "candidate_pool_enabled": "",
                         "candidate_pool_multiplier": "",
                         "min_buy_lots": "",
+                        "monitor_can_trade": "",
                     },
                 },
             )
@@ -188,6 +193,12 @@ PLAN_LIST_PROJECTION = {
     "score_date": 1,
     "execute_date": 1,
     "plan_type": 1,
+    "is_rebalance_day": 1,
+    "previous_rebalance_date": 1,
+    "monitor_can_trade": 1,
+    "trading_enabled": 1,
+    "executable": 1,
+    "non_executable_reason": 1,
     "status": 1,
     "summary": 1,
     "excluded_symbols": 1,
