@@ -742,6 +742,14 @@ async def get_stock_rankings_by_index(
             row.update(dict(RETURN_SINCE_EMPTY))
             row.update(dict(PRIOR_3M_EMPTY))
             formatted.append(row)
+        try:
+            vp_col = get_data_db()["volume_price"]
+            # Index rankings are paged; enrich only the visible page to keep
+            # large constituent universes cheap while preserving table parity.
+            enrich_rows_return_since_score(formatted, vp_col)
+            enrich_rows_prior_3m_return(formatted, vp_col)
+        except Exception as ex:
+            print(f"[stock-rankings/by-index] enrich price returns failed: {ex}")
         return {
             "success": True,
             "data": formatted,

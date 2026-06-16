@@ -929,10 +929,18 @@ def test_by_index_rankings_latest_per_symbol_and_sort(monkeypatch):
     ]
     fake_db = FakeDB(stock_scores_docs=docs, stock_info_docs=info_docs)
     monkeypatch.setattr(stock_ranking, "get_db_collections", lambda: fake_db)
+    vp = [
+        {"symbol": "A.SH", "trade_date": "20250620", "close": 80},
+        {"symbol": "A.SH", "trade_date": "20250920", "close": 100},
+        {"symbol": "A.SH", "trade_date": "20251001", "close": 110},
+        {"symbol": "B.SH", "trade_date": "20250620", "close": 160},
+        {"symbol": "B.SH", "trade_date": "20250920", "close": 200},
+        {"symbol": "B.SH", "trade_date": "20251001", "close": 220},
+    ]
     monkeypatch.setattr(
         stock_ranking,
         "get_data_db",
-        lambda: {"volume_price": FakeVolumePriceCollection([])},
+        lambda: {"volume_price": FakeVolumePriceCollection(vp)},
     )
     client = TestClient(app)
     r_bal = client.get("/api/stock-rankings/by-index/csi500?strategy=balanced")
@@ -941,8 +949,10 @@ def test_by_index_rankings_latest_per_symbol_and_sort(monkeypatch):
     assert j["total"] == 2
     assert [x["symbol"] for x in j["data"]] == ["B.SH", "A.SH"]
     assert j["data"][0]["composite_score"]["balanced"] == 80
-    assert j["data"][0].get("return_since_score_pct") is None
-    assert j["data"][0].get("prior_3m_return_pct") is None
+    assert j["data"][0].get("return_since_score_pct") == pytest.approx(10.0)
+    assert j["data"][0].get("prior_3m_return_pct") == pytest.approx(25.0)
+    assert j["data"][0].get("price_base_trade_date") == "20250920"
+    assert j["data"][0].get("price_latest_trade_date") == "20251001"
 
     r_agg = client.get("/api/stock-rankings/by-index/csi500?strategy=aggressive")
     # A 最新 aggressive=20，B=30 → 降序 B 在前
