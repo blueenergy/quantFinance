@@ -230,6 +230,65 @@ def test_stock_rankings_can_sort_by_single_dimension(monkeypatch):
 
 
 @pytest.mark.unit
+def test_stock_rankings_can_sort_by_weighted_dimensions(monkeypatch):
+    docs = [
+        {
+            'symbol': 'AAA.SH',
+            'composite_score': {'balanced': 90},
+            'cycle_score': 100,
+            'value_score': 1,
+            'fundamental_score': 1,
+            'growth_score': 20,
+            'technical_score': 1,
+            'money_flow_score': 1,
+            'score_date': '20250920',
+        },
+        {
+            'symbol': 'BBB.SH',
+            'composite_score': {'balanced': 70},
+            'cycle_score': 10,
+            'value_score': 1,
+            'fundamental_score': 1,
+            'growth_score': 100,
+            'technical_score': 1,
+            'money_flow_score': 1,
+            'score_date': '20250920',
+        },
+    ]
+    info_docs = [{'symbol': 'AAA.SH', 'name': 'A Corp'}, {'symbol': 'BBB.SH', 'name': 'B Corp'}]
+    fake_db = FakeDB(stock_scores_docs=docs, stock_info_docs=info_docs)
+    monkeypatch.setattr(stock_ranking, 'get_db_collections', lambda: fake_db)
+    monkeypatch.setattr(
+        stock_ranking,
+        'get_data_db',
+        lambda: {'volume_price': FakeVolumePriceCollection([])},
+    )
+
+    client = TestClient(app)
+    resp = client.get('/api/stock-rankings?limit=2&sort_by=weighted&weights=growth:60,cycle:40')
+    assert resp.status_code == 200
+    rows = resp.json()['data']
+    assert [row['symbol'] for row in rows] == ['BBB.SH', 'AAA.SH']
+    assert rows[0]['weighted_score'] == pytest.approx(64.0)
+    assert rows[0]['weighted_score_weights'] == {'growth': 60.0, 'cycle': 40.0}
+
+    resp_8020 = client.get('/api/stock-rankings?limit=2&sort_by=weighted&weights=growth:20,cycle:80')
+    assert resp_8020.status_code == 200
+    assert [row['symbol'] for row in resp_8020.json()['data']] == ['AAA.SH', 'BBB.SH']
+
+
+@pytest.mark.unit
+def test_stock_rankings_reject_invalid_weighted_dimensions(monkeypatch):
+    fake_db = FakeDB(stock_scores_docs=[], stock_info_docs=[])
+    monkeypatch.setattr(stock_ranking, 'get_db_collections', lambda: fake_db)
+    client = TestClient(app)
+
+    resp = client.get('/api/stock-rankings?sort_by=weighted&weights=unknown:1')
+    assert resp.status_code == 400
+    assert 'weights 参数无效' in resp.json()['detail']
+
+
+@pytest.mark.unit
 def test_selected_stock_rankings_defaults_and_fields(monkeypatch):
     docs = [
         {'symbol': 'CCC.SH', 'composite_score': {'balanced': 60}, 'cycle_score': 11, 'value_score': 19, 'fundamental_score': 25, 'growth_score': 6, 'technical_score': 9, 'money_flow_score': 5, 'score_date': '20250919'},
@@ -430,6 +489,51 @@ def test_selected_stock_rankings_can_sort_by_dimension(monkeypatch):
     )
     assert r.status_code == 200
     assert [s["symbol"] for s in r.json()["data"]] == ["BBB.SH", "AAA.SH"]
+
+
+@pytest.mark.unit
+def test_selected_stock_rankings_can_sort_by_weighted_dimensions(monkeypatch):
+    docs = [
+        {
+            "symbol": "AAA.SH",
+            "composite_score": {"balanced": 90},
+            "cycle_score": 90,
+            "value_score": 1,
+            "fundamental_score": 1,
+            "growth_score": 20,
+            "technical_score": 1,
+            "money_flow_score": 1,
+            "score_date": "20250919",
+        },
+        {
+            "symbol": "BBB.SH",
+            "composite_score": {"balanced": 60},
+            "cycle_score": 10,
+            "value_score": 1,
+            "fundamental_score": 1,
+            "growth_score": 100,
+            "technical_score": 1,
+            "money_flow_score": 1,
+            "score_date": "20250919",
+        },
+    ]
+    info_docs = [{"symbol": "AAA.SH", "name": "A"}, {"symbol": "BBB.SH", "name": "B"}]
+    fake_db = FakeDB(stock_scores_docs=docs, stock_info_docs=info_docs)
+    monkeypatch.setattr(stock_ranking, "get_db_collections", lambda: fake_db)
+    monkeypatch.setattr(
+        stock_ranking,
+        "get_data_db",
+        lambda: {"volume_price": FakeVolumePriceCollection([])},
+    )
+    client = TestClient(app)
+    r = client.post(
+        "/api/stock-rankings/selected?sort_by=weighted&weights=growth:80,cycle:20",
+        json={"symbols": ["AAA.SH", "BBB.SH"]},
+    )
+    assert r.status_code == 200
+    rows = r.json()["data"]
+    assert [s["symbol"] for s in rows] == ["BBB.SH", "AAA.SH"]
+    assert rows[0]["weighted_score"] == pytest.approx(82.0)
 
 
 @pytest.mark.unit

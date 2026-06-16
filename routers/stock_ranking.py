@@ -1,7 +1,13 @@
 # routers/stock_scoring.py
 from fastapi import APIRouter, HTTPException, Depends, Query, Request
 from db import get_db_collections, get_data_db
-from utils.score_utils import safe_round, safe_float, extract_strategy_score
+from utils.score_utils import (
+    parse_score_weights,
+    safe_round,
+    safe_float,
+    extract_strategy_score,
+    weighted_dimension_score,
+)
 from typing import Optional, List, Any, cast, Dict, Tuple, Set
 from pydantic import BaseModel
 from datetime import datetime, timedelta
@@ -80,19 +86,64 @@ def _normalize_sort_by(sort_by: Optional[str]) -> str:
     key = (sort_by or "composite").strip().lower()
     if key in ("composite", "total", "score"):
         return "composite"
+    if key in ("weighted", "custom_weighted", "custom"):
+        return "weighted"
     if key not in SCORE_SORT_FIELDS:
         raise HTTPException(
             status_code=400,
-            detail="不支持的 sort_by: %s；允许: composite, %s"
+            detail="不支持的 sort_by: %s；允许: composite, weighted, %s"
             % (sort_by, ", ".join(SCORE_SORT_FIELDS.keys())),
         )
     return key
 
 
-def _score_sort_value(row: dict, sort_by: str, strategy: str) -> float:
+def _parse_weighted_sort_weights(weights: Optional[str]) -> Dict[str, float]:
+    try:
+        return parse_score_weights(
+            weights,
+            allowed_dimensions=(
+                "cycle",
+                "growth",
+                "fundamental",
+                "value",
+                "technical",
+                "money_flow",
+            ),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"weights 参数无效: {exc}") from exc
+
+
+def _score_sort_value(
+    row: dict,
+    sort_by: str,
+    strategy: str,
+    weights: Optional[Dict[str, float]] = None,
+) -> float:
     if sort_by == "composite":
         return extract_strategy_score(row.get("composite_score", 0), strategy)
+    if sort_by == "weighted":
+        return weighted_dimension_score(row, weights or {})
     return safe_float(row.get(SCORE_SORT_FIELDS[sort_by]), 0.0)
+
+
+def _weighted_score_or_none(row: dict, sort_by: str, weights: Dict[str, float]) -> Optional[float]:
+    if sort_by != "weighted":
+        return None
+    return safe_round(weighted_dimension_score(row, weights), 2)
+
+
+def _weighted_sort_value_from_per_date_fields(
+    row: dict,
+    weights: Dict[str, float],
+) -> float:
+    return max(
+        (
+            weighted_dimension_score(fields, weights)
+            for fields in (row.get("per_date_fields") or {}).values()
+        ),
+        default=0.0,
+    )
 
 
 # using helpers from stock-scoring-system/utils/score_utils.py
@@ -607,7 +658,11 @@ async def get_stock_rankings_by_index(
     ),
     sort_by: str = Query(
         "composite",
-        description="排序维度：composite/cycle/growth/fundamental/value/technical/money_flow",
+        description="排序维度：composite/weighted/cycle/growth/fundamental/value/technical/money_flow",
+    ),
+    weights: Optional[str] = Query(
+        None,
+        description="sort_by=weighted 时使用，如 growth:0.6,cycle:0.4；权重自动归一化",
     ),
     date: Optional[str] = Query(
         None,
@@ -634,9 +689,10 @@ async def get_stock_rankings_by_index(
         stock_info = db["stock_info"]
         effective_strategy = (strategy or "balanced").strip() or "balanced"
         sort_key = _normalize_sort_by(sort_by)
+        weighted_weights = _parse_weighted_sort_weights(weights) if sort_key == "weighted" else {}
         raw = _aggregate_index_ranking_score_docs(stock_scores, ic, date)
         raw.sort(
-            key=lambda d: _score_sort_value(d, sort_key, effective_strategy),
+            key=lambda d: _score_sort_value(d, sort_key, effective_strategy, weighted_weights),
             reverse=True,
         )
         symbols = [s.get("symbol") for s in raw if s.get("symbol")]
@@ -680,6 +736,9 @@ async def get_stock_rankings_by_index(
                 "industry_rs_score": stock.get("industry_rs_score"),
                 "score_date": stock.get("score_date", ""),
             }
+            if sort_key == "weighted":
+                row["weighted_score"] = _weighted_score_or_none(row, sort_key, weighted_weights)
+                row["weighted_score_weights"] = weighted_weights
             row.update(dict(RETURN_SINCE_EMPTY))
             row.update(dict(PRIOR_3M_EMPTY))
             formatted.append(row)
@@ -714,7 +773,11 @@ async def get_stock_rankings(
     strategy: str = Query('balanced', description="指定排行榜策略，balanced/aggressive/conservative"),
     sort_by: str = Query(
         "composite",
-        description="排序维度：composite/cycle/growth/fundamental/value/technical/money_flow",
+        description="排序维度：composite/weighted/cycle/growth/fundamental/value/technical/money_flow",
+    ),
+    weights: Optional[str] = Query(
+        None,
+        description="sort_by=weighted 时使用，如 growth:0.6,cycle:0.4；权重自动归一化",
     ),
 ):
     """
@@ -726,6 +789,7 @@ async def get_stock_rankings(
         stock_info = db['stock_info']
         effective_strategy = (strategy or "balanced").strip() or "balanced"
         sort_key = _normalize_sort_by(sort_by)
+        weighted_weights = _parse_weighted_sort_weights(weights) if sort_key == "weighted" else {}
 
         # Efficient aggregation: $sort -> $group (first doc) -> project -> sort
         if date:
@@ -802,7 +866,7 @@ async def get_stock_rankings(
 
         # use centralized helper to extract strategy-specific score
         top_stocks.sort(
-            key=lambda s: _score_sort_value(s, sort_key, effective_strategy),
+            key=lambda s: _score_sort_value(s, sort_key, effective_strategy, weighted_weights),
             reverse=True,
         )
 
@@ -827,6 +891,9 @@ async def get_stock_rankings(
                 'industry_rs_score': stock.get('industry_rs_score'),
                 'score_date': stock.get('score_date', '')
             }
+            if sort_key == "weighted":
+                row["weighted_score"] = _weighted_score_or_none(row, sort_key, weighted_weights)
+                row["weighted_score_weights"] = weighted_weights
             row.update(dict(RETURN_SINCE_EMPTY))
             row.update(dict(PRIOR_3M_EMPTY))
             formatted.append(row)
@@ -1163,7 +1230,11 @@ async def get_selected_stock_rankings(
     ),
     sort_by: str = Query(
         "composite",
-        description="排序维度：composite/cycle/growth/fundamental/value/technical/money_flow",
+        description="排序维度：composite/weighted/cycle/growth/fundamental/value/technical/money_flow",
+    ),
+    weights: Optional[str] = Query(
+        None,
+        description="sort_by=weighted 时使用，如 growth:0.6,cycle:0.4；权重自动归一化",
     ),
     offset: int = Query(0, ge=0, description="分页：排序后截取起点"),
     page_size: Optional[int] = Query(
@@ -1188,6 +1259,7 @@ async def get_selected_stock_rankings(
         bs = (body.strategy or "").strip() if body.strategy else ""
         effective_strategy = qs or bs or "balanced"
         sort_key = _normalize_sort_by(sort_by)
+        weighted_weights = _parse_weighted_sort_weights(weights) if sort_key == "weighted" else {}
         # support optional multi-date per-symbol queries via body.dates
         dates = getattr(body, 'dates', None) or None
         if dates:
@@ -1262,14 +1334,38 @@ async def get_selected_stock_rankings(
                     'composite_score': latest_any.get('composite_score', {}) if latest_any else {},
                     'per_date_scores': per_date_scores,
                     'per_date_fields': per_date_fields,
+                    'per_date_weighted_scores': (
+                        {
+                            d: safe_round(weighted_dimension_score(fields, weighted_weights), 2)
+                            for d, fields in per_date_fields.items()
+                        }
+                        if sort_key == "weighted"
+                        else {}
+                    ),
                     'per_date_return_since': per_date_return_since,
                     'per_date_prior_3m_return': per_date_prior_3m_return,
-                    'score_date': latest_any.get('score_date') if latest_any else ''
+                    'score_date': latest_any.get('score_date') if latest_any else '',
+                    **(
+                        {
+                            'weighted_score': safe_round(
+                                _weighted_sort_value_from_per_date_fields(
+                                    {'per_date_fields': per_date_fields},
+                                    weighted_weights,
+                                ),
+                                2,
+                            ),
+                            'weighted_score_weights': weighted_weights,
+                        }
+                        if sort_key == "weighted"
+                        else {}
+                    ),
                 })
             formatted_stocks.sort(
                 key=lambda row: (
-                    _score_sort_value(row, sort_key, effective_strategy)
+                    _score_sort_value(row, sort_key, effective_strategy, weighted_weights)
                     if sort_key == "composite"
+                    else _weighted_sort_value_from_per_date_fields(row, weighted_weights)
+                    if sort_key == "weighted"
                     else max(
                         (
                             safe_float(fields.get(SCORE_SORT_FIELDS[sort_key]), 0.0)
@@ -1336,7 +1432,7 @@ async def get_selected_stock_rankings(
             stock["industry"] = inf.get("industry", "") if inf else ""
         # 按当前策略降序（兼容 composite_score 为 dict 或数值；聚合 $sort 对 dict 不可靠，统一在 Python 侧排序）
         selected_stocks.sort(
-            key=lambda x: _score_sort_value(x, sort_key, effective_strategy),
+            key=lambda x: _score_sort_value(x, sort_key, effective_strategy, weighted_weights),
             reverse=True,
         )
         # 格式化返回数据
@@ -1361,6 +1457,13 @@ async def get_selected_stock_rankings(
                 'industry_rs_score': stock.get('industry_rs_score'),
                 'score_date': stock.get('score_date', date if date else '')
             }
+            if sort_key == "weighted":
+                formatted_stock["weighted_score"] = _weighted_score_or_none(
+                    formatted_stock,
+                    sort_key,
+                    weighted_weights,
+                )
+                formatted_stock["weighted_score_weights"] = weighted_weights
             formatted_stock.update(dict(RETURN_SINCE_EMPTY))
             formatted_stock.update(dict(PRIOR_3M_EMPTY))
             formatted_stocks.append(formatted_stock)
