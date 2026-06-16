@@ -6,8 +6,10 @@ from routers.hermes_quant_tools import _foreign_top10_floatholders_payload
 class _Collection:
     def __init__(self, docs=None):
         self.docs = list(docs or [])
+        self.find_calls = 0
 
     def find(self, query=None, projection=None, sort=None, limit=0):
+        self.find_calls += 1
         rows = [dict(doc) for doc in self.docs if self._matches(doc, query or {})]
         if sort:
             for field, direction in reversed(sort):
@@ -179,6 +181,7 @@ def test_foreign_top10_floatholders_filters_by_range_return(monkeypatch):
     assert payload["results"][0]["return_start_trade_date"] == "20260102"
     assert payload["results"][0]["return_end_trade_date"] == "20260615"
     assert payload["results"][0]["range_return"]["return_pct"] == pytest.approx(25.0)
+    assert prices.find_calls == 1
 
 
 def test_foreign_top10_floatholders_reports_period_changes(monkeypatch):

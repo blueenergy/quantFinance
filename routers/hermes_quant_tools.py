@@ -834,6 +834,74 @@ def _range_return_for_symbol(
     }
 
 
+def _range_returns_for_symbols(
+    price_collection: Any,
+    symbols: List[str],
+    *,
+    start: Optional[str],
+    end: Optional[str],
+) -> Dict[str, Dict[str, Any]]:
+    if not start:
+        return {}
+
+    canonical_symbols = sorted({str(symbol or "").strip() for symbol in symbols if symbol})
+    if not canonical_symbols:
+        return {}
+
+    variant_to_symbol: Dict[str, str] = {}
+    for symbol in canonical_symbols:
+        for variant in _symbol_variants(symbol):
+            variant_to_symbol[variant] = symbol
+
+    date_filter = _date_query(start, end)
+    query: Dict[str, Any] = {
+        "$or": [
+            {"symbol": {"$in": sorted(variant_to_symbol)}},
+            {"ts_code": {"$in": sorted(variant_to_symbol)}},
+            {"con_code": {"$in": sorted(variant_to_symbol)}},
+        ],
+        "trade_date": date_filter,
+    }
+    projection = {"_id": 0, "symbol": 1, "ts_code": 1, "con_code": 1, "trade_date": 1, "close": 1}
+
+    rows_by_symbol: Dict[str, List[Dict[str, Any]]] = {symbol: [] for symbol in canonical_symbols}
+    for row in price_collection.find(query, projection, sort=[("trade_date", 1)]):
+        matched_symbol = None
+        for field in ("ts_code", "symbol", "con_code"):
+            value = str(row.get(field) or "").strip()
+            if value in variant_to_symbol:
+                matched_symbol = variant_to_symbol[value]
+                break
+        if not matched_symbol:
+            continue
+        if _get_number(row, "close") in (None, 0):
+            continue
+        rows_by_symbol.setdefault(matched_symbol, []).append(row)
+
+    returns: Dict[str, Dict[str, Any]] = {}
+    for symbol, rows in rows_by_symbol.items():
+        if len(rows) < 2:
+            continue
+        start_row = rows[0]
+        end_row = rows[-1]
+        start_close = _get_number(start_row, "close")
+        end_close = _get_number(end_row, "close")
+        if start_close in (None, 0) or end_close is None:
+            continue
+        return_pct = (end_close - start_close) / start_close * 100
+        returns[symbol] = {
+            "return_start": start,
+            "return_end": end or "latest",
+            "return_start_trade_date": start_row.get("trade_date"),
+            "return_end_trade_date": end_row.get("trade_date"),
+            "return_start_close": start_close,
+            "return_end_close": end_close,
+            "return_pct": round(return_pct, 4),
+        }
+
+    return returns
+
+
 def _latest_previous_period(collection: Any, period: str) -> Optional[str]:
     try:
         periods = collection.distinct("end_date", {"end_date": {"$lt": period}})
@@ -1023,13 +1091,14 @@ def _foreign_top10_floatholders_payload(
     missing_return_count = 0
     if return_start:
         filtered_matches: List[Dict[str, Any]] = []
+        return_map = _range_returns_for_symbols(
+            prices,
+            [row.get("ts_code") or "" for row in matches],
+            start=return_start.strip(),
+            end=return_end.strip() if return_end else None,
+        )
         for row in matches:
-            ret = _range_return_for_symbol(
-                prices,
-                row.get("ts_code") or "",
-                start=return_start.strip(),
-                end=return_end.strip() if return_end else None,
-            )
+            ret = return_map.get(row.get("ts_code") or "")
             if ret is None:
                 missing_return_count += 1
                 if max_return_pct is None:
@@ -1100,7 +1169,7 @@ def _foreign_top10_floatholders_payload(
 
 
 @router.get("/stock/foreign-top10-floatholders", operation_id="foreign_top10_floatholders", tags=[MCP_READ_TAG])
-async def foreign_top10_floatholders(
+def foreign_top10_floatholders(
     period: str = Query(..., description="报告期 YYYYMMDD，例如 20260331"),
     holders: Optional[str] = Query(
         None,
