@@ -355,6 +355,8 @@ services:
     volumes:
       - ../stock-scoring-system/logs:/app/logs
       - ../shared/portfolio-research:/app/reports/portfolio-research
+    networks:
+      - quant-network
     logging:
       driver: json-file
       options:
