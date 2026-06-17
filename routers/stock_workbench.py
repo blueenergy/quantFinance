@@ -21,7 +21,17 @@ except ModuleNotFoundError:
     _stock_data_access_src = Path(__file__).resolve().parents[1] / "data-access-lib" / "src"
     if str(_stock_data_access_src) not in sys.path:
         sys.path.insert(0, str(_stock_data_access_src))
-    from stock_data_access.indicators.nineturn import enrich_nineturn_signals, latest_signal_summary
+    try:
+        from stock_data_access.indicators.nineturn import enrich_nineturn_signals, latest_signal_summary
+    except ModuleNotFoundError:
+        log = logging.getLogger(__name__)
+        log.warning("stock_data_access is unavailable; nineturn signal enrichment is disabled")
+
+        def enrich_nineturn_signals(daily_quotes: List[Dict[str, Any]], nineturn_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+            return []
+
+        def latest_signal_summary(signals: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+            return None
 
 router = APIRouter()
 log = logging.getLogger(__name__)
