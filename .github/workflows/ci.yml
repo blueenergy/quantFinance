@@ -49,6 +49,8 @@ jobs:
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     runs-on: ubuntu-latest
     needs: [test-build, docker]
+    env:
+      DEPLOY_MCP: ${{ vars.DEPLOY_MCP || 'false' }}
     steps:
       - name: Set up SSH key
         run: |
@@ -65,7 +67,7 @@ jobs:
             -o ServerAliveInterval=30 \
             -o ServerAliveCountMax=6 \
             ${{ secrets.VOLC_USER }}@${{ secrets.VOLC_HOST }} \
-            "ALIYUN_USER='${{ secrets.ALIYUN_USER }}' ALIYUN_TOKEN='${{ secrets.ALIYUN_TOKEN }}' bash -s" <<'EOF'
+            "ALIYUN_USER='${{ secrets.ALIYUN_USER }}' ALIYUN_TOKEN='${{ secrets.ALIYUN_TOKEN }}' DEPLOY_MCP='${DEPLOY_MCP}' bash -s" <<'EOF'
           set -euo pipefail
 
           IMAGE="crpi-gv3f6mfcrw75qane.cn-hangzhou.personal.cr.aliyuncs.com/wukongquant/quant-api:latest"
@@ -120,51 +122,55 @@ jobs:
             -v /home/deployuser/shared/portfolio-research:/app/reports/portfolio-research \
             "$IMAGE"
 
-          log_step "Starting quant-mcp-read"
-          timeout 60 docker run -d \
-            --name quant-mcp-read \
-            --restart unless-stopped \
-            --network quant-network \
-            --add-host=host.docker.internal:host-gateway \
-            -p 3002:3002 \
-            -e TZ=Asia/Shanghai \
-            -e ENABLE_EMBEDDED_SCHEDULER=false \
-            -e ENABLE_MCP_SERVER=true \
-            -e MCP_SERVER_MODE=read \
-            --health-cmd "curl -f http://localhost:3002/health || exit 1" \
-            --health-interval 30s \
-            --health-timeout 10s \
-            --health-retries 3 \
-            --log-driver json-file \
-            --log-opt max-size=50m \
-            --log-opt max-file=3 \
-            -v /home/deployuser/quantFinance/.env:/app/.env:ro \
-            -v /home/deployuser/quantFinance/logs:/app/logs \
-            "$IMAGE" \
-            uvicorn main:app --host 0.0.0.0 --port 3002 --workers 1 --log-level info
+          if [ "${DEPLOY_MCP:-false}" = "true" ]; then
+            log_step "Starting quant-mcp-read"
+            timeout 60 docker run -d \
+              --name quant-mcp-read \
+              --restart unless-stopped \
+              --network quant-network \
+              --add-host=host.docker.internal:host-gateway \
+              -p 3002:3002 \
+              -e TZ=Asia/Shanghai \
+              -e ENABLE_EMBEDDED_SCHEDULER=false \
+              -e ENABLE_MCP_SERVER=true \
+              -e MCP_SERVER_MODE=read \
+              --health-cmd "curl -f http://localhost:3002/health || exit 1" \
+              --health-interval 30s \
+              --health-timeout 10s \
+              --health-retries 3 \
+              --log-driver json-file \
+              --log-opt max-size=50m \
+              --log-opt max-file=3 \
+              -v /home/deployuser/quantFinance/.env:/app/.env:ro \
+              -v /home/deployuser/quantFinance/logs:/app/logs \
+              "$IMAGE" \
+              uvicorn main:app --host 0.0.0.0 --port 3002 --workers 1 --log-level info
 
-          log_step "Starting quant-mcp-actions"
-          timeout 60 docker run -d \
-            --name quant-mcp-actions \
-            --restart unless-stopped \
-            --network quant-network \
-            --add-host=host.docker.internal:host-gateway \
-            -p 3003:3003 \
-            -e TZ=Asia/Shanghai \
-            -e ENABLE_EMBEDDED_SCHEDULER=false \
-            -e ENABLE_MCP_SERVER=true \
-            -e MCP_SERVER_MODE=actions \
-            --health-cmd "curl -f http://localhost:3003/health || exit 1" \
-            --health-interval 30s \
-            --health-timeout 10s \
-            --health-retries 3 \
-            --log-driver json-file \
-            --log-opt max-size=50m \
-            --log-opt max-file=3 \
-            -v /home/deployuser/quantFinance/.env:/app/.env:ro \
-            -v /home/deployuser/quantFinance/logs:/app/logs \
-            "$IMAGE" \
-            uvicorn main:app --host 0.0.0.0 --port 3003 --workers 1 --log-level info
+            log_step "Starting quant-mcp-actions"
+            timeout 60 docker run -d \
+              --name quant-mcp-actions \
+              --restart unless-stopped \
+              --network quant-network \
+              --add-host=host.docker.internal:host-gateway \
+              -p 3003:3003 \
+              -e TZ=Asia/Shanghai \
+              -e ENABLE_EMBEDDED_SCHEDULER=false \
+              -e ENABLE_MCP_SERVER=true \
+              -e MCP_SERVER_MODE=actions \
+              --health-cmd "curl -f http://localhost:3003/health || exit 1" \
+              --health-interval 30s \
+              --health-timeout 10s \
+              --health-retries 3 \
+              --log-driver json-file \
+              --log-opt max-size=50m \
+              --log-opt max-file=3 \
+              -v /home/deployuser/quantFinance/.env:/app/.env:ro \
+              -v /home/deployuser/quantFinance/logs:/app/logs \
+              "$IMAGE" \
+              uvicorn main:app --host 0.0.0.0 --port 3003 --workers 1 --log-level info
+          else
+            log_step "Skipping MCP containers because DEPLOY_MCP=${DEPLOY_MCP:-false}"
+          fi
 
           log_step "Starting quant-scheduler"
           timeout 60 docker run -d \
