@@ -145,7 +145,7 @@ async def lifespan(app: FastAPI):
             stop_scheduler()
 
 app = FastAPI(lifespan=lifespan)
-_MCP_SERVER_ENABLED = os.getenv("ENABLE_MCP_SERVER", "true").strip().lower() in ("1", "true", "yes", "on")
+_MCP_SERVER_ENABLED = os.getenv("ENABLE_MCP_SERVER", "false").strip().lower() in ("1", "true", "yes", "on")
 _MCP_SERVER_MODE = os.getenv("MCP_SERVER_MODE", "all").strip().lower()
 _MCP_ONLY_PROCESS = _MCP_SERVER_ENABLED and _MCP_SERVER_MODE in {"read", "actions"}
 
