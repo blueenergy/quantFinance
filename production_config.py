@@ -95,6 +95,16 @@ def setup_production_middleware(app: FastAPI):
         response = await call_next(request)
         process_time = time.time() - start_time
         response.headers["X-Process-Time"] = str(process_time)
+        slow_threshold = float(os.getenv("SLOW_REQUEST_LOG_SECONDS", "5"))
+        if process_time >= slow_threshold:
+            logging.getLogger("slow_request").warning(
+                "Slow request %.3fs method=%s path=%s client=%s status=%s",
+                process_time,
+                request.method,
+                request.url.path,
+                request.client.host if request.client else "-",
+                response.status_code,
+            )
         return response
     
     return limiter
