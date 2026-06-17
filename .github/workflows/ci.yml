@@ -67,10 +67,10 @@ jobs:
             -o ServerAliveInterval=30 \
             -o ServerAliveCountMax=6 \
             ${{ secrets.VOLC_USER }}@${{ secrets.VOLC_HOST }} \
-            "ALIYUN_USER='${{ secrets.ALIYUN_USER }}' ALIYUN_TOKEN='${{ secrets.ALIYUN_TOKEN }}' DEPLOY_MCP='${DEPLOY_MCP}' bash -s" <<'EOF'
+            "ALIYUN_USER='${{ secrets.ALIYUN_USER }}' ALIYUN_TOKEN='${{ secrets.ALIYUN_TOKEN }}' DEPLOY_MCP='${DEPLOY_MCP}' IMAGE_TAG='sha-${GITHUB_SHA::7}' bash -s" <<'EOF'
           set -euo pipefail
 
-          IMAGE="crpi-gv3f6mfcrw75qane.cn-hangzhou.personal.cr.aliyuncs.com/wukongquant/quant-api:latest"
+          IMAGE="crpi-gv3f6mfcrw75qane.cn-hangzhou.personal.cr.aliyuncs.com/wukongquant/quant-api:${IMAGE_TAG}"
 
           log_step() {
             echo "[$(date '+%Y-%m-%d %H:%M:%S %z')] $*"
