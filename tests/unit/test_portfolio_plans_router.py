@@ -40,6 +40,17 @@ class _Collection:
                 doc.update(update.get("$set", {}))
                 return
 
+    def replace_one(self, query, new_doc, upsert=False):
+        for idx, doc in enumerate(self.docs):
+            if self._matches(doc, query):
+                self.docs[idx] = dict(new_doc)
+                return
+        if upsert:
+            self.docs.append(dict(new_doc))
+
+    def delete_many(self, query):
+        self.docs = [doc for doc in self.docs if not self._matches(doc, query)]
+
     def count_documents(self, query=None):
         return len(self.find(query or {}))
 
@@ -52,6 +63,8 @@ class _Collection:
             value = doc.get(key)
             if isinstance(expected, dict):
                 if "$in" in expected and value not in expected["$in"]:
+                    return False
+                if "$ne" in expected and value == expected["$ne"]:
                     return False
                 if "$gte" in expected and not (value >= expected["$gte"]):
                     return False
@@ -590,6 +603,167 @@ def test_execute_paper_blocks_after_live_signal_publish(monkeypatch):
 
     assert exc.value.status_code == 400
     assert "live signals" in exc.value.detail
+
+
+def test_attach_live_context_preserves_plan_current_without_live_signals():
+    finance = _finance_collections()
+    items = [
+        {
+            "plan_id": "plan-1",
+            "symbol": "300184.SZ",
+            "action": "sell",
+            "current_shares": 500,
+            "target_shares": 0,
+            "delta_shares": -500,
+        }
+    ]
+
+    enriched = portfolio_plans._attach_live_plan_item_context(
+        finance_collections=finance,
+        plan={"plan_id": "plan-1"},
+        items=items,
+        user_id="user-1",
+    )
+
+    assert enriched[0]["current_shares"] == 500
+    assert enriched[0]["plan_current_shares"] == 500
+
+
+def test_execute_paper_inherits_lineage_positions(monkeypatch):
+    collections = _collections()
+    parent = {
+        "plan_id": "parent-plan",
+        "strategy_template_id": "s1",
+        "user_id": "user-1",
+        "params_hash": "hash-1",
+        "base_date": "20250101",
+        "execute_date": "20250102",
+        "status": "executed_paper",
+    }
+    child = {
+        "plan_id": "child-plan",
+        "strategy_template_id": "s1",
+        "user_id": "user-1",
+        "params_hash": "hash-1",
+        "base_date": "20250103",
+        "execute_date": "20250103",
+        "status": "approved",
+        "params_snapshot": {"initial_capital": 1_000_000, "lot_size": 100},
+    }
+    collections["portfolio_trade_plans"].docs.extend([parent, child])
+    collections["portfolio_paper_positions"].docs.append(
+        {
+            "strategy_template_id": "s1",
+            "user_id": "user-1",
+            "params_hash": "hash-1",
+            "as_of_date": "20250102",
+            "plan_id": "parent-plan",
+            "cash": 99_000,
+            "equity": 100_000,
+            "positions": [{"symbol": "000001", "name": "平安银行", "shares": 100, "cost_basis": 10.0}],
+        }
+    )
+    collections["portfolio_trade_plan_items"].docs.append(
+        {
+            "plan_id": "child-plan",
+            "user_id": "user-1",
+            "symbol": "000001",
+            "name": "平安银行",
+            "industry": "Bank",
+            "rank": 1,
+            "delta_shares": -100,
+        }
+    )
+    data = _data_collections()
+    data["volume_price"].docs.append({"symbol": "000001", "trade_date": "20250103", "open": 11.0, "close": 12.0})
+    monkeypatch.setattr(portfolio_plans, "get_db_collections", lambda: _finance_collections())
+
+    result = portfolio_plans._apply_paper_execution(
+        collections,
+        data_collections=data,
+        plan_id="child-plan",
+        user_id="user-1",
+    )
+
+    assert result["inherited_from_plan_id"] == "parent-plan"
+    assert result["position_snapshot"]["cash"] == 100_100
+    assert result["position_snapshot"]["positions"] == []
+    assert collections["portfolio_paper_equity"].find_one({"plan_id": "child-plan"})["inherited_from_plan_id"] == "parent-plan"
+
+
+def test_get_portfolio_plan_lineage_equity_returns_combo_rows(monkeypatch):
+    collections = _collections()
+    collections["portfolio_trade_plans"].docs.extend(
+        [
+            {
+                "plan_id": "parent-plan",
+                "strategy_template_id": "s1",
+                "user_id": "user-1",
+                "params_hash": "hash-1",
+                "base_date": "20250101",
+                "plan_type": "rebalance",
+                "status": "executed_paper",
+            },
+            {
+                "plan_id": "child-plan",
+                "strategy_template_id": "s1",
+                "user_id": "user-1",
+                "params_hash": "hash-1",
+                "base_date": "20250103",
+                "plan_type": "rebalance",
+                "status": "executed_paper",
+            },
+        ]
+    )
+    collections["portfolio_paper_equity"].docs.extend(
+        [
+            {"strategy_template_id": "s1", "user_id": "user-1", "plan_id": "parent-plan", "date": "20250102", "equity": 100_000},
+            {"strategy_template_id": "s1", "user_id": "user-1", "params_hash": "hash-1", "plan_id": "child-plan", "date": "20250103", "equity": 101_000},
+            {"strategy_template_id": "s1", "user_id": "user-1", "params_hash": "other", "plan_id": "other-plan", "date": "20250103", "equity": 1},
+        ]
+    )
+    collections["portfolio_paper_positions"].docs.append(
+        {
+            "strategy_template_id": "s1",
+            "user_id": "user-1",
+            "params_hash": "hash-1",
+            "plan_id": "child-plan",
+            "as_of_date": "20250104",
+            "equity": 102_000,
+            "cash": 10_000,
+            "market_value": 92_000,
+        }
+    )
+    collections["portfolio_paper_positions"].docs.append(
+        {
+            "strategy_template_id": "s1",
+            "user_id": "user-1",
+            "params_hash": "hash-1",
+            "plan_id": "parent-plan",
+            "as_of_date": "20250104",
+            "equity": 101_500,
+            "cash": 10_000,
+            "market_value": 91_500,
+            "updated_at": 1,
+        }
+    )
+    collections["portfolio_paper_positions"].docs[-2]["updated_at"] = 2
+    monkeypatch.setattr(portfolio_plans, "get_trading_db_collections", lambda: collections)
+
+    response = asyncio.run(
+        portfolio_plans.get_portfolio_plan_lineage_equity(
+            "child-plan",
+            start_date=None,
+            end_date=None,
+            current_user={"id": "user-1"},
+        )
+    )
+
+    assert response["data"]["source_plan_ids"] == ["child-plan", "parent-plan"]
+    assert [row["plan_id"] for row in response["data"]["rows"]] == ["parent-plan", "child-plan", "child-plan"]
+    assert response["data"]["rows"][1]["is_current_plan"] is True
+    assert response["data"]["rows"][2]["source"] == "position_snapshot"
+    assert response["data"]["rows"][2]["equity"] == 102_000
 
 
 def test_plan_live_executions_are_scoped_to_plan_order_ids(monkeypatch):

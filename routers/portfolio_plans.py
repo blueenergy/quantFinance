@@ -180,6 +180,57 @@ def _require_plan(collections: Dict[str, Any], plan_id: str, current_user: Optio
     return plan
 
 
+def _lineage_plan_ids_for_plan(collections: Dict[str, Any], plan: Dict[str, Any], user_id: str) -> List[str]:
+    params_hash = plan.get("params_hash")
+    if not params_hash:
+        return [str(plan.get("plan_id"))] if plan.get("plan_id") else []
+    rows = collections["portfolio_trade_plans"].find(
+        {
+            "strategy_template_id": plan.get("strategy_template_id"),
+            "user_id": user_id,
+            "params_hash": params_hash,
+        },
+        {"_id": 0, "plan_id": 1},
+    )
+    plan_ids = {str(row.get("plan_id")) for row in rows if row.get("plan_id")}
+    if plan.get("plan_id"):
+        plan_ids.add(str(plan.get("plan_id")))
+    return sorted(plan_ids)
+
+
+def _lineage_query_for_plan(collections: Dict[str, Any], plan: Dict[str, Any], user_id: str) -> Dict[str, Any]:
+    query: Dict[str, Any] = {
+        "strategy_template_id": plan.get("strategy_template_id"),
+        "user_id": user_id,
+    }
+    params_hash = plan.get("params_hash")
+    plan_ids = _lineage_plan_ids_for_plan(collections, plan, user_id)
+    branches = []
+    if params_hash:
+        branches.append({"params_hash": params_hash})
+    if plan_ids:
+        branches.append({"plan_id": {"$in": plan_ids}})
+    if len(branches) == 1:
+        query.update(branches[0])
+    elif branches:
+        query["$or"] = branches
+    return query
+
+
+def _latest_lineage_position_snapshot(
+    collections: Dict[str, Any],
+    plan: Dict[str, Any],
+    user_id: str,
+    before_or_on: Optional[str] = None,
+) -> Dict[str, Any]:
+    query = _lineage_query_for_plan(collections, plan, user_id)
+    if plan.get("plan_id"):
+        query["plan_id"] = {"$ne": plan.get("plan_id")}
+    if before_or_on:
+        query["as_of_date"] = {"$lte": before_or_on}
+    return collections["portfolio_paper_positions"].find_one(query, sort=[("as_of_date", -1)]) or {}
+
+
 PLAN_LIST_PROJECTION = {
     "_id": 0,
     "plan_id": 1,
@@ -195,6 +246,7 @@ PLAN_LIST_PROJECTION = {
     "plan_type": 1,
     "is_rebalance_day": 1,
     "previous_rebalance_date": 1,
+    "previous_rebalance_plan_id": 1,
     "monitor_can_trade": 1,
     "trading_enabled": 1,
     "executable": 1,
@@ -507,11 +559,18 @@ def _attach_live_plan_item_context(
         items=items,
         user_id=user_id,
     )
+    has_live_context = any(
+        row.get("live_status") is not None
+        or _int_value(row.get("live_filled_qty")) != 0
+        or _int_value(row.get("live_remaining_qty")) != 0
+        or row.get("account_current_shares") is not None
+        for row in context.values()
+    )
     enriched = []
     for item in items:
         symbol_context = context.get(_symbol_key(item.get("symbol"))) or {}
         original_current = _int_value(item.get("current_shares"))
-        strategy_current = _int_value(symbol_context.get("strategy_current_shares"), original_current)
+        strategy_current = _int_value(symbol_context.get("strategy_current_shares"), original_current) if has_live_context else original_current
         enriched.append(
             {
                 **item,
@@ -540,10 +599,17 @@ def _plan_execution_context(finance_collections: Dict[str, Any], plan: Dict[str,
             "has_live_signals": False,
             "signal_count": 0,
         }
+    plan_id = str(plan.get("plan_id") or "")
+    if plan_id and get_trading_db_collections()["portfolio_paper_executions"].find_one({"plan_id": plan_id, "user_id": user_id}):
+        return {
+            "execution_mode": "paper",
+            "has_live_signals": False,
+            "signal_count": 0,
+        }
     signal_count = finance_collections["trade_signals"].count_documents(
         {
             "user_id": user_id,
-            "plan_id": plan.get("plan_id"),
+            "plan_id": plan_id,
             "mode": "live",
             "source": "portfolio_plan",
         }
@@ -1226,6 +1292,95 @@ async def get_portfolio_plan_equity(
     return {"success": True, "data": _jsonable(rows)}
 
 
+@router.get("/plans/{plan_id}/lineage-equity")
+async def get_portfolio_plan_lineage_equity(
+    plan_id: str,
+    start_date: Optional[str] = Query(default=None),
+    end_date: Optional[str] = Query(default=None),
+    current_user: dict = Depends(get_current_user),
+):
+    collections = get_trading_db_collections()
+    user_id = _current_user_id(current_user)
+    plan = _require_plan(collections, plan_id, current_user)
+    query = _lineage_query_for_plan(collections, plan, user_id)
+    if start_date or end_date:
+        date_query: Dict[str, Any] = {}
+        if start_date:
+            date_query["$gte"] = start_date.replace("-", "")
+        if end_date:
+            date_query["$lte"] = end_date.replace("-", "")
+        query["date"] = date_query
+    equity_rows = list(collections["portfolio_paper_equity"].find(query).sort("date", 1))
+    position_query = dict(query)
+    if "date" in position_query:
+        position_query["as_of_date"] = position_query.pop("date")
+    position_rows = list(collections["portfolio_paper_positions"].find(position_query).sort("as_of_date", 1))
+    rows_by_key: Dict[tuple, Dict[str, Any]] = {}
+    for row in equity_rows:
+        key = (row.get("plan_id"), row.get("date"))
+        rows_by_key[key] = dict(row)
+    for row in position_rows:
+        date = row.get("as_of_date")
+        key = (row.get("plan_id"), date)
+        if key in rows_by_key or not date:
+            continue
+        rows_by_key[key] = {
+            "strategy_template_id": row.get("strategy_template_id"),
+            "user_id": row.get("user_id"),
+            "params_hash": row.get("params_hash"),
+            "date": date,
+            "plan_id": row.get("plan_id"),
+            "inherited_from_plan_id": row.get("inherited_from_plan_id"),
+            "inherited_from_as_of_date": row.get("inherited_from_as_of_date"),
+            "equity": row.get("equity"),
+            "cash": row.get("cash"),
+            "market_value": row.get("market_value"),
+            "updated_at": row.get("updated_at"),
+            "source": "position_snapshot",
+        }
+    latest_by_date: Dict[str, Dict[str, Any]] = {}
+    for row in rows_by_key.values():
+        date = str(row.get("date") or "")
+        if not date:
+            continue
+        existing = latest_by_date.get(date)
+        if existing is None or str(row.get("updated_at") or "") >= str(existing.get("updated_at") or ""):
+            latest_by_date[date] = row
+    rows = sorted(latest_by_date.values(), key=lambda row: str(row.get("date") or ""))
+    plan_ids = sorted({row.get("plan_id") for row in rows if row.get("plan_id")})
+    plan_map = {
+        row.get("plan_id"): row
+        for row in collections["portfolio_trade_plans"].find(
+            {"plan_id": {"$in": plan_ids}, "user_id": user_id},
+            {"_id": 0, "plan_id": 1, "base_date": 1, "plan_type": 1, "status": 1},
+        )
+    } if plan_ids else {}
+    enriched = []
+    for row in rows:
+        source_plan = plan_map.get(row.get("plan_id"), {})
+        enriched.append(
+            {
+                **row,
+                "source_plan_base_date": source_plan.get("base_date"),
+                "source_plan_type": source_plan.get("plan_type"),
+                "source_plan_status": source_plan.get("status"),
+                "is_current_plan": row.get("plan_id") == plan_id,
+            }
+        )
+    return {
+        "success": True,
+        "data": _jsonable(
+            {
+                "plan_id": plan_id,
+                "strategy_template_id": plan.get("strategy_template_id"),
+                "params_hash": plan.get("params_hash"),
+                "rows": enriched,
+                "source_plan_ids": plan_ids,
+            }
+        ),
+    }
+
+
 @router.get("/plans/{plan_id}/live-executions")
 async def get_portfolio_plan_live_executions(plan_id: str, current_user: dict = Depends(get_current_user)):
     trading_collections = get_trading_db_collections()
@@ -1520,11 +1675,15 @@ def _apply_paper_execution(collections: Dict[str, Any], data_collections: Dict[s
     if not strategy_template_id:
         raise HTTPException(status_code=400, detail="plan is missing strategy_template_id")
 
-    # Plan-level paper execution: every plan runs in an isolated paper account.
-    # We intentionally do not inherit previous strategy snapshots.
-    positions: Dict[str, Dict[str, Any]] = {}
     params_snapshot = plan.get("params_snapshot") or {}
-    cash = float(params_snapshot.get("initial_capital", 1_000_000.0))
+    inherited_snapshot = _latest_lineage_position_snapshot(collections, plan, user_id, execute_date)
+    positions: Dict[str, Dict[str, Any]] = {
+        row.get("symbol"): dict(row)
+        for row in (inherited_snapshot.get("positions") or [])
+        if row.get("symbol")
+    }
+    cash = float(inherited_snapshot.get("cash", params_snapshot.get("initial_capital", 1_000_000.0)) or 0)
+    inherited_equity = float(inherited_snapshot.get("equity", params_snapshot.get("initial_capital", 1_000_000.0)) or 0)
     item_query = {"plan_id": plan_id}
     if user_id:
         item_query["user_id"] = user_id
@@ -1609,8 +1768,11 @@ def _apply_paper_execution(collections: Dict[str, Any], data_collections: Dict[s
     snapshot = {
         "strategy_template_id": strategy_template_id,
         "user_id": user_id,
+        "params_hash": plan.get("params_hash"),
         "as_of_date": execute_date,
         "plan_id": plan_id,
+        "inherited_from_plan_id": inherited_snapshot.get("plan_id"),
+        "inherited_from_as_of_date": inherited_snapshot.get("as_of_date"),
         "cash": cash,
         "market_value": market_value,
         "equity": equity,
@@ -1625,14 +1787,34 @@ def _apply_paper_execution(collections: Dict[str, Any], data_collections: Dict[s
     collections["portfolio_paper_positions"].replace_one(position_query, snapshot, upsert=True)
     collections["portfolio_paper_equity"].replace_one(
         equity_query,
-        {"strategy_template_id": strategy_template_id, "user_id": user_id, "date": execute_date, "plan_id": plan_id, "equity": equity, "cash": cash, "market_value": market_value, "updated_at": now},
+        {
+            "strategy_template_id": strategy_template_id,
+            "user_id": user_id,
+            "params_hash": plan.get("params_hash"),
+            "date": execute_date,
+            "plan_id": plan_id,
+            "inherited_from_plan_id": inherited_snapshot.get("plan_id"),
+            "inherited_from_as_of_date": inherited_snapshot.get("as_of_date"),
+            "equity": equity,
+            "cash": cash,
+            "market_value": market_value,
+            "updated_at": now,
+        },
         upsert=True,
     )
     plan_update_query = {"plan_id": plan_id}
     if user_id:
         plan_update_query["user_id"] = user_id
     collections["portfolio_trade_plans"].update_one(plan_update_query, {"$set": {"status": status, "paper_executed_at": now}})
-    return {"plan_id": plan_id, "status": status, "executions": executions, "position_snapshot": snapshot}
+    return {
+        "plan_id": plan_id,
+        "status": status,
+        "executions": executions,
+        "position_snapshot": snapshot,
+        "inherited_from_plan_id": inherited_snapshot.get("plan_id"),
+        "inherited_from_as_of_date": inherited_snapshot.get("as_of_date"),
+        "inherited_equity": inherited_equity,
+    }
 
 
 def _paper_execution_status(collections: Dict[str, Any], data_collections: Dict[str, Any], plan: Dict[str, Any], items: List[Dict[str, Any]]) -> Dict[str, Any]:
