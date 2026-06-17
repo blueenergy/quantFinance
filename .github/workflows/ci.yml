@@ -85,6 +85,9 @@ jobs:
           log_step "Preparing shared directories"
           mkdir -p /home/deployuser/quantFinance/logs /home/deployuser/shared/portfolio-research
 
+          log_step "Ensuring shared Docker network"
+          docker network inspect quant-network >/dev/null 2>&1 || docker network create quant-network
+
           log_step "Stopping existing containers"
           timeout 30 docker stop -t 20 quant-mcp-actions 2>/dev/null || true
           timeout 30 docker rm quant-mcp-actions 2>/dev/null || true
@@ -101,6 +104,7 @@ jobs:
           timeout 60 docker run -d \
             --name quant-api \
             --restart unless-stopped \
+            --network quant-network \
             --add-host=host.docker.internal:host-gateway \
             -p 3001:3001 \
             -e TZ=Asia/Shanghai \
@@ -120,6 +124,7 @@ jobs:
           timeout 60 docker run -d \
             --name quant-mcp-read \
             --restart unless-stopped \
+            --network quant-network \
             --add-host=host.docker.internal:host-gateway \
             -p 3002:3002 \
             -e TZ=Asia/Shanghai \
@@ -142,6 +147,7 @@ jobs:
           timeout 60 docker run -d \
             --name quant-mcp-actions \
             --restart unless-stopped \
+            --network quant-network \
             --add-host=host.docker.internal:host-gateway \
             -p 3003:3003 \
             -e TZ=Asia/Shanghai \
@@ -164,6 +170,7 @@ jobs:
           timeout 60 docker run -d \
             --name quant-scheduler \
             --restart unless-stopped \
+            --network quant-network \
             --add-host=host.docker.internal:host-gateway \
             -e TZ=Asia/Shanghai \
             --health-cmd "python tools/check_scheduler_health.py" \
