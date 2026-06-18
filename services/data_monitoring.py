@@ -176,10 +176,28 @@ def _latest_ingestion_doc_for_catalog_key(key: str) -> Optional[Dict[str, Any]]:
     原因：1) 不可依赖 Mongo 对 `date` 的 sort（int/str、7/8 位混存会排错）；
     2) 仅看 pipeline 时，若其中只有脏 date，会漏掉 job_status 里正确的记录。
     """
-    pt_docs = list(
-        db["pipeline_tasks"].find({"domain": "data_collection", "task_type": key})
-    )
-    js_docs = list(db["job_status"].find({"job_type": key}))
+    projection = {
+        "_id": 1,
+        "domain": 1,
+        "task_type": 1,
+        "job_type": 1,
+        "date": 1,
+        "status": 1,
+        "payload": 1,
+        "records_changed": 1,
+        "completed_at": 1,
+        "updated_at": 1,
+        "error": 1,
+    }
+    # Bound the candidate set. Sorting solely by date is unreliable because the
+    # field has mixed historical types, so combine recent timestamp and date
+    # candidates, then apply the normalized business-date sort in Python.
+    pt_query = {"domain": "data_collection", "task_type": key}
+    js_query = {"job_type": key}
+    pt_docs = list(db["pipeline_tasks"].find(pt_query, projection).sort("updated_at", -1).limit(20))
+    pt_docs.extend(db["pipeline_tasks"].find(pt_query, projection).sort("date", -1).limit(20))
+    js_docs = list(db["job_status"].find(js_query, projection).sort("updated_at", -1).limit(20))
+    js_docs.extend(db["job_status"].find(js_query, projection).sort("date", -1).limit(20))
     all_docs = pt_docs + js_docs
     if not all_docs:
         return None
@@ -378,6 +396,7 @@ def _append_freshness_row_for_collection(
     database: str,
     collection: str,
     display_label: str,
+    include_coverage: bool = True,
 ) -> None:
     """Append one freshness row (max field + optional coverage) for a Mongo collection."""
     field = fr.get("field")
@@ -417,7 +436,7 @@ def _append_freshness_row_for_collection(
         "error": err,
     }
     cov_cfg = fr.get("coverage") or {}
-    if raw is not None and not err and cov_cfg.get("universe_collection") and cov_cfg.get("match_key"):
+    if include_coverage and raw is not None and not err and cov_cfg.get("universe_collection") and cov_cfg.get("match_key"):
         try:
             u_db = cov_cfg.get("universe_database") or database
             data_coll = _get_collection(database, collection)
@@ -710,7 +729,7 @@ def query_coverage_gaps(
     return out
 
 
-def build_freshness_rows() -> List[Dict[str, Any]]:
+def build_freshness_rows(*, include_coverage: bool = True) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     for p in load_pipelines_catalog():
         fr = p.get("freshness") or {}
@@ -736,6 +755,7 @@ def build_freshness_rows() -> List[Dict[str, Any]]:
                     database=database,
                     collection=str(coll),
                     display_label=str(label),
+                    include_coverage=include_coverage,
                 )
             continue
         coll = fr.get("collection")
@@ -748,6 +768,7 @@ def build_freshness_rows() -> List[Dict[str, Any]]:
             database=database,
             collection=str(coll),
             display_label=str(p.get("label") or p.get("id") or coll),
+            include_coverage=include_coverage,
         )
     return out
 

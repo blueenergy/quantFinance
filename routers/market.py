@@ -7,14 +7,17 @@ from auth import get_current_active_user
 from db import get_db_collections, get_analyzer_db, get_data_db, realtime_db
 from market_analysis_cache import market_analysis_cache
 from datetime import date, datetime
+import os
 import time
 from services.tushare_cached import get_latest_trade_date
 from external_data import external_market_data
 from utils.stock_utils import serialize_doc
 from bson import ObjectId
 from services.analysis_tasks import build_task_doc
+import logging
 
 router = APIRouter()
+log = logging.getLogger(__name__)
 
 _HOME_SUMMARIES_CACHE_TTL_SECONDS = 60
 _MARKET_ANALYSIS_SUMMARY_CACHE_TTL_SECONDS = 60
@@ -196,17 +199,17 @@ def _build_data_pulse_home_summary(overview: Mapping[str, Any]) -> Dict[str, Any
 
 def _get_data_pulse_overview_for_home() -> Dict[str, Any]:
     from routers.data_pulse import _get_international_news_doc
-    from services.data_monitoring import build_data_monitoring_overview
+    from services.data_monitoring import build_freshness_rows, build_sync_health_from_catalog
 
     from datetime import timezone
 
-    dm = build_data_monitoring_overview()
-    freshness_rows = dm.get("freshness") or []
+    sync_health = build_sync_health_from_catalog()
+    freshness_rows = build_freshness_rows(include_coverage=False)
     overview: Dict[str, Any] = {
         "news": None,
-        "sync_health": dm.get("sync_health"),
+        "sync_health": sync_health,
         "freshness_detail": freshness_rows,
-        "pipelines_detail": dm.get("pipelines"),
+        "pipelines_detail": [],
     }
 
     news_doc = _get_international_news_doc()
@@ -235,14 +238,38 @@ def _get_data_pulse_overview_for_home() -> Dict[str, Any]:
 
 
 def _collect_home_summary_cards(analysis_date: Optional[str] = None) -> Dict[str, Any]:
+    started_at = time.perf_counter()
+    marks: List[tuple[str, float]] = []
+
+    def mark(label: str) -> None:
+        marks.append((label, time.perf_counter() - started_at))
+
     market_result = fetch_market_analysis_result(analysis_date)
+    mark("market_analysis")
 
     global_doc = get_analyzer_db()["global_analysis"].find_one(sort=[("_id", -1)])
     global_payload = serialize_doc(dict(global_doc)) if global_doc else {}
     global_summary = _build_global_home_summary(global_payload if isinstance(global_payload, dict) else {})
+    mark("global_analysis")
 
     data_pulse_overview = _get_data_pulse_overview_for_home()
     data_pulse_summary = _build_data_pulse_home_summary(data_pulse_overview)
+    mark("data_pulse")
+
+    total_elapsed = time.perf_counter() - started_at
+    threshold = float(os.getenv("HOME_SUMMARIES_TIMING_SECONDS", "1"))
+    if total_elapsed >= threshold:
+        previous = 0.0
+        parts = []
+        for label, elapsed in marks:
+            parts.append(f"{label}={elapsed - previous:.3f}s")
+            previous = elapsed
+        log.warning(
+            "Home summaries timing total=%.3fs date=%s %s",
+            total_elapsed,
+            analysis_date,
+            " ".join(parts),
+        )
 
     return {
         "global-market-brief": {

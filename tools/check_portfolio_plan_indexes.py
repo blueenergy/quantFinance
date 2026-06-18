@@ -228,6 +228,35 @@ def _expected_indexes() -> List[ExpectedIndex]:
             "trader_accounts_user_account_synced_desc",
             "latest account snapshot lookup",
         ),
+        # finance: dashboard data-pulse/home summary health checks.
+        ExpectedIndex(
+            "finance",
+            "pipeline_tasks",
+            [("domain", ASCENDING), ("task_type", ASCENDING), ("updated_at", DESCENDING)],
+            "pipeline_tasks_domain_type_updated_desc",
+            "latest data pipeline task lookup by updated_at",
+        ),
+        ExpectedIndex(
+            "finance",
+            "pipeline_tasks",
+            [("domain", ASCENDING), ("task_type", ASCENDING), ("date", DESCENDING)],
+            "pipeline_tasks_domain_type_date_desc",
+            "latest data pipeline task lookup by business date",
+        ),
+        ExpectedIndex(
+            "finance",
+            "job_status",
+            [("job_type", ASCENDING), ("updated_at", DESCENDING)],
+            "job_status_type_updated_desc",
+            "latest legacy job status lookup by updated_at",
+        ),
+        ExpectedIndex(
+            "finance",
+            "job_status",
+            [("job_type", ASCENDING), ("date", DESCENDING)],
+            "job_status_type_date_desc",
+            "latest legacy job status lookup by business date",
+        ),
         # quant_data: execution price checks.
         ExpectedIndex(
             "data",
