@@ -288,7 +288,6 @@ def _plan_has_live_signals(finance_collections: Dict[str, Any], plan_id: str, us
                 "user_id": user_id,
                 "plan_id": plan_id,
                 "mode": "live",
-                "source": "portfolio_plan",
             }
         )
     )
@@ -498,7 +497,6 @@ def _build_live_plan_item_context(
         "user_id": user_id,
         "plan_id": plan.get("plan_id"),
         "mode": "live",
-        "source": "portfolio_plan",
         "symbol": {"$in": symbol_values},
     }
     plan_signals = list(
@@ -652,37 +650,43 @@ def _plan_execution_context(finance_collections: Dict[str, Any], plan: Dict[str,
     Returns an ``execution_mode`` of ``paper``, ``live`` or ``not_executed``
     so the UI never has to infer the layout from scattered fields.
     """
-    if plan.get("status") in {"executed_paper", "partially_executed"}:
-        return {
-            "execution_mode": "paper",
-            "has_live_signals": False,
-            "signal_count": 0,
-        }
     plan_id = str(plan.get("plan_id") or "")
-    if plan_id and get_trading_db_collections()["portfolio_paper_executions"].find_one({"plan_id": plan_id, "user_id": user_id}):
-        return {
-            "execution_mode": "paper",
-            "has_live_signals": False,
-            "signal_count": 0,
-        }
-    signal_count = finance_collections["trade_signals"].count_documents(
-        {
-            "user_id": user_id,
-            "plan_id": plan_id,
-            "mode": "live",
-            "source": "portfolio_plan",
-        }
+    paper_execution = (
+        get_trading_db_collections()["portfolio_paper_executions"].find_one({"plan_id": plan_id, "user_id": user_id})
+        if plan_id
+        else None
+    )
+    has_paper_state = bool(plan.get("status") in {"executed_paper", "partially_executed"} or plan.get("paper_executed_at") or paper_execution)
+    signal_count = (
+        finance_collections["trade_signals"].count_documents(
+            {
+                "user_id": user_id,
+                "plan_id": plan_id,
+                "mode": "live",
+            }
+        )
+        if plan_id
+        else 0
     )
     if signal_count > 0:
         return {
             "execution_mode": "live",
             "has_live_signals": True,
             "signal_count": signal_count,
+            "has_paper_conflict": has_paper_state,
+        }
+    if has_paper_state:
+        return {
+            "execution_mode": "paper",
+            "has_live_signals": False,
+            "signal_count": 0,
+            "has_paper_conflict": False,
         }
     return {
         "execution_mode": "not_executed",
         "has_live_signals": False,
         "signal_count": 0,
+        "has_paper_conflict": False,
     }
 
 
@@ -1478,7 +1482,6 @@ async def get_portfolio_plan_live_executions(plan_id: str, current_user: dict = 
         "user_id": user_id,
         "plan_id": plan_id,
         "mode": "live",
-        "source": "portfolio_plan",
     }
     signals = _attach_signal_names(data_collections, [add_display_time_fields(row) for row in finance_collections["trade_signals"].find(signal_query).sort("created_at", 1)])
     order_ids = [row.get("order_id") for row in signals if row.get("order_id")]
@@ -1925,7 +1928,7 @@ def _apply_paper_execution(collections: Dict[str, Any], data_collections: Dict[s
     plan = _require_plan(collections, plan_id, {"id": user_id} if user_id else None)
     if plan.get("status") != "approved" and not force:
         raise HTTPException(status_code=400, detail="plan must be approved before paper execution")
-    if user_id and _plan_has_live_signals(get_db_collections(), plan_id, user_id) and not force:
+    if user_id and _plan_has_live_signals(get_db_collections(), plan_id, user_id):
         raise HTTPException(status_code=400, detail="plan already has live signals; cannot execute paper trading")
     execution_query = {"plan_id": plan_id}
     if user_id:

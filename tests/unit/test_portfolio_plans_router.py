@@ -610,6 +610,34 @@ def test_execute_paper_blocks_after_live_signal_publish(monkeypatch):
     assert "live signals" in exc.value.detail
 
 
+def test_execute_paper_force_still_blocks_after_live_signal_publish(monkeypatch):
+    collections = _collections()
+    collections["portfolio_trade_plans"].docs[0]["status"] = "approved"
+    finance = _finance_collections()
+    finance["trade_signals"].docs.append(
+        {
+            "user_id": "user-1",
+            "plan_id": "plan-user-1",
+            "source": "portfolio_plan",
+            "mode": "live",
+            "order_id": "live-order-1",
+        }
+    )
+    monkeypatch.setattr(portfolio_plans, "get_db_collections", lambda: finance)
+
+    with pytest.raises(portfolio_plans.HTTPException) as exc:
+        portfolio_plans._apply_paper_execution(
+            collections,
+            data_collections={},
+            plan_id="plan-user-1",
+            force=True,
+            user_id="user-1",
+        )
+
+    assert exc.value.status_code == 400
+    assert "live signals" in exc.value.detail
+
+
 def test_attach_live_context_preserves_plan_current_without_live_signals():
     finance = _finance_collections()
     items = [
@@ -913,7 +941,7 @@ def test_plan_detail_without_live_signals_marks_live_context_false(monkeypatch):
     assert response["data"]["live_execution_context"]["signal_count"] == 0
 
 
-def test_paper_executed_plan_suppresses_live_context(monkeypatch):
+def test_paper_executed_plan_with_live_signals_prefers_live_context(monkeypatch):
     collections = _collections()
     collections["portfolio_trade_plans"].docs[0]["status"] = "executed_paper"
     collections["portfolio_trade_plan_items"].docs.append(
@@ -949,10 +977,28 @@ def test_paper_executed_plan_suppresses_live_context(monkeypatch):
 
     response = asyncio.run(portfolio_plans.get_portfolio_plan("plan-user-1", current_user={"id": "user-1"}))
 
+    assert response["data"]["execution_mode"] == "live"
+    context = response["data"]["live_execution_context"]
+    assert context["has_live_signals"] is True
+    assert context["signal_count"] == 1
+    assert context["has_paper_conflict"] is True
+
+
+def test_paper_executed_plan_without_live_signals_marks_paper(monkeypatch):
+    collections = _collections()
+    collections["portfolio_trade_plans"].docs[0]["status"] = "executed_paper"
+    finance = _finance_collections()
+    monkeypatch.setattr(portfolio_plans, "get_trading_db_collections", lambda: collections)
+    monkeypatch.setattr(portfolio_plans, "get_db_collections", lambda: finance)
+    monkeypatch.setattr(portfolio_plans, "get_data_db", _data_collections)
+
+    response = asyncio.run(portfolio_plans.get_portfolio_plan("plan-user-1", current_user={"id": "user-1"}))
+
     assert response["data"]["execution_mode"] == "paper"
     context = response["data"]["live_execution_context"]
     assert context["has_live_signals"] is False
     assert context["signal_count"] == 0
+    assert context["has_paper_conflict"] is False
 
 
 def test_plan_live_equity_returns_sorted_rows(monkeypatch):

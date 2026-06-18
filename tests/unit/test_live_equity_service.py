@@ -1,4 +1,4 @@
-from services.live_equity import compute_live_plan_equity, snapshot_account_equity
+from services.live_equity import compute_live_plan_equity, snapshot_account_equity, snapshot_live_plan_equity
 
 
 class _Cursor(list):
@@ -117,3 +117,59 @@ def test_compute_live_plan_equity_uses_plan_executions_and_fees():
     assert round(point["unrealized_pnl"], 2) == 57.0
     assert round(point["equity"], 2) == 100132.0
     assert round(point["cash"], 2) == 99472.0
+
+
+def test_snapshot_live_plan_equity_writes_when_plan_has_paper_conflict():
+    trading_collections = {
+        "portfolio_trade_plans": _Collection(
+            [
+                {
+                    "user_id": "user-1",
+                    "plan_id": "plan-1",
+                    "strategy_template_id": "s1",
+                    "status": "executed_paper",
+                    "paper_executed_at": 1,
+                    "params_snapshot": {"initial_capital": 100000},
+                }
+            ]
+        ),
+        "portfolio_paper_executions": _Collection([{"user_id": "user-1", "plan_id": "plan-1"}]),
+        "portfolio_live_equity": _Collection(),
+    }
+    finance_collections = {
+        "trade_signals": _Collection(
+            [
+                {
+                    "user_id": "user-1",
+                    "plan_id": "plan-1",
+                    "mode": "live",
+                    "source": "portfolio_plan",
+                    "order_id": "live-order-1",
+                }
+            ]
+        ),
+        "trade_executions": _Collection(
+            [
+                {
+                    "user_id": "user-1",
+                    "order_id": "live-order-1",
+                    "symbol": "000001",
+                    "action": "buy",
+                    "filled_size": 100,
+                    "filled_price": 10,
+                    "total_fee": 5,
+                    "timestamp": 1,
+                }
+            ]
+        ),
+    }
+    data_collections = {"volume_price": _Collection([{"symbol": "000001", "close": 11, "trade_date": "20250604"}])}
+
+    result = snapshot_live_plan_equity(trading_collections, finance_collections, data_collections, date="20250604")
+
+    assert result["written"] == 1
+    assert result["skipped"] == 0
+    row = trading_collections["portfolio_live_equity"].docs[0]
+    assert row["plan_id"] == "plan-1"
+    assert row["has_paper_conflict"] is True
+    assert row["execution_count"] == 1

@@ -164,7 +164,6 @@ def _load_live_plan_inputs(
         "user_id": plan.get("user_id"),
         "plan_id": plan.get("plan_id"),
         "mode": "live",
-        "source": "portfolio_plan",
     }
     signals = list(finance_collections["trade_signals"].find(signal_query))
     order_ids = [row.get("order_id") for row in signals if row.get("order_id")]
@@ -309,7 +308,7 @@ def snapshot_live_plan_equity(
     updated_at = _utc_now()
     live_signals = list(
         finance_collections["trade_signals"].find(
-            {"mode": "live", "source": "portfolio_plan", "plan_id": {"$exists": True}}
+            {"mode": "live", "plan_id": {"$exists": True}}
         )
     )
     plan_keys = sorted({(row.get("user_id"), row.get("plan_id")) for row in live_signals if row.get("user_id") and row.get("plan_id")})
@@ -321,12 +320,6 @@ def snapshot_live_plan_equity(
         if not plan:
             skipped += 1
             continue
-        # 显式排除已 paper 执行的 plan，避免与实盘净值混淆。
-        if plan.get("paper_executed_at") or trading_collections["portfolio_paper_executions"].find_one(
-            {"user_id": user_id, "plan_id": plan_id}
-        ):
-            skipped += 1
-            continue
         _signals, executions = _load_live_plan_inputs(trading_collections, finance_collections, plan)
         if not executions:
             skipped += 1
@@ -334,6 +327,11 @@ def snapshot_live_plan_equity(
         symbols = sorted({str(row.get("symbol")) for row in executions if row.get("symbol")})
         prices = _load_latest_close_prices(data_collections["volume_price"], symbols)
         point = compute_live_plan_equity(plan, executions, prices, date=snapshot_date)
+        point["has_paper_conflict"] = bool(
+            plan.get("paper_executed_at")
+            or plan.get("status") in {"executed_paper", "partially_executed"}
+            or trading_collections["portfolio_paper_executions"].find_one({"user_id": user_id, "plan_id": plan_id})
+        )
         point["updated_at"] = updated_at
         point["execution_count"] = len(executions)
         trading_collections["portfolio_live_equity"].update_one(
