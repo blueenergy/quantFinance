@@ -212,7 +212,7 @@ def test_signal_activity_timestamp_prefers_update_time():
 
 
 @pytest.mark.unit
-def test_create_trader_execution_is_idempotent(monkeypatch):
+def test_create_trader_execution_is_idempotent():
     executions = _FakeWriteCollection()
     signals = _FakeWriteCollection(
         [
@@ -224,11 +224,7 @@ def test_create_trader_execution_is_idempotent(monkeypatch):
             }
         ]
     )
-    monkeypatch.setattr(
-        te,
-        "get_db_collections",
-        lambda: {"trade_executions": executions, "trade_signals": signals},
-    )
+    from services import trader_execution_upload as teu
 
     payload = {
         "order_id": "order-1",
@@ -239,11 +235,16 @@ def test_create_trader_execution_is_idempotent(monkeypatch):
         "timestamp": 1000.0,
     }
 
-    first = te.create_trader_execution(dict(payload), current_user={"id": "user-1"})
-    second = te.create_trader_execution({**payload, "timestamp": 1001.0}, current_user={"id": "user-1"})
+    first_id, first_ins = teu.upsert_trader_execution(
+        dict(payload), "user-1", executions_coll=executions, signals_coll=signals
+    )
+    second_id, second_ins = teu.upsert_trader_execution(
+        {**payload, "timestamp": 1001.0}, "user-1", executions_coll=executions, signals_coll=signals
+    )
 
-    assert first["inserted"] is True
-    assert second["inserted"] is False
+    assert first_ins is True
+    assert second_ins is False
+    assert first_id == second_id
     assert executions.insert_count == 1
     assert executions.update_count == 1
     assert len(executions.docs) == 1

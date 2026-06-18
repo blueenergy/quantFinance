@@ -10,6 +10,7 @@ This is the bridge between quantTrader (client) and quantFinance (backend).
 """
 
 from fastapi import APIRouter, Depends, Query, HTTPException, Body
+from pydantic import BaseModel, Field
 from typing import List, Optional, Dict, Any
 from datetime import datetime
 import time
@@ -19,8 +20,39 @@ from utils.stock_utils import serialize_doc
 from utils.time_display import add_display_time_fields
 from bson import ObjectId
 from services.live_equity import list_account_equity
+from services.trader_execution_upload import upsert_trader_execution
+from services import trader_signal_reprice as signal_reprice
 
 router = APIRouter()
+
+# Fields quantTrader may set via POST /trader/signals/{order_id}/status (allowlist).
+_TRADER_SIGNAL_STATUS_ALLOWED_FIELDS = frozenset(
+    {
+        "status",
+        "qmt_order_id",
+        "broker_order_id",
+        "retry_count",
+        "last_error",
+        "error",
+        "submitted_at",
+        "executed_at",
+        "filled_qty",
+        "avg_price",
+        "effective_limit_price",
+        "execution_phase",
+        "execution_priority",
+        "plan_item_rank",
+        "remaining_size",
+        "chase_suggestion",
+        "cancel_requested_at",
+        # submitted / poll diagnostics
+        "submitted_age_seconds",
+        "broker_status",
+        "broker_status_msg",
+        "last_status_checked_at",
+        "last_market_price",
+    }
+)
 
 
 def _attach_stock_names(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -127,12 +159,17 @@ def update_signal_status(
         if not signal:
             raise HTTPException(status_code=404, detail=f"Signal not found: {order_id}")
         
-        # Update fields
-        update_doc = {"$set": status_update}
-        
+        if "status" not in status_update:
+            raise HTTPException(status_code=400, detail="status is required")
+
+        filtered = {
+            k: v for k, v in status_update.items() if k in _TRADER_SIGNAL_STATUS_ALLOWED_FIELDS
+        }
+        filtered["updated_at"] = time.time()
+
         result = signals_coll.update_one(
             {"order_id": order_id, "user_id": user_id},
-            update_doc
+            {"$set": filtered},
         )
         
         if result.matched_count == 0:
@@ -163,68 +200,83 @@ def create_execution(
         collections = get_db_collections()
         executions_coll = collections["trade_executions"]
         signals_coll = collections["trade_signals"]
-        
+
         user_id = current_user["id"]
-        
-        # Add user_id and timestamp
-        execution["user_id"] = user_id
-        if "timestamp" not in execution:
-            execution["timestamp"] = time.time()
-        
-        broker_order_id = execution.get("broker_order_id") or execution.get("qmt_order_id")
-        order_id = execution.get("order_id")
-        execution_status = execution.get("status") or "filled"
-        signal = signals_coll.find_one({"order_id": order_id, "user_id": user_id}) if order_id else None
-        if signal:
-            for field in ("plan_id", "strategy_template_id", "source", "securities_account_id", "account_id", "broker"):
-                if signal.get(field) is not None:
-                    execution.setdefault(field, signal.get(field))
-        if broker_order_id:
-            execution["broker_order_id"] = broker_order_id
-            execution.setdefault("qmt_order_id", broker_order_id)
-        execution_key = {
-            "user_id": user_id,
-            "order_id": order_id,
-            "status": execution_status,
-        }
-        if broker_order_id:
-            execution_key["broker_order_id"] = broker_order_id
-        if execution.get("filled_size") is not None:
-            execution_key["filled_size"] = execution.get("filled_size")
+        execution_id, inserted = upsert_trader_execution(
+            dict(execution),
+            user_id,
+            executions_coll=executions_coll,
+            signals_coll=signals_coll,
+        )
 
-        existing = executions_coll.find_one(execution_key) if order_id else None
-        if existing:
-            executions_coll.update_one({"_id": existing["_id"]}, {"$set": execution})
-            execution_id = str(existing["_id"])
-        else:
-            result = executions_coll.insert_one(execution)
-            execution_id = str(result.inserted_id)
-
-        # Update signal status to the broker lifecycle status.
-        if order_id:
-            signal_update = {
-                "status": execution_status,
-                "updated_at": execution["timestamp"],
-            }
-            if execution_status in {"filled", "executed", "rejected", "cancelled", "canceled", "partial_cancelled", "failed"}:
-                signal_update["executed_at"] = execution["timestamp"]
-            if execution.get("filled_size") is not None:
-                signal_update["filled_qty"] = execution.get("filled_size")
-            if execution.get("filled_price") is not None:
-                signal_update["avg_price"] = execution.get("filled_price")
-            signals_coll.update_one(
-                {"order_id": order_id, "user_id": user_id},
-                {"$set": signal_update}
-            )
-        
         return {
             "success": True,
             "message": "Execution recorded",
-            "execution_id": execution_id
+            "execution_id": execution_id,
+            "inserted": inserted,
         }
-        
+
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to create execution: {str(e)}")
+
+
+class RepriceConfirmBody(BaseModel):
+    """Confirm replacement buy signal after preview (manual pricing)."""
+
+    effective_limit_price: float = Field(..., gt=0, description="Limit price for the new buy order")
+    size: Optional[int] = Field(None, gt=0, description="Override size; default from cancelled signal")
+    reason: str = Field("", max_length=2000)
+
+
+@router.post("/trader/signals/{order_id}/reprice", summary="Preview repricing for a cancelled buy signal")
+def preview_signal_reprice(
+    order_id: str,
+    current_user: dict = Depends(get_current_active_user),
+):
+    try:
+        collections = get_db_collections()
+        return signal_reprice.build_reprice_preview(
+            collections,
+            user_id=str(current_user["id"]),
+            order_id=order_id,
+        )
+    except signal_reprice.RepriceError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.message) from exc
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@router.post(
+    "/trader/signals/{order_id}/reprice/confirm",
+    summary="Create replacement buy signal (manual confirm)",
+)
+def confirm_signal_reprice(
+    order_id: str,
+    body: RepriceConfirmBody,
+    current_user: dict = Depends(get_current_active_user),
+):
+    try:
+        collections = get_db_collections()
+        return signal_reprice.confirm_reprice_and_insert_signal(
+            collections,
+            user_id=str(current_user["id"]),
+            order_id=order_id,
+            effective_limit_price=float(body.effective_limit_price),
+            size_override=body.size,
+            reason=body.reason or "",
+            reviewer=str(
+                current_user.get("username")
+                or current_user.get("email")
+                or current_user.get("id")
+                or "unknown"
+            ),
+        )
+    except signal_reprice.RepriceError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.message) from exc
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
 
 
 @router.get("/trader/live-signals", summary="List live trading signals")

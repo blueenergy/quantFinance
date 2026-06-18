@@ -1098,6 +1098,7 @@ def get_all_trade_activities(
                 "_id": str(signal_doc.get("_id")),
                 "symbol": signal_doc.get("symbol"),
                 "direction": (signal_doc.get("action", "")).upper(),
+                "action": signal_doc.get("action"),
                 "status": status_map.get(raw_status, raw_status.upper()),
                 "status_category": status_category,
                 "price": signal_doc.get("avg_price", signal_doc.get("price", 0)),
@@ -1112,7 +1113,14 @@ def get_all_trade_activities(
                 "source": "trade_signal",
                 "error_message": signal_doc.get("error_message"),
                 "retry_count": signal_doc.get("retry_count", 0),
-                "date": signal_doc.get("date", "")
+                "date": signal_doc.get("date", ""),
+                "effective_limit_price": signal_doc.get("effective_limit_price"),
+                "last_market_price": signal_doc.get("last_market_price"),
+                "submitted_age_seconds": signal_doc.get("submitted_age_seconds"),
+                "broker_status": signal_doc.get("broker_status"),
+                "broker_status_msg": signal_doc.get("broker_status_msg"),
+                "last_status_checked_at": signal_doc.get("last_status_checked_at"),
+                "raw_signal_status": raw_status,
             })
             signal_included_count += 1
         
@@ -1162,198 +1170,3 @@ def get_all_trade_activities(
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"查询失败: {str(e)}")
-
-
-@router.get("/trader/signals", summary="Trader: 获取当前用户的待执行交易信号（供本地 Trader 使用）")
-def get_trader_pending_signals(
-    limit: int = Query(50, ge=1, le=500, description="返回记录数量限制"),
-    include_submitted: bool = Query(False, description="是否包含已提交但未完成的订单"),
-    current_user: dict = Depends(get_current_active_user),
-):
-    """供本地 Trader 使用的信号获取接口.
-
-    - 只返回当前用户的实盘可执行信号
-    - 默认只包含 `pending` 和 `retry_pending` 状态
-    - 可选包含 `submitted` 状态，便于断线重连后恢复
-    """
-    try:
-        collections = get_db_collections()
-        signals_coll = collections["trade_signals"]
-
-        user_id = current_user["id"]
-        query: Dict[str, Any] = {
-            "user_id": user_id,
-            "is_executable": True,
-            "mode": "live",
-        }
-
-        status_list = ["pending", "retry_pending"]
-        if include_submitted:
-            status_list.append("submitted")
-        query["status"] = {"$in": status_list}
-
-        cursor = (
-            signals_coll.find(query)
-            .sort("timestamp", 1)
-            .limit(limit)
-        )
-        signals = [serialize_doc(doc) for doc in cursor]
-
-        return {
-            "success": True,
-            "data": signals,
-            "count": len(signals),
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"查询失败: {str(e)}")
-
-
-@router.post("/trader/signals/{order_id}/status", summary="Trader: 更新交易信号状态（供本地 Trader 使用）")
-def update_trader_signal_status(
-    order_id: str,
-    payload: Dict[str, Any],
-    current_user: dict = Depends(get_current_active_user),
-):
-    """供本地 Trader 使用的信号状态更新接口.
-
-    典型用法：
-    - 下单成功后将信号标记为 `submitted`，并写入 `qmt_order_id`
-    - 下单失败或需要重试时，将信号标记为 `retry_pending` 并累加 `retry_count`
-    - 超过重试次数后标记为 `failed` 并写入错误信息
-    """
-    status = payload.get("status")
-    if not status:
-        raise HTTPException(status_code=400, detail="status 字段为必填")
-
-    allowed_fields = {
-        "status",
-        "qmt_order_id",
-        "retry_count",
-        "last_error",
-        "error",
-        "submitted_at",
-        "executed_at",
-        "filled_qty",
-        "avg_price",
-    }
-
-    update_doc: Dict[str, Any] = {k: v for k, v in payload.items() if k in allowed_fields}
-    update_doc["updated_at"] = time.time()
-
-    collections = get_db_collections()
-    signals_coll = collections["trade_signals"]
-    user_id = current_user["id"]
-
-    result = signals_coll.update_one(
-        {"order_id": order_id, "user_id": user_id},
-        {"$set": update_doc},
-    )
-
-    if result.matched_count == 0:
-        raise HTTPException(status_code=404, detail="对应订单不存在或不属于当前用户")
-
-    return {
-        "success": True,
-        "matched": result.matched_count,
-        "modified": result.modified_count,
-    }
-
-
-@router.post("/trader/executions", summary="Trader: 上报交易执行结果（供本地 Trader 使用）")
-def create_trader_execution(
-    payload: Dict[str, Any],
-    current_user: dict = Depends(get_current_active_user),
-):
-    """供本地 Trader 使用的执行结果上报接口.
-
-    Trader 侧可以直接将原来写入 `trade_executions` 的字典作为 payload 发送：
-
-    - 服务器会自动补充/覆盖 `user_id` 字段
-    - 如未提供时间字段，会自动填充 `timestamp`/`date`/`datetime`
-    - 同时会根据执行结果更新对应 `trade_signals` 的状态
-    """
-    order_id = payload.get("order_id")
-    if not order_id:
-        raise HTTPException(status_code=400, detail="order_id 字段为必填")
-
-    collections = get_db_collections()
-    executions_coll = collections["trade_executions"]
-    signals_coll = collections["trade_signals"]
-
-    user_id = current_user["id"]
-
-    # 构建执行记录
-    execution_record: Dict[str, Any] = dict(payload)
-    execution_record["user_id"] = user_id
-
-    ts = execution_record.get("timestamp")
-    if not isinstance(ts, (int, float)):
-        ts = time.time()
-        execution_record["timestamp"] = ts
-
-    # 补充日期相关字段
-    dt = datetime.fromtimestamp(ts)
-    execution_record.setdefault("date", dt.strftime("%Y%m%d"))
-    execution_record.setdefault("datetime", dt.strftime("%Y-%m-%d %H:%M:%S"))
-
-    # 默认实盘模式
-    execution_record.setdefault("mode", "live")
-    signal = signals_coll.find_one({"order_id": order_id, "user_id": user_id})
-    if signal:
-        for field in ("plan_id", "strategy_template_id", "source", "securities_account_id", "account_id", "broker"):
-            if signal.get(field) is not None:
-                execution_record.setdefault(field, signal.get(field))
-
-    broker_order_id = execution_record.get("broker_order_id") or execution_record.get("qmt_order_id")
-    execution_status = execution_record.get("status") or "filled"
-    if broker_order_id:
-        execution_record["broker_order_id"] = broker_order_id
-        execution_record.setdefault("qmt_order_id", broker_order_id)
-
-    execution_key: Dict[str, Any] = {
-        "user_id": user_id,
-        "order_id": order_id,
-        "status": execution_status,
-    }
-    if broker_order_id:
-        execution_key["broker_order_id"] = broker_order_id
-    if execution_record.get("filled_size") is not None:
-        execution_key["filled_size"] = execution_record.get("filled_size")
-
-    existing_execution = executions_coll.find_one(execution_key)
-    if existing_execution:
-        executions_coll.update_one({"_id": existing_execution["_id"]}, {"$set": execution_record})
-        execution_id = str(existing_execution["_id"])
-        inserted = False
-    else:
-        insert_result = executions_coll.insert_one(execution_record)
-        execution_id = str(insert_result.inserted_id)
-        inserted = True
-
-    # 同步更新对应信号状态（如果存在）
-    signal_update: Dict[str, Any] = {}
-    if execution_status:
-        signal_update["status"] = execution_status
-
-    filled_size = execution_record.get("filled_size")
-    if filled_size is not None:
-        signal_update["filled_qty"] = filled_size
-
-    filled_price = execution_record.get("filled_price")
-    if filled_price is not None:
-        signal_update["avg_price"] = filled_price
-
-    if signal_update:
-        signal_update["updated_at"] = execution_record["timestamp"]
-        if execution_status in {"filled", "executed", "rejected", "cancelled", "canceled", "partial_cancelled", "failed"}:
-            signal_update["executed_at"] = execution_record["timestamp"]
-        signals_coll.update_one(
-            {"order_id": order_id, "user_id": user_id},
-            {"$set": signal_update},
-        )
-
-    return {
-        "success": True,
-        "execution_id": execution_id,
-        "inserted": inserted,
-    }
