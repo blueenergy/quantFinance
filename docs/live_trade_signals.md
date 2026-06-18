@@ -91,6 +91,24 @@ pending -> submitted -> partial_filled -> filled
 
 `trade_executions` writes are idempotent by `user_id + order_id + status + broker_order_id + filled_size`, so polling the same broker state does not create duplicate execution records.
 
+## Ghost entrust ids (QMT list no longer shows the order)
+
+When miniQMT's `query_stock_orders` returns other today's orders but **not** this
+`broker_order_id`, `quantTrader` treats a failed cancel API as **idempotent success**
+(no live entrust to cancel). After `cancel_requested`, if the broker snapshot **still**
+omits that id, the tracker marks the signal **cancelled** with
+`last_error=order_absent_from_broker_query_after_cancel` so Mongo can reach a
+terminal state.
+
+**Operational follow-up (new plan / re-approve):** cancelling the signal does **not**
+regenerate `portfolio_trade_plan_items`. To align the portfolio with **latest**
+positions and risk, use your normal plan pipeline (e.g. enqueue plan generation /
+review, `POST /portfolio-plans/plans/{plan_id}/approve`, then
+`POST /portfolio-plans/plans/{plan_id}/publish-live-signals` with a dry run
+first). Published `order_id` values are derived from plan item fields, so a new
+plan revision produces new signals rather than reviving the old `live-plan-*`
+rows.
+
 ## Execution Ordering And Price Guards
 
 Portfolio-plan signals are published with this first-level execution policy:

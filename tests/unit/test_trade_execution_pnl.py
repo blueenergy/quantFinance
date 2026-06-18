@@ -252,6 +252,39 @@ def test_create_trader_execution_is_idempotent():
 
 
 @pytest.mark.unit
+def test_upsert_execution_preserves_cancel_requested_against_submitted_poll():
+    """quantTrader poll must not clobber cancel_requested via execution upsert."""
+    executions = _FakeWriteCollection()
+    signals = _FakeWriteCollection(
+        [
+            {
+                "order_id": "order-1",
+                "user_id": "user-1",
+                "status": "cancel_requested",
+            }
+        ]
+    )
+    from services import trader_execution_upload as teu
+
+    teu.upsert_trader_execution(
+        {
+            "order_id": "order-1",
+            "status": "submitted",
+            "filled_size": 0,
+            "broker_order_id": "br-1",
+            "timestamp": 2000.0,
+        },
+        "user-1",
+        executions_coll=executions,
+        signals_coll=signals,
+    )
+
+    assert signals.docs[0]["status"] == "cancel_requested"
+    assert signals.docs[0]["filled_qty"] == 0
+    assert signals.docs[0]["updated_at"] == 2000.0
+
+
+@pytest.mark.unit
 def test_trade_pnl_summary_unrealized_zero_when_no_minute_price(monkeypatch):
     user_id = "u2"
 
