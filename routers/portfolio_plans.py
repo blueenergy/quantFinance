@@ -459,6 +459,15 @@ def _build_live_plan_item_context(
     items: List[Dict[str, Any]],
     user_id: str,
 ) -> Dict[str, Dict[str, Any]]:
+    if not plan.get("live_signals_published_at") and _int_value(plan.get("live_signal_count")) <= 0:
+        return {}
+
+    started_at = time.perf_counter()
+    marks: List[tuple[str, float]] = []
+
+    def mark(label: str) -> None:
+        marks.append((label, time.perf_counter() - started_at))
+
     strategy_template_id = plan.get("strategy_template_id")
     symbols = {_symbol_key(item.get("symbol")) for item in items if item.get("symbol")}
     if not symbols:
@@ -492,6 +501,7 @@ def _build_live_plan_item_context(
             },
         )
     )
+    mark("signals")
     order_ids = [row.get("order_id") for row in plan_signals if row.get("order_id")]
     account_ids = {str(row.get("securities_account_id")) for row in plan_signals if row.get("securities_account_id")}
 
@@ -503,6 +513,7 @@ def _build_live_plan_item_context(
                 {"_id": 0, "symbol": 1, "filled_size": 1, "filled_qty": 1, "quantity": 1, "size": 1},
             )
         )
+    mark("plan_executions")
 
     strategy_executions: List[Dict[str, Any]] = []
     account_positions: List[Dict[str, Any]] = []
@@ -528,6 +539,7 @@ def _build_live_plan_item_context(
                 },
             )
         )
+        mark("strategy_executions")
         account_positions = list(
             finance_collections["trader_positions"].find(
                 {
@@ -538,6 +550,7 @@ def _build_live_plan_item_context(
                 {"_id": 0, "symbol": 1, "qty": 1, "quantity": 1, "volume": 1, "shares": 1, "can_use_volume": 1, "available_qty": 1},
             )
         )
+    mark("account_positions")
 
     context: Dict[str, Dict[str, Any]] = {
         symbol: {
@@ -593,6 +606,25 @@ def _build_live_plan_item_context(
         current = context[symbol]
         current["account_current_shares"] = (current["account_current_shares"] or 0) + qty
         current["account_available_shares"] = (current["account_available_shares"] or 0) + available
+
+    total_elapsed = time.perf_counter() - started_at
+    threshold = float(os.getenv("PORTFOLIO_PLAN_DETAIL_TIMING_SECONDS", "1"))
+    if total_elapsed >= threshold:
+        previous = 0.0
+        parts = []
+        for label, elapsed in marks:
+            parts.append(f"{label}={elapsed - previous:.3f}s")
+            previous = elapsed
+        log.warning(
+            "Portfolio plan live context timing total=%.3fs plan_id=%s signals=%d order_ids=%d account_ids=%d symbols=%d %s",
+            total_elapsed,
+            plan.get("plan_id"),
+            len(plan_signals),
+            len(order_ids),
+            len(account_ids),
+            len(symbol_values),
+            " ".join(parts),
+        )
 
     return context
 
