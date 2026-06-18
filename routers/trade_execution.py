@@ -739,7 +739,7 @@ def get_trade_activities_stats(current_user: dict = Depends(get_current_active_u
 
 @router.get("/trade-activities/", summary="获取当前用户的所有交易活动（包含信号和执行记录）")
 def get_all_trade_activities(
-    limit: int = Query(100, description="返回记录数量限制", ge=1, le=MAX_TRADE_ACTIVITY_LIMIT),
+    limit: int = Query(100, description="返回记录数量限制", ge=1),
     skip: int = Query(0, description="跳过的记录数量", ge=0, le=MAX_TRADE_SKIP),
     start_date: Optional[str] = Query(None, description="开始日期 (YYYY-MM-DD)"),
     end_date: Optional[str] = Query(None, description="结束日期 (YYYY-MM-DD)"),
