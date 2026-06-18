@@ -100,6 +100,15 @@ omits that id, the tracker marks the signal **cancelled** with
 `last_error=order_absent_from_broker_query_after_cancel` so Mongo can reach a
 terminal state.
 
+If `cancel_requested` is set but **QMT still lists** the same `broker_order_id` as an
+active entrust, `quantTrader` **retries** `cancel_order` on a throttle (defaults:
+`QUANT_TRADER_CANCEL_RETRY_GRACE_SECONDS=15`,
+`QUANT_TRADER_CANCEL_RETRY_INTERVAL_SECONDS=25`). Optional **forced DB terminal**:
+set `QUANT_TRADER_CANCEL_REQUESTED_FORCE_CANCELLED_AFTER_SECONDS` (seconds after
+`cancel_requested_at`) to mark `cancelled` in Mongo even while the query list is
+stale; default `0` disables this (use only when you accept reconciling against a
+possibly live broker row).
+
 **Operational follow-up (new plan / re-approve):** cancelling the signal does **not**
 regenerate `portfolio_trade_plan_items`. To align the portfolio with **latest**
 positions and risk, use your normal plan pipeline (e.g. enqueue plan generation /
