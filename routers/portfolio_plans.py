@@ -18,11 +18,18 @@ from db import db as finance_db
 from db import get_data_db, get_db_collections, get_trading_db_collections
 from utils.time_display import add_display_time_fields
 from services.live_trade_signals import (
+    ACTIVE_SIGNAL_STATUSES,
     active_signal_query_for_order_ids,
     build_portfolio_plan_live_signal,
     summarize_signal_statuses,
 )
 from services.live_equity import compute_live_plan_realtime_equity, list_live_plan_equity
+from services.portfolio_plan_remainder import (
+    LIVE_SIGNAL_SOURCE_PLAN_TOPUP,
+    build_remainder_specs,
+    build_topup_signal_doc,
+)
+from services.trader_signal_reprice import resolve_market_reference_price
 
 
 router = APIRouter(prefix="/portfolio-plans", tags=["portfolio-plans"])
@@ -78,6 +85,12 @@ class PaperExecuteRequest(BaseModel):
 class PublishLiveSignalsRequest(BaseModel):
     securities_account_id: str
     dry_run: bool = Field(default=True)
+
+
+class ReplanRemainderRequest(BaseModel):
+    securities_account_id: str
+    dry_run: bool = Field(default=True)
+    reason: str = Field(default="")
 
 
 class GeneratePlanRequest(BaseModel):
@@ -1621,6 +1634,189 @@ async def publish_portfolio_plan_live_signals(
             }
         ),
     }
+
+
+@router.post("/plans/{plan_id}/replan-remainder")
+async def replan_portfolio_plan_remainder(
+    plan_id: str,
+    request: ReplanRemainderRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    """Gap-fill a live plan whose execution fell short (cancelled / partial).
+
+    Computes, against the **live account** baseline, the remaining shares needed
+    to finish what the plan intended to trade — capped by the planned per-position
+    budget and available cash — and (after dry-run confirmation) publishes
+    ``plan_topup`` signals. It never re-selects stocks; it only finishes the
+    original selection.
+    """
+    trading_collections = get_trading_db_collections()
+    finance_collections = get_db_collections()
+    data_collections = get_data_db()
+    user_id = _current_user_id(current_user)
+
+    plan = _require_plan(trading_collections, plan_id, current_user)
+    if plan.get("status") != "approved":
+        raise HTTPException(status_code=400, detail="plan must be approved to reconcile remainder")
+    if not plan.get("live_signals_published_at") and _int_value(plan.get("live_signal_count")) <= 0:
+        raise HTTPException(status_code=400, detail="plan has no live signals to reconcile")
+
+    account = _require_securities_account(finance_collections, request.securities_account_id, user_id)
+    account_snapshot = _latest_account_snapshot(finance_collections, account, user_id)
+    account_synced = bool(account_snapshot)
+    available_cash = _numeric(
+        account_snapshot.get("available_cash") or account_snapshot.get("cash")
+    ) if account_snapshot else None
+
+    items = list(
+        trading_collections["portfolio_trade_plan_items"]
+        .find({"plan_id": plan_id, "user_id": user_id})
+        .sort("rank", 1)
+    )
+    enriched_items = _attach_live_plan_item_context(
+        finance_collections=finance_collections,
+        plan=plan,
+        items=items,
+        user_id=user_id,
+    )
+
+    # Symbols with an in-flight (non-terminal) live signal for this plan: never
+    # double-send while an order is still working.
+    active_rows = finance_collections["trade_signals"].find(
+        {
+            "user_id": user_id,
+            "plan_id": plan_id,
+            "mode": "live",
+            "status": {"$in": sorted(ACTIVE_SIGNAL_STATUSES)},
+        },
+        {"_id": 0, "symbol": 1},
+    )
+    active_symbols = {_symbol_key(row.get("symbol")) for row in active_rows if row.get("symbol")}
+
+    # Cancelled / terminal originals per symbol, surfaced as replaces_order_ids.
+    replaced_rows = finance_collections["trade_signals"].find(
+        {
+            "user_id": user_id,
+            "plan_id": plan_id,
+            "mode": "live",
+            "status": {"$in": ["cancelled", "canceled", "partial_cancelled", "failed", "rejected"]},
+        },
+        {"_id": 0, "order_id": 1, "symbol": 1},
+    )
+    replaces_by_symbol: Dict[str, List[str]] = {}
+    for row in replaced_rows:
+        sym = _symbol_key(row.get("symbol"))
+        if sym and row.get("order_id"):
+            replaces_by_symbol.setdefault(sym, []).append(str(row.get("order_id")))
+
+    specs = build_remainder_specs(
+        plan=plan,
+        enriched_items=enriched_items,
+        available_cash=available_cash,
+        account_synced=account_synced,
+        active_symbols=active_symbols,
+        price_resolver=resolve_market_reference_price,
+    )
+
+    now = datetime.utcnow()
+    signals: List[Dict[str, Any]] = []
+    for spec in specs:
+        if not spec.actionable:
+            continue
+        try:
+            signals.append(
+                build_topup_signal_doc(
+                    plan=plan,
+                    account=account,
+                    spec=spec,
+                    now=now,
+                    user_id=user_id,
+                    reason=request.reason,
+                    replaces_order_ids=replaces_by_symbol.get(_symbol_key(spec.symbol), []),
+                )
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            log.warning("Skipping remainder signal for %s: %s", spec.symbol, exc)
+
+    risk_report = _build_live_publish_risk_report(
+        finance_collections=finance_collections,
+        data_collections=data_collections,
+        account=account,
+        signals=signals,
+        user_id=user_id,
+    )
+    blocked = [item for item in risk_report["items"] if item["blockers"]]
+    if blocked and not request.dry_run:
+        raise HTTPException(
+            status_code=409,
+            detail={"message": "remainder risk check failed", "risk_report": risk_report},
+        )
+
+    inserted_count = 0
+    if not request.dry_run and signals:
+        finance_collections["trade_signals"].insert_many(signals)
+        inserted_count = len(signals)
+        _append_remainder_audit(
+            trading_collections,
+            plan_id=plan_id,
+            user_id=user_id,
+            reviewer=str(current_user.get("username") or current_user.get("id") or ""),
+            reason=request.reason,
+            signals=signals,
+        )
+
+    return {
+        "success": True,
+        "data": _jsonable(
+            {
+                "plan_id": plan_id,
+                "dry_run": request.dry_run,
+                "account_synced": account_synced,
+                "available_cash": available_cash,
+                "remainder": [spec.to_public() for spec in specs],
+                "actionable_count": sum(1 for spec in specs if spec.actionable),
+                "signals": signals,
+                "risk_report": risk_report,
+                "inserted_count": inserted_count,
+                "blocked": bool(blocked),
+            }
+        ),
+    }
+
+
+def _append_remainder_audit(
+    trading_collections: Dict[str, Any],
+    *,
+    plan_id: str,
+    user_id: str,
+    reviewer: str,
+    reason: str,
+    signals: List[Dict[str, Any]],
+) -> None:
+    logs = trading_collections.get("portfolio_plan_operation_logs")
+    if logs is None:
+        return
+    now = datetime.utcnow()
+    logs.insert_one(
+        {
+            "log_id": str(uuid.uuid4()),
+            "plan_id": plan_id or "",
+            "user_id": user_id,
+            "task_id": None,
+            "operation_type": "plan_remainder_topup",
+            "operation_symbol": None,
+            "status": "success",
+            "message": f"published {len(signals)} top-up signals",
+            "payload": {
+                "reviewer": reviewer,
+                "reason": (reason or "")[:2000],
+                "order_ids": [s.get("order_id") for s in signals],
+                "symbols": [s.get("symbol") for s in signals],
+            },
+            "created_at": now,
+            "updated_at": now,
+        }
+    )
 
 
 @router.get("/strategies/{strategy_template_id}/equity")

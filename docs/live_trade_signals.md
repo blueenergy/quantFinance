@@ -106,6 +106,19 @@ does **not** include this `broker_order_id`, `quantTrader` reconciles straight t
 `cancel_requested` step). A successful empty QMT entrust list is interpreted as
 "no live orders".
 
+**Trusted vs untrusted snapshot (critical invariant):** only a *successfully
+returned* order snapshot may drive the "id absent → cancelled" reconcile. A
+successful **empty** snapshot is trusted (means no live orders); a **failure** is
+not. The broker layer (`MiniQMTBroker.query_orders` / `get_execution_status`)
+therefore raises `BrokerQueryError` when the snapshot is unreliable — not
+connected, the xtquant API raised, or it returned `None` — instead of collapsing
+that into an empty dict. On `BrokerQueryError` the tracker **skips the whole poll
+cycle** and leaves order state unchanged, so a disconnect is never mistaken for
+"broker has no orders". For the same reason, a `cancel_order` returning `-1` is
+only treated as idempotent success when the re-query **succeeds** and omits the
+id; if the re-query itself is untrusted, cancel is reported as not accepted and
+retried next cycle.
+
 If `cancel_requested` is set but **QMT still lists** the same `broker_order_id` as an
 active entrust, `quantTrader` **retries** `cancel_order` on a throttle (defaults:
 `QUANT_TRADER_CANCEL_RETRY_GRACE_SECONDS=15`,
@@ -113,6 +126,34 @@ active entrust, `quantTrader` **retries** `cancel_order` on a throttle (defaults
 `config.json`, with env overriding JSON). When the entrust id **disappears** from the
 query (or the query is empty), the tracker moves to **cancelled** as above — no
 separate “force timer while row still exists” knob.
+
+## Gap-fill remainder (`plan_topup`)
+
+When a live plan under-executes (signals cancelled or only partially filled) and
+deployed capital falls short of target, `POST /portfolio-plans/plans/{plan_id}/replan-remainder`
+finishes **the same selection** without re-picking stocks. It is **preview-first**:
+call with `dry_run=true` to get a per-item breakdown plus a risk report, then
+`dry_run=false` after human confirmation to publish `source=plan_topup` signals.
+
+Rules:
+
+- **Baseline is the live account** (`trader_positions` actual holdings +
+  `trader_accounts` available cash), not the paper lineage used at plan
+  generation. If the account has no synced snapshot, every item is blocked with
+  `account_not_synced` (we never guess holdings).
+- Only items the plan **meant to trade** (original `delta_shares != 0`) are topped
+  up, and only in the **same direction**. This avoids inventing new sells of
+  pre-existing holdings the plan never intended to touch.
+- **Buys are capped by remaining budget** (planned target cost − current position
+  value) and then by **available cash**, so a price rise since plan time cannot
+  overspend the original budget (`budget_capped` / `cash_capped` reasons).
+- **Sells** fill the remaining `current − target` shares, limited by available
+  (non-frozen) quantity (`available_position_below_gap`).
+- A symbol with an **in-flight** (non-terminal) live signal for the plan is
+  skipped (`live_signal_active`) so we never double-send. Top-up `order_id`s are
+  `live-topup-*` (unique per round) and carry `replaces_order_ids`,
+  `topup_reason`, and a `topup_baseline` audit snapshot. Each publish writes a
+  `plan_remainder_topup` entry to `portfolio_plan_operation_logs`.
 
 **Operational follow-up (new plan / re-approve):** cancelling the signal does **not**
 regenerate `portfolio_trade_plan_items`. To align the portfolio with **latest**

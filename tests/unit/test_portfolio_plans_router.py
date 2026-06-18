@@ -1048,3 +1048,100 @@ def test_publish_live_signals_blocks_when_position_pct_exceeded(monkeypatch):
     blockers = exc.value.detail["risk_report"]["items"][0]["blockers"]
     assert "max_position_pct_exceeded" in blockers
     assert not finance["trade_signals"].docs
+
+
+def _remainder_setup(monkeypatch):
+    collections = _collections()
+    plan = collections["portfolio_trade_plans"].docs[0]
+    plan["status"] = "approved"
+    plan["live_signal_count"] = 1
+    plan["live_signals_published_at"] = 1
+    plan["params_snapshot"] = {"lot_size": 100}
+    collections["portfolio_trade_plan_items"].docs.append(
+        {
+            "plan_id": "plan-user-1",
+            "user_id": "user-1",
+            "symbol": "000001",
+            "name": "平安银行",
+            "action": "buy",
+            "delta_shares": 1000,
+            "target_shares": 1000,
+            "estimated_price": 10.0,
+            "current_shares": 0,
+            "rank": 1,
+        }
+    )
+    collections["portfolio_plan_operation_logs"] = _Collection()
+    finance = _finance_collections()
+    # An original published buy that got cancelled after a 400-share partial fill.
+    finance["trade_signals"].docs.append(
+        {
+            "order_id": "live-plan-orig",
+            "user_id": "user-1",
+            "plan_id": "plan-user-1",
+            "mode": "live",
+            "source": "portfolio_plan",
+            "symbol": "000001",
+            "action": "buy",
+            "status": "cancelled",
+            "size": 1000,
+            "filled_qty": 400,
+            "securities_account_id": "acct-1",
+        }
+    )
+    # Live account holds the 400 already filled (synced).
+    finance["trader_positions"].docs.append(
+        {"user_id": "user-1", "securities_account_id": "acct-1", "symbol": "000001", "qty": 400, "can_use_volume": 400}
+    )
+    monkeypatch.setattr(portfolio_plans, "get_trading_db_collections", lambda: collections)
+    monkeypatch.setattr(portfolio_plans, "get_db_collections", lambda: finance)
+    monkeypatch.setattr(portfolio_plans, "get_data_db", _data_collections)
+    monkeypatch.setattr(portfolio_plans, "resolve_market_reference_price", lambda symbol: (10.0, "realtime"))
+    return collections, finance
+
+
+def test_replan_remainder_dry_run_computes_gap(monkeypatch):
+    collections, finance = _remainder_setup(monkeypatch)
+
+    response = asyncio.run(
+        portfolio_plans.replan_portfolio_plan_remainder(
+            "plan-user-1",
+            portfolio_plans.ReplanRemainderRequest(securities_account_id="acct-1", dry_run=True),
+            current_user={"id": "user-1"},
+        )
+    )
+
+    data = response["data"]
+    assert data["dry_run"] is True
+    assert data["inserted_count"] == 0
+    assert data["actionable_count"] == 1
+    assert len(data["signals"]) == 1
+    signal = data["signals"][0]
+    assert signal["source"] == "plan_topup"
+    assert signal["action"] == "buy"
+    assert signal["size"] == 600
+    assert signal["order_id"].startswith("live-topup-")
+    assert signal["replaces_order_ids"] == ["live-plan-orig"]
+    assert not finance["trade_signals"].docs[1:]  # nothing inserted
+
+
+def test_replan_remainder_confirm_inserts_and_is_idempotent(monkeypatch):
+    collections, finance = _remainder_setup(monkeypatch)
+    request = portfolio_plans.ReplanRemainderRequest(securities_account_id="acct-1", dry_run=False)
+
+    first = asyncio.run(
+        portfolio_plans.replan_portfolio_plan_remainder("plan-user-1", request, current_user={"id": "user-1"})
+    )
+    assert first["data"]["inserted_count"] == 1
+    assert len(finance["trade_signals"].docs) == 2  # original + topup
+    assert len(collections["portfolio_plan_operation_logs"].docs) == 1
+
+    # The freshly inserted top-up is now an active signal for 000001, so a second
+    # run must not double-send.
+    second = asyncio.run(
+        portfolio_plans.replan_portfolio_plan_remainder("plan-user-1", request, current_user={"id": "user-1"})
+    )
+    assert second["data"]["inserted_count"] == 0
+    assert second["data"]["actionable_count"] == 0
+    remainder = second["data"]["remainder"][0]
+    assert "live_signal_active" in remainder["reasons"]
