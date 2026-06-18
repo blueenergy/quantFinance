@@ -26,8 +26,69 @@ class _LogsColl:
         self.rows.append(doc)
 
 
+class _MarketColl:
+    def __init__(self, rows):
+        self.rows = list(rows)
+
+    def find_one(self, query, sort=None):
+        symbols = set((query.get("symbol") or {}).get("$in") or [])
+        rows = [row for row in self.rows if row.get("symbol") in symbols]
+        if not rows:
+            return None
+        if sort:
+            for key, direction in reversed(sort):
+                rows.sort(key=lambda row: row.get(key) or "", reverse=direction < 0)
+        return rows[0]
+
+
 def _oid() -> str:
     return str(ObjectId())
+
+
+def test_resolve_market_reference_price_prefers_fresh_realtime(monkeypatch):
+    monkeypatch.setattr(
+        sr,
+        "get_data_db",
+        lambda: {
+            "volume_price": _MarketColl([{"symbol": "000001.SZ", "trade_date": "2026-06-18", "close": 10.2}]),
+            "volume_price_realtime_latest": _MarketColl(
+                [{"symbol": "000001.SZ", "trade_date": "2026-06-18", "trade_time": "14:30:00", "close": 10.5}]
+            ),
+        },
+    )
+
+    assert sr.resolve_market_reference_price("000001.SZ") == (10.5, "realtime")
+
+
+def test_resolve_market_reference_price_skips_stale_realtime(monkeypatch):
+    monkeypatch.setattr(
+        sr,
+        "get_data_db",
+        lambda: {
+            "volume_price": _MarketColl([{"symbol": "000001.SZ", "trade_date": "2026-06-18", "close": 10.2}]),
+            "volume_price_realtime_latest": _MarketColl(
+                [{"symbol": "000001.SZ", "trade_date": "2026-06-13", "trade_time": "15:00:00", "close": 9.8}]
+            ),
+        },
+    )
+
+    assert sr.resolve_market_reference_price("000001.SZ") == (10.2, "daily_close")
+
+
+def test_resolve_market_reference_price_falls_back_to_recent_realtime(monkeypatch):
+    today = sr.datetime.utcnow().date().isoformat()
+    monkeypatch.setattr(
+        sr,
+        "get_data_db",
+        lambda: {
+            "volume_price": _MarketColl([]),
+            "volume_price_realtime_latest": _MarketColl(
+                [{"symbol": "000001.SZ", "trade_date": today, "trade_time": "15:00:00", "price": 9.8}]
+            ),
+        },
+    )
+
+    assert sr.resolve_market_reference_price("000001.SZ") == (9.8, "realtime")
 
 
 def test_preview_rejects_non_cancelled(monkeypatch):

@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import uuid
 from datetime import datetime, timedelta
+from datetime import date as date_cls
 from typing import Any, Dict, Optional, Tuple
 
 from bson import ObjectId
@@ -18,6 +19,7 @@ LIVE_SIGNAL_SOURCE_MANUAL_REPRICE = "manual_reprice"
 
 # Max relative deviation of user limit from market reference (risk guard).
 _MAX_LIMIT_VS_MARKET_DEVIATION = float(os.getenv("REPRICE_MAX_LIMIT_VS_MARKET_DEVIATION", "0.25"))
+_REALTIME_MAX_STALE_DAYS = int(os.getenv("REPRICE_REALTIME_MAX_STALE_DAYS", "1"))
 
 
 class RepriceError(Exception):
@@ -40,10 +42,58 @@ def _first_float(*values: Any) -> Optional[float]:
     return None
 
 
+def _parse_doc_date(value: Any) -> Optional[date_cls]:
+    if value is None or value == "":
+        return None
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date_cls):
+        return value
+    text = str(value).strip()
+    for fmt, length in (("%Y-%m-%d", 10), ("%Y%m%d", 8)):
+        try:
+            return datetime.strptime(text[:length], fmt).date()
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _market_doc_date(doc: Optional[Dict[str, Any]]) -> Optional[date_cls]:
+    if not doc:
+        return None
+    return (
+        _parse_doc_date(doc.get("trade_date"))
+        or _parse_doc_date(doc.get("date"))
+        or _parse_doc_date(doc.get("updated_at"))
+        or _parse_doc_date(doc.get("created_at"))
+    )
+
+
+def _is_realtime_fresh(rt_doc: Dict[str, Any], daily_doc: Optional[Dict[str, Any]]) -> bool:
+    rt_date = _market_doc_date(rt_doc)
+    if not rt_date:
+        return False
+
+    daily_date = _market_doc_date(daily_doc)
+    if daily_date:
+        return rt_date >= daily_date
+
+    return (datetime.utcnow().date() - rt_date).days <= _REALTIME_MAX_STALE_DAYS
+
+
 def resolve_market_reference_price(symbol: str) -> Tuple[Optional[float], str]:
-    """Best-effort last price for A-share symbol (realtime latest then daily close)."""
+    """Best-effort reference price for A-share symbol.
+
+    Use realtime when it is at least as fresh as the latest daily bar; otherwise
+    fall back to daily close so stale realtime snapshots cannot anchor orders.
+    """
     data = get_data_db()
     candidates = _symbol_candidates(symbol)
+
+    daily_doc = None
+    vp = data.get("volume_price")
+    if vp is not None:
+        daily_doc = vp.find_one({"symbol": {"$in": candidates}}, sort=[("trade_date", -1)])
 
     rt = data.get("volume_price_realtime_latest")
     if rt is not None:
@@ -53,16 +103,13 @@ def resolve_market_reference_price(symbol: str) -> Tuple[Optional[float], str]:
         )
         if doc:
             px = _first_float(doc.get("close"), doc.get("price"), doc.get("latest_price"))
-            if px and px > 0:
+            if px and px > 0 and _is_realtime_fresh(doc, daily_doc):
                 return float(px), "realtime"
 
-    vp = data.get("volume_price")
-    if vp is not None:
-        doc = vp.find_one({"symbol": {"$in": candidates}}, sort=[("trade_date", -1)])
-        if doc:
-            px = _first_float(doc.get("close"))
-            if px and px > 0:
-                return float(px), "daily_close"
+    if daily_doc:
+        px = _first_float(daily_doc.get("close"))
+        if px and px > 0:
+            return float(px), "daily_close"
 
     return None, "unavailable"
 
