@@ -182,6 +182,7 @@ def build_remainder_specs(
             spec.reasons.append(REASON_CASH_CAPPED)
             if spec.topup_shares <= 0:
                 spec.actionable = False
+        spec.estimated_amount = spec.topup_shares * price
         remaining_cash -= spec.topup_shares * price
 
     return specs

@@ -79,6 +79,7 @@ def test_buy_cash_capped():
     )
     spec = _spec_for(specs)
     assert spec.topup_shares == 300
+    assert spec.estimated_amount == 3000
     assert rem.REASON_CASH_CAPPED in spec.reasons
 
 
