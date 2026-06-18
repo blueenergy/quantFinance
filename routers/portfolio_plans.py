@@ -425,6 +425,15 @@ def _symbol_key(value: Any) -> str:
     return str(value or "").split(".", 1)[0]
 
 
+def _symbol_query_values(value: Any) -> List[str]:
+    raw = str(value or "")
+    base = _symbol_key(raw)
+    values = {raw, base}
+    if base:
+        values.update({f"{base}.SH", f"{base}.SZ"})
+    return [item for item in values if item]
+
+
 def _execution_signed_size(row: Dict[str, Any]) -> int:
     size = _int_value(row.get("filled_size", row.get("filled_qty", row.get("quantity", row.get("size", 0)))))
     action = str(row.get("action") or row.get("side") or "").lower()
@@ -450,14 +459,35 @@ def _build_live_plan_item_context(
     symbols = {_symbol_key(item.get("symbol")) for item in items if item.get("symbol")}
     if not symbols:
         return {}
+    symbol_values = sorted(
+        {
+            value
+            for item in items
+            for value in _symbol_query_values(item.get("symbol"))
+            if value
+        }
+    )
 
     signal_query = {
         "user_id": user_id,
         "plan_id": plan.get("plan_id"),
         "mode": "live",
         "source": "portfolio_plan",
+        "symbol": {"$in": symbol_values},
     }
-    plan_signals = list(finance_collections["trade_signals"].find(signal_query))
+    plan_signals = list(
+        finance_collections["trade_signals"].find(
+            signal_query,
+            {
+                "_id": 0,
+                "order_id": 1,
+                "symbol": 1,
+                "status": 1,
+                "size": 1,
+                "securities_account_id": 1,
+            },
+        )
+    )
     order_ids = [row.get("order_id") for row in plan_signals if row.get("order_id")]
     account_ids = {str(row.get("securities_account_id")) for row in plan_signals if row.get("securities_account_id")}
 
@@ -465,7 +495,8 @@ def _build_live_plan_item_context(
     if order_ids:
         plan_executions = list(
             finance_collections["trade_executions"].find(
-                {"user_id": user_id, "order_id": {"$in": order_ids}}
+                {"user_id": user_id, "order_id": {"$in": order_ids}},
+                {"_id": 0, "symbol": 1, "filled_size": 1, "filled_qty": 1, "quantity": 1, "size": 1},
             )
         )
 
@@ -479,12 +510,28 @@ def _build_live_plan_item_context(
                     "strategy_template_id": strategy_template_id,
                     "mode": "live",
                     "securities_account_id": {"$in": sorted(account_ids)},
-                }
+                    "symbol": {"$in": symbol_values},
+                },
+                {
+                    "_id": 0,
+                    "symbol": 1,
+                    "filled_size": 1,
+                    "filled_qty": 1,
+                    "quantity": 1,
+                    "size": 1,
+                    "action": 1,
+                    "side": 1,
+                },
             )
         )
         account_positions = list(
             finance_collections["trader_positions"].find(
-                {"user_id": user_id, "securities_account_id": {"$in": sorted(account_ids)}}
+                {
+                    "user_id": user_id,
+                    "securities_account_id": {"$in": sorted(account_ids)},
+                    "symbol": {"$in": symbol_values},
+                },
+                {"_id": 0, "symbol": 1, "qty": 1, "quantity": 1, "volume": 1, "shares": 1, "can_use_volume": 1, "available_qty": 1},
             )
         )
 
