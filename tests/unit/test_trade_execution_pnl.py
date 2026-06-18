@@ -124,6 +124,35 @@ def test_compute_realized_pnl_with_sell_side_commission_only():
 
 
 @pytest.mark.unit
+def test_execution_filled_size_uses_trade_execution_contract_field():
+    execution = {"status": "filled", "filled_size": 100, "size": 200}
+
+    assert te._is_filled_execution(execution) is True
+    assert te._execution_filled_size(execution) == 100
+
+
+@pytest.mark.unit
+def test_execution_filled_size_does_not_treat_signal_fields_as_execution_contract():
+    execution = {"status": "filled", "filled_qty": 100, "size": 200}
+
+    assert te._is_filled_execution(execution) is False
+    assert te._execution_filled_size(execution) == 0
+
+
+@pytest.mark.unit
+def test_trade_time_window_query_uses_trade_execution_time_contract():
+    query = te._trade_time_window_query(days=30, start_date=None, end_date=None)
+    conditions = query["$or"]
+
+    assert any("timestamp" in condition for condition in conditions)
+    assert any("date" in condition for condition in conditions)
+    assert not any(
+        "created_at" in condition or "updated_at" in condition or "executed_at" in condition
+        for condition in conditions
+    )
+
+
+@pytest.mark.unit
 def test_trade_pnl_summary_unrealized_zero_when_no_minute_price(monkeypatch):
     user_id = "u2"
 

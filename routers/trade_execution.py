@@ -31,9 +31,13 @@ def _trade_time_window_query(
     days: Optional[int],
     start_date: Optional[str],
     end_date: Optional[str],
+    all_dates: bool = False,
     default_days: int = DEFAULT_TRADE_QUERY_DAYS,
 ) -> Dict[str, Any]:
     """Return a bounded date/timestamp query for trade read paths."""
+    if all_dates:
+        return {}
+
     days = _valid_int(days)
     start_date = start_date if isinstance(start_date, str) else None
     end_date = end_date if isinstance(end_date, str) else None
@@ -88,7 +92,14 @@ def _apply_query_filter(query: Dict[str, Any], extra_filter: Dict[str, Any]) -> 
         query[key] = value
 
 
-def _effective_window_days(days: Optional[int], start_date: Optional[str], end_date: Optional[str]) -> Optional[int]:
+def _effective_window_days(
+    days: Optional[int],
+    start_date: Optional[str],
+    end_date: Optional[str],
+    all_dates: bool = False,
+) -> Optional[int]:
+    if all_dates:
+        return None
     days = _valid_int(days)
     has_range = isinstance(start_date, str) or isinstance(end_date, str)
     if days:
@@ -102,6 +113,103 @@ def _bounded_trade_limit(limit: int) -> int:
 
 def _bounded_trade_skip(skip: int) -> int:
     return max(0, min(_valid_int(skip) or 0, MAX_TRADE_SKIP))
+
+
+def _execution_filled_size(row: Dict[str, Any]) -> float:
+    value = row.get("filled_size")
+    if value in (None, ""):
+        return 0.0
+    try:
+        return abs(float(value))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _is_filled_execution(row: Dict[str, Any]) -> bool:
+    return _execution_filled_size(row) != 0
+
+
+def _safe_count_documents(collection: Any, query: Dict[str, Any]) -> Optional[int]:
+    try:
+        return collection.count_documents(query, maxTimeMS=1000)
+    except TypeError:
+        try:
+            return collection.count_documents(query)
+        except Exception:
+            return None
+    except Exception:
+        return None
+
+
+def _latest_trade_sample(collection: Any, query: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    try:
+        return collection.find_one(
+            query,
+            {
+                "_id": 0,
+                "user_id": 1,
+                "order_id": 1,
+                "timestamp": 1,
+                "date": 1,
+                "datetime": 1,
+                "filled_size": 1,
+                "status": 1,
+                "worker_mode": 1,
+                "mode": 1,
+            },
+            sort=[("timestamp", -1)],
+        )
+    except Exception:
+        return None
+
+
+def _log_empty_trade_activity_diagnostics(
+    *,
+    executions_coll: Any,
+    signals_coll: Any,
+    user_id: Any,
+    exec_query: Optional[Dict[str, Any]],
+    signal_query: Optional[Dict[str, Any]],
+    status_filter: Optional[str],
+    execution_source_count: int,
+    execution_filled_count: int,
+    signal_source_count: int,
+) -> None:
+    if os.getenv("TRADE_ACTIVITY_EMPTY_DIAGNOSTICS", "1") == "0":
+        return
+
+    base_exec_query = {"user_id": user_id, "worker_mode": {"$ne": "backtest"}}
+    base_signal_query = {"user_id": user_id}
+    log.warning(
+        "Trade activities empty diagnostics user_id=%s status_filter=%s "
+        "exec_base=%s exec_window=%s exec_source=%s exec_filled=%s "
+        "signal_base=%s signal_window=%s signal_source=%s latest_exec=%s latest_signal=%s",
+        user_id,
+        status_filter,
+        _safe_count_documents(executions_coll, base_exec_query),
+        _safe_count_documents(executions_coll, exec_query) if exec_query else None,
+        execution_source_count,
+        execution_filled_count,
+        _safe_count_documents(signals_coll, base_signal_query),
+        _safe_count_documents(signals_coll, signal_query) if signal_query else None,
+        signal_source_count,
+        _latest_trade_sample(executions_coll, base_exec_query),
+        _latest_trade_sample(signals_coll, base_signal_query),
+    )
+
+
+def _display_trade_quantity(row: Dict[str, Any]) -> float:
+    filled = _execution_filled_size(row)
+    if filled:
+        return filled
+    for field in ("size", "quantity"):
+        value = row.get(field)
+        if value not in (None, ""):
+            try:
+                return abs(float(value))
+            except (TypeError, ValueError):
+                return 0.0
+    return 0.0
 
 
 def _log_trade_timing(label: str, started_at: float, **parts: Any) -> None:
@@ -357,6 +465,7 @@ def get_all_trade_executions(
     start_date: Optional[str] = Query(None, description="开始日期 (YYYY-MM-DD)"),
     end_date: Optional[str] = Query(None, description="结束日期 (YYYY-MM-DD)"),
     days: Optional[int] = Query(None, description="最近N天"),
+    all_dates: bool = Query(False, description="显式查询所有日期"),
     plan_id: Optional[str] = Query(None, description="只返回指定 portfolio plan 发布的实盘成交"),
     current_user: dict = Depends(get_current_active_user),
 ):
@@ -387,7 +496,10 @@ def get_all_trade_executions(
                 }
             query["order_id"] = {"$in": order_ids}
         
-        _apply_query_filter(query, _trade_time_window_query(days=days, start_date=start_date, end_date=end_date))
+        _apply_query_filter(
+            query,
+            _trade_time_window_query(days=days, start_date=start_date, end_date=end_date, all_dates=all_dates),
+        )
         
         # 查询并排序
         cursor = collection.find(query).sort("timestamp", -1).skip(skip).limit(limit)
@@ -438,7 +550,7 @@ def get_trade_executions_by_symbol(
         cursor = collection.find(query).sort("timestamp", -1).skip(skip).limit(limit)
         trades = _group_executions_by_order([add_display_time_fields(serialize_doc(doc)) for doc in cursor])
         # 过滤掉未成交的订单（filled_size 为 0 的废单）
-        trades = [t for t in trades if t.get("filled_size", 0) != 0]
+        trades = [t for t in trades if _is_filled_execution(t)]
         
         # 添加股票名称
         trades = enrich_trades_with_stock_names(trades, stock_info_collection)
@@ -490,6 +602,7 @@ def get_trade_execution_stats(
     days: Optional[int] = Query(None, ge=1, le=366, description="最近N天，默认30天"),
     start_date: Optional[str] = Query(None, description="开始日期 (YYYY-MM-DD)"),
     end_date: Optional[str] = Query(None, description="结束日期 (YYYY-MM-DD)"),
+    all_dates: bool = Query(False, description="显式查询所有日期"),
     current_user: dict = Depends(get_current_active_user),
 ):
     """获取当前登录用户的交易统计数据"""
@@ -500,11 +613,14 @@ def get_trade_execution_stats(
         
         user_id = current_user["id"]
         query: Dict[str, Any] = {"user_id": user_id}
-        effective_days = _effective_window_days(days, start_date, end_date)
-        _apply_query_filter(query, _trade_time_window_query(days=days, start_date=start_date, end_date=end_date))
+        effective_days = _effective_window_days(days, start_date, end_date, all_dates=all_dates)
+        _apply_query_filter(
+            query,
+            _trade_time_window_query(days=days, start_date=start_date, end_date=end_date, all_dates=all_dates),
+        )
         trades = _group_executions_by_order(list(collection.find(query).sort("timestamp", -1).limit(2000)))
         # 过滤掉完全未成交的订单（filled_size 为 0），避免统计中计入作废单
-        trades = [t for t in trades if t.get("filled_size", 0) != 0]
+        trades = [t for t in trades if _is_filled_execution(t)]
         
         if not trades:
             return {
@@ -541,7 +657,7 @@ def get_trade_execution_stats(
             elif side == "SELL":
                 symbols[symbol]["sell_count"] += 1
                 
-            symbols[symbol]["total_quantity"] += trade.get("filled_size", trade.get("quantity", trade.get("size", 0)))
+            symbols[symbol]["total_quantity"] += _execution_filled_size(trade)
             symbols[symbol]["strategies"].add(trade.get("strategy_name", trade.get("strategy", "UNKNOWN")))
         
         # 转换策略集合为列表
@@ -569,6 +685,7 @@ def get_trade_pnl_summary(
     days: Optional[int] = Query(None, ge=1, le=366, description="最近N天，默认30天"),
     start_date: Optional[str] = Query(None, description="开始日期 (YYYY-MM-DD)"),
     end_date: Optional[str] = Query(None, description="结束日期 (YYYY-MM-DD)"),
+    all_dates: bool = Query(False, description="显式查询所有日期"),
     current_user: dict = Depends(get_current_active_user),
 ):
     """按股票和策略分组汇总当前用户的已实现盈亏和净持仓.
@@ -594,14 +711,19 @@ def get_trade_pnl_summary(
             start_date = None
         if not isinstance(end_date, (str, type(None))):
             end_date = None
+        if not isinstance(all_dates, bool):
+            all_dates = False
 
         query: Dict[str, Any] = {"user_id": user_id}
-        effective_days = _effective_window_days(days, start_date, end_date)
-        _apply_query_filter(query, _trade_time_window_query(days=days, start_date=start_date, end_date=end_date))
+        effective_days = _effective_window_days(days, start_date, end_date, all_dates=all_dates)
+        _apply_query_filter(
+            query,
+            _trade_time_window_query(days=days, start_date=start_date, end_date=end_date, all_dates=all_dates),
+        )
 
         trades = _group_executions_by_order(list(executions_coll.find(query).sort("timestamp", -1).limit(5000)))
         # 过滤掉完全未成交的订单（filled_size 为 0），避免统计中计入作废单
-        trades = [t for t in trades if t.get("filled_size", 0) != 0]
+        trades = [t for t in trades if _is_filled_execution(t)]
         if not trades:
             return {"success": True, "data": [], "total_realized_pnl": 0.0, "total_unrealized_pnl": 0.0}
 
@@ -744,6 +866,7 @@ def get_all_trade_activities(
     start_date: Optional[str] = Query(None, description="开始日期 (YYYY-MM-DD)"),
     end_date: Optional[str] = Query(None, description="结束日期 (YYYY-MM-DD)"),
     days: Optional[int] = Query(None, description="最近N天"),
+    all_dates: bool = Query(False, description="显式查询所有日期"),
     status_filter: Optional[str] = Query(None, description="状态筛选: executed, pending, all"),
     current_user: dict = Depends(get_current_active_user),
 ):
@@ -760,12 +883,15 @@ def get_all_trade_activities(
         limit = _bounded_trade_limit(limit)
         skip = _bounded_trade_skip(skip)
         fetch_limit = min(MAX_TRADE_SKIP + MAX_TRADE_ACTIVITY_LIMIT, skip + limit + 100)
-        effective_days = _effective_window_days(days, start_date, end_date)
-        date_query = _trade_time_window_query(days=days, start_date=start_date, end_date=end_date)
+        effective_days = _effective_window_days(days, start_date, end_date, all_dates=all_dates)
+        date_query = _trade_time_window_query(days=days, start_date=start_date, end_date=end_date, all_dates=all_dates)
         
         merged_activities = []
         execution_source_count = 0
+        execution_filled_count = 0
         signal_source_count = 0
+        exec_query = None
+        signal_query = None
         
         # 1. 获取已执行的交易记录（如果不是仅显示 pending）
         if status_filter != "pending":
@@ -777,7 +903,8 @@ def get_all_trade_activities(
             execution_source_count = len(execution_docs)
             executions = _group_executions_by_order(execution_docs)
             # 排除完全未成交的订单，避免在用户视图中显示作废单
-            executions = [e for e in executions if e.get("filled_size", 0) != 0]
+            executions = [e for e in executions if _is_filled_execution(e)]
+            execution_filled_count = len(executions)
             
             for exec_doc in executions:
                 exec_time = add_display_time_fields(dict(exec_doc))
@@ -803,7 +930,7 @@ def get_all_trade_activities(
                     "price": exec_doc.get("filled_price", exec_doc.get("price", 0)),
                     "target_price": exec_doc.get("target_price"),
                     "filled_price": exec_doc.get("filled_price"),
-                    "quantity": exec_doc.get("filled_size", exec_doc.get("size", exec_doc.get("quantity", 0))),
+                    "quantity": _display_trade_quantity(exec_doc),
                     "strategy": exec_doc.get("strategy_name", exec_doc.get("strategy", "")),
                     "timestamp": exec_doc.get("timestamp", 0),
                     "execution_time": exec_time.get("execution_time"),
@@ -880,6 +1007,18 @@ def get_all_trade_activities(
         
         # 4. 分页
         total = len(merged_activities)
+        if total == 0:
+            _log_empty_trade_activity_diagnostics(
+                executions_coll=executions_coll,
+                signals_coll=signals_coll,
+                user_id=user_id,
+                exec_query=exec_query,
+                signal_query=signal_query,
+                status_filter=status_filter,
+                execution_source_count=execution_source_count,
+                execution_filled_count=execution_filled_count,
+                signal_source_count=signal_source_count,
+            )
         merged_activities = merged_activities[skip:skip + limit]
         
         # 5. 添加股票名称
