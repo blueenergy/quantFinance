@@ -62,6 +62,7 @@ _NAV_ROWS: List[Tuple[str, str, int]] = [
     ("strategy-lab", "🧪 策略实验室", 95),
     ("portfolio-research", "组合研究", 96),
     ("portfolio-plans", "📋 组合交易计划", 98),
+    ("portfolio-overview", "📊 组合总览(实盘)", 99),
     ("strategies", "策略配置", 100),
     ("strategy-workers", "🚀 实盘交易", 110),
     ("trade-executions", "交易记录", 120),

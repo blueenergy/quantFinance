@@ -64,12 +64,20 @@ class _Collection:
             if isinstance(expected, dict):
                 if "$in" in expected and value not in expected["$in"]:
                     return False
+                if "$nin" in expected and value in expected["$nin"]:
+                    return False
                 if "$ne" in expected and value == expected["$ne"]:
                     return False
                 if "$gte" in expected and not (value >= expected["$gte"]):
                     return False
                 if "$lte" in expected and not (value <= expected["$lte"]):
                     return False
+                if "$exists" in expected:
+                    has_key = key in doc and doc.get(key) is not None
+                    if expected["$exists"] and not has_key:
+                        return False
+                    if not expected["$exists"] and has_key:
+                        return False
                 continue
             if isinstance(value, list):
                 if expected not in value:
@@ -1191,3 +1199,113 @@ def test_replan_remainder_confirm_inserts_and_is_idempotent(monkeypatch):
     assert second["data"]["actionable_count"] == 0
     remainder = second["data"]["remainder"][0]
     assert "live_signal_active" in remainder["reasons"]
+
+
+def _patch_lineage_live_env(monkeypatch, cols, fin, data):
+    monkeypatch.setattr(portfolio_plans, "get_trading_db_collections", lambda: cols)
+    monkeypatch.setattr(portfolio_plans, "get_db_collections", lambda: fin)
+    monkeypatch.setattr(portfolio_plans, "get_data_db", lambda: data)
+    monkeypatch.setattr(portfolio_plans, "_attach_signal_names", lambda _dc, sigs: sigs)
+
+
+def test_list_live_portfolios_finds_lineage_with_live_signals(monkeypatch):
+    cols = _collections()
+    fin = _finance_collections()
+    data = _data_collections()
+    cols["portfolio_trade_plans"] = _Collection(
+        [
+            {"plan_id": "pla", "strategy_template_id": "stx", "user_id": "user-1", "base_date": "20250101", "status": "approved", "params_hash": "hx", "strategy_name": "L1"},
+            {"plan_id": "plb", "strategy_template_id": "stx", "user_id": "user-1", "base_date": "20250125", "status": "approved", "params_hash": "hx", "strategy_name": "L1"},
+            {"plan_id": "plz", "strategy_template_id": "sty", "user_id": "user-1", "base_date": "20250110", "status": "approved", "params_hash": "hy", "strategy_name": "NoLive"},
+        ]
+    )
+    fin["trade_signals"].docs = [
+        {"user_id": "user-1", "mode": "live", "plan_id": "pla", "securities_account_id": "acct-1"},
+    ]
+    _patch_lineage_live_env(monkeypatch, cols, fin, data)
+    resp = asyncio.run(portfolio_plans.list_live_portfolios(current_user={"id": "user-1"}))
+    ports = resp["data"]["portfolios"]
+    assert len(ports) == 1
+    assert ports[0]["strategy_template_id"] == "stx"
+    assert ports[0]["params_hash"] == "hx"
+    assert ports[0]["plan_count"] == 2
+    assert ports[0]["latest_plan_id"] == "plb"
+
+
+def test_lineage_live_executions_spans_two_plans(monkeypatch):
+    cols = _collections()
+    fin = _finance_collections()
+    data = _data_collections()
+    cols["portfolio_trade_plans"] = _Collection(
+        [
+            {"plan_id": "pla", "strategy_template_id": "stx", "user_id": "user-1", "base_date": "20250101", "status": "approved", "params_hash": "hx", "strategy_name": "L1"},
+            {"plan_id": "plb", "strategy_template_id": "stx", "user_id": "user-1", "base_date": "20250125", "status": "approved", "params_hash": "hx", "strategy_name": "L1"},
+        ]
+    )
+    fin["trade_signals"].docs = [
+        {"order_id": "oa", "user_id": "user-1", "mode": "live", "plan_id": "pla", "symbol": "000001.SZ", "name": "Ping", "created_at": 1},
+        {"order_id": "ob", "user_id": "user-1", "mode": "live", "plan_id": "plb", "symbol": "600000.SH", "name": "Pu", "created_at": 2},
+    ]
+    fin["trade_executions"].docs = [
+        {"order_id": "oa", "user_id": "user-1", "symbol": "000001.SZ", "side": "BUY", "filled_size": 100, "filled_price": 10.0, "timestamp": 1.0},
+        {"order_id": "ob", "user_id": "user-1", "symbol": "600000.SH", "side": "BUY", "filled_size": 200, "filled_price": 11.0, "timestamp": 2.0},
+    ]
+    _patch_lineage_live_env(monkeypatch, cols, fin, data)
+    resp = asyncio.run(portfolio_plans.get_lineage_live_executions("pla", current_user={"id": "user-1"}))
+    ex = resp["data"]["executions"]
+    assert len(ex) == 2
+    assert {ex[0]["source_plan_base_date"], ex[1]["source_plan_base_date"]} == {"20250101", "20250125"}
+
+
+def test_lineage_live_positions_aggregates_lineage_executions(monkeypatch):
+    cols = _collections()
+    fin = _finance_collections()
+    data = _data_collections()
+    cols["portfolio_trade_plans"] = _Collection(
+        [
+            {"plan_id": "pla", "strategy_template_id": "stx", "user_id": "user-1", "base_date": "20250101", "status": "approved", "params_hash": "hx", "strategy_name": "L1"},
+            {"plan_id": "plb", "strategy_template_id": "stx", "user_id": "user-1", "base_date": "20250125", "status": "approved", "params_hash": "hx", "strategy_name": "L1"},
+        ]
+    )
+    fin["trade_signals"].docs = [
+        {"order_id": "oa", "user_id": "user-1", "mode": "live", "plan_id": "pla", "symbol": "000001.SZ", "name": "Ping", "created_at": 1},
+        {"order_id": "ob", "user_id": "user-1", "mode": "live", "plan_id": "plb", "symbol": "000001.SZ", "name": "Ping", "created_at": 2},
+    ]
+    fin["trade_executions"].docs = [
+        {"order_id": "oa", "user_id": "user-1", "symbol": "000001.SZ", "side": "BUY", "filled_size": 100, "filled_price": 10.0, "timestamp": 1.0},
+        {"order_id": "ob", "user_id": "user-1", "symbol": "000001.SZ", "side": "BUY", "filled_size": 100, "filled_price": 12.0, "timestamp": 2.0},
+    ]
+    _patch_lineage_live_env(monkeypatch, cols, fin, data)
+    resp = asyncio.run(portfolio_plans.get_lineage_live_positions("pla", current_user={"id": "user-1"}))
+    pos = resp["data"]["positions"]
+    assert len(pos) == 1
+    assert pos[0]["symbol"] == "000001.SZ"
+    assert pos[0]["shares"] == 200
+    assert pos[0]["avg_cost"] == 11.0
+
+
+def test_lineage_live_equity_dedupes_date_by_updated_at(monkeypatch):
+    cols = _collections()
+    fin = _finance_collections()
+    data = _data_collections()
+    cols["portfolio_trade_plans"] = _Collection(
+        [
+            {"plan_id": "pla", "strategy_template_id": "stx", "user_id": "user-1", "base_date": "20250101", "status": "approved", "params_hash": "hx"},
+            {"plan_id": "plb", "strategy_template_id": "stx", "user_id": "user-1", "base_date": "20250125", "status": "approved", "params_hash": "hx"},
+        ]
+    )
+    cols["portfolio_live_equity"] = _Collection(
+        [
+            {"user_id": "user-1", "plan_id": "pla", "date": "20250130", "equity": 1_000_000, "updated_at": "2025-01-30T10:00:00"},
+            {"user_id": "user-1", "plan_id": "plb", "date": "20250130", "equity": 1_010_000, "updated_at": "2025-01-30T15:00:00"},
+        ]
+    )
+    _patch_lineage_live_env(monkeypatch, cols, fin, data)
+    resp = asyncio.run(
+        portfolio_plans.get_lineage_live_equity("pla", start_date=None, end_date=None, current_user={"id": "user-1"})
+    )
+    rows = resp["data"]["rows"]
+    assert len(rows) == 1
+    assert rows[0]["plan_id"] == "plb"
+    assert rows[0]["equity"] == 1_010_000
+    assert "caveat" in resp["data"]

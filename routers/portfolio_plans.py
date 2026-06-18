@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+from collections import defaultdict
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 import logging
 import os
 import time
@@ -23,7 +24,17 @@ from services.live_trade_signals import (
     build_portfolio_plan_live_signal,
     summarize_signal_statuses,
 )
-from services.live_equity import compute_live_plan_realtime_equity, list_live_plan_equity
+from services.live_equity import (
+    _load_latest_close_prices,
+    _load_realtime_prices,
+    compute_live_plan_realtime_equity,
+    list_live_plan_equity,
+)
+from services.portfolio_lineage_live import (
+    build_lineage_live_positions,
+    merge_lineage_live_executions,
+)
+from services.trade_ledger import group_executions_by_order
 from services.portfolio_plan_remainder import (
     LIVE_SIGNAL_SOURCE_PLAN_TOPUP,
     build_remainder_specs,
@@ -232,6 +243,38 @@ def _lineage_query_for_plan(collections: Dict[str, Any], plan: Dict[str, Any], u
     elif branches:
         query["$or"] = branches
     return query
+
+
+def _lineage_live_signal_execution_bundle(
+    trading_collections: Dict[str, Any],
+    finance_collections: Dict[str, Any],
+    plan: Dict[str, Any],
+    user_id: str,
+) -> Tuple[List[str], List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Live signals + raw executions for all plans in the same params_hash lineage."""
+
+    lineage_ids = _lineage_plan_ids_for_plan(trading_collections, plan, user_id)
+    if not lineage_ids:
+        return [], [], []
+    signal_query: Dict[str, Any] = {
+        "user_id": user_id,
+        "plan_id": {"$in": lineage_ids},
+        "mode": "live",
+    }
+    signals = list(
+        finance_collections["trade_signals"]
+        .find(signal_query)
+        .sort("created_at", 1)
+    )
+    order_ids = [row.get("order_id") for row in signals if row.get("order_id")]
+    if not order_ids:
+        return lineage_ids, signals, []
+    executions = list(
+        finance_collections["trade_executions"]
+        .find({"user_id": user_id, "order_id": {"$in": order_ids}})
+        .sort("timestamp", 1)
+    )
+    return lineage_ids, signals, executions
 
 
 def _latest_lineage_position_snapshot(
@@ -1539,6 +1582,249 @@ async def get_portfolio_plan_live_realtime_equity(plan_id: str, current_user: di
         plan=plan,
     )
     return {"success": True, "data": _jsonable(row)}
+
+
+@router.get("/live-portfolios")
+async def list_live_portfolios(current_user: dict = Depends(get_current_user)):
+    """Enumerate live-traded plan lineages (strategy_template_id + params_hash) for the user."""
+
+    trading_collections = get_trading_db_collections()
+    finance_collections = get_db_collections()
+    user_id = _current_user_id(current_user)
+
+    live_rows = finance_collections["trade_signals"].find(
+        {"user_id": user_id, "mode": "live", "plan_id": {"$exists": True}},
+        {"_id": 0, "plan_id": 1},
+    )
+    live_plan_ids = {str(r["plan_id"]) for r in live_rows if r.get("plan_id")}
+    if not live_plan_ids:
+        return {"success": True, "data": _jsonable({"portfolios": []})}
+
+    plans = list(
+        trading_collections["portfolio_trade_plans"].find(
+            {"user_id": user_id, "params_hash": {"$exists": True, "$nin": [None, ""]}},
+            {
+                "_id": 0,
+                "plan_id": 1,
+                "strategy_template_id": 1,
+                "params_hash": 1,
+                "base_date": 1,
+                "strategy_name": 1,
+            },
+        )
+    )
+    groups: Dict[tuple, List[Dict[str, Any]]] = defaultdict(list)
+    for p in plans:
+        stid = p.get("strategy_template_id")
+        ph = p.get("params_hash")
+        if not stid or not ph:
+            continue
+        groups[(str(stid), str(ph))].append(p)
+
+    portfolios: List[Dict[str, Any]] = []
+    for (stid, phash), _plist in groups.items():
+        sample = max(_plist, key=lambda x: str(x.get("base_date") or ""))
+        lineage_ids = set(_lineage_plan_ids_for_plan(trading_collections, sample, user_id))
+        if not lineage_ids & live_plan_ids:
+            continue
+
+        all_lineage = list(
+            trading_collections["portfolio_trade_plans"].find(
+                {"user_id": user_id, "strategy_template_id": stid, "params_hash": phash},
+                {"_id": 0, "plan_id": 1, "base_date": 1, "strategy_name": 1},
+            )
+        )
+        if not all_lineage:
+            continue
+        latest = max(all_lineage, key=lambda x: str(x.get("base_date") or ""))
+        earliest = min(all_lineage, key=lambda x: str(x.get("base_date") or ""))
+
+        sig = finance_collections["trade_signals"].find_one(
+            {"user_id": user_id, "mode": "live", "plan_id": {"$in": list(lineage_ids)}},
+            {"_id": 0, "securities_account_id": 1},
+        )
+        sec_id = str(sig.get("securities_account_id") or "") if sig else ""
+
+        portfolios.append(
+            {
+                "strategy_template_id": stid,
+                "params_hash": phash,
+                "latest_plan_id": latest.get("plan_id"),
+                "plan_count": len(all_lineage),
+                "first_base_date": earliest.get("base_date"),
+                "last_base_date": latest.get("base_date"),
+                "strategy_name": latest.get("strategy_name") or earliest.get("strategy_name") or "",
+                "securities_account_id": sec_id,
+            }
+        )
+
+    portfolios.sort(key=lambda x: str(x.get("last_base_date") or ""), reverse=True)
+    return {"success": True, "data": _jsonable({"portfolios": portfolios})}
+
+
+@router.get("/plans/{plan_id}/lineage-live-executions")
+async def get_lineage_live_executions(plan_id: str, current_user: dict = Depends(get_current_user)):
+    trading_collections = get_trading_db_collections()
+    finance_collections = get_db_collections()
+    data_collections = get_data_db()
+    user_id = _current_user_id(current_user)
+    plan = _require_plan(trading_collections, plan_id, current_user)
+
+    lineage_ids, signals, executions = _lineage_live_signal_execution_bundle(
+        trading_collections, finance_collections, plan, user_id
+    )
+    plan_rows = list(
+        trading_collections["portfolio_trade_plans"].find(
+            {"user_id": user_id, "plan_id": {"$in": lineage_ids}},
+            {"_id": 0, "plan_id": 1, "base_date": 1},
+        )
+    )
+    plan_meta = {str(r.get("plan_id")): dict(r) for r in plan_rows if r.get("plan_id")}
+
+    signals_named = _attach_signal_names(
+        data_collections, [add_display_time_fields(row) for row in signals]
+    )
+    executions_display = [add_display_time_fields(row) for row in executions]
+    merged = merge_lineage_live_executions(signals_named, executions_display, plan_meta)
+
+    return {
+        "success": True,
+        "data": _jsonable(
+            {
+                "anchor_plan_id": plan_id,
+                "lineage_plan_ids": lineage_ids,
+                "strategy_template_id": plan.get("strategy_template_id"),
+                "params_hash": plan.get("params_hash"),
+                "signals": signals_named,
+                "executions": merged,
+                "signal_count": len(signals_named),
+                "execution_count": len(merged),
+            }
+        ),
+    }
+
+
+@router.get("/plans/{plan_id}/lineage-live-positions")
+async def get_lineage_live_positions(plan_id: str, current_user: dict = Depends(get_current_user)):
+    trading_collections = get_trading_db_collections()
+    finance_collections = get_db_collections()
+    data_collections = get_data_db()
+    user_id = _current_user_id(current_user)
+    plan = _require_plan(trading_collections, plan_id, current_user)
+
+    lineage_ids, _, executions = _lineage_live_signal_execution_bundle(
+        trading_collections, finance_collections, plan, user_id
+    )
+    grouped = group_executions_by_order(executions)
+    symbols = sorted({str(row.get("symbol")) for row in grouped if row.get("symbol")})
+    realtime_prices, realtime_docs = _load_realtime_prices(
+        data_collections["volume_price_realtime_latest"], symbols
+    )
+    close_prices = _load_latest_close_prices(data_collections["volume_price"], symbols)
+    prices = {**close_prices, **realtime_prices}
+
+    payload = build_lineage_live_positions(grouped, prices, realtime_docs=realtime_docs)
+    return {
+        "success": True,
+        "data": _jsonable(
+            {
+                "anchor_plan_id": plan_id,
+                "lineage_plan_ids": lineage_ids,
+                "strategy_template_id": plan.get("strategy_template_id"),
+                "params_hash": plan.get("params_hash"),
+                **payload,
+            }
+        ),
+    }
+
+
+@router.get("/plans/{plan_id}/lineage-live-equity")
+async def get_lineage_live_equity(
+    plan_id: str,
+    start_date: Optional[str] = Query(default=None),
+    end_date: Optional[str] = Query(default=None),
+    current_user: dict = Depends(get_current_user),
+):
+    """Merge per-plan ``portfolio_live_equity`` rows across lineage by calendar date."""
+
+    trading_collections = get_trading_db_collections()
+    user_id = _current_user_id(current_user)
+    plan = _require_plan(trading_collections, plan_id, current_user)
+    lineage_ids = _lineage_plan_ids_for_plan(trading_collections, plan, user_id)
+    if not lineage_ids:
+        return {
+            "success": True,
+            "data": _jsonable(
+                {
+                    "anchor_plan_id": plan_id,
+                    "lineage_plan_ids": [],
+                    "rows": [],
+                    "caveat": "No lineage plan ids; equity curve unavailable.",
+                }
+            ),
+        }
+
+    query: Dict[str, Any] = {"user_id": user_id, "plan_id": {"$in": lineage_ids}}
+    if start_date or end_date:
+        date_query: Dict[str, str] = {}
+        if start_date:
+            date_query["$gte"] = start_date.replace("-", "")
+        if end_date:
+            date_query["$lte"] = end_date.replace("-", "")
+        query["date"] = date_query
+
+    equity_rows = list(trading_collections["portfolio_live_equity"].find(query).sort("date", 1))
+    latest_by_date: Dict[str, Dict[str, Any]] = {}
+    for row in equity_rows:
+        date = str(row.get("date") or "")
+        if not date:
+            continue
+        existing = latest_by_date.get(date)
+        if existing is None or str(row.get("updated_at") or "") >= str(existing.get("updated_at") or ""):
+            latest_by_date[date] = row
+
+    rows_sorted = sorted(latest_by_date.values(), key=lambda r: str(r.get("date") or ""))
+    plan_ids_in_data = sorted({row.get("plan_id") for row in rows_sorted if row.get("plan_id")})
+    plan_map = {
+        row.get("plan_id"): row
+        for row in trading_collections["portfolio_trade_plans"].find(
+            {"plan_id": {"$in": plan_ids_in_data}, "user_id": user_id},
+            {"_id": 0, "plan_id": 1, "base_date": 1, "plan_type": 1, "status": 1},
+        )
+    } if plan_ids_in_data else {}
+
+    enriched: List[Dict[str, Any]] = []
+    for row in rows_sorted:
+        src = plan_map.get(row.get("plan_id"), {})
+        enriched.append(
+            {
+                **row,
+                "source_plan_base_date": src.get("base_date"),
+                "source_plan_type": src.get("plan_type"),
+                "source_plan_status": src.get("status"),
+                "is_current_plan": row.get("plan_id") == plan_id,
+            }
+        )
+
+    caveat = (
+        "Each ``portfolio_live_equity`` point is computed from that plan's own live "
+        "executions only; stitching by date is best-effort and does not re-attribute "
+        "carry-over positions across rebalance plan_ids."
+    )
+    return {
+        "success": True,
+        "data": _jsonable(
+            {
+                "anchor_plan_id": plan_id,
+                "strategy_template_id": plan.get("strategy_template_id"),
+                "params_hash": plan.get("params_hash"),
+                "lineage_plan_ids": lineage_ids,
+                "rows": enriched,
+                "source_plan_ids": plan_ids_in_data,
+                "caveat": caveat,
+            }
+        ),
+    }
 
 
 @router.post("/plans/{plan_id}/execute-paper")
