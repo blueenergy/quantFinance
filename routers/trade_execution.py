@@ -1039,6 +1039,8 @@ def get_all_trade_activities(
                     "execution_time": exec_time.get("execution_time"),
                     "timestamp_iso": exec_time.get("timestamp_iso"),
                     "order_id": exec_doc.get("order_id", ""),
+                    "broker_order_id": exec_doc.get("broker_order_id") or exec_doc.get("qmt_order_id"),
+                    "qmt_order_id": exec_doc.get("qmt_order_id") or exec_doc.get("broker_order_id"),
                     "source": "trade_execution",
                     "date": exec_doc.get("date", "")
                 })
@@ -1110,6 +1112,8 @@ def get_all_trade_activities(
                 "execution_time": signal_time.get("execution_time"),
                 "timestamp_iso": signal_time.get("timestamp_iso"),
                 "order_id": order_id,
+                "broker_order_id": signal_doc.get("broker_order_id") or signal_doc.get("qmt_order_id"),
+                "qmt_order_id": signal_doc.get("qmt_order_id") or signal_doc.get("broker_order_id"),
                 "source": "trade_signal",
                 "error_message": signal_doc.get("error_message"),
                 "retry_count": signal_doc.get("retry_count", 0),
