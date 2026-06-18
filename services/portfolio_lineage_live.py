@@ -69,17 +69,17 @@ def merge_lineage_live_executions(
 ) -> List[Dict[str, Any]]:
     """Attach ``source_plan_*`` to each execution and sort chronologically (oldest first)."""
 
-    order_to_plan: Dict[str, str] = {}
+    order_to_signal: Dict[str, Dict[str, Any]] = {}
     for sig in signals:
         oid = sig.get("order_id")
-        pid = sig.get("plan_id")
-        if oid and pid:
-            order_to_plan[str(oid)] = str(pid)
+        if oid:
+            order_to_signal[str(oid)] = sig
 
     merged: List[Dict[str, Any]] = []
     for row in executions:
         oid = str(row.get("order_id") or row.get("_id") or "")
-        plan_id = order_to_plan.get(oid) or str(row.get("plan_id") or "")
+        sig = order_to_signal.get(oid) or {}
+        plan_id = str(sig.get("plan_id") or row.get("plan_id") or "")
         meta = plan_meta.get(plan_id) or {}
         base_date = meta.get("base_date")
         enriched = {
@@ -87,6 +87,9 @@ def merge_lineage_live_executions(
             "plan_id": plan_id or row.get("plan_id"),
             "source_plan_id": plan_id or None,
             "source_plan_base_date": base_date,
+            "name": row.get("name") or sig.get("name") or sig.get("stock_name") or "",
+            "signal_action": sig.get("action"),
+            "signal_size": sig.get("size"),
         }
         merged.append(enriched)
 
