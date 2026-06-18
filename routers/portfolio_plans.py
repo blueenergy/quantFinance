@@ -72,6 +72,9 @@ GROWTH_CYCLE_PARAMETER_SCHEMA = {
     # produce executable trades; the portfolio rebalances strictly every
     # rebalance_days. Set true to allow intra-cycle drift trading.
     "monitor_can_trade": {"type": "boolean"},
+    # Capital baseline for rebalance sizing. Defaults auto-derive (live -> rolling
+    # real account equity, paper -> paper snapshot). Not part of params_hash.
+    "capital_basis": {"type": "enum", "options": ["account_equity", "rolling_paper", "fixed_notional"], "nullable": True},
 }
 DEFAULT_STRATEGY_TEMPLATES = (
     {
@@ -275,6 +278,71 @@ def _lineage_live_signal_execution_bundle(
         .sort("timestamp", 1)
     )
     return lineage_ids, signals, executions
+
+
+def _lineage_initial_capital(plan: Dict[str, Any]) -> float:
+    params = plan.get("params_snapshot") or {}
+    summary = plan.get("summary") or {}
+    return _numeric(
+        params.get("initial_capital", plan.get("initial_capital", summary.get("baseline_equity"))),
+        1_000_000.0,
+    )
+
+
+def _compute_lineage_book_equity(
+    *,
+    trading_collections: Dict[str, Any],
+    finance_collections: Dict[str, Any],
+    data_collections: Dict[str, Any],
+    plan: Dict[str, Any],
+    user_id: str,
+) -> Dict[str, Any]:
+    """Rolling one-book equity over all live executions in the plan's lineage.
+
+    equity = initial_capital + total_realized_pnl + total_unrealized_pnl, where the
+    positions are rebuilt from every live fill across the lineage's rebalance
+    plan_ids (deduped per order). This is the continuous combo-scoped equity, as
+    opposed to the per-plan points which each restart from ``initial_capital``.
+    """
+    lineage_ids, _signals, executions = _lineage_live_signal_execution_bundle(
+        trading_collections, finance_collections, plan, user_id
+    )
+    initial_capital = _lineage_initial_capital(plan)
+    if not executions:
+        return {
+            "equity": initial_capital,
+            "initial_capital": initial_capital,
+            "realized_pnl": 0.0,
+            "unrealized_pnl": 0.0,
+            "market_value": 0.0,
+            "cash": initial_capital,
+            "lineage_plan_ids": lineage_ids,
+            "execution_count": 0,
+        }
+    grouped = group_executions_by_order(executions)
+    symbols = sorted({str(row.get("symbol")) for row in grouped if row.get("symbol")})
+    realtime_prices, realtime_docs = _load_realtime_prices(
+        data_collections["volume_price_realtime_latest"], symbols
+    )
+    close_prices = _load_latest_close_prices(data_collections["volume_price"], symbols)
+    prices = {**close_prices, **realtime_prices}
+    payload = build_lineage_live_positions(grouped, prices, realtime_docs=realtime_docs)
+    summary = payload.get("summary") or {}
+    realized = _numeric(summary.get("total_realized_pnl"))
+    unrealized = _numeric(summary.get("total_unrealized_pnl"))
+    market_value = _numeric(summary.get("total_market_value"))
+    equity = initial_capital + realized + unrealized
+    return {
+        "equity": equity,
+        "initial_capital": initial_capital,
+        "realized_pnl": realized,
+        "unrealized_pnl": unrealized,
+        "market_value": market_value,
+        "cash": equity - market_value,
+        "lineage_plan_ids": lineage_ids,
+        "execution_count": len(grouped),
+        "latest_price_update": payload.get("latest_price_update"),
+    }
 
 
 def _latest_lineage_position_snapshot(
@@ -1748,6 +1816,8 @@ async def get_lineage_live_equity(
     """Merge per-plan ``portfolio_live_equity`` rows across lineage by calendar date."""
 
     trading_collections = get_trading_db_collections()
+    finance_collections = get_db_collections()
+    data_collections = get_data_db()
     user_id = _current_user_id(current_user)
     plan = _require_plan(trading_collections, plan_id, current_user)
     lineage_ids = _lineage_plan_ids_for_plan(trading_collections, plan, user_id)
@@ -1806,10 +1876,23 @@ async def get_lineage_live_equity(
             }
         )
 
+    # One-book lineage equity: treat all live executions across the lineage as a
+    # single rolling portfolio (combo-scoped) so the headline equity does not reset
+    # to ``initial_capital`` each rebalance plan_id. This mirrors the generator's
+    # ``account_equity`` baseline reconstruction.
+    book_equity = _compute_lineage_book_equity(
+        trading_collections=trading_collections,
+        finance_collections=finance_collections,
+        data_collections=data_collections,
+        plan=plan,
+        user_id=user_id,
+    )
+
     caveat = (
-        "Each ``portfolio_live_equity`` point is computed from that plan's own live "
-        "executions only; stitching by date is best-effort and does not re-attribute "
-        "carry-over positions across rebalance plan_ids."
+        "Per-date ``rows`` are each computed from a single plan's own live "
+        "executions (legacy stitching). Prefer ``current_book_equity`` for the "
+        "rolling lineage equity: it treats all live executions across rebalance "
+        "plan_ids as one combo-scoped portfolio."
     )
     return {
         "success": True,
@@ -1821,6 +1904,7 @@ async def get_lineage_live_equity(
                 "lineage_plan_ids": lineage_ids,
                 "rows": enriched,
                 "source_plan_ids": plan_ids_in_data,
+                "current_book_equity": book_equity,
                 "caveat": caveat,
             }
         ),

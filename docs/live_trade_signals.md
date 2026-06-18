@@ -164,6 +164,43 @@ first). Published `order_id` values are derived from plan item fields, so a new
 plan revision produces new signals rather than reviving the old `live-plan-*`
 rows.
 
+## Capital Basis (compounding / rolling equity)
+
+Each rebalance sizes positions against a **capital baseline**. The basis is
+recorded on the plan as `capital_basis` and audited in `plan.summary`
+(`baseline_source`, `baseline_equity`, `baseline_cash`,
+`baseline_securities_account_id`, `baseline_synced_at`).
+
+Modes:
+
+- `account_equity` (**default once the lineage has live signals**): the next
+  period rolls on the lineage's **own** real equity. It is reconstructed
+  combo-scoped from `initial_capital` + every live fill across the lineage's
+  rebalance `plan_id`s (deduped per order) + current close prices, so other
+  strategies or manual holdings sharing the same brokerage account never leak in.
+  This matches the backtest report, whose equity curve is compounded
+  (`(1 + period_return).cumprod()`).
+- `rolling_paper` (**default for paper-only lineages**, legacy behavior): inherit
+  the `portfolio_paper_positions` lineage snapshot (cash/equity/positions).
+- `fixed_notional` (opt-in): size every period against a fixed `initial_capital`
+  while still carrying lineage positions for sell/hold. Use for fixed-allocation
+  or simulation runs.
+
+`capital_basis` is intentionally **not** part of `params_hash` (like
+`monitor_can_trade`), so switching it never forks the plan/position lineage.
+
+**Freshness gate (block on stale):** when an `account_equity` lineage already has
+carried live state, the brokerage account must have a fresh `trader_accounts`
+snapshot. If the account is missing or its `synced_at` is older than
+`PORTFOLIO_LIVE_BASELINE_STALE_SECONDS` (default 6h), plan generation **fails
+with `account_not_synced`** instead of seeding a plan from stale state. The first
+live period (no prior fills) starts from `initial_capital` and is not gated.
+
+The cross-plan endpoint `GET /portfolio-plans/plans/{plan_id}/lineage-live-equity`
+returns `current_book_equity`, a continuous one-book equity over all lineage live
+executions, so the headline equity no longer resets to `initial_capital` each
+rebalance `plan_id`.
+
 ## Execution Ordering And Price Guards
 
 Portfolio-plan signals are published with this first-level execution policy:

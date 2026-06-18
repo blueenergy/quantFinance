@@ -1309,3 +1309,8 @@ def test_lineage_live_equity_dedupes_date_by_updated_at(monkeypatch):
     assert rows[0]["plan_id"] == "plb"
     assert rows[0]["equity"] == 1_010_000
     assert "caveat" in resp["data"]
+    # Continuous one-book equity is always present; with no live executions it
+    # falls back to initial_capital rather than resetting per plan.
+    book = resp["data"]["current_book_equity"]
+    assert book["equity"] == book["initial_capital"]
+    assert book["execution_count"] == 0
