@@ -10,9 +10,107 @@ from services.trade_ledger import (
     compute_realized_pnl_for_group,
     group_executions_by_order,
 )
+import logging
+import os
 import time
 
 router = APIRouter()
+log = logging.getLogger(__name__)
+
+DEFAULT_TRADE_QUERY_DAYS = 30
+MAX_TRADE_ACTIVITY_LIMIT = 200
+MAX_TRADE_SKIP = 5000
+
+
+def _valid_int(value: Any) -> Optional[int]:
+    return value if isinstance(value, int) else None
+
+
+def _trade_time_window_query(
+    *,
+    days: Optional[int],
+    start_date: Optional[str],
+    end_date: Optional[str],
+    default_days: int = DEFAULT_TRADE_QUERY_DAYS,
+) -> Dict[str, Any]:
+    """Return a bounded date/timestamp query for trade read paths."""
+    days = _valid_int(days)
+    start_date = start_date if isinstance(start_date, str) else None
+    end_date = end_date if isinstance(end_date, str) else None
+
+    if days is None and not (start_date or end_date):
+        days = default_days
+
+    if days:
+        days = max(1, min(days, 366))
+        end = datetime.now().replace(hour=23, minute=59, second=59)
+        start = (end - timedelta(days=days - 1)).replace(hour=0, minute=0, second=0)
+    else:
+        start = datetime.strptime(start_date, "%Y-%m-%d").replace(hour=0, minute=0, second=0) if start_date else None
+        end = datetime.strptime(end_date, "%Y-%m-%d").replace(hour=23, minute=59, second=59) if end_date else None
+
+    or_conditions = []
+    if start or end:
+        timestamp_query: Dict[str, Any] = {}
+        date_query: Dict[str, Any] = {}
+        compact_date_query: Dict[str, Any] = {}
+        if start:
+            timestamp_query["$gte"] = start.timestamp()
+            date_query["$gte"] = start.strftime("%Y-%m-%d")
+            compact_date_query["$gte"] = start.strftime("%Y%m%d")
+        if end:
+            timestamp_query["$lte"] = end.timestamp()
+            date_query["$lte"] = end.strftime("%Y-%m-%d")
+            compact_date_query["$lte"] = end.strftime("%Y%m%d")
+        or_conditions.extend(
+            [
+                {"timestamp": timestamp_query},
+                {"date": date_query},
+                {"date": compact_date_query},
+            ]
+        )
+    return {"$or": or_conditions} if or_conditions else {}
+
+
+def _apply_query_filter(query: Dict[str, Any], extra_filter: Dict[str, Any]) -> None:
+    if not extra_filter:
+        return
+
+    existing_or = query.pop("$or", None)
+    extra_or = extra_filter.get("$or")
+    if existing_or and extra_or:
+        query.setdefault("$and", [])
+        query["$and"].extend([{"$or": existing_or}, {"$or": extra_or}])
+
+    for key, value in extra_filter.items():
+        if key == "$or" and existing_or and extra_or:
+            continue
+        query[key] = value
+
+
+def _effective_window_days(days: Optional[int], start_date: Optional[str], end_date: Optional[str]) -> Optional[int]:
+    days = _valid_int(days)
+    has_range = isinstance(start_date, str) or isinstance(end_date, str)
+    if days:
+        return max(1, min(days, 366))
+    return None if has_range else DEFAULT_TRADE_QUERY_DAYS
+
+
+def _bounded_trade_limit(limit: int) -> int:
+    return max(1, min(_valid_int(limit) or 100, MAX_TRADE_ACTIVITY_LIMIT))
+
+
+def _bounded_trade_skip(skip: int) -> int:
+    return max(0, min(_valid_int(skip) or 0, MAX_TRADE_SKIP))
+
+
+def _log_trade_timing(label: str, started_at: float, **parts: Any) -> None:
+    elapsed = time.perf_counter() - started_at
+    threshold = float(os.getenv("TRADE_API_TIMING_SECONDS", "1"))
+    if elapsed < threshold:
+        return
+    suffix = " ".join(f"{key}={value}" for key, value in parts.items())
+    log.warning("%s timing total=%.3fs %s", label, elapsed, suffix)
 
 
 @router.get("/minute-bars/", summary="获取股票分钟K线数据")
@@ -254,8 +352,8 @@ _group_executions_by_order = group_executions_by_order
 
 @router.get("/trade-executions/", summary="获取当前用户的交易执行记录")
 def get_all_trade_executions(
-    limit: int = Query(100, description="返回记录数量限制"),
-    skip: int = Query(0, description="跳过的记录数量"),
+    limit: int = Query(100, description="返回记录数量限制", ge=1, le=500),
+    skip: int = Query(0, description="跳过的记录数量", ge=0, le=5000),
     start_date: Optional[str] = Query(None, description="开始日期 (YYYY-MM-DD)"),
     end_date: Optional[str] = Query(None, description="结束日期 (YYYY-MM-DD)"),
     days: Optional[int] = Query(None, description="最近N天"),
@@ -263,6 +361,7 @@ def get_all_trade_executions(
     current_user: dict = Depends(get_current_active_user),
 ):
     """获取当前登录用户的交易执行记录，按时间倒序排列，支持日期范围筛选"""
+    started_at = time.perf_counter()
     try:
         collections = get_db_collections()
         collection = collections["trade_executions"]
@@ -288,54 +387,7 @@ def get_all_trade_executions(
                 }
             query["order_id"] = {"$in": order_ids}
         
-        # 处理日期筛选
-        if days:
-            # 最近N天（包含今天）
-            from datetime import datetime, timedelta
-            end = datetime.now().replace(hour=23, minute=59, second=59)
-            start = (end - timedelta(days=days - 1)).replace(hour=0, minute=0, second=0)
-            # 尝试使用 date 字段，如果不存在则使用 timestamp
-            query["$or"] = [
-                {
-                    "date": {
-                        "$gte": start.strftime("%Y-%m-%d"),
-                        "$lte": end.strftime("%Y-%m-%d")
-                    }
-                },
-                {
-                    "timestamp": {
-                        "$gte": start.timestamp(),
-                        "$lte": end.timestamp()
-                    }
-                }
-            ]
-        elif start_date or end_date:
-            # 日期范围
-            from datetime import datetime
-            or_conditions = []
-            
-            # date 字段条件
-            date_query: Dict[str, Any] = {}
-            if start_date:
-                date_query["$gte"] = start_date
-            if end_date:
-                date_query["$lte"] = end_date
-            if date_query:
-                or_conditions.append({"date": date_query})
-            
-            # timestamp 字段条件
-            timestamp_query: Dict[str, Any] = {}
-            if start_date:
-                start_dt = datetime.strptime(start_date, "%Y-%m-%d").replace(hour=0, minute=0, second=0)
-                timestamp_query["$gte"] = start_dt.timestamp()
-            if end_date:
-                end_dt = datetime.strptime(end_date, "%Y-%m-%d").replace(hour=23, minute=59, second=59)
-                timestamp_query["$lte"] = end_dt.timestamp()
-            if timestamp_query:
-                or_conditions.append({"timestamp": timestamp_query})
-            
-            if or_conditions:
-                query["$or"] = or_conditions
+        _apply_query_filter(query, _trade_time_window_query(days=days, start_date=start_date, end_date=end_date))
         
         # 查询并排序
         cursor = collection.find(query).sort("timestamp", -1).skip(skip).limit(limit)
@@ -343,6 +395,7 @@ def get_all_trade_executions(
         
         # 添加股票名称
         trades = enrich_trades_with_stock_names(trades, stock_info_collection)
+        _log_trade_timing("Trade executions", started_at, rows=len(trades), limit=limit, skip=skip)
         
         return {
             "success": True,
@@ -433,14 +486,23 @@ def get_trade_executions_by_date(
         raise HTTPException(status_code=500, detail=f"查询失败: {str(e)}")
 
 @router.get("/trade-executions/stats", summary="获取当前用户的交易统计数据")
-def get_trade_execution_stats(current_user: dict = Depends(get_current_active_user)):
+def get_trade_execution_stats(
+    days: Optional[int] = Query(None, ge=1, le=366, description="最近N天，默认30天"),
+    start_date: Optional[str] = Query(None, description="开始日期 (YYYY-MM-DD)"),
+    end_date: Optional[str] = Query(None, description="结束日期 (YYYY-MM-DD)"),
+    current_user: dict = Depends(get_current_active_user),
+):
     """获取当前登录用户的交易统计数据"""
+    started_at = time.perf_counter()
     try:
         collections = get_db_collections()
         collection = collections["trade_executions"]
         
         user_id = current_user["id"]
-        trades = _group_executions_by_order(list(collection.find({"user_id": user_id})))
+        query: Dict[str, Any] = {"user_id": user_id}
+        effective_days = _effective_window_days(days, start_date, end_date)
+        _apply_query_filter(query, _trade_time_window_query(days=days, start_date=start_date, end_date=end_date))
+        trades = _group_executions_by_order(list(collection.find(query).sort("timestamp", -1).limit(2000)))
         # 过滤掉完全未成交的订单（filled_size 为 0），避免统计中计入作废单
         trades = [t for t in trades if t.get("filled_size", 0) != 0]
         
@@ -486,7 +548,7 @@ def get_trade_execution_stats(current_user: dict = Depends(get_current_active_us
         for symbol_data in symbols.values():
             symbol_data["strategies"] = list(symbol_data["strategies"])
         
-        return {
+        response = {
             "success": True,
             "stats": {
                 "total_trades": total_trades,
@@ -496,13 +558,15 @@ def get_trade_execution_stats(current_user: dict = Depends(get_current_active_us
                 "symbols": symbols
             }
         }
+        _log_trade_timing("Trade execution stats", started_at, rows=len(trades), days=effective_days)
+        return response
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"统计失败: {str(e)}")
 
 
 @router.get("/trade-executions/pnl-summary", summary="获取当前用户按股票和策略分组的盈亏统计")
 def get_trade_pnl_summary(
-    days: Optional[int] = Query(None, description="最近N天"),
+    days: Optional[int] = Query(None, ge=1, le=366, description="最近N天，默认30天"),
     start_date: Optional[str] = Query(None, description="开始日期 (YYYY-MM-DD)"),
     end_date: Optional[str] = Query(None, description="结束日期 (YYYY-MM-DD)"),
     current_user: dict = Depends(get_current_active_user),
@@ -513,6 +577,7 @@ def get_trade_pnl_summary(
       - 每个股票 + 策略的交易笔数、净持仓数量、已实现盈亏
       - 支持按日期范围或最近N天筛选，便于回溯查看
     """
+    started_at = time.perf_counter()
     try:
         collections = get_db_collections()
         executions_coll = collections["trade_executions"]
@@ -530,52 +595,11 @@ def get_trade_pnl_summary(
         if not isinstance(end_date, (str, type(None))):
             end_date = None
 
-        # 基于 get_all_trade_executions 的日期筛选逻辑构建查询
         query: Dict[str, Any] = {"user_id": user_id}
+        effective_days = _effective_window_days(days, start_date, end_date)
+        _apply_query_filter(query, _trade_time_window_query(days=days, start_date=start_date, end_date=end_date))
 
-        if days:
-            end = datetime.now().replace(hour=23, minute=59, second=59)
-            start = (end - timedelta(days=days - 1)).replace(hour=0, minute=0, second=0)
-            query["$or"] = [
-                {
-                    "date": {
-                        "$gte": start.strftime("%Y-%m-%d"),
-                        "$lte": end.strftime("%Y-%m-%d"),
-                    }
-                },
-                {
-                    "timestamp": {
-                        "$gte": start.timestamp(),
-                        "$lte": end.timestamp(),
-                    }
-                },
-            ]
-        elif start_date or end_date:
-            or_conditions = []
-
-            date_query: Dict[str, Any] = {}
-            if start_date:
-                date_query["$gte"] = start_date
-            if end_date:
-                date_query["$lte"] = end_date
-            if date_query:
-                or_conditions.append({"date": date_query})
-
-            timestamp_query: Dict[str, Any] = {}
-            if start_date:
-                start_dt = datetime.strptime(start_date, "%Y-%m-%d").replace(hour=0, minute=0, second=0)
-                timestamp_query["$gte"] = start_dt.timestamp()
-            if end_date:
-                end_dt = datetime.strptime(end_date, "%Y-%m-%d").replace(hour=23, minute=59, second=59)
-                timestamp_query["$lte"] = end_dt.timestamp()
-            if timestamp_query:
-                or_conditions.append({"timestamp": timestamp_query})
-
-            if or_conditions:
-                query["$or"] = or_conditions
-
-        # 查询当前用户的所有执行记录
-        trades = _group_executions_by_order(list(executions_coll.find(query)))
+        trades = _group_executions_by_order(list(executions_coll.find(query).sort("timestamp", -1).limit(5000)))
         # 过滤掉完全未成交的订单（filled_size 为 0），避免统计中计入作废单
         trades = [t for t in trades if t.get("filled_size", 0) != 0]
         if not trades:
@@ -673,12 +697,15 @@ def get_trade_pnl_summary(
         total_realized_pnl = round(sum(r["realized_pnl"] for r in summary_rows), 2)
         total_unrealized_pnl = round(total_unrealized_pnl, 2)
 
-        return {
+        response = {
             "success": True,
             "data": summary_rows,
             "total_realized_pnl": total_realized_pnl,
             "total_unrealized_pnl": total_unrealized_pnl,
+            "window_days": effective_days,
         }
+        _log_trade_timing("Trade PnL summary", started_at, rows=len(trades), groups=len(summary_rows), days=effective_days)
+        return response
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"统计失败: {str(e)}")
 
@@ -712,8 +739,8 @@ def get_trade_activities_stats(current_user: dict = Depends(get_current_active_u
 
 @router.get("/trade-activities/", summary="获取当前用户的所有交易活动（包含信号和执行记录）")
 def get_all_trade_activities(
-    limit: int = Query(100, description="返回记录数量限制"),
-    skip: int = Query(0, description="跳过的记录数量"),
+    limit: int = Query(100, description="返回记录数量限制", ge=1, le=MAX_TRADE_ACTIVITY_LIMIT),
+    skip: int = Query(0, description="跳过的记录数量", ge=0, le=MAX_TRADE_SKIP),
     start_date: Optional[str] = Query(None, description="开始日期 (YYYY-MM-DD)"),
     end_date: Optional[str] = Query(None, description="结束日期 (YYYY-MM-DD)"),
     days: Optional[int] = Query(None, description="最近N天"),
@@ -721,6 +748,7 @@ def get_all_trade_activities(
     current_user: dict = Depends(get_current_active_user),
 ):
     """融合 trade_signals 和 trade_executions，提供当前用户的完整交易活动视图"""
+    started_at = time.perf_counter()
     try:
         collections = get_db_collections()
         executions_coll = collections["trade_executions"]
@@ -728,60 +756,26 @@ def get_all_trade_activities(
         data_collections = get_data_db()
         stock_info_coll = data_collections["stock_info"]
         user_id = current_user["id"]
-        
-        # 构建日期查询条件
-        date_query = {}
-        if days:
-            from datetime import datetime, timedelta
-            end = datetime.now().replace(hour=23, minute=59, second=59)
-            start = (end - timedelta(days=days - 1)).replace(hour=0, minute=0, second=0)
-            date_query = {
-                "$or": [
-                    {
-                        "date": {
-                            "$gte": start.strftime("%Y-%m-%d"),
-                            "$lte": end.strftime("%Y-%m-%d")
-                        }
-                    },
-                    {
-                        "timestamp": {
-                            "$gte": start.timestamp(),
-                            "$lte": end.timestamp()
-                        }
-                    }
-                ]
-            }
-        elif start_date or end_date:
-            from datetime import datetime
-            or_conditions = []
-            date_filter = {}
-            timestamp_filter = {}
-            
-            if start_date:
-                date_filter["$gte"] = start_date
-                start_dt = datetime.strptime(start_date, "%Y-%m-%d")
-                timestamp_filter["$gte"] = start_dt.timestamp()
-            if end_date:
-                date_filter["$lte"] = end_date
-                end_dt = datetime.strptime(end_date, "%Y-%m-%d").replace(hour=23, minute=59, second=59)
-                timestamp_filter["$lte"] = end_dt.timestamp()
-            
-            if date_filter:
-                or_conditions.append({"date": date_filter})
-            if timestamp_filter:
-                or_conditions.append({"timestamp": timestamp_filter})
-            if or_conditions:
-                date_query = {"$or": or_conditions}
+
+        limit = _bounded_trade_limit(limit)
+        skip = _bounded_trade_skip(skip)
+        fetch_limit = min(MAX_TRADE_SKIP + MAX_TRADE_ACTIVITY_LIMIT, skip + limit + 100)
+        effective_days = _effective_window_days(days, start_date, end_date)
+        date_query = _trade_time_window_query(days=days, start_date=start_date, end_date=end_date)
         
         merged_activities = []
+        execution_source_count = 0
+        signal_source_count = 0
         
         # 1. 获取已执行的交易记录（如果不是仅显示 pending）
         if status_filter != "pending":
             exec_query = {"worker_mode": {"$ne": "backtest"}, "user_id": user_id}  # 排除回测数据，按用户过滤
             if date_query:
-                exec_query.update(date_query)
+                _apply_query_filter(exec_query, date_query)
             
-            executions = _group_executions_by_order(list(executions_coll.find(exec_query).sort("timestamp", -1)))
+            execution_docs = list(executions_coll.find(exec_query).sort("timestamp", -1).limit(fetch_limit))
+            execution_source_count = len(execution_docs)
+            executions = _group_executions_by_order(execution_docs)
             # 排除完全未成交的订单，避免在用户视图中显示作废单
             executions = [e for e in executions if e.get("filled_size", 0) != 0]
             
@@ -829,10 +823,11 @@ def get_all_trade_activities(
                 "user_id": user_id,
             }
             if date_query:
-                signal_query.update(date_query)
+                _apply_query_filter(signal_query, date_query)
             
             pending_signal_statuses = {"pending", "retry_pending", "submitted", ""}
-            signals = list(signals_coll.find(signal_query).sort("timestamp", -1))
+            signals = list(signals_coll.find(signal_query).sort("timestamp", -1).limit(fetch_limit))
+            signal_source_count = len(signals)
             
             for signal_doc in signals:
                 signal_time = add_display_time_fields(dict(signal_doc))
@@ -890,12 +885,24 @@ def get_all_trade_activities(
         # 5. 添加股票名称
         merged_activities = enrich_trades_with_stock_names(merged_activities, stock_info_coll)
         
-        return {
+        response = {
             "success": True,
             "data": merged_activities,
             "count": len(merged_activities),
-            "total": total
+            "total": total,
+            "window_days": effective_days,
         }
+        _log_trade_timing(
+            "Trade activities",
+            started_at,
+            execution_docs=execution_source_count,
+            signal_docs=signal_source_count,
+            merged=total,
+            returned=len(merged_activities),
+            limit=limit,
+            skip=skip,
+        )
+        return response
     except Exception as e:
         import traceback
         traceback.print_exc()

@@ -3,6 +3,14 @@ import pytest
 from routers import trade_execution as te
 
 
+class _FakeCursor(list):
+    def sort(self, field, direction=None):
+        return _FakeCursor(sorted(self, key=lambda row: row.get(field) or 0, reverse=direction == -1))
+
+    def limit(self, n):
+        return _FakeCursor(list(self)[:n])
+
+
 @pytest.mark.unit
 def test_group_executions_by_order_keeps_latest_per_order_id():
     executions = [
@@ -151,7 +159,7 @@ def test_trade_pnl_summary_unrealized_zero_when_no_minute_price(monkeypatch):
 
         def find(self, query):
             uid = query.get("user_id")
-            return [d for d in self.docs if d.get("user_id") == uid]
+            return _FakeCursor([d for d in self.docs if d.get("user_id") == uid])
 
     class FakeMinuteBarsCollection:
         def __init__(self, docs):
@@ -230,7 +238,7 @@ def test_trade_pnl_summary_unrealized_zero_when_net_quantity_zero(monkeypatch):
 
         def find(self, query):
             uid = query.get("user_id")
-            return [d for d in self.docs if d.get("user_id") == uid]
+            return _FakeCursor([d for d in self.docs if d.get("user_id") == uid])
 
     class FakeMinuteBarsCollection2:
         def __init__(self, docs):
@@ -330,7 +338,7 @@ def test_trade_pnl_summary_multiple_symbols_total_unrealized_matches_sum(monkeyp
 
         def find(self, query):
             uid = query.get("user_id")
-            return [d for d in self.docs if d.get("user_id") == uid]
+            return _FakeCursor([d for d in self.docs if d.get("user_id") == uid])
 
     class FakeMinuteBarsCollection3:
         def __init__(self, docs):

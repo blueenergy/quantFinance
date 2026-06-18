@@ -183,6 +183,20 @@ def _expected_indexes() -> List[ExpectedIndex]:
         ExpectedIndex(
             "finance",
             "trade_signals",
+            [("user_id", ASCENDING), ("timestamp", DESCENDING)],
+            "trade_signals_user_timestamp_desc",
+            "trade activity list by user sorted by timestamp",
+        ),
+        ExpectedIndex(
+            "finance",
+            "trade_signals",
+            [("user_id", ASCENDING), ("mode", ASCENDING), ("timestamp", DESCENDING)],
+            "trade_signals_user_mode_timestamp_desc",
+            "live trade activity list by user and mode sorted by timestamp",
+        ),
+        ExpectedIndex(
+            "finance",
+            "trade_signals",
             [("user_id", ASCENDING), ("order_id", ASCENDING)],
             "unique_live_order_id_per_user",
             "live signal lookup and duplicate protection",
@@ -194,6 +208,13 @@ def _expected_indexes() -> List[ExpectedIndex]:
             [("user_id", ASCENDING), ("order_id", ASCENDING)],
             "trade_exec_user_order",
             "plan detail execution lookup by order ids",
+        ),
+        ExpectedIndex(
+            "finance",
+            "trade_executions",
+            [("user_id", ASCENDING), ("timestamp", DESCENDING)],
+            "trade_exec_user_timestamp_desc",
+            "trade execution/activity list by user sorted by timestamp",
         ),
         ExpectedIndex(
             "finance",
