@@ -76,6 +76,65 @@ def _trade_time_window_query(
     return {"$or": or_conditions} if or_conditions else {}
 
 
+def _signal_time_window_query(
+    *,
+    days: Optional[int],
+    start_date: Optional[str],
+    end_date: Optional[str],
+    all_dates: bool = False,
+    default_days: int = DEFAULT_TRADE_QUERY_DAYS,
+) -> Dict[str, Any]:
+    """Return a bounded time query for trade signal activity.
+
+    Unlike trade executions, a signal may be created earlier and later updated
+    to filled. For activity views, updated_at/executed_at are part of the signal
+    lifecycle contract and should participate in recent-window filtering.
+    """
+    if all_dates:
+        return {}
+
+    days = _valid_int(days)
+    start_date = start_date if isinstance(start_date, str) else None
+    end_date = end_date if isinstance(end_date, str) else None
+
+    if days is None and not (start_date or end_date):
+        days = default_days
+
+    if days:
+        days = max(1, min(days, 366))
+        end = datetime.now().replace(hour=23, minute=59, second=59)
+        start = (end - timedelta(days=days - 1)).replace(hour=0, minute=0, second=0)
+    else:
+        start = datetime.strptime(start_date, "%Y-%m-%d").replace(hour=0, minute=0, second=0) if start_date else None
+        end = datetime.strptime(end_date, "%Y-%m-%d").replace(hour=23, minute=59, second=59) if end_date else None
+
+    if not (start or end):
+        return {}
+
+    numeric_query: Dict[str, Any] = {}
+    date_query: Dict[str, Any] = {}
+    compact_date_query: Dict[str, Any] = {}
+    if start:
+        numeric_query["$gte"] = start.timestamp()
+        date_query["$gte"] = start.strftime("%Y-%m-%d")
+        compact_date_query["$gte"] = start.strftime("%Y%m%d")
+    if end:
+        numeric_query["$lte"] = end.timestamp()
+        date_query["$lte"] = end.strftime("%Y-%m-%d")
+        compact_date_query["$lte"] = end.strftime("%Y%m%d")
+
+    return {
+        "$or": [
+            {"timestamp": numeric_query},
+            {"updated_at": numeric_query},
+            {"executed_at": numeric_query},
+            {"submitted_at": numeric_query},
+            {"date": date_query},
+            {"date": compact_date_query},
+        ]
+    }
+
+
 def _apply_query_filter(query: Dict[str, Any], extra_filter: Dict[str, Any]) -> None:
     if not extra_filter:
         return
@@ -174,6 +233,7 @@ def _log_empty_trade_activity_diagnostics(
     execution_source_count: int,
     execution_filled_count: int,
     signal_source_count: int,
+    signal_included_count: int,
 ) -> None:
     if os.getenv("TRADE_ACTIVITY_EMPTY_DIAGNOSTICS", "1") == "0":
         return
@@ -183,7 +243,8 @@ def _log_empty_trade_activity_diagnostics(
     log.warning(
         "Trade activities empty diagnostics user_id=%s status_filter=%s "
         "exec_base=%s exec_window=%s exec_source=%s exec_filled=%s "
-        "signal_base=%s signal_window=%s signal_source=%s latest_exec=%s latest_signal=%s",
+        "signal_base=%s signal_window=%s signal_source=%s signal_included=%s "
+        "latest_exec=%s latest_signal=%s",
         user_id,
         status_filter,
         _safe_count_documents(executions_coll, base_exec_query),
@@ -193,6 +254,7 @@ def _log_empty_trade_activity_diagnostics(
         _safe_count_documents(signals_coll, base_signal_query),
         _safe_count_documents(signals_coll, signal_query) if signal_query else None,
         signal_source_count,
+        signal_included_count,
         _latest_trade_sample(executions_coll, base_exec_query),
         _latest_trade_sample(signals_coll, base_signal_query),
     )
@@ -203,6 +265,38 @@ def _display_trade_quantity(row: Dict[str, Any]) -> float:
     if filled:
         return filled
     for field in ("size", "quantity"):
+        value = row.get(field)
+        if value not in (None, ""):
+            try:
+                return abs(float(value))
+            except (TypeError, ValueError):
+                return 0.0
+    return 0.0
+
+
+def _numeric_timestamp(value: Any) -> float:
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, datetime):
+        return value.timestamp()
+    if isinstance(value, str):
+        try:
+            return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            return 0.0
+    return 0.0
+
+
+def _signal_activity_timestamp(row: Dict[str, Any]) -> float:
+    for field in ("updated_at", "executed_at", "submitted_at", "timestamp", "created_at"):
+        ts = _numeric_timestamp(row.get(field))
+        if ts:
+            return ts
+    return 0.0
+
+
+def _signal_display_quantity(row: Dict[str, Any]) -> float:
+    for field in ("filled_qty", "size", "quantity"):
         value = row.get(field)
         if value not in (None, ""):
             try:
@@ -885,11 +979,19 @@ def get_all_trade_activities(
         fetch_limit = min(MAX_TRADE_SKIP + MAX_TRADE_ACTIVITY_LIMIT, skip + limit + 100)
         effective_days = _effective_window_days(days, start_date, end_date, all_dates=all_dates)
         date_query = _trade_time_window_query(days=days, start_date=start_date, end_date=end_date, all_dates=all_dates)
+        signal_date_query = _signal_time_window_query(
+            days=days,
+            start_date=start_date,
+            end_date=end_date,
+            all_dates=all_dates,
+        )
         
         merged_activities = []
         execution_source_count = 0
         execution_filled_count = 0
         signal_source_count = 0
+        signal_included_count = 0
+        execution_order_ids = set()
         exec_query = None
         signal_query = None
         
@@ -905,6 +1007,7 @@ def get_all_trade_activities(
             # 排除完全未成交的订单，避免在用户视图中显示作废单
             executions = [e for e in executions if _is_filled_execution(e)]
             execution_filled_count = len(executions)
+            execution_order_ids = {e.get("order_id") for e in executions if e.get("order_id")}
             
             for exec_doc in executions:
                 exec_time = add_display_time_fields(dict(exec_doc))
@@ -940,67 +1043,78 @@ def get_all_trade_activities(
                     "date": exec_doc.get("date", "")
                 })
         
-        # 2. 获取待执行的交易信号（如果不是仅显示 executed）
-        if status_filter != "executed":
-            signal_query = {
-                "$or": [
-                    {"worker_mode": "live"},
-                    {"mode": "live"}
-                ],
-                "user_id": user_id,
+        # 2. 获取交易信号。执行视图也需要信号兜底：有些实盘状态只更新 trade_signals，
+        # 对应的 trade_executions 可能尚未写入或被去重。
+        signal_query = {
+            "$or": [
+                {"worker_mode": "live"},
+                {"mode": "live"}
+            ],
+            "user_id": user_id,
+        }
+        if signal_date_query:
+            _apply_query_filter(signal_query, signal_date_query)
+        
+        pending_signal_statuses = {"pending", "retry_pending", "submitted", ""}
+        executed_signal_statuses = {"executed", "filled", "partial_filled"}
+        signals = list(signals_coll.find(signal_query).sort("timestamp", -1).limit(fetch_limit))
+        signal_source_count = len(signals)
+        
+        for signal_doc in signals:
+            order_id = signal_doc.get("order_id", "")
+            if order_id and order_id in execution_order_ids:
+                continue
+            raw_status = str(signal_doc.get("status", "pending")).lower()
+            if status_filter == "pending" and raw_status not in pending_signal_statuses:
+                continue
+            if status_filter == "executed" and raw_status not in executed_signal_statuses:
+                continue
+            status_map = {
+                "pending": "PENDING",
+                "retry_pending": "RETRY",
+                "submitted": "SUBMITTED",
+                "executed": "FILLED",
+                "filled": "FILLED",
+                "partial_filled": "PARTIAL_FILLED",
+                "failed": "FAILED",
+                "rejected": "FAILED",
             }
-            if date_query:
-                _apply_query_filter(signal_query, date_query)
+            # 粗分为待执行 vs 已执行/失败，便于前端理解
+            if raw_status in ("pending", "retry_pending", "submitted"):
+                status_category = "pending"
+            elif raw_status in executed_signal_statuses:
+                status_category = "executed"
+            elif raw_status in ("failed", "rejected"):
+                status_category = "failed"
+            else:
+                status_category = "other"
             
-            pending_signal_statuses = {"pending", "retry_pending", "submitted", ""}
-            signals = list(signals_coll.find(signal_query).sort("timestamp", -1).limit(fetch_limit))
-            signal_source_count = len(signals)
-            
-            for signal_doc in signals:
-                signal_time = add_display_time_fields(dict(signal_doc))
-                raw_status = str(signal_doc.get("status", "pending")).lower()
-                if status_filter == "pending" and raw_status not in pending_signal_statuses:
-                    continue
-                status_map = {
-                    "pending": "PENDING",
-                    "retry_pending": "RETRY",
-                    "submitted": "SUBMITTED",
-                    "executed": "FILLED",
-                    "filled": "FILLED",
-                    "partial_filled": "PARTIAL_FILLED",
-                    "failed": "FAILED",
-                    "rejected": "FAILED",
-                }
-                # 粗分为待执行 vs 已执行/失败，便于前端理解
-                if raw_status in ("pending", "retry_pending", "submitted"):
-                    status_category = "pending"
-                elif raw_status in ("executed", "filled", "partial_filled"):
-                    status_category = "executed"
-                elif raw_status in ("failed", "rejected"):
-                    status_category = "failed"
-                else:
-                    status_category = "other"
-                
-                merged_activities.append({
-                    "_id": str(signal_doc.get("_id")),
-                    "symbol": signal_doc.get("symbol"),
-                    "direction": (signal_doc.get("action", "")).upper(),
-                    "status": status_map.get(raw_status, raw_status.upper()),
-                    "status_category": status_category,
-                    "price": signal_doc.get("price", 0),
-                    "target_price": signal_doc.get("price"),
-                    "filled_price": None,
-                    "quantity": signal_doc.get("size", 0),
-                    "strategy": signal_doc.get("strategy", ""),
-                    "timestamp": signal_doc.get("timestamp", 0),
-                    "execution_time": signal_time.get("execution_time"),
-                    "timestamp_iso": signal_time.get("timestamp_iso"),
-                    "order_id": signal_doc.get("order_id", ""),
-                    "source": "trade_signal",
-                    "error_message": signal_doc.get("error_message"),
-                    "retry_count": signal_doc.get("retry_count", 0),
-                    "date": signal_doc.get("date", "")
-                })
+            activity_ts = _signal_activity_timestamp(signal_doc)
+            signal_display_doc = dict(signal_doc)
+            if activity_ts:
+                signal_display_doc["timestamp"] = activity_ts
+            signal_time = add_display_time_fields(signal_display_doc)
+            merged_activities.append({
+                "_id": str(signal_doc.get("_id")),
+                "symbol": signal_doc.get("symbol"),
+                "direction": (signal_doc.get("action", "")).upper(),
+                "status": status_map.get(raw_status, raw_status.upper()),
+                "status_category": status_category,
+                "price": signal_doc.get("avg_price", signal_doc.get("price", 0)),
+                "target_price": signal_doc.get("price"),
+                "filled_price": signal_doc.get("avg_price"),
+                "quantity": _signal_display_quantity(signal_doc),
+                "strategy": signal_doc.get("strategy", ""),
+                "timestamp": activity_ts or signal_doc.get("timestamp", 0),
+                "execution_time": signal_time.get("execution_time"),
+                "timestamp_iso": signal_time.get("timestamp_iso"),
+                "order_id": order_id,
+                "source": "trade_signal",
+                "error_message": signal_doc.get("error_message"),
+                "retry_count": signal_doc.get("retry_count", 0),
+                "date": signal_doc.get("date", "")
+            })
+            signal_included_count += 1
         
         # 3. 按时间倒序排序
         merged_activities.sort(key=lambda x: x.get("timestamp", 0), reverse=True)
@@ -1018,6 +1132,7 @@ def get_all_trade_activities(
                 execution_source_count=execution_source_count,
                 execution_filled_count=execution_filled_count,
                 signal_source_count=signal_source_count,
+                signal_included_count=signal_included_count,
             )
         merged_activities = merged_activities[skip:skip + limit]
         
@@ -1036,6 +1151,7 @@ def get_all_trade_activities(
             started_at,
             execution_docs=execution_source_count,
             signal_docs=signal_source_count,
+            signal_included=signal_included_count,
             merged=total,
             returned=len(merged_activities),
             limit=limit,
@@ -1188,13 +1304,36 @@ def create_trader_execution(
             if signal.get(field) is not None:
                 execution_record.setdefault(field, signal.get(field))
 
-    insert_result = executions_coll.insert_one(execution_record)
+    broker_order_id = execution_record.get("broker_order_id") or execution_record.get("qmt_order_id")
+    execution_status = execution_record.get("status") or "filled"
+    if broker_order_id:
+        execution_record["broker_order_id"] = broker_order_id
+        execution_record.setdefault("qmt_order_id", broker_order_id)
+
+    execution_key: Dict[str, Any] = {
+        "user_id": user_id,
+        "order_id": order_id,
+        "status": execution_status,
+    }
+    if broker_order_id:
+        execution_key["broker_order_id"] = broker_order_id
+    if execution_record.get("filled_size") is not None:
+        execution_key["filled_size"] = execution_record.get("filled_size")
+
+    existing_execution = executions_coll.find_one(execution_key)
+    if existing_execution:
+        executions_coll.update_one({"_id": existing_execution["_id"]}, {"$set": execution_record})
+        execution_id = str(existing_execution["_id"])
+        inserted = False
+    else:
+        insert_result = executions_coll.insert_one(execution_record)
+        execution_id = str(insert_result.inserted_id)
+        inserted = True
 
     # 同步更新对应信号状态（如果存在）
     signal_update: Dict[str, Any] = {}
-    status = execution_record.get("status")
-    if status:
-        signal_update["status"] = status
+    if execution_status:
+        signal_update["status"] = execution_status
 
     filled_size = execution_record.get("filled_size")
     if filled_size is not None:
@@ -1205,8 +1344,9 @@ def create_trader_execution(
         signal_update["avg_price"] = filled_price
 
     if signal_update:
-        signal_update["executed_at"] = time.time()
-        signal_update["updated_at"] = time.time()
+        signal_update["updated_at"] = execution_record["timestamp"]
+        if execution_status in {"filled", "executed", "rejected", "cancelled", "canceled", "partial_cancelled", "failed"}:
+            signal_update["executed_at"] = execution_record["timestamp"]
         signals_coll.update_one(
             {"order_id": order_id, "user_id": user_id},
             {"$set": signal_update},
@@ -1214,5 +1354,6 @@ def create_trader_execution(
 
     return {
         "success": True,
-        "inserted_id": str(insert_result.inserted_id),
+        "execution_id": execution_id,
+        "inserted": inserted,
     }

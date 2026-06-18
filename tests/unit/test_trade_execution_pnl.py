@@ -11,6 +11,48 @@ class _FakeCursor(list):
         return _FakeCursor(list(self)[:n])
 
 
+class _FakeWriteCollection:
+    def __init__(self, docs=None):
+        self.docs = list(docs or [])
+        self.insert_count = 0
+        self.update_count = 0
+
+    def find_one(self, query, projection=None, sort=None):  # noqa: ARG002
+        for doc in self.docs:
+            if all(doc.get(key) == value for key, value in query.items()):
+                return doc
+        return None
+
+    def insert_one(self, doc):
+        self.insert_count += 1
+        row = dict(doc)
+        row.setdefault("_id", f"id-{self.insert_count}")
+        self.docs.append(row)
+
+        class Result:
+            inserted_id = row["_id"]
+
+        return Result()
+
+    def update_one(self, query, update):
+        self.update_count += 1
+        for doc in self.docs:
+            if all(doc.get(key) == value for key, value in query.items()):
+                doc.update(update.get("$set", {}))
+
+                class Result:
+                    matched_count = 1
+                    modified_count = 1
+
+                return Result()
+
+        class Result:
+            matched_count = 0
+            modified_count = 0
+
+        return Result()
+
+
 @pytest.mark.unit
 def test_group_executions_by_order_keeps_latest_per_order_id():
     executions = [
@@ -150,6 +192,62 @@ def test_trade_time_window_query_uses_trade_execution_time_contract():
         "created_at" in condition or "updated_at" in condition or "executed_at" in condition
         for condition in conditions
     )
+
+
+@pytest.mark.unit
+def test_signal_time_window_query_uses_signal_lifecycle_timestamps():
+    query = te._signal_time_window_query(days=30, start_date=None, end_date=None)
+    conditions = query["$or"]
+
+    assert any("timestamp" in condition for condition in conditions)
+    assert any("updated_at" in condition for condition in conditions)
+    assert any("executed_at" in condition for condition in conditions)
+
+
+@pytest.mark.unit
+def test_signal_activity_timestamp_prefers_update_time():
+    signal = {"timestamp": 1, "updated_at": 10, "executed_at": 9}
+
+    assert te._signal_activity_timestamp(signal) == 10
+
+
+@pytest.mark.unit
+def test_create_trader_execution_is_idempotent(monkeypatch):
+    executions = _FakeWriteCollection()
+    signals = _FakeWriteCollection(
+        [
+            {
+                "order_id": "order-1",
+                "user_id": "user-1",
+                "plan_id": "plan-1",
+                "mode": "live",
+            }
+        ]
+    )
+    monkeypatch.setattr(
+        te,
+        "get_db_collections",
+        lambda: {"trade_executions": executions, "trade_signals": signals},
+    )
+
+    payload = {
+        "order_id": "order-1",
+        "status": "filled",
+        "filled_size": 100,
+        "filled_price": 10.5,
+        "broker_order_id": "broker-1",
+        "timestamp": 1000.0,
+    }
+
+    first = te.create_trader_execution(dict(payload), current_user={"id": "user-1"})
+    second = te.create_trader_execution({**payload, "timestamp": 1001.0}, current_user={"id": "user-1"})
+
+    assert first["inserted"] is True
+    assert second["inserted"] is False
+    assert executions.insert_count == 1
+    assert executions.update_count == 1
+    assert len(executions.docs) == 1
+    assert executions.docs[0]["timestamp"] == 1001.0
 
 
 @pytest.mark.unit
