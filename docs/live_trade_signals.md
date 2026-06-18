@@ -107,7 +107,8 @@ active entrust, `quantTrader` **retries** `cancel_order` on a throttle (defaults
 set `QUANT_TRADER_CANCEL_REQUESTED_FORCE_CANCELLED_AFTER_SECONDS` (seconds after
 `cancel_requested_at`) to mark `cancelled` in Mongo even while the query list is
 stale; default `0` disables this (use only when you accept reconciling against a
-possibly live broker row).
+possibly live broker row). The same keys may be set under **`execution` in
+quantTrader `config.json`** (environment variables override JSON when both are set).
 
 **Operational follow-up (new plan / re-approve):** cancelling the signal does **not**
 regenerate `portfolio_trade_plan_items`. To align the portfolio with **latest**
