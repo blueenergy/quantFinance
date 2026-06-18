@@ -80,6 +80,11 @@ class _Collection:
         return True
 
 
+class _FailingFindCollection(_Collection):
+    def find(self, query=None, projection=None):
+        raise AssertionError("trade_executions should not be queried by plan detail")
+
+
 def _collections():
     return {
         "portfolio_strategy_configs": _Collection(
@@ -847,39 +852,7 @@ def test_plan_detail_enriches_strategy_and_account_positions_separately(monkeypa
             "securities_account_id": "acct-1",
         }
     )
-    finance["trade_executions"].docs.extend(
-        [
-            {
-                "user_id": "user-1",
-                "strategy_template_id": "s1",
-                "securities_account_id": "acct-1",
-                "order_id": "plan-order-1",
-                "symbol": "000001",
-                "action": "buy",
-                "filled_size": 100,
-                "mode": "live",
-            },
-            {
-                "user_id": "user-1",
-                "strategy_template_id": "other-strategy",
-                "securities_account_id": "acct-1",
-                "order_id": "other-strategy-order",
-                "symbol": "000001",
-                "action": "buy",
-                "filled_size": 200,
-                "mode": "live",
-            },
-            {
-                "user_id": "user-1",
-                "securities_account_id": "acct-1",
-                "order_id": "manual-order",
-                "symbol": "000001",
-                "action": "buy",
-                "filled_size": 300,
-                "mode": "live",
-            },
-        ]
-    )
+    finance["trade_executions"] = _FailingFindCollection()
     finance["trader_positions"].docs.append(
         {
             "user_id": "user-1",

@@ -438,18 +438,19 @@ def _symbol_query_values(value: Any) -> List[str]:
     return [item for item in values if item]
 
 
-def _execution_signed_size(row: Dict[str, Any]) -> int:
-    size = _int_value(row.get("filled_size", row.get("filled_qty", row.get("quantity", row.get("size", 0)))))
+def _signal_filled_qty(row: Dict[str, Any]) -> int:
+    filled = _int_value(row.get("filled_qty", row.get("filled_size", 0)))
+    if filled == 0 and str(row.get("status") or "").lower() == "filled":
+        return abs(_int_value(row.get("size")))
+    return abs(filled)
+
+
+def _signal_signed_filled_qty(row: Dict[str, Any]) -> int:
+    qty = _signal_filled_qty(row)
     action = str(row.get("action") or row.get("side") or "").lower()
     if action in {"sell", "s"}:
-        return -abs(size)
-    if action in {"buy", "b"}:
-        return abs(size)
-    return size
-
-
-def _execution_qty(row: Dict[str, Any]) -> int:
-    return abs(_int_value(row.get("filled_size", row.get("filled_qty", row.get("quantity", row.get("size", 0))))))
+        return -qty
+    return qty
 
 
 def _build_live_plan_item_context(
@@ -494,8 +495,12 @@ def _build_live_plan_item_context(
                 "_id": 0,
                 "order_id": 1,
                 "symbol": 1,
+                "action": 1,
+                "side": 1,
                 "status": 1,
                 "size": 1,
+                "filled_qty": 1,
+                "filled_size": 1,
                 "securities_account_id": 1,
             },
         )
@@ -503,16 +508,6 @@ def _build_live_plan_item_context(
     mark("signals")
     order_ids = [row.get("order_id") for row in plan_signals if row.get("order_id")]
     account_ids = {str(row.get("securities_account_id")) for row in plan_signals if row.get("securities_account_id")}
-
-    plan_executions: List[Dict[str, Any]] = []
-    if order_ids:
-        plan_executions = list(
-            finance_collections["trade_executions"].find(
-                {"user_id": user_id, "order_id": {"$in": order_ids}},
-                {"_id": 0, "symbol": 1, "filled_size": 1, "filled_qty": 1, "quantity": 1, "size": 1, "action": 1, "side": 1},
-            )
-        )
-    mark("plan_executions")
 
     account_positions: List[Dict[str, Any]] = []
     if account_ids:
@@ -545,12 +540,8 @@ def _build_live_plan_item_context(
         symbol = _symbol_key(signal.get("symbol"))
         if symbol in context:
             signal_by_symbol.setdefault(symbol, []).append(signal)
-
-    for row in plan_executions:
-        symbol = _symbol_key(row.get("symbol"))
-        if symbol in context:
-            context[symbol]["live_filled_qty"] += _execution_qty(row)
-            context[symbol]["live_signed_delta"] += _execution_signed_size(row)
+            context[symbol]["live_filled_qty"] += _signal_filled_qty(signal)
+            context[symbol]["live_signed_delta"] += _signal_signed_filled_qty(signal)
 
     terminal_statuses = {"filled", "cancelled", "canceled", "rejected", "failed", "partial_cancelled"}
     for symbol, signals in signal_by_symbol.items():
