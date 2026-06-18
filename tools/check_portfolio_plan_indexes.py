@@ -216,19 +216,6 @@ def _expected_indexes() -> List[ExpectedIndex]:
         ),
         ExpectedIndex(
             "finance",
-            "trade_executions",
-            [
-                ("user_id", ASCENDING),
-                ("strategy_template_id", ASCENDING),
-                ("mode", ASCENDING),
-                ("securities_account_id", ASCENDING),
-                ("symbol", ASCENDING),
-            ],
-            "trade_exec_user_strategy_mode_account_symbol",
-            "plan detail strategy position reconstruction",
-        ),
-        ExpectedIndex(
-            "finance",
             "trader_positions",
             [("user_id", ASCENDING), ("securities_account_id", ASCENDING), ("symbol", ASCENDING)],
             "trader_positions_user_account_symbol",

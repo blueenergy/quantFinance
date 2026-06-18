@@ -468,7 +468,6 @@ def _build_live_plan_item_context(
     def mark(label: str) -> None:
         marks.append((label, time.perf_counter() - started_at))
 
-    strategy_template_id = plan.get("strategy_template_id")
     symbols = {_symbol_key(item.get("symbol")) for item in items if item.get("symbol")}
     if not symbols:
         return {}
@@ -510,36 +509,13 @@ def _build_live_plan_item_context(
         plan_executions = list(
             finance_collections["trade_executions"].find(
                 {"user_id": user_id, "order_id": {"$in": order_ids}},
-                {"_id": 0, "symbol": 1, "filled_size": 1, "filled_qty": 1, "quantity": 1, "size": 1},
+                {"_id": 0, "symbol": 1, "filled_size": 1, "filled_qty": 1, "quantity": 1, "size": 1, "action": 1, "side": 1},
             )
         )
     mark("plan_executions")
 
-    strategy_executions: List[Dict[str, Any]] = []
     account_positions: List[Dict[str, Any]] = []
     if account_ids:
-        strategy_executions = list(
-            finance_collections["trade_executions"].find(
-                {
-                    "user_id": user_id,
-                    "strategy_template_id": strategy_template_id,
-                    "mode": "live",
-                    "securities_account_id": {"$in": sorted(account_ids)},
-                    "symbol": {"$in": symbol_values},
-                },
-                {
-                    "_id": 0,
-                    "symbol": 1,
-                    "filled_size": 1,
-                    "filled_qty": 1,
-                    "quantity": 1,
-                    "size": 1,
-                    "action": 1,
-                    "side": 1,
-                },
-            )
-        )
-        mark("strategy_executions")
         account_positions = list(
             finance_collections["trader_positions"].find(
                 {
@@ -554,7 +530,7 @@ def _build_live_plan_item_context(
 
     context: Dict[str, Dict[str, Any]] = {
         symbol: {
-            "strategy_current_shares": 0,
+            "live_signed_delta": 0,
             "live_filled_qty": 0,
             "live_remaining_qty": 0,
             "live_status": None,
@@ -563,11 +539,6 @@ def _build_live_plan_item_context(
         }
         for symbol in symbols
     }
-
-    for row in strategy_executions:
-        symbol = _symbol_key(row.get("symbol"))
-        if symbol in context:
-            context[symbol]["strategy_current_shares"] += _execution_signed_size(row)
 
     signal_by_symbol: Dict[str, List[Dict[str, Any]]] = {}
     for signal in plan_signals:
@@ -579,6 +550,7 @@ def _build_live_plan_item_context(
         symbol = _symbol_key(row.get("symbol"))
         if symbol in context:
             context[symbol]["live_filled_qty"] += _execution_qty(row)
+            context[symbol]["live_signed_delta"] += _execution_signed_size(row)
 
     terminal_statuses = {"filled", "cancelled", "canceled", "rejected", "failed", "partial_cancelled"}
     for symbol, signals in signal_by_symbol.items():
@@ -653,7 +625,7 @@ def _attach_live_plan_item_context(
     for item in items:
         symbol_context = context.get(_symbol_key(item.get("symbol"))) or {}
         original_current = _int_value(item.get("current_shares"))
-        strategy_current = _int_value(symbol_context.get("strategy_current_shares"), original_current) if has_live_context else original_current
+        strategy_current = original_current + _int_value(symbol_context.get("live_signed_delta")) if has_live_context else original_current
         enriched.append(
             {
                 **item,

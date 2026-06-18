@@ -817,6 +817,7 @@ def test_plan_live_executions_are_scoped_to_plan_order_ids(monkeypatch):
 def test_plan_detail_enriches_strategy_and_account_positions_separately(monkeypatch):
     collections = _collections()
     collections["portfolio_trade_plans"].docs[0]["status"] = "approved"
+    collections["portfolio_trade_plans"].docs[0]["live_signal_count"] = 1
     collections["portfolio_trade_plan_items"].docs.append(
         {
             "plan_id": "plan-user-1",
