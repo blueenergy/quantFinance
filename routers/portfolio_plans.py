@@ -4,6 +4,9 @@ from __future__ import annotations
 
 from datetime import datetime
 from typing import Any, Dict, List, Optional
+import logging
+import os
+import time
 import uuid
 
 from bson import ObjectId
@@ -23,6 +26,7 @@ from services.live_equity import compute_live_plan_realtime_equity, list_live_pl
 
 
 router = APIRouter(prefix="/portfolio-plans", tags=["portfolio-plans"])
+log = logging.getLogger(__name__)
 ALLOWED_UNIVERSE_INDICES = {"hs300", "a500", "csi500", "csi1000", "star50"}
 GROWTH_CYCLE_PARAMETER_SCHEMA = {
     "universe_index": {"type": "enum", "options": sorted(ALLOWED_UNIVERSE_INDICES)},
@@ -1213,12 +1217,20 @@ async def get_portfolio_plan_generation_watermark(
 
 @router.get("/plans/{plan_id}")
 async def get_portfolio_plan(plan_id: str, current_user: dict = Depends(get_current_user)):
+    started_at = time.perf_counter()
+    marks: List[tuple[str, float]] = []
+
+    def mark(label: str) -> None:
+        marks.append((label, time.perf_counter() - started_at))
+
     collections = get_trading_db_collections()
     finance_collections = get_db_collections()
     data_collections = get_data_db()
     plan = _require_plan(collections, plan_id, current_user)
+    mark("plan")
     owner_query = {"plan_id": plan_id, "user_id": _current_user_id(current_user)}
     items = list(collections["portfolio_trade_plan_items"].find(owner_query).sort("rank", 1))
+    mark("items")
     user_id = _current_user_id(current_user)
     items = _attach_live_plan_item_context(
         finance_collections=finance_collections,
@@ -1226,9 +1238,27 @@ async def get_portfolio_plan(plan_id: str, current_user: dict = Depends(get_curr
         items=items,
         user_id=user_id,
     )
+    mark("live_context")
     reviews = list(collections["portfolio_plan_reviews"].find(owner_query).sort("created_at", -1))
+    mark("reviews")
     execution_status = _paper_execution_status(collections, data_collections, plan, items)
+    mark("paper_status")
     execution_context = _plan_execution_context(finance_collections, plan, user_id)
+    mark("execution_context")
+    total_elapsed = time.perf_counter() - started_at
+    threshold = float(os.getenv("PORTFOLIO_PLAN_DETAIL_TIMING_SECONDS", "1"))
+    if total_elapsed >= threshold:
+        previous = 0.0
+        parts = []
+        for label, elapsed in marks:
+            parts.append(f"{label}={elapsed - previous:.3f}s")
+            previous = elapsed
+        log.warning(
+            "Portfolio plan detail timing total=%.3fs plan_id=%s %s",
+            total_elapsed,
+            plan_id,
+            " ".join(parts),
+        )
     return {
         "success": True,
         "data": {
@@ -1871,25 +1901,34 @@ def _paper_execution_status(collections: Dict[str, Any], data_collections: Dict[
         execution_query["user_id"] = plan.get("user_id")
     execute_date = plan.get("execute_date")
     effective_execute_date = execute_date or datetime.now().strftime("%Y%m%d")
-    execution_symbols = sorted(
-        {
-            item.get("symbol")
-            for item in items
-            if item.get("symbol") and int(item.get("delta_shares", 0) or 0) != 0
-        }
-    )
-    open_prices = _load_prices(data_collections["volume_price"], execution_symbols, effective_execute_date, "open") if execution_symbols else {}
-    missing_symbols = [symbol for symbol in execution_symbols if symbol not in open_prices]
-    latest_execution = collections["portfolio_paper_executions"].find_one(
-        execution_query,
-        sort=[("created_at", -1)],
-    )
-    execution_count = collections["portfolio_paper_executions"].count_documents(execution_query)
+    plan_status = str(plan.get("status") or "")
 
-    if plan.get("status") == "approved":
+    missing_symbols: List[str] = []
+    if plan_status == "approved":
+        execution_symbols = sorted(
+            {
+                item.get("symbol")
+                for item in items
+                if item.get("symbol") and int(item.get("delta_shares", 0) or 0) != 0
+            }
+        )
+        open_prices = _load_prices(data_collections["volume_price"], execution_symbols, effective_execute_date, "open") if execution_symbols else {}
+        missing_symbols = [symbol for symbol in execution_symbols if symbol not in open_prices]
+
+    should_load_executions = plan_status in {"approved", "executed_paper", "partially_executed"} or bool(plan.get("paper_executed_at"))
+    latest_execution = None
+    execution_count = 0
+    if should_load_executions:
+        latest_execution = collections["portfolio_paper_executions"].find_one(
+            execution_query,
+            sort=[("created_at", -1)],
+        )
+        execution_count = collections["portfolio_paper_executions"].count_documents(execution_query)
+
+    if plan_status == "approved":
         backend_status = "waiting_for_open_prices" if missing_symbols else "ready_for_background_execution"
-    elif plan.get("status") in {"executed_paper", "partially_executed"}:
-        backend_status = str(plan.get("status"))
+    elif plan_status in {"executed_paper", "partially_executed"}:
+        backend_status = plan_status
     else:
         backend_status = "not_approved"
 
