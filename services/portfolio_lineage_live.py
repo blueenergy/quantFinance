@@ -39,14 +39,31 @@ def _execution_side(row: Dict[str, Any]) -> str:
     return ""
 
 
+def _execution_status(row: Dict[str, Any]) -> str:
+    return str(row.get("status") or row.get("execution_status") or "").lower()
+
+
+def _first_present(row: Dict[str, Any], keys: Tuple[str, ...]) -> Any:
+    for key in keys:
+        if row.get(key) is not None:
+            return row.get(key)
+    return None
+
+
 def _execution_qty(row: Dict[str, Any]) -> float:
-    return _numeric(
-        row.get("filled_size")
-        or row.get("filled_qty")
-        or row.get("quantity")
-        or row.get("size")
-        or 0
-    )
+    explicit_fill = _first_present(row, ("filled_size", "filled_qty"))
+    if explicit_fill is not None:
+        return _numeric(explicit_fill)
+
+    status = _execution_status(row)
+    unfilled_terminal = {"cancelled", "canceled", "rejected", "failed", "expired"}
+    if status in unfilled_terminal:
+        return 0.0
+
+    qty = row.get("quantity") or row.get("size") or 0
+    if status and status not in {"filled", "partial_filled", "partial_cancelled"}:
+        return 0.0
+    return _numeric(qty)
 
 
 def _execution_price(row: Dict[str, Any]) -> float:
@@ -75,8 +92,21 @@ def _execution_date(row: Dict[str, Any]) -> str:
         or ""
     )
     if isinstance(value, datetime):
-        return value.date().isoformat()
-    return str(value or "")[:10]
+        return value.strftime("%Y%m%d")
+    if isinstance(value, (int, float)):
+        seconds = float(value) / 1000 if float(value) > 1_000_000_000_000 else float(value)
+        return datetime.fromtimestamp(seconds).strftime("%Y%m%d")
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    if text.isdigit():
+        if len(text) == 8:
+            return text
+        if len(text) >= 13:
+            return datetime.fromtimestamp(float(text[:13]) / 1000).strftime("%Y%m%d")
+        if len(text) == 10:
+            return datetime.fromtimestamp(float(text)).strftime("%Y%m%d")
+    return text[:10].replace("-", "")
 
 
 def _round_or_none(value: Optional[float], digits: int = 2) -> Optional[float]:
@@ -92,16 +122,11 @@ def _trades_for_ledger(executions: List[Dict[str, Any]]) -> List[Dict[str, Any]]
         side = _execution_side(row)
         if side not in ("BUY", "SELL"):
             continue
-        qty = (
-            row.get("filled_size")
-            or row.get("filled_qty")
-            or row.get("quantity")
-            or row.get("size")
-            or 0
-        )
+        qty = _execution_qty(row)
         if not qty:
             continue
         doc = dict(row)
+        doc["filled_size"] = qty
         doc["side"] = side
         doc["action"] = side
         out.append(doc)

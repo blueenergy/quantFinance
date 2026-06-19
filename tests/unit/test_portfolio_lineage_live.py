@@ -102,6 +102,8 @@ def test_build_lineage_live_trades_fifo_splits_one_sell_across_buy_lots():
     assert [row["quantity"] for row in trades] == [1000, 200, 300]
     assert trades[0]["rebalance_date"] == "20250101"
     assert trades[1]["rebalance_date"] == "20250120"
+    assert trades[0]["buy_date"] == "20250102"
+    assert trades[0]["sell_date"] == "20250210"
     assert trades[0]["buy_price"] == 10.0
     assert trades[0]["sell_price"] == 12.0
     assert trades[0]["fee"] == 20.0
@@ -179,3 +181,76 @@ def test_build_lineage_live_positions_adds_symbol_name():
     out = build_lineage_live_positions(grouped, {"000001.SZ": 11.0}, name_map={"000001": "平安银行"})
 
     assert out["positions"][0]["name"] == "平安银行"
+
+
+def test_cancelled_buy_without_fill_does_not_create_position_or_open_trade():
+    executions = [
+        {
+            "order_id": "cancelled-buy",
+            "symbol": "000001.SZ",
+            "side": "BUY",
+            "status": "cancelled",
+            "size": 1000,
+            "quantity": 1000,
+            "target_price": 10.0,
+            "timestamp": 1735808400,
+            "source_plan_base_date": "20250101",
+        }
+    ]
+
+    positions = build_lineage_live_positions(executions, {"000001.SZ": 11.0})
+    trades = build_lineage_live_trades(executions, {"000001.SZ": 11.0})
+
+    assert positions["positions"] == []
+    assert positions["summary"]["holding_count"] == 0
+    assert trades == []
+
+
+def test_partial_cancelled_buy_counts_only_filled_quantity():
+    executions = [
+        {
+            "order_id": "partial-buy",
+            "symbol": "000001.SZ",
+            "side": "BUY",
+            "status": "partial_cancelled",
+            "filled_qty": 300,
+            "size": 1000,
+            "target_price": 10.0,
+            "filled_price": 10.0,
+            "timestamp": 1735808400,
+            "source_plan_base_date": "20250101",
+        }
+    ]
+
+    positions = build_lineage_live_positions(executions, {"000001.SZ": 11.0})
+    trades = build_lineage_live_trades(executions, {"000001.SZ": 11.0})
+
+    assert positions["positions"][0]["shares"] == 300
+    assert trades[0]["quantity"] == 300
+
+
+def test_build_lineage_live_trades_formats_numeric_timestamp_as_yyyymmdd():
+    executions = [
+        {
+            "order_id": "buy-1",
+            "symbol": "000001.SZ",
+            "side": "BUY",
+            "filled_size": 100,
+            "filled_price": 10.0,
+            "timestamp": 1735808400,
+            "source_plan_base_date": "20250101",
+        },
+        {
+            "order_id": "sell-1",
+            "symbol": "000001.SZ",
+            "side": "SELL",
+            "filled_size": 100,
+            "filled_price": 11.0,
+            "timestamp": 1736499600000,
+        },
+    ]
+
+    trades = build_lineage_live_trades(executions, {})
+
+    assert trades[0]["buy_date"] == "20250102"
+    assert trades[0]["sell_date"] == "20250110"
