@@ -138,6 +138,7 @@ class LiveTradeSignal(BaseModel):
     effective_limit_price: Optional[float] = None
     activate_after: Optional[datetime] = None
     valid_until: Optional[datetime] = None
+    phase_barrier: Optional[Dict[str, Any]] = None
     status: str = Field(default="pending")
     created_at: datetime
 
@@ -194,6 +195,81 @@ class LiveTradeSignal(BaseModel):
         doc["datetime"] = self.created_at
         doc["strategy"] = self.strategy_template_id
         return doc
+
+
+PHASE_BARRIER_PLAN_SELLS_TERMINAL = "plan_sells_terminal"
+
+# Plan-level execution phase states (derived, see docs/stable_rebalance_execution.md D1).
+PLAN_PHASE_APPROVED_PUBLISHED = "approved_published"
+PLAN_PHASE_SELLING = "selling"
+PLAN_PHASE_SELL_SETTLED = "sell_settled"
+PLAN_PHASE_BUYING = "buying"
+PLAN_PHASE_DONE = "done"
+
+
+def build_plan_sells_terminal_barrier(plan_id: str) -> Dict[str, Any]:
+    """Barrier carried on buy signals: hold until the plan's sells are terminal.
+
+    Written in Phase 1, enforced by the trader in Phase 2 (see design doc D3).
+    """
+
+    return {"type": PHASE_BARRIER_PLAN_SELLS_TERMINAL, "plan_id": str(plan_id)}
+
+
+def _signal_is_terminal(signal: Dict[str, Any]) -> bool:
+    return str(signal.get("status") or "").lower() in TERMINAL_SIGNAL_STATUSES
+
+
+def sells_barrier_satisfied(signals: Iterable[Dict[str, Any]]) -> bool:
+    """Return True when every live sell signal in ``signals`` is terminal.
+
+    Barrier definition (design doc D2): for a plan, the sell barrier is satisfied
+    when all ``mode=live`` ``execution_phase=sell`` signals are in a terminal
+    status. Cancelled/rejected sells count as terminal (the barrier means "no
+    in-flight sells", not "all sells filled"). A plan with no sell signals
+    trivially satisfies the barrier.
+    """
+
+    for signal in signals:
+        if str(signal.get("mode") or "live").lower() != "live":
+            continue
+        phase = str(signal.get("execution_phase") or signal.get("action") or "").lower()
+        if phase != "sell":
+            continue
+        if not _signal_is_terminal(signal):
+            return False
+    return True
+
+
+def derive_execution_phase_state(signals: Iterable[Dict[str, Any]]) -> str:
+    """Derive the plan-level execution phase from its live signals.
+
+    This is a computed value (design doc D1); it is never stored as authoritative
+    state. ``partial_done`` is intentionally not produced in Phase 1 (D3).
+    """
+
+    signals = [s for s in signals if str(s.get("mode") or "live").lower() == "live"]
+    if not signals:
+        return PLAN_PHASE_APPROVED_PUBLISHED
+
+    sells = [s for s in signals if str(s.get("execution_phase") or s.get("action") or "").lower() == "sell"]
+    buys = [s for s in signals if str(s.get("execution_phase") or s.get("action") or "").lower() == "buy"]
+
+    sells_settled = sells_barrier_satisfied(signals)
+    if not sells_settled:
+        return PLAN_PHASE_SELLING
+
+    if not buys:
+        return PLAN_PHASE_DONE
+
+    if all(_signal_is_terminal(s) for s in buys):
+        return PLAN_PHASE_DONE
+
+    buys_started = any(str(s.get("status") or "").lower() != "pending" for s in buys)
+    if buys_started:
+        return PLAN_PHASE_BUYING
+
+    return PLAN_PHASE_SELL_SETTLED
 
 
 def stable_live_order_id(
@@ -256,6 +332,10 @@ def build_portfolio_plan_live_signal(
     if action == "sell":
         execution_priority -= 10000
     activate_after = default_activate_after(now)
+    # Phase 1: buy signals carry the sell barrier; enforcement lands in Phase 2.
+    phase_barrier = (
+        build_plan_sells_terminal_barrier(str(plan["plan_id"])) if action == "buy" else None
+    )
 
     order_id = stable_live_order_id(
         plan_id=str(plan["plan_id"]),
@@ -291,6 +371,7 @@ def build_portfolio_plan_live_signal(
         effective_limit_price=effective_limit_price,
         activate_after=activate_after,
         valid_until=default_valid_until(now, activate_after),
+        phase_barrier=phase_barrier,
         created_at=now,
     )
 

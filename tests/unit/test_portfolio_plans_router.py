@@ -428,6 +428,58 @@ def test_get_portfolio_plan_generation_watermark_falls_back_to_global_scores(mon
     assert response["data"]["latest_available_score_scope"] == "global"
 
 
+def test_plan_execution_context_derives_phase_and_stamps_sell_settled():
+    finance = _finance_collections()
+    finance["trade_signals"] = portfolio_plans_collection = _Collection(
+        [
+            {"plan_id": "plan-user-1", "user_id": "user-1", "mode": "live", "execution_phase": "sell", "status": "filled"},
+            {"plan_id": "plan-user-1", "user_id": "user-1", "mode": "live", "execution_phase": "buy", "status": "pending"},
+        ]
+    )
+    trading = {
+        "portfolio_paper_executions": _Collection(),
+        "portfolio_trade_plans": _Collection([{"plan_id": "plan-user-1", "user_id": "user-1"}]),
+    }
+    import routers.portfolio_plans as pp
+
+    orig = pp.get_trading_db_collections
+    pp.get_trading_db_collections = lambda: trading
+    try:
+        ctx = pp._plan_execution_context(finance, {"plan_id": "plan-user-1"}, "user-1")
+    finally:
+        pp.get_trading_db_collections = orig
+
+    assert ctx["execution_mode"] == "live"
+    assert ctx["execution_phase_state"] == "sell_settled"
+    plan_doc = trading["portfolio_trade_plans"].find_one({"plan_id": "plan-user-1"})
+    assert plan_doc.get("sell_settled_at") is not None
+
+
+def test_plan_execution_context_selling_does_not_stamp_sell_settled():
+    finance = _finance_collections()
+    finance["trade_signals"] = _Collection(
+        [
+            {"plan_id": "plan-user-1", "user_id": "user-1", "mode": "live", "execution_phase": "sell", "status": "submitted"},
+        ]
+    )
+    trading = {
+        "portfolio_paper_executions": _Collection(),
+        "portfolio_trade_plans": _Collection([{"plan_id": "plan-user-1", "user_id": "user-1"}]),
+    }
+    import routers.portfolio_plans as pp
+
+    orig = pp.get_trading_db_collections
+    pp.get_trading_db_collections = lambda: trading
+    try:
+        ctx = pp._plan_execution_context(finance, {"plan_id": "plan-user-1"}, "user-1")
+    finally:
+        pp.get_trading_db_collections = orig
+
+    assert ctx["execution_phase_state"] == "selling"
+    plan_doc = trading["portfolio_trade_plans"].find_one({"plan_id": "plan-user-1"})
+    assert plan_doc.get("sell_settled_at") is None
+
+
 def test_publish_live_signals_dry_run_builds_contract(monkeypatch):
     collections = _collections()
     collections["portfolio_trade_plans"].docs[0]["status"] = "approved"
@@ -490,10 +542,12 @@ def test_publish_live_signals_dry_run_builds_contract(monkeypatch):
     activate_after = datetime.fromisoformat(signal["activate_after"])
     valid_until = datetime.fromisoformat(signal["valid_until"])
     assert (valid_until - activate_after).total_seconds() == 600
+    assert signal["phase_barrier"] == {"type": "plan_sells_terminal", "plan_id": "plan-user-1"}
     sell_signal = response["data"]["signals"][1]
     assert sell_signal["execution_phase"] == "sell"
     assert sell_signal["execution_priority"] == -9998
     assert sell_signal["price_floor"] == 11.88
+    assert sell_signal["phase_barrier"] is None
     assert response["data"]["risk_report"]["blocked_count"] == 0
 
 

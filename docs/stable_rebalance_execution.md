@@ -131,6 +131,30 @@ sequenceDiagram
 
 说明：`buy_phase_replan` 可实现在 **Backend**（推荐：集中审计、复用定价与风控）或 **Trader**（需额外 API 与鉴权）；默认推荐 Backend 异步任务或「屏障满足后单次 RPC」模式，具体在 Phase 3 实现时选定。
 
+### 3.4 实现决策：派生状态 + 屏障精确定义（Phase 1 固化）
+
+**(D1) `execution_phase_state` 采用「派生 + 事件时间戳落库」，不作为权威可变状态存储。**
+
+- 计划级阶段状态由该 `plan_id` 下所有 live signal 的实时状态**派生计算**（函数 `derive_execution_phase_state`），避免「信号已终态但 plan 字段没回写」造成的漂移。
+- 只**落库不会漂移的事件事实**：`sell_settled_at`（屏障首次满足时间）、已有的 `live_signals_published_at`。
+- 计划详情接口可返回派生出的 `execution_phase_state`，但它是计算结果，不是需要维护一致性的存储字段。
+
+**(D2) 卖出屏障（`plan_sells_terminal`）的精确定义：**
+
+> 对某 `plan_id`，当其下**所有** `mode=live` 且 `execution_phase=sell` 的 live signal 都处于**终态**时，屏障满足。
+
+- 终态集合：`filled` / `cancelled` / `canceled` / `rejected` / `failed` / `partial_cancelled`（复用 `TERMINAL_SIGNAL_STATUSES`）。
+- **不区分来源**：原始发布、`plan_topup`、`manual_reprice` 的卖单都计入。
+- **未成交也算满足**：卖单 `cancelled` / `rejected` 同样视为该卖意图已结束（屏障是「不再有在途卖单」，不是「卖出全部成交」）。
+- **纯买计划**（无任何 sell signal）：屏障 trivially 满足。
+- 该定义同时驱动 §3.1 的 `selling → sell_settled` 推进与 buy signal 的 `phase_barrier` 放行（放行强制在 Phase 2）。
+
+**(D3) 阶段范围声明：**
+
+- **Phase 1**：仅写入 buy signal 的 `phase_barrier` 字段、提供 `derive_execution_phase_state`/屏障判定函数、落库 `sell_settled_at`（当可判定时）。`phase_barrier` 字段此阶段**写入但不强制**（trader 仍按现有同轮 sell→buy 顺序执行，无回归）。
+- **Phase 2**：trader/后端开始**强制**屏障，未满足则买单保持 `pending`。
+- `partial_done`：**Phase 1 不产生**，留待买阶段策略（Phase 3）定义。
+
 ---
 
 ## 4. 字段定义
@@ -160,13 +184,15 @@ sequenceDiagram
 
 ### 4.2 `portfolio_trade_plans`（或等价集合）扩展
 
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| `execution_phase_state` | `string` | 与 §3.1 对齐：`approved_published` / `selling` / `sell_settled` / `buying` / `done` / `partial_done` / `aborted` 等。 |
-| `sell_settled_at` | `datetime` | 屏障满足时间。 |
-| `buy_replan_rules` | `object` | approve 时固化的预授权规则（与 §4.3 一致或为其子集指针）。 |
-| `last_buy_replan_at` | `datetime` | 上次买阶段重算时间。 |
-| `last_buy_replan_summary` | `object` | 可选：重算前后 notional、现金、逐标的 diff 摘要。 |
+存储策略见 §3.4 (D1)：`execution_phase_state` 为**派生值**（不落库为权威状态），其余为**落库事件**。
+
+| 字段 | 类型 | 存储 | 说明 |
+|------|------|------|------|
+| `execution_phase_state` | `string` | 派生（不落库） | 由 `derive_execution_phase_state` 实时计算，值域见 §3.1。 |
+| `sell_settled_at` | `datetime` | 落库事件 | 卖出屏障首次满足时间；幂等写入，不回退。 |
+| `buy_replan_rules` | `object` | 落库（Phase 3） | approve 时固化的预授权规则（与 §4.3 一致或为其子集指针）。 |
+| `last_buy_replan_at` | `datetime` | 落库（Phase 3） | 上次买阶段重算时间。 |
+| `last_buy_replan_summary` | `object` | 落库（Phase 3） | 可选：重算前后 notional、现金、逐标的 diff 摘要。 |
 
 审计：继续沿用 `portfolio_plan_operation_logs`（与 `plan_topup` 一致思想），新增事件类型如 `buy_phase_replan`。
 

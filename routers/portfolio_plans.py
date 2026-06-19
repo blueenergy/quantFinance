@@ -20,8 +20,11 @@ from db import get_data_db, get_db_collections, get_trading_db_collections
 from utils.time_display import add_display_time_fields
 from services.live_trade_signals import (
     ACTIVE_SIGNAL_STATUSES,
+    PLAN_PHASE_APPROVED_PUBLISHED,
+    PLAN_PHASE_SELLING,
     active_signal_query_for_order_ids,
     build_portfolio_plan_live_signal,
+    derive_execution_phase_state,
     summarize_signal_statuses,
 )
 from services.live_equity import (
@@ -751,6 +754,37 @@ def _attach_live_plan_item_context(
     return enriched
 
 
+def _stamp_sell_settled_at(
+    trading_collections: Dict[str, Any],
+    plan: Dict[str, Any],
+    user_id: str,
+    phase_state: str,
+) -> None:
+    """Idempotently record when the plan's sell barrier first becomes satisfied.
+
+    ``sell_settled_at`` is a non-drifting event fact (design doc D1); it is only
+    written once and never rolled back. ``execution_phase_state`` itself stays a
+    derived value and is not stored.
+    """
+
+    plan_id = str(plan.get("plan_id") or "")
+    if not plan_id:
+        return
+    if phase_state in {PLAN_PHASE_APPROVED_PUBLISHED, PLAN_PHASE_SELLING}:
+        return
+    if plan.get("sell_settled_at"):
+        return
+    now = datetime.utcnow()
+    plan["sell_settled_at"] = now
+    try:
+        trading_collections["portfolio_trade_plans"].update_one(
+            {"plan_id": plan_id, "user_id": user_id, "sell_settled_at": {"$exists": False}},
+            {"$set": {"sell_settled_at": now}},
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.debug("Failed to stamp sell_settled_at for plan %s: %s", plan_id, exc)
+
+
 def _plan_execution_context(finance_collections: Dict[str, Any], plan: Dict[str, Any], user_id: str) -> Dict[str, Any]:
     """Single source of truth for how a plan is being executed.
 
@@ -758,29 +792,33 @@ def _plan_execution_context(finance_collections: Dict[str, Any], plan: Dict[str,
     so the UI never has to infer the layout from scattered fields.
     """
     plan_id = str(plan.get("plan_id") or "")
+    trading_collections = get_trading_db_collections()
     paper_execution = (
-        get_trading_db_collections()["portfolio_paper_executions"].find_one({"plan_id": plan_id, "user_id": user_id})
+        trading_collections["portfolio_paper_executions"].find_one({"plan_id": plan_id, "user_id": user_id})
         if plan_id
         else None
     )
     has_paper_state = bool(plan.get("status") in {"executed_paper", "partially_executed"} or plan.get("paper_executed_at") or paper_execution)
-    signal_count = (
-        finance_collections["trade_signals"].count_documents(
-            {
-                "user_id": user_id,
-                "plan_id": plan_id,
-                "mode": "live",
-            }
+    live_signals = (
+        list(
+            finance_collections["trade_signals"].find(
+                {"user_id": user_id, "plan_id": plan_id, "mode": "live"},
+                {"_id": 0, "execution_phase": 1, "action": 1, "status": 1, "mode": 1},
+            )
         )
         if plan_id
-        else 0
+        else []
     )
+    signal_count = len(live_signals)
     if signal_count > 0:
+        phase_state = derive_execution_phase_state(live_signals)
+        _stamp_sell_settled_at(trading_collections, plan, user_id, phase_state)
         return {
             "execution_mode": "live",
             "has_live_signals": True,
             "signal_count": signal_count,
             "has_paper_conflict": has_paper_state,
+            "execution_phase_state": phase_state,
         }
     if has_paper_state:
         return {

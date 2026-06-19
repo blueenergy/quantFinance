@@ -37,6 +37,10 @@ Executable live signals must include:
 - `valid_until`: first execution window expiry, now anchored to `activate_after`
   by default so overnight-published signals do not expire before the next
   executable session; later iterations may cancel or reprice.
+- `phase_barrier`: optional buy-signal hold condition, e.g.
+  `{ "type": "plan_sells_terminal", "plan_id": "..." }`. Written in Phase 1 of the
+  stable-rebalance design but not yet enforced by the trader (enforcement is
+  Phase 2); see [stable_rebalance_execution.md](./stable_rebalance_execution.md).
 - `fee_model`: optional account fee model used only when broker execution reports do not include real fees. It may include `buy_commission_rate`, `sell_commission_rate`, `min_commission`, `stamp_tax_rate`, and `transfer_fee_rate`; estimated execution fees must be marked with `estimated_fee=true`.
 - `status`: initial value is `pending`.
 - `created_at`: signal creation time.
