@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime
 from datetime import date as date_cls
 from typing import Any, Dict, Optional, Tuple
 
@@ -13,7 +13,12 @@ from bson.errors import InvalidId
 
 from db import get_data_db
 from routers.stock import _symbol_candidates
-from services.live_trade_signals import _protected_limit_price, LiveTradeSignal
+from services.live_trade_signals import (
+    LiveTradeSignal,
+    _protected_limit_price,
+    default_activate_after,
+    default_valid_until,
+)
 
 LIVE_SIGNAL_SOURCE_MANUAL_REPRICE = "manual_reprice"
 
@@ -279,6 +284,7 @@ def confirm_reprice_and_insert_signal(
 
     now = datetime.utcnow()
     new_order_id = f"live-reprice-{uuid.uuid4().hex[:20]}"
+    activate_after = default_activate_after(now)
 
     lt = LiveTradeSignal(
         order_id=new_order_id,
@@ -305,7 +311,8 @@ def confirm_reprice_and_insert_signal(
         price_floor=None,
         price_ceiling=float(effective_limit_price),
         effective_limit_price=float(effective_limit_price),
-        valid_until=now + timedelta(hours=4),
+        activate_after=activate_after,
+        valid_until=default_valid_until(now, activate_after),
         status="pending",
         created_at=now,
     )

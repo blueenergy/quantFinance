@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import hashlib
-from datetime import datetime, timedelta
+import os
+from datetime import datetime, time as dt_time, timedelta, timezone
 from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
 from typing import Any, Dict, Iterable, List, Optional
+from zoneinfo import ZoneInfo
 
 from fastapi import HTTPException
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -15,6 +17,78 @@ LIVE_SIGNAL_SOURCE_PORTFOLIO_PLAN = "portfolio_plan"
 TERMINAL_SIGNAL_STATUSES = {"filled", "executed", "rejected", "cancelled", "canceled", "partial_cancelled", "failed"}
 ACTIVE_SIGNAL_STATUSES = {"pending", "retry_pending", "submitted", "partial_filled", "cancel_requested"}
 PRICE_TICK = Decimal("0.01")
+CN_TZ = ZoneInfo("Asia/Shanghai")
+CN_A_MORNING_OPEN = dt_time(9, 25)
+CN_A_MORNING_CLOSE = dt_time(11, 30)
+CN_A_AFTERNOON_OPEN = dt_time(13, 0)
+CN_A_AFTERNOON_CLOSE = dt_time(15, 0)
+DEFAULT_SIGNAL_VALID_TTL_SECONDS = 600
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw in (None, ""):
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+def _to_cn_datetime(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(CN_TZ)
+
+
+def _from_cn_datetime(value: datetime) -> datetime:
+    return value.astimezone(timezone.utc).replace(tzinfo=None)
+
+
+def _next_weekday(value) -> Any:
+    current = value + timedelta(days=1)
+    while current.weekday() >= 5:
+        current += timedelta(days=1)
+    return current
+
+
+def default_activate_after(now: datetime) -> datetime:
+    """Return the next conservative A-share executable window anchor."""
+
+    local_now = _to_cn_datetime(now)
+    local_date = local_now.date()
+    local_time = local_now.time()
+
+    if local_now.weekday() >= 5:
+        next_date = local_date
+        while next_date.weekday() >= 5:
+            next_date += timedelta(days=1)
+        return _from_cn_datetime(datetime.combine(next_date, CN_A_MORNING_OPEN, tzinfo=CN_TZ))
+
+    if local_time < CN_A_MORNING_OPEN:
+        return _from_cn_datetime(datetime.combine(local_date, CN_A_MORNING_OPEN, tzinfo=CN_TZ))
+    if CN_A_MORNING_OPEN <= local_time <= CN_A_MORNING_CLOSE:
+        return now
+    if local_time < CN_A_AFTERNOON_OPEN:
+        return _from_cn_datetime(datetime.combine(local_date, CN_A_AFTERNOON_OPEN, tzinfo=CN_TZ))
+    if CN_A_AFTERNOON_OPEN <= local_time <= CN_A_AFTERNOON_CLOSE:
+        return now
+
+    next_date = _next_weekday(local_date)
+    return _from_cn_datetime(datetime.combine(next_date, CN_A_MORNING_OPEN, tzinfo=CN_TZ))
+
+
+def default_valid_until(now: datetime, activate_after: Optional[datetime] = None) -> datetime:
+    mode = (os.getenv("PORTFOLIO_SIGNAL_VALID_UNTIL_MODE") or "from_activate_after").strip().lower()
+    ttl = max(1, _env_int("PORTFOLIO_SIGNAL_VALID_TTL_SECONDS", DEFAULT_SIGNAL_VALID_TTL_SECONDS))
+    if mode == "from_publish":
+        anchor = now
+    elif mode == "session_close":
+        local_anchor = _to_cn_datetime(activate_after or now)
+        return _from_cn_datetime(datetime.combine(local_anchor.date(), CN_A_AFTERNOON_CLOSE, tzinfo=CN_TZ))
+    else:
+        anchor = activate_after or now
+    return anchor + timedelta(seconds=ttl)
 
 
 def _round_price_to_tick(price: float, *, action: str) -> float:
@@ -62,6 +136,7 @@ class LiveTradeSignal(BaseModel):
     price_floor: Optional[float] = None
     price_ceiling: Optional[float] = None
     effective_limit_price: Optional[float] = None
+    activate_after: Optional[datetime] = None
     valid_until: Optional[datetime] = None
     status: str = Field(default="pending")
     created_at: datetime
@@ -180,6 +255,7 @@ def build_portfolio_plan_live_signal(
     execution_priority = int(plan_item_rank if plan_item_rank is not None else 1000)
     if action == "sell":
         execution_priority -= 10000
+    activate_after = default_activate_after(now)
 
     order_id = stable_live_order_id(
         plan_id=str(plan["plan_id"]),
@@ -213,7 +289,8 @@ def build_portfolio_plan_live_signal(
         price_floor=price_floor,
         price_ceiling=price_ceiling,
         effective_limit_price=effective_limit_price,
-        valid_until=now + timedelta(minutes=10),
+        activate_after=activate_after,
+        valid_until=default_valid_until(now, activate_after),
         created_at=now,
     )
 

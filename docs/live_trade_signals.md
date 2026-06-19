@@ -33,7 +33,10 @@ Executable live signals must include:
 - `price_floor`: lowest acceptable sell limit price when available.
 - `price_ceiling`: highest acceptable buy limit price when available.
 - `effective_limit_price`: initial protected limit price sent to the trader.
-- `valid_until`: first execution window expiry; later iterations may cancel or reprice.
+- `activate_after`: earliest time the trader may submit the signal to the broker.
+- `valid_until`: first execution window expiry, now anchored to `activate_after`
+  by default so overnight-published signals do not expire before the next
+  executable session; later iterations may cancel or reprice.
 - `fee_model`: optional account fee model used only when broker execution reports do not include real fees. It may include `buy_commission_rate`, `sell_commission_rate`, `min_commission`, `stamp_tax_rate`, and `transfer_fee_rate`; estimated execution fees must be marked with `estimated_fee=true`.
 - `status`: initial value is `pending`.
 - `created_at`: signal creation time.
@@ -216,3 +219,7 @@ price_floor = reference_price * (1 - max_slippage_bps / 10000)
 ```
 
 `quantTrader` should use `effective_limit_price` or recompute the protected limit before sending the broker order. If no reference price is available for a live sell order, the trader should reject or retry the signal rather than submit an unprotected market sell.
+
+## Stable rebalance execution (design)
+
+For the proposed **two-phase sell → barrier → buy** flow, **pre-authorized buy replanning** after sells settle, new signal/plan fields, and `QUANT_TRADER_*` / backend configuration knobs, see [stable_rebalance_execution.md](./stable_rebalance_execution.md).

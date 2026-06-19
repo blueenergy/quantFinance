@@ -1,4 +1,5 @@
 import asyncio
+from datetime import datetime
 
 import pytest
 
@@ -484,6 +485,11 @@ def test_publish_live_signals_dry_run_builds_contract(monkeypatch):
     assert signal["max_slippage_bps"] == 100
     assert signal["price_ceiling"] == 10.1
     assert signal["effective_limit_price"] == 10.1
+    assert signal["activate_after"]
+    assert signal["valid_until"]
+    activate_after = datetime.fromisoformat(signal["activate_after"])
+    valid_until = datetime.fromisoformat(signal["valid_until"])
+    assert (valid_until - activate_after).total_seconds() == 600
     sell_signal = response["data"]["signals"][1]
     assert sell_signal["execution_phase"] == "sell"
     assert sell_signal["execution_priority"] == -9998

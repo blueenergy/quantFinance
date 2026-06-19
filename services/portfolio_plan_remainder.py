@@ -24,20 +24,20 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime
 from decimal import Decimal, ROUND_FLOOR
 from typing import Any, Callable, Dict, List, Optional
 
 from services.live_trade_signals import (
     LiveTradeSignal,
     _protected_limit_price,
+    default_activate_after,
+    default_valid_until,
 )
 
 LIVE_SIGNAL_SOURCE_PLAN_TOPUP = "plan_topup"
 
 DEFAULT_LOT_SIZE = 100
-DEFAULT_VALID_FOR = timedelta(minutes=10)
-
 # Skip / informational reason codes surfaced in the preview.
 REASON_NOT_PLANNED_TRADE = "item_not_a_planned_trade"
 REASON_ALREADY_AT_TARGET = "already_at_target"
@@ -332,6 +332,7 @@ def build_topup_signal_doc(
         execution_priority -= 10000
 
     order_id = f"live-topup-{uuid.uuid4().hex[:20]}"
+    activate_after = default_activate_after(now)
     signal = LiveTradeSignal(
         order_id=order_id,
         user_id=str(user_id),
@@ -357,7 +358,8 @@ def build_topup_signal_doc(
         price_floor=price_floor,
         price_ceiling=price_ceiling,
         effective_limit_price=effective_limit_price,
-        valid_until=now + DEFAULT_VALID_FOR,
+        activate_after=activate_after,
+        valid_until=default_valid_until(now, activate_after),
         status="pending",
         created_at=now,
     )
