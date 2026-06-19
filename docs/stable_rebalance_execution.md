@@ -359,7 +359,9 @@ _passes_execution_gates:
 2. 读取 `sig.phase_barrier`；无屏障或 `type` 非 `plan_sells_terminal` → **放行**（向后兼容旧买单），`hard` 模式打 `WARNING`。
 3. 取 `plan_id`，调用 `are_plan_sells_terminal(plan_id)`：
    - `True` → 放行。
-   - `False` → **保持 `pending`**（不提交，不改状态，仅 `log.info` 等待原因），下一轮重试。
+   - `False`：
+     - `soft`（影子模式）→ **放行**，打 `WARNING`「本应被拦截」，仅用于灰度观察拦截频率。
+     - `hard` → **保持 `pending`**（不提交、不改状态，仅 `log.info` 等待原因），下一轮重试。
    - 查询异常 → **放行 + 告警**（不因 DB 抖动阻塞资金，见 §9.8 决策 3）。
 
 > 不可判定（无 `phase_barrier` 字段、`type` 未知、查询失败）统一按「放行 + `WARNING`」处理，仅在 `hard` 模式打告警；`off`/`soft` 静默放行。
@@ -370,7 +372,7 @@ _passes_execution_gates:
 
 | 字段 | 默认 | 说明 |
 |------|------|------|
-| `sell_barrier_mode` | `off`（含 miniQMT；灰度期显式开启 `hard`） | `off` 完全不强制；`soft`/`hard` 均强制屏障，区别仅在是否打告警；不可判定一律放行。 |
+| `sell_barrier_mode` | `off`（含 miniQMT） | `off` 不检查；`soft` 影子模式（屏障未满足时放行但打告警，用于灰度观察）；`hard` 真正拦截。推荐灰度路径 `off → soft → hard`。 |
 | `sell_barrier_timeout_seconds` | `0`（关闭，永不超时） | 预留：>0 时自买单 `activate_after`（缺失回退 `created_at`）起超时则放行并打 `WARNING`。默认 `0` 表示卖未结清就一直等。 |
 
 环境变量 `QUANT_TRADER_SELL_BARRIER_MODE`、`QUANT_TRADER_SELL_BARRIER_TIMEOUT_SECONDS` 覆盖 JSON，沿用 Phase 0 的 `_execution_string` / `_execution_float` 装载方式。
