@@ -1828,7 +1828,7 @@ async def get_lineage_live_equity(
     end_date: Optional[str] = Query(default=None),
     current_user: dict = Depends(get_current_user),
 ):
-    """Merge per-plan ``portfolio_live_equity`` rows across lineage by calendar date."""
+    """Return daily account equity for the live account(s) behind this lineage."""
 
     trading_collections = get_trading_db_collections()
     finance_collections = get_db_collections()
@@ -1849,13 +1849,84 @@ async def get_lineage_live_equity(
             ),
         }
 
+    date_query: Dict[str, str] = {}
+    if start_date:
+        date_query["$gte"] = start_date.replace("-", "")
+    if end_date:
+        date_query["$lte"] = end_date.replace("-", "")
+
+    signal_rows = list(
+        finance_collections["trade_signals"].find(
+            {"user_id": user_id, "mode": "live", "plan_id": {"$in": lineage_ids}},
+            {"_id": 0, "securities_account_id": 1},
+        )
+    )
+    account_ids = sorted(
+        {
+            str(row.get("securities_account_id") or "")
+            for row in signal_rows
+            if str(row.get("securities_account_id") or "")
+        }
+    )
+
+    account_equity_rows: List[Dict[str, Any]] = []
+    if account_ids:
+        account_query: Dict[str, Any] = {
+            "user_id": user_id,
+            "securities_account_id": {"$in": account_ids},
+        }
+        if date_query:
+            account_query["date"] = date_query
+        raw_account_rows = list(
+            finance_collections["trader_account_equity"].find(account_query).sort("date", 1)
+        )
+        latest_by_account_date: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        for row in raw_account_rows:
+            date = str(row.get("date") or "")
+            account_id = str(row.get("securities_account_id") or "")
+            if not date or not account_id:
+                continue
+            key = (date, account_id)
+            existing = latest_by_account_date.get(key)
+            if existing is None or str(row.get("updated_at") or "") >= str(existing.get("updated_at") or ""):
+                latest_by_account_date[key] = row
+
+        daily_totals: Dict[str, Dict[str, Any]] = {}
+        for (date, account_id), row in latest_by_account_date.items():
+            bucket = daily_totals.setdefault(
+                date,
+                {
+                    "date": date,
+                    "source": "trader_account_equity",
+                    "account_ids": [],
+                    "equity": 0.0,
+                    "cash": 0.0,
+                    "market_value": 0.0,
+                    "available_cash": 0.0,
+                    "updated_at": "",
+                },
+            )
+            bucket["account_ids"].append(account_id)
+            bucket["equity"] += _numeric(row.get("total_asset", row.get("total_assets")))
+            bucket["cash"] += _numeric(row.get("cash"))
+            bucket["market_value"] += _numeric(row.get("market_value"))
+            bucket["available_cash"] += _numeric(row.get("available_cash"))
+            bucket["updated_at"] = max(str(bucket.get("updated_at") or ""), str(row.get("updated_at") or ""))
+
+        account_equity_rows = [
+            {
+                **row,
+                "account_ids": sorted(set(row.get("account_ids") or [])),
+                "equity": round(_numeric(row.get("equity")), 2),
+                "cash": round(_numeric(row.get("cash")), 2),
+                "market_value": round(_numeric(row.get("market_value")), 2),
+                "available_cash": round(_numeric(row.get("available_cash")), 2),
+            }
+            for row in sorted(daily_totals.values(), key=lambda r: str(r.get("date") or ""))
+        ]
+
     query: Dict[str, Any] = {"user_id": user_id, "plan_id": {"$in": lineage_ids}}
-    if start_date or end_date:
-        date_query: Dict[str, str] = {}
-        if start_date:
-            date_query["$gte"] = start_date.replace("-", "")
-        if end_date:
-            date_query["$lte"] = end_date.replace("-", "")
+    if date_query:
         query["date"] = date_query
 
     equity_rows = list(trading_collections["portfolio_live_equity"].find(query).sort("date", 1))
@@ -1903,12 +1974,20 @@ async def get_lineage_live_equity(
         user_id=user_id,
     )
 
-    caveat = (
-        "Per-date ``rows`` are each computed from a single plan's own live "
-        "executions (legacy stitching). Prefer ``current_book_equity`` for the "
-        "rolling lineage equity: it treats all live executions across rebalance "
-        "plan_ids as one combo-scoped portfolio."
-    )
+    if account_equity_rows:
+        rows_for_chart = account_equity_rows
+        row_source = "trader_account_equity"
+        caveat = (
+            "净值曲线使用该组合关联证券账户的每日总资产(total_asset)，按日期聚合；"
+            "横轴为交易日/自然日快照日期，纵轴为账户整体权益。"
+        )
+    else:
+        rows_for_chart = enriched
+        row_source = "portfolio_live_equity_legacy"
+        caveat = (
+            "未找到该组合关联账户的 trader_account_equity 日快照，暂回退到旧的 "
+            "portfolio_live_equity plan 级快照；建议先生成账户级每日权益快照。"
+        )
     return {
         "success": True,
         "data": _jsonable(
@@ -1917,8 +1996,11 @@ async def get_lineage_live_equity(
                 "strategy_template_id": plan.get("strategy_template_id"),
                 "params_hash": plan.get("params_hash"),
                 "lineage_plan_ids": lineage_ids,
-                "rows": enriched,
+                "rows": rows_for_chart,
+                "row_source": row_source,
+                "securities_account_ids": account_ids,
                 "source_plan_ids": plan_ids_in_data,
+                "legacy_plan_rows": enriched,
                 "current_book_equity": book_equity,
                 "caveat": caveat,
             }

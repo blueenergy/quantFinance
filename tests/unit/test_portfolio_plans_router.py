@@ -159,6 +159,7 @@ def _finance_collections():
         ),
         "trade_signals": _Collection(),
         "trade_executions": _Collection(),
+        "trader_account_equity": _Collection(),
         "trader_accounts": _Collection([{"user_id": "user-1", "securities_account_id": "acct-1", "available_cash": 100000, "synced_at": 10}]),
         "trader_positions": _Collection([{"user_id": "user-1", "securities_account_id": "acct-1", "symbol": "600000", "can_use_volume": 500}]),
     }
@@ -1345,3 +1346,39 @@ def test_lineage_live_equity_dedupes_date_by_updated_at(monkeypatch):
     book = resp["data"]["current_book_equity"]
     assert book["equity"] == book["initial_capital"]
     assert book["execution_count"] == 0
+
+
+def test_lineage_live_equity_prefers_account_daily_equity(monkeypatch):
+    cols = _collections()
+    fin = _finance_collections()
+    data = _data_collections()
+    cols["portfolio_trade_plans"] = _Collection(
+        [
+            {"plan_id": "pla", "strategy_template_id": "stx", "user_id": "user-1", "base_date": "20250101", "status": "approved", "params_hash": "hx"},
+            {"plan_id": "plb", "strategy_template_id": "stx", "user_id": "user-1", "base_date": "20250125", "status": "approved", "params_hash": "hx"},
+        ]
+    )
+    cols["portfolio_live_equity"] = _Collection(
+        [
+            {"user_id": "user-1", "plan_id": "pla", "date": "20250130", "equity": 1_000_000, "updated_at": "2025-01-30T10:00:00"},
+        ]
+    )
+    fin["trade_signals"].docs = [
+        {"user_id": "user-1", "mode": "live", "plan_id": "pla", "securities_account_id": "acct-1"},
+        {"user_id": "user-1", "mode": "live", "plan_id": "plb", "securities_account_id": "acct-1"},
+    ]
+    fin["trader_account_equity"].docs = [
+        {"user_id": "user-1", "securities_account_id": "acct-1", "date": "20250129", "total_asset": 1_010_000, "cash": 100_000, "market_value": 910_000},
+        {"user_id": "user-1", "securities_account_id": "acct-1", "date": "20250130", "total_asset": 1_020_000, "cash": 90_000, "market_value": 930_000},
+    ]
+
+    _patch_lineage_live_env(monkeypatch, cols, fin, data)
+    resp = asyncio.run(
+        portfolio_plans.get_lineage_live_equity("pla", start_date=None, end_date=None, current_user={"id": "user-1"})
+    )
+
+    assert resp["data"]["row_source"] == "trader_account_equity"
+    assert resp["data"]["securities_account_ids"] == ["acct-1"]
+    assert [row["date"] for row in resp["data"]["rows"]] == ["20250129", "20250130"]
+    assert [row["equity"] for row in resp["data"]["rows"]] == [1_010_000, 1_020_000]
+    assert resp["data"]["rows"][0]["account_ids"] == ["acct-1"]
