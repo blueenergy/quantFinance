@@ -26,7 +26,6 @@ from services.live_trade_signals import (
 )
 from services.live_equity import (
     _load_latest_close_prices,
-    _load_realtime_prices,
     compute_live_plan_realtime_equity,
     list_live_plan_equity,
 )
@@ -322,11 +321,7 @@ def _compute_lineage_book_equity(
         }
     grouped = group_executions_by_order(executions)
     symbols = sorted({str(row.get("symbol")) for row in grouped if row.get("symbol")})
-    realtime_prices, realtime_docs = _load_realtime_prices(
-        data_collections["volume_price_realtime_latest"], symbols
-    )
-    close_prices = _load_latest_close_prices(data_collections["volume_price"], symbols)
-    prices = {**close_prices, **realtime_prices}
+    prices, realtime_docs = _load_fresh_market_prices(data_collections, symbols)
     payload = build_lineage_live_positions(grouped, prices, realtime_docs=realtime_docs)
     summary = payload.get("summary") or {}
     realized = _numeric(summary.get("total_realized_pnl"))
@@ -1757,11 +1752,7 @@ async def get_lineage_live_executions(plan_id: str, current_user: dict = Depends
     executions_display = [add_display_time_fields(row) for row in grouped]
     merged = merge_lineage_live_executions(signals_named, executions_display, plan_meta)
     symbols = sorted({str(row.get("symbol")) for row in merged if row.get("symbol")})
-    realtime_prices, _realtime_docs = _load_realtime_prices(
-        data_collections["volume_price_realtime_latest"], symbols
-    )
-    close_prices = _load_latest_close_prices(data_collections["volume_price"], symbols)
-    prices = {**close_prices, **realtime_prices}
+    prices, _realtime_docs = _load_fresh_market_prices(data_collections, symbols)
     name_map = {
         str(row.get("symbol")): str(row.get("name") or row.get("stock_name") or "")
         for row in signals_named
@@ -1813,11 +1804,7 @@ async def get_lineage_live_positions(plan_id: str, current_user: dict = Depends(
     }
     for symbol, name in list(name_map.items()):
         name_map.setdefault(symbol.split(".", 1)[0], name)
-    realtime_prices, realtime_docs = _load_realtime_prices(
-        data_collections["volume_price_realtime_latest"], symbols
-    )
-    close_prices = _load_latest_close_prices(data_collections["volume_price"], symbols)
-    prices = {**close_prices, **realtime_prices}
+    prices, realtime_docs = _load_fresh_market_prices(data_collections, symbols)
 
     payload = build_lineage_live_positions(grouped, prices, realtime_docs=realtime_docs, name_map=name_map)
     return {
@@ -2586,6 +2573,97 @@ def _load_latest_close_prices(volume_price, symbols: List[str]) -> Dict[str, flo
         if price > 0:
             prices[symbol] = price
     return prices
+
+
+def _first_positive_float(*values: Any) -> Optional[float]:
+    for value in values:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            continue
+        if number > 0:
+            return number
+    return None
+
+
+def _market_doc_yyyymmdd(doc: Optional[Dict[str, Any]]) -> str:
+    if not doc:
+        return ""
+    value = (
+        doc.get("trade_date")
+        or doc.get("date")
+        or doc.get("realtime_trade_time")
+        or doc.get("snapshot_time")
+        or doc.get("updated_at")
+        or doc.get("created_at")
+        or ""
+    )
+    if isinstance(value, datetime):
+        return value.strftime("%Y%m%d")
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    for fmt, length in (("%Y%m%d", 8), ("%Y-%m-%d", 10)):
+        try:
+            return datetime.strptime(text[:length], fmt).strftime("%Y%m%d")
+        except (TypeError, ValueError):
+            continue
+    return ""
+
+
+def _load_fresh_market_prices(data_collections: Dict[str, Any], symbols: List[str]) -> Tuple[Dict[str, float], Dict[str, Dict[str, Any]]]:
+    """Load latest usable market prices.
+
+    Realtime prices are used only when their document date is at least as fresh
+    as the latest daily bar. Otherwise the daily close is used so stale realtime
+    snapshots do not distort live holdings.
+    """
+
+    prices: Dict[str, float] = {}
+    realtime_docs: Dict[str, Dict[str, Any]] = {}
+    daily_coll = data_collections["volume_price"]
+    realtime_coll = data_collections["volume_price_realtime_latest"]
+
+    for symbol in symbols:
+        candidates = _symbol_query_values(symbol)
+        daily_doc = daily_coll.find_one(
+            {"symbol": {"$in": candidates}},
+            sort=[("trade_date", -1)],
+            projection={"_id": 0, "symbol": 1, "trade_date": 1, "date": 1, "close": 1},
+        )
+        realtime_doc = realtime_coll.find_one(
+            {"symbol": {"$in": candidates}},
+            sort=[("trade_date", -1)],
+            projection={
+                "_id": 0,
+                "symbol": 1,
+                "trade_date": 1,
+                "date": 1,
+                "close": 1,
+                "price": 1,
+                "latest_price": 1,
+                "realtime_trade_time": 1,
+                "snapshot_time": 1,
+                "updated_at": 1,
+                "created_at": 1,
+            },
+        )
+
+        daily_price = _first_positive_float((daily_doc or {}).get("close"))
+        realtime_price = _first_positive_float(
+            (realtime_doc or {}).get("close"),
+            (realtime_doc or {}).get("price"),
+            (realtime_doc or {}).get("latest_price"),
+        )
+        daily_date = _market_doc_yyyymmdd(daily_doc)
+        realtime_date = _market_doc_yyyymmdd(realtime_doc)
+        if realtime_doc and realtime_price and realtime_date and (not daily_date or realtime_date >= daily_date):
+            prices[symbol] = realtime_price
+            realtime_docs[symbol] = realtime_doc
+        elif daily_price:
+            prices[symbol] = daily_price
+
+    return prices, realtime_docs
 
 
 def _execution_doc(plan: Dict[str, Any], item: Dict[str, Any], action: str, quantity: int, price: Optional[float], amount: float, blocker: Optional[str], now: datetime) -> Dict[str, Any]:

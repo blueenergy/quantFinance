@@ -1284,6 +1284,37 @@ def test_lineage_live_positions_aggregates_lineage_executions(monkeypatch):
     assert pos[0]["avg_cost"] == 11.0
 
 
+def test_lineage_live_positions_falls_back_when_realtime_is_stale(monkeypatch):
+    cols = _collections()
+    fin = _finance_collections()
+    data = _data_collections()
+    cols["portfolio_trade_plans"] = _Collection(
+        [
+            {"plan_id": "pla", "user_id": "user-1", "strategy_template_id": "stx", "params_hash": "h", "base_date": "20250101"},
+        ]
+    )
+    fin["trade_signals"].docs = [
+        {"order_id": "oa", "user_id": "user-1", "mode": "live", "plan_id": "pla", "symbol": "000001.SZ"},
+    ]
+    fin["trade_executions"].docs = [
+        {"order_id": "oa", "user_id": "user-1", "symbol": "000001.SZ", "side": "BUY", "filled_size": 100, "filled_price": 10.0, "timestamp": 1.0},
+    ]
+    data["volume_price"].docs = [
+        {"symbol": "000001.SZ", "trade_date": "20250110", "close": 12.0},
+    ]
+    data["volume_price_realtime_latest"].docs = [
+        {"symbol": "000001.SZ", "trade_date": "20250109", "close": 99.0},
+    ]
+
+    _patch_lineage_live_env(monkeypatch, cols, fin, data)
+    resp = asyncio.run(portfolio_plans.get_lineage_live_positions("pla", current_user={"id": "user-1"}))
+    pos = resp["data"]["positions"][0]
+
+    assert pos["last_price"] == 12.0
+    assert pos["last_price_source"] == "market"
+    assert pos["unrealized_pnl_pct"] == 0.2
+
+
 def test_lineage_live_equity_dedupes_date_by_updated_at(monkeypatch):
     cols = _collections()
     fin = _finance_collections()

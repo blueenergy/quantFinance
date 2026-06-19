@@ -344,6 +344,7 @@ def build_lineage_live_positions(
             price = avg_cost
         value = qty * price
         unrealized = (price - avg_cost) * qty if qty > 0 else 0.0
+        unrealized_pct = price / avg_cost - 1 if qty > 0 and avg_cost > 0 and price > 0 else None
         total_market_value += value
         total_unrealized_pnl += unrealized
         if qty > 0:
@@ -383,6 +384,7 @@ def build_lineage_live_positions(
                     "market_value": round(value, 2),
                     "realized_pnl": round(realized, 2),
                     "unrealized_pnl": round(unrealized, 2),
+                    "unrealized_pnl_pct": round(unrealized_pct, 6) if unrealized_pct is not None else None,
                     **({"realtime_doc": rt_doc} if rt_doc else {}),
                 }
             )

@@ -50,6 +50,7 @@ def test_build_lineage_live_positions_weighted_cost_and_unrealized():
     assert pos["shares"] == 200
     assert pos["avg_cost"] == 11.0
     assert abs(pos["unrealized_pnl"]) < 0.01
+    assert pos["unrealized_pnl_pct"] == 0.0
     assert out["summary"]["holding_count"] == 1
     assert out["summary"]["total_market_value"] == 2200.0
 
