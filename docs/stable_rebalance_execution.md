@@ -407,7 +407,101 @@ _passes_execution_gates:
 
 ---
 
-## 10. 参考文献（仓库内）
+## 10. Phase 3 详细设计（预授权自动重算买单，待评审）
+
+**目标**：卖出屏障满足后（计划进入 `sell_settled`），用**最新账户现金 + 最新行情**在 approve 时固化的**预授权规则**内自动重算买单，闭环资金/数量确定性。架构选型：**实现在 Backend（quantFinance）**，复用 `portfolio_plan_remainder` 的预算/现金约束与 dry-run/风控/审计模式。
+
+### 10.1 触发与时序
+
+```text
+approve(plan, buy_replan_rules)            # 固化预授权规则
+  -> publishLiveSignals                    # 卖单 + 买单(phase_barrier, pending)
+  -> trader 执行卖单, Phase 2 屏障挡住买单
+  -> 所有卖单终态 -> Phase 1 落库 sell_settled_at, 派生 sell_settled
+  -> Backend buy_phase_replan（本阶段）：
+       刷新账户现金 + 行情
+       在 buy_replan_rules 内重算买单
+       supersede 旧 pending 买单, 插入新买单(新 order_id, replan_generation+1)
+       风控 + 审计(buy_phase_replan)
+  -> Phase 2 屏障此时已满足 -> trader 提交新买单
+```
+
+**触发机制（已定）**：Backend **周期性 reconcile 任务**（复用现有 worker/定时模式）扫描满足条件的计划。首期为**人工确认**模式（见 §10.9 决策 2）：worker 只负责**发现并提示**「计划已 `sell_settled`、可重算」（写一条 `buy_phase_replan_ready` 审计/通知），实际落单仍走 §10.6 的 dry-run→confirm 接口；不新增 trader→backend 鉴权链路。后续验证稳定后再开放预授权全自动落单。
+
+**触发条件（全部满足）**：
+- `status == approved` 且已发布 live 信号；
+- 全局开关 `PORTFOLIO_BUY_REPLAN_ENABLED == true` 且 `plan.buy_replan_rules.enabled == true`；
+- 派生 `execution_phase_state == sell_settled`（卖屏障满足、买单尚未提交）；
+- 幂等未触发：`replan_generation` 未推进 / `last_buy_replan_at` 为空（见 §10.4）。
+
+### 10.2 预授权规则 `buy_replan_rules`（approve 时固化）
+
+在 `_review_plan` 的 `approved` 分支接收并落库到 `portfolio_trade_plans.buy_replan_rules`（结构对齐 §4.3）：
+
+| 字段 | 默认 | 说明 |
+|------|------|------|
+| `enabled` | `false` | 计划级开关；与全局 `PORTFOLIO_BUY_REPLAN_ENABLED` 同时为真才生效。 |
+| `allow_new_symbols` | `false` | 是否允许引入原计划未选中的标的；默认禁止（只在原选股内重算）。 |
+| `max_total_buy_notional` | 原计划买入名义 | 重算买单总额上限。 |
+| `max_symbol_buy_notional` | 原单标的预算 | 单标的买入上限。 |
+| `on_out_of_bounds` | `clip` | 越界处理：`clip`（截断到边界）/ `skip`（跳过该标的）/ `halt`（中止并告警）。 |
+
+> 与 `plan_topup` 的关系：两者都是「在边界内生成可执行买单」；Phase 4 统一为同一引擎，本阶段先复用 `build_remainder_specs` 的预算/现金/lot 逻辑，按「目标 = 原计划买入目标」而非「补缺口」口径调用。
+
+### 10.3 重算逻辑（复用 + 收紧）
+
+1. **基线**：实盘账户（`trader_positions` 当前持仓 + 最新 `available_cash`），与 gap-fill 一致。
+2. **目标**：原计划买入标的的目标仓位；按最新行情重算保护价（沿用 `_protected_limit_price` 公式契约）。
+3. **预算/现金双重封顶**：单标的 ≤ `max_symbol_buy_notional`，总额 ≤ `max_total_buy_notional`，再 ≤ 可用现金；`allow_new_symbols=false` 时跳过新标的。
+4. **越界**：按 `on_out_of_bounds` 处理；`halt` → 不下任何买单、置审计告警、计划标记需人工。
+5. **supersede 旧买单**：原 `pending`（被 Phase 2 挡住）买单标记为 `cancelled`（`last_error=superseded_by_buy_replan`）并记录 `supersedes_order_ids`；新买单用**新 `order_id`**、`replan_generation+1`，携带相同 `phase_barrier`（此时已满足）。
+6. **风控**：复用 `_build_live_publish_risk_report`；阻断项不落单。
+
+### 10.4 幂等与状态
+
+- `portfolio_trade_plans` 增加 `last_buy_replan_at`、`replan_generation`（计划级，落库），`last_buy_replan_summary`（可选 diff 摘要）。
+- 单次 `sell_settled` 只重算一次：以 `replan_generation` 或 `last_buy_replan_at` 作为幂等闸；重算后 `execution_phase_state` 自然派生为 `buying`（有非 pending 买单）或保持（新 pending 买单）。
+- 新买单 `order_id` 采用确定性 id（含 `replan_generation`）以防并发重复插入。
+
+### 10.5 配置项
+
+| 配置 | 默认 | 说明 |
+|------|------|------|
+| `PORTFOLIO_BUY_REPLAN_ENABLED` | `false` | Backend 全局总开关。 |
+| `PORTFOLIO_BUY_REPLAN_INTERVAL_SECONDS` | 视实现 | reconcile 任务扫描周期（若采用周期任务）。 |
+| `plan.buy_replan_rules.enabled` | `false` | 计划级开关（§10.2）。 |
+
+### 10.6 接口
+
+- 复用现有 dry-run 优先模式：`POST /plans/{plan_id}/replan-buys`，`dry_run=true` 返回重算明细 + 风控报告（不落单），人工核对后 `dry_run=false` 确认落单（首期落单路径）。
+- worker 仅生成「可重算」提示，不直接落单（见 §10.1）。
+- 审计：`portfolio_plan_operation_logs` 新增 `operation_type=buy_phase_replan`（落单）与 `buy_phase_replan_ready`（worker 提示），记录 before/after notional、现金、逐标的 diff、supersede 列表。
+
+### 10.7 测试要点
+
+- 现金变少 → 买单按现金封顶；现金变多 → 不超过 `max_total_buy_notional`。
+- 价格跳涨 → 数量 clip；`on_out_of_bounds` 三枚举分别验证。
+- `allow_new_symbols=false` → 不引入新标的。
+- 幂等：同一 `sell_settled` 重复触发只重算一次。
+- 开关矩阵：全局/计划级任一为关则不重算。
+- supersede：旧 pending 买单被置 `cancelled` 且新单 `order_id` 唯一、带正确 `phase_barrier`。
+- 回归：`plan_topup`、发布风控、Phase 2 屏障行为不受影响。
+
+### 10.8 回滚
+
+`PORTFOLIO_BUY_REPLAN_ENABLED=false` 一键关闭自动重算；已发布买单仍按 Phase 2 屏障执行（退回「发布即定」的买单），无数据破坏。
+
+### 10.9 已定决策（评审通过）
+
+1. **触发机制**：Backend **周期 reconcile 任务**。自治、无需新增 trader→backend 鉴权链路。
+2. **自动 vs 预览确认**：**首期人工确认**——worker 发现并提示，人工经 dry-run→confirm 落单；待稳定后再开放预授权全自动。
+3. **`buy_replan_rules` 默认边界**：`max_total_buy_notional` 默认取「原计划买入名义」；后续如需安全系数再在规则里显式配置。
+
+> 实施排期：**暂缓**。先让 Phase 2 以 `soft`（影子）模式在生产观察一段时间，确认屏障拦截频率与卖出结清时序符合预期后，再启动 Phase 3 编码。
+
+---
+
+## 11. 参考文献（仓库内）
 
 - [live_trade_signals.md](./live_trade_signals.md) — 信号契约、发布流程、gap-fill、`valid_until` 语义。
 - `quantTrader/src/quant_trader/trader_loop.py` — 卖/买顺序、现金门控、轮询结构。
