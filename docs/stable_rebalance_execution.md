@@ -316,7 +316,96 @@ sequenceDiagram
 
 ---
 
-## 9. 参考文献（仓库内）
+## 9. Phase 2 详细设计（卖出硬屏障，决策已定）
+
+**目标**：让 trader 在「同 `plan_id` 卖单全部终态」前**不提交**该计划的买单，闭环「先卖后买」的资金/数量确定性。架构选型：**A — trader 直查 Mongo 自行判定**（低延迟、自给自足）。
+
+### 9.1 判定语义（复用 Phase 1 D2）
+
+对一条携带 `phase_barrier = {type: "plan_sells_terminal", plan_id}` 的买单，屏障满足当且仅当：
+
+> 该 `user_id + plan_id` 下所有 `mode=live` 且 `execution_phase=sell`（缺失时回退 `action=sell`）的卖单都处于终态。
+
+- 终态集合（trader 侧本地常量，对齐 quantFinance）：`filled` / `cancelled` / `canceled` / `rejected` / `failed` / `partial_cancelled`。
+- 卖单为空（纯买计划）→ 屏障 trivially 满足。
+- 作用域按 `user_id + plan_id`；trader 单账户运行，暂不再按 `securities_account_id` 细分（同一 plan 发布在同一账户）。
+
+### 9.2 数据来源（方案 A）
+
+在 `MongoTraderClient` 新增只读方法：
+
+```python
+def are_plan_sells_terminal(self, plan_id: str) -> bool:
+    """True if every live sell signal of this plan is terminal (or none exist)."""
+```
+
+实现：`trade_signals.find({user_id, plan_id, mode:"live", execution_phase:"sell"})`，逐条比对终态集合；空结果返回 `True`。
+（`execution_phase` 缺失的历史卖单回退按 `action` 判定。）
+
+`TraderApiClient`（api 模式，非 miniQMT 默认）：本期不实现远程查询，提供同名方法但返回「不可判定」信号，由闸门按 `sell_barrier_mode` 处理（见 §9.4）。后续如需 api 模式可加只读 REST 端点。
+
+### 9.3 闸门接入点
+
+在 `_passes_execution_gates` 的买单分支前插入屏障闸门（`_passes_schedule_gates` 之后，现金门 `_passes_buy_cash_gate` 之前，避免对未解冻买单做无谓现金计算）：
+
+```text
+_passes_execution_gates:
+  schedule_gates -> (sell? sell_position_gate)
+                 -> (buy?  barrier_gate -> buy_cash_gate)
+```
+
+`_passes_barrier_gate(sig)`：
+1. `mode = cfg.sell_barrier_mode`；`off` → 直接放行（完全回到 Phase 1 行为）。
+2. 读取 `sig.phase_barrier`；无屏障或 `type` 非 `plan_sells_terminal` → **放行**（向后兼容旧买单），`hard` 模式打 `WARNING`。
+3. 取 `plan_id`，调用 `are_plan_sells_terminal(plan_id)`：
+   - `True` → 放行。
+   - `False` → **保持 `pending`**（不提交，不改状态，仅 `log.info` 等待原因），下一轮重试。
+   - 查询异常 → **放行 + 告警**（不因 DB 抖动阻塞资金，见 §9.8 决策 3）。
+
+> 不可判定（无 `phase_barrier` 字段、`type` 未知、查询失败）统一按「放行 + `WARNING`」处理，仅在 `hard` 模式打告警；`off`/`soft` 静默放行。
+
+> 关键：屏障未满足时**不**写 `retry_pending`/`rejected`，仅跳过本轮提交，保持 `pending`，与 `activate_after` 等待语义一致，避免污染状态机。
+
+### 9.4 配置项（`config.py` + `QUANT_TRADER_*`）
+
+| 字段 | 默认 | 说明 |
+|------|------|------|
+| `sell_barrier_mode` | `off`（含 miniQMT；灰度期显式开启 `hard`） | `off` 完全不强制；`soft`/`hard` 均强制屏障，区别仅在是否打告警；不可判定一律放行。 |
+| `sell_barrier_timeout_seconds` | `0`（关闭，永不超时） | 预留：>0 时自买单 `activate_after`（缺失回退 `created_at`）起超时则放行并打 `WARNING`。默认 `0` 表示卖未结清就一直等。 |
+
+环境变量 `QUANT_TRADER_SELL_BARRIER_MODE`、`QUANT_TRADER_SELL_BARRIER_TIMEOUT_SECONDS` 覆盖 JSON，沿用 Phase 0 的 `_execution_string` / `_execution_float` 装载方式。
+
+### 9.5 边界与并发
+
+- **同轮 sell 先于 buy**：卖单本轮才 `submitted`，DB 尚未终态，买单本轮正确等待，跨轮解冻，无需额外编排。
+- **部分成交**：卖单 `partial_filled` 非终态 → 屏障不满足，买单继续等待（符合「先把仓位卖结清」意图）。
+- **卖全撤/全拒**：视为终态 → 屏障满足，买单放行（屏障是「无在途卖单」，非「卖出全部成交」）。
+- **plan_topup 卖单**：同 `plan_id`、`mode=live`、`execution_phase=sell` 也计入，自动纳入屏障。
+
+### 9.6 测试计划（`tests/trader/`）
+
+- `barrier_mode=off`：买单照常提交（回归，无行为变化）。
+- `hard` + 卖单 `submitted`：买单不提交，状态保持 `pending`，无 `update_signal_status` 调用。
+- `hard` + 卖单全 `filled`：买单进入提交路径。
+- `hard` + 卖单全 `cancelled`：买单放行。
+- 纯买计划（无卖单）：买单放行。
+- `are_plan_sells_terminal` 单测：混合终态、空结果、`execution_phase` 缺失回退 `action`。
+- 超时分支：`timeout>0` 且超时 → 放行并告警。
+- DB 异常：`hard` 等待 / `soft` 放行。
+
+### 9.7 回滚
+
+`QUANT_TRADER_SELL_BARRIER_MODE=off` 一键回退至 Phase 1 行为（字段仍写入但不强制）。
+
+### 9.8 已定决策（评审通过）
+
+1. **miniQMT 默认模式**：`off`。灰度期显式设 `QUANT_TRADER_SELL_BARRIER_MODE=hard` 开启，验证后再考虑提升默认（零回归风险）。
+2. **超时默认**：`0`（永不超时）。卖单未结清就一直等，最安全；超时放行能力作为预留参数保留。
+3. **不可判定（无屏障字段 / 查询失败）**：**放行 + 告警**，避免 DB 抖动或历史旧买单卡死。
+
+---
+
+## 10. 参考文献（仓库内）
 
 - [live_trade_signals.md](./live_trade_signals.md) — 信号契约、发布流程、gap-fill、`valid_until` 语义。
 - `quantTrader/src/quant_trader/trader_loop.py` — 卖/买顺序、现金门控、轮询结构。
