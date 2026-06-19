@@ -39,6 +39,52 @@ def _execution_side(row: Dict[str, Any]) -> str:
     return ""
 
 
+def _execution_qty(row: Dict[str, Any]) -> float:
+    return _numeric(
+        row.get("filled_size")
+        or row.get("filled_qty")
+        or row.get("quantity")
+        or row.get("size")
+        or 0
+    )
+
+
+def _execution_price(row: Dict[str, Any]) -> float:
+    return _numeric(
+        row.get("filled_price")
+        or row.get("traded_price")
+        or row.get("avg_price")
+        or row.get("price")
+        or row.get("target_price")
+        or 0.0
+    )
+
+
+def _execution_fee(row: Dict[str, Any]) -> float:
+    if row.get("total_fee") is not None:
+        return _numeric(row.get("total_fee"))
+    return _numeric(row.get("commission") if row.get("commission") is not None else row.get("fee"))
+
+
+def _execution_date(row: Dict[str, Any]) -> str:
+    value = (
+        row.get("display_time")
+        or row.get("created_at_display")
+        or row.get("created_at")
+        or row.get("timestamp")
+        or ""
+    )
+    if isinstance(value, datetime):
+        return value.date().isoformat()
+    return str(value or "")[:10]
+
+
+def _round_or_none(value: Optional[float], digits: int = 2) -> Optional[float]:
+    if value is None:
+        return None
+    return round(value, digits)
+
+
 def _trades_for_ledger(executions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Normalize execution docs for ``compute_realized_pnl_for_group``."""
     out: List[Dict[str, Any]] = []
@@ -97,10 +143,144 @@ def merge_lineage_live_executions(
     return merged
 
 
+def build_lineage_live_trades(
+    executions: List[Dict[str, Any]],
+    price_map: Optional[Dict[str, float]] = None,
+    name_map: Optional[Dict[str, str]] = None,
+) -> List[Dict[str, Any]]:
+    """Build FIFO round-trip rows from lineage live executions.
+
+    One output row is one FIFO match between a buy lot and a sell execution.
+    Remaining buy lots are emitted as open rows using ``price_map`` for floating
+    P&L when a latest price is available.
+    """
+
+    latest_prices = price_map or {}
+    names = name_map or {}
+    by_symbol: Dict[str, List[Dict[str, Any]]] = {}
+    for row in executions:
+        symbol = str(row.get("symbol") or "")
+        if not symbol:
+            continue
+        by_symbol.setdefault(symbol, []).append(row)
+
+    out: List[Dict[str, Any]] = []
+    seq = 0
+    for symbol in sorted(by_symbol.keys()):
+        lots: List[Dict[str, Any]] = []
+        rows = sorted(by_symbol[symbol], key=_execution_ts)
+        for row in rows:
+            side = _execution_side(row)
+            qty = _execution_qty(row)
+            price = _execution_price(row)
+            if side not in ("BUY", "SELL") or qty <= 0 or price <= 0:
+                continue
+
+            fee = _execution_fee(row)
+            name = row.get("name") or row.get("stock_name") or names.get(symbol) or names.get(_symbol_key(symbol)) or ""
+            if side == "BUY":
+                lots.append(
+                    {
+                        "row": row,
+                        "symbol": symbol,
+                        "name": name,
+                        "quantity": qty,
+                        "remaining": qty,
+                        "price": price,
+                        "fee": fee,
+                        "date": _execution_date(row),
+                        "rebalance_date": row.get("source_plan_base_date"),
+                    }
+                )
+                continue
+
+            sell_remaining = qty
+            while sell_remaining > 0 and lots:
+                lot = lots[0]
+                match_qty = min(_numeric(lot.get("remaining")), sell_remaining)
+                if match_qty <= 0:
+                    lots.pop(0)
+                    continue
+
+                buy_qty = _numeric(lot.get("quantity"))
+                buy_fee = _numeric(lot.get("fee")) * match_qty / buy_qty if buy_qty > 0 else 0.0
+                sell_fee = fee * match_qty / qty if qty > 0 else 0.0
+                total_fee = buy_fee + sell_fee
+                buy_price = _numeric(lot.get("price"))
+                holding_return = price / buy_price - 1 if buy_price > 0 else None
+                net_pnl = (price - buy_price) * match_qty - total_fee
+                seq += 1
+                out.append(
+                    {
+                        "trade_id": f"{symbol}-{seq}",
+                        "status": "closed",
+                        "rebalance_date": lot.get("rebalance_date"),
+                        "symbol": symbol,
+                        "name": lot.get("name") or name,
+                        "buy_date": lot.get("date") or "",
+                        "buy_price": round(buy_price, 4),
+                        "sell_date": _execution_date(row),
+                        "sell_price": round(price, 4),
+                        "quantity": int(match_qty) if float(match_qty).is_integer() else round(match_qty, 4),
+                        "buy_amount": round(buy_price * match_qty, 2),
+                        "holding_return": _round_or_none(holding_return, 6),
+                        "net_pnl": round(net_pnl, 2),
+                        "fee": round(total_fee, 2),
+                        "source_plan_id": lot["row"].get("source_plan_id"),
+                        "sell_source_plan_id": row.get("source_plan_id"),
+                        "buy_order_id": lot["row"].get("order_id"),
+                        "sell_order_id": row.get("order_id"),
+                    }
+                )
+
+                lot["remaining"] = _numeric(lot.get("remaining")) - match_qty
+                sell_remaining -= match_qty
+                if _numeric(lot.get("remaining")) <= 0:
+                    lots.pop(0)
+
+        latest_price = latest_prices.get(symbol) or latest_prices.get(_symbol_key(symbol))
+        for lot in lots:
+            remaining = _numeric(lot.get("remaining"))
+            if remaining <= 0:
+                continue
+            buy_price = _numeric(lot.get("price"))
+            buy_qty = _numeric(lot.get("quantity"))
+            buy_fee = _numeric(lot.get("fee")) * remaining / buy_qty if buy_qty > 0 else 0.0
+            mark_price = _numeric(latest_price)
+            holding_return = mark_price / buy_price - 1 if mark_price > 0 and buy_price > 0 else None
+            net_pnl = (mark_price - buy_price) * remaining - buy_fee if mark_price > 0 else None
+            seq += 1
+            out.append(
+                {
+                    "trade_id": f"{symbol}-{seq}",
+                    "status": "open",
+                    "rebalance_date": lot.get("rebalance_date"),
+                    "symbol": symbol,
+                    "name": lot.get("name") or names.get(symbol) or names.get(_symbol_key(symbol)) or "",
+                    "buy_date": lot.get("date") or "",
+                    "buy_price": round(buy_price, 4),
+                    "sell_date": "",
+                    "sell_price": None,
+                    "quantity": int(remaining) if float(remaining).is_integer() else round(remaining, 4),
+                    "buy_amount": round(buy_price * remaining, 2),
+                    "holding_return": _round_or_none(holding_return, 6),
+                    "net_pnl": _round_or_none(net_pnl, 2),
+                    "fee": round(buy_fee, 2),
+                    "source_plan_id": lot["row"].get("source_plan_id"),
+                    "sell_source_plan_id": None,
+                    "buy_order_id": lot["row"].get("order_id"),
+                    "sell_order_id": None,
+                }
+            )
+
+    return out
+
+
 def build_lineage_live_positions(
     executions: List[Dict[str, Any]],
     price_map: Dict[str, float],
     realtime_docs: Optional[Dict[str, Dict[str, Any]]] = None,
+    name_map: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     """Combine executions across plans; per-symbol weighted avg cost + PnL.
 
@@ -158,9 +338,19 @@ def build_lineage_live_positions(
         price_source = "market" if in_market and price > 0 else "avg_cost"
 
         if qty != 0 or realized != 0:
+            names = name_map or {}
+            first_name = next(
+                (
+                    row.get("name") or row.get("stock_name") or ""
+                    for row in grouped[symbol]
+                    if row.get("name") or row.get("stock_name")
+                ),
+                "",
+            )
             positions.append(
                 {
                     "symbol": symbol,
+                    "name": first_name or names.get(symbol) or names.get(_symbol_key(symbol)) or "",
                     "shares": qty,
                     "avg_cost": round(avg_cost, 4) if qty > 0 else round(avg_cost, 4),
                     "last_price": round(price, 4) if price else 0.0,

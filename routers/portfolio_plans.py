@@ -32,6 +32,7 @@ from services.live_equity import (
 )
 from services.portfolio_lineage_live import (
     build_lineage_live_positions,
+    build_lineage_live_trades,
     merge_lineage_live_executions,
 )
 from services.trade_ledger import group_executions_by_order
@@ -1752,8 +1753,23 @@ async def get_lineage_live_executions(plan_id: str, current_user: dict = Depends
     signals_named = _attach_signal_names(
         data_collections, [add_display_time_fields(row) for row in signals]
     )
-    executions_display = [add_display_time_fields(row) for row in executions]
+    grouped = group_executions_by_order(executions)
+    executions_display = [add_display_time_fields(row) for row in grouped]
     merged = merge_lineage_live_executions(signals_named, executions_display, plan_meta)
+    symbols = sorted({str(row.get("symbol")) for row in merged if row.get("symbol")})
+    realtime_prices, _realtime_docs = _load_realtime_prices(
+        data_collections["volume_price_realtime_latest"], symbols
+    )
+    close_prices = _load_latest_close_prices(data_collections["volume_price"], symbols)
+    prices = {**close_prices, **realtime_prices}
+    name_map = {
+        str(row.get("symbol")): str(row.get("name") or row.get("stock_name") or "")
+        for row in signals_named
+        if row.get("symbol") and (row.get("name") or row.get("stock_name"))
+    }
+    for symbol, name in list(name_map.items()):
+        name_map.setdefault(symbol.split(".", 1)[0], name)
+    trades = build_lineage_live_trades(merged, prices, name_map=name_map)
 
     return {
         "success": True,
@@ -1765,8 +1781,10 @@ async def get_lineage_live_executions(plan_id: str, current_user: dict = Depends
                 "params_hash": plan.get("params_hash"),
                 "signals": signals_named,
                 "executions": merged,
+                "trades": trades,
                 "signal_count": len(signals_named),
                 "execution_count": len(merged),
+                "trade_count": len(trades),
             }
         ),
     }
@@ -1780,18 +1798,28 @@ async def get_lineage_live_positions(plan_id: str, current_user: dict = Depends(
     user_id = _current_user_id(current_user)
     plan = _require_plan(trading_collections, plan_id, current_user)
 
-    lineage_ids, _, executions = _lineage_live_signal_execution_bundle(
+    lineage_ids, signals, executions = _lineage_live_signal_execution_bundle(
         trading_collections, finance_collections, plan, user_id
     )
     grouped = group_executions_by_order(executions)
     symbols = sorted({str(row.get("symbol")) for row in grouped if row.get("symbol")})
+    signals_named = _attach_signal_names(
+        data_collections, [add_display_time_fields(row) for row in signals]
+    )
+    name_map = {
+        str(row.get("symbol")): str(row.get("name") or row.get("stock_name") or "")
+        for row in signals_named
+        if row.get("symbol") and (row.get("name") or row.get("stock_name"))
+    }
+    for symbol, name in list(name_map.items()):
+        name_map.setdefault(symbol.split(".", 1)[0], name)
     realtime_prices, realtime_docs = _load_realtime_prices(
         data_collections["volume_price_realtime_latest"], symbols
     )
     close_prices = _load_latest_close_prices(data_collections["volume_price"], symbols)
     prices = {**close_prices, **realtime_prices}
 
-    payload = build_lineage_live_positions(grouped, prices, realtime_docs=realtime_docs)
+    payload = build_lineage_live_positions(grouped, prices, realtime_docs=realtime_docs, name_map=name_map)
     return {
         "success": True,
         "data": _jsonable(
