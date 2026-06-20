@@ -123,6 +123,7 @@ def _collections():
         "portfolio_paper_equity": _Collection(),
         "portfolio_live_equity": _Collection(),
         "portfolio_plan_generation_tasks": _Collection(),
+        "portfolio_plan_operation_logs": _Collection(),
         "portfolio_worker_status": _Collection(),
         "portfolio_strategy_param_presets": _Collection(
             [
@@ -172,6 +173,74 @@ def _data_collections():
         "volume_price": _Collection(),
         "volume_price_realtime_latest": _Collection([{"symbol": "000001", "close": 10.0}, {"symbol": "600000", "close": 12.0}]),
     }
+
+
+def test_bulk_reject_plan_items_enqueues_single_regeneration(monkeypatch):
+    collections = _collections()
+    plan = collections["portfolio_trade_plans"].docs[0]
+    plan["excluded_symbols"] = ["000003"]
+    monkeypatch.setattr(portfolio_plans, "get_trading_db_collections", lambda: collections)
+
+    response = asyncio.run(
+        portfolio_plans.bulk_reject_portfolio_plan_items(
+            "plan-user-1",
+            portfolio_plans.BulkRejectPlanItemsRequest(symbols=["000001", "600000", "000001", " "]),
+            current_user={"id": "user-1"},
+        )
+    )
+
+    data = response["data"]
+    assert data["rejected_symbols"] == ["000001", "600000"]
+    assert data["excluded_symbols"] == ["000001", "000003", "600000"]
+    assert len(collections["portfolio_plan_generation_tasks"].docs) == 1
+    task = collections["portfolio_plan_generation_tasks"].docs[0]
+    assert task["task_type"] == "generate_portfolio_plan"
+    assert task["operation_type"] == "bulk_reject_symbols"
+    assert task["operation_symbol"] is None
+    assert task["excluded_symbols"] == ["000001", "000003", "600000"]
+
+    updated_plan = collections["portfolio_trade_plans"].find_one({"plan_id": "plan-user-1", "user_id": "user-1"})
+    assert updated_plan["excluded_symbols"] == ["000001", "000003", "600000"]
+    assert len(collections["portfolio_plan_operation_logs"].docs) == 1
+    log = collections["portfolio_plan_operation_logs"].docs[0]
+    assert log["operation_type"] == "bulk_reject_symbols"
+    assert log["operation_symbol"] is None
+    assert log["payload"]["operation_symbols"] == ["000001", "600000"]
+
+
+def test_bulk_reject_plan_items_rejects_empty_symbols(monkeypatch):
+    collections = _collections()
+    monkeypatch.setattr(portfolio_plans, "get_trading_db_collections", lambda: collections)
+
+    with pytest.raises(portfolio_plans.HTTPException) as exc:
+        asyncio.run(
+            portfolio_plans.bulk_reject_portfolio_plan_items(
+                "plan-user-1",
+                portfolio_plans.BulkRejectPlanItemsRequest(symbols=["", " "]),
+                current_user={"id": "user-1"},
+            )
+        )
+
+    assert exc.value.status_code == 400
+    assert not collections["portfolio_plan_generation_tasks"].docs
+
+
+def test_bulk_reject_plan_items_requires_reselectable_status(monkeypatch):
+    collections = _collections()
+    collections["portfolio_trade_plans"].docs[0]["status"] = "approved"
+    monkeypatch.setattr(portfolio_plans, "get_trading_db_collections", lambda: collections)
+
+    with pytest.raises(portfolio_plans.HTTPException) as exc:
+        asyncio.run(
+            portfolio_plans.bulk_reject_portfolio_plan_items(
+                "plan-user-1",
+                portfolio_plans.BulkRejectPlanItemsRequest(symbols=["000001", "600000"]),
+                current_user={"id": "user-1"},
+            )
+        )
+
+    assert exc.value.status_code == 409
+    assert not collections["portfolio_plan_generation_tasks"].docs
 
 
 def test_list_portfolio_plans_is_scoped_to_current_user(monkeypatch):

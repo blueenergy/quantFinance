@@ -110,6 +110,10 @@ class ReplanRemainderRequest(BaseModel):
     reason: str = Field(default="")
 
 
+class BulkRejectPlanItemsRequest(BaseModel):
+    symbols: List[str] = Field(default_factory=list)
+
+
 class GeneratePlanRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -1147,6 +1151,7 @@ def _enqueue_plan_regeneration(
     *,
     operation_type: str,
     operation_symbol: Optional[str] = None,
+    operation_symbols: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """Re-run plan generation in place with an updated exclusion set.
 
@@ -1190,7 +1195,10 @@ def _enqueue_plan_regeneration(
         message=f"operation enqueued: {operation_type}",
         task_id=task["task_id"],
         symbol=operation_symbol,
-        payload={"excluded_symbols": excluded_symbols},
+        payload={
+            "excluded_symbols": excluded_symbols,
+            "operation_symbols": operation_symbols or ([operation_symbol] if operation_symbol else []),
+        },
     )
     return task
 
@@ -1215,6 +1223,45 @@ async def reject_portfolio_plan_item(plan_id: str, symbol: str, current_user: di
         operation_symbol=str(symbol),
     )
     return {"success": True, "data": _jsonable({"task": task, "excluded_symbols": excluded})}
+
+
+@router.post("/plans/{plan_id}/items/bulk-reject")
+async def bulk_reject_portfolio_plan_items(
+    plan_id: str,
+    request: BulkRejectPlanItemsRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    collections = get_trading_db_collections()
+    user_id = _current_user_id(current_user)
+    plan = _require_plan(collections, plan_id, current_user)
+    if plan.get("status") not in PLAN_RESELECT_STATUSES:
+        raise HTTPException(
+            status_code=409,
+            detail=f"plan is {plan.get('status')}; can only reselect while in {sorted(PLAN_RESELECT_STATUSES)}",
+        )
+    symbols = sorted({str(symbol).strip() for symbol in request.symbols if str(symbol).strip()})
+    if not symbols:
+        raise HTTPException(status_code=400, detail="symbols is empty")
+
+    excluded = sorted({*(plan.get("excluded_symbols") or []), *symbols})
+    task = _enqueue_plan_regeneration(
+        collections,
+        plan,
+        user_id,
+        excluded,
+        operation_type="bulk_reject_symbols",
+        operation_symbols=symbols,
+    )
+    return {
+        "success": True,
+        "data": _jsonable(
+            {
+                "task": task,
+                "excluded_symbols": excluded,
+                "rejected_symbols": symbols,
+            }
+        ),
+    }
 
 
 @router.post("/plans/{plan_id}/items/{symbol}/restore")
