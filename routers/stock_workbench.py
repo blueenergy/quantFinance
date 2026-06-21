@@ -181,17 +181,35 @@ def _score_history(symbol: str, limit: int = 60) -> List[Dict[str, Any]]:
 
 def _latest_daily_quote(data: Any, candidates: List[str], trade_date: Any = None) -> Optional[Dict[str, Any]]:
     volume_price = data["volume_price"]
-    query: Dict[str, Any] = {"symbol": {"$in": candidates}}
-    if trade_date:
-        same_day = volume_price.find_one(
-            {**query, "trade_date": trade_date},
-            sort=[("trade_date", -1), ("_id", -1)],
-        )
-        if same_day:
-            return same_day
-        query["trade_date"] = {"$lt": trade_date}
+    # Prefer symbol first: most deployments index volume_price by symbol; ts_code-only first can full-scan.
+    for field in ("symbol", "ts_code"):
+        base: Dict[str, Any] = {field: {"$in": candidates}}
+        if trade_date:
+            same_day = volume_price.find_one(
+                {**base, "trade_date": trade_date},
+                sort=[("trade_date", -1), ("_id", -1)],
+            )
+            if same_day:
+                return same_day
+            doc = volume_price.find_one(
+                {**base, "trade_date": {"$lt": trade_date}},
+                sort=[("trade_date", -1), ("_id", -1)],
+            )
+            if doc:
+                return doc
+        else:
+            doc = volume_price.find_one(base, sort=[("trade_date", -1), ("_id", -1)])
+            if doc:
+                return doc
+    return None
 
-    return volume_price.find_one(query, sort=[("trade_date", -1), ("_id", -1)])
+
+def _trade_date_key(value: Any) -> str:
+    """YYYYMMDD prefix for comparing calendar trade dates (string compare safe)."""
+    s = str(value or "").strip()
+    if len(s) >= 8 and s[:8].isdigit():
+        return s[:8]
+    return ""
 
 
 def _recent_docs_for_symbol(
@@ -367,7 +385,7 @@ def _with_partial_period_kline(
         "volume_price",
         candidates,
         limit=80 if tf == "1w" else 120,
-        fields=("symbol",),
+        fields=("symbol", "ts_code"),
     )
     if not daily_rows:
         return rows
@@ -478,7 +496,7 @@ def _quote_section(symbol: str) -> Dict[str, Any]:
         "volume_price",
         candidates,
         limit=WORKBENCH_DAILY_KLINE_LIMIT,
-        fields=("symbol",),
+        fields=("symbol", "ts_code"),
     )
     profiler.lap("daily_kline", rows=len(daily_quotes))
     daily_basic = _recent_docs_for_symbol(
@@ -554,7 +572,7 @@ def _kline_section(symbol: str, tf: str) -> Dict[str, Any]:
         "1w": WORKBENCH_WEEKLY_KLINE_LIMIT,
         "1m": WORKBENCH_MONTHLY_KLINE_LIMIT,
     }[tfc]
-    fields = ("symbol",) if tfc == "1d" else ("ts_code", "symbol")
+    fields = ("symbol", "ts_code")
     rows = _recent_kline_docs(
         data,
         collection_name,
@@ -737,21 +755,42 @@ def _attach_display_pct_change(data: Any, quote: Optional[Dict[str, Any]], candi
 def _latest_quote(symbol: str) -> Optional[Dict[str, Any]]:
     data = get_data_db()
     candidates = _symbol_candidates(symbol)
-    quote = data["volume_price_realtime_latest"].find_one(
-        {"symbol": {"$in": candidates}},
-        sort=[("trade_time", -1), ("trade_date", -1), ("_id", -1)],
-    )
-    if quote:
-        quote["source"] = "realtime"
-        return _attach_display_pct_change(data, quote, candidates)
+    daily_latest = _latest_daily_quote(data, candidates)
+    rt = None
+    for field in ("symbol", "ts_code"):
+        doc = data["volume_price_realtime_latest"].find_one(
+            {field: {"$in": candidates}},
+            sort=[("trade_time", -1), ("trade_date", -1), ("_id", -1)],
+        )
+        if doc:
+            rt = doc
+            break
+    dy_key = _trade_date_key((daily_latest or {}).get("trade_date"))
+    rt_key = _trade_date_key((rt or {}).get("trade_date"))
 
-    quote = _latest_daily_quote(data, candidates)
-    if quote:
+    # Realtime snapshot is often ETL-delayed; if quant_data.volume_price already has a newer
+    # completed session, prefer that bar so refresh matches the K-line tail.
+    if daily_latest and dy_key and rt and (not rt_key or dy_key > rt_key):
+        quote = dict(daily_latest)
         quote["source"] = "daily"
         if quote.get("display_pct_chg") is None:
             quote["display_pct_chg"] = _first_float(quote.get("pct_chg"), quote.get("pct_change"))
             quote["display_pct_chg_source"] = "daily.pct_chg"
-    return quote
+        return _attach_display_pct_change(data, quote, candidates)
+
+    if rt:
+        quote = rt
+        quote["source"] = "realtime"
+        return _attach_display_pct_change(data, quote, candidates)
+
+    if daily_latest:
+        quote = daily_latest
+        quote["source"] = "daily"
+        if quote.get("display_pct_chg") is None:
+            quote["display_pct_chg"] = _first_float(quote.get("pct_chg"), quote.get("pct_change"))
+            quote["display_pct_chg_source"] = "daily.pct_chg"
+        return quote
+    return None
 
 
 def _stock_identity(symbol: str) -> Dict[str, Any]:

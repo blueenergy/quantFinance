@@ -251,6 +251,40 @@ def test_quote_section_merges_market_money_flow_and_daily_basic(monkeypatch):
     assert section["data_status"]["found"] is True
 
 
+def test_quote_section_prefers_daily_when_realtime_trade_date_is_stale(monkeypatch):
+    """Stale realtime ETL must not hide newer completed bars in quant_data.volume_price."""
+    data = {
+        "volume_price_realtime_latest": _Collection(
+            [
+                {
+                    "symbol": "000001.SZ",
+                    "trade_date": "20260615",
+                    "close": 9.0,
+                    "trade_time": "20260615150000",
+                }
+            ]
+        ),
+        "volume_price": _Collection(
+            [
+                {"symbol": "000001.SZ", "trade_date": "20260618", "close": 11.0, "pct_chg": 2.0},
+                {"symbol": "000001.SZ", "trade_date": "20260617", "close": 10.5, "pct_chg": 0.5},
+            ]
+        ),
+        "stock_weekly": _Collection([]),
+        "stock_monthly": _Collection([]),
+        "financial_daily_basic": _Collection([]),
+        "money_flow": _Collection([]),
+    }
+    monkeypatch.setattr("routers.stock_workbench.get_data_db", lambda: data)
+
+    section = _quote_section("000001.SZ")
+
+    assert section["quote"]["source"] == "daily"
+    assert section["quote"]["trade_date"] == "20260618"
+    assert section["quote"]["close"] == 11.0
+    assert section["daily_quotes"][0]["trade_date"] == "20260618"
+
+
 def test_kline_section_loads_weekly_and_monthly_on_demand(monkeypatch):
     data = {
         "volume_price": _Collection([]),
@@ -517,6 +551,20 @@ def test_valuation_section_returns_models_and_percentiles(monkeypatch):
                 {"ts_code": "000001.SZ", "end_date": "20231231", "ann_date": "20240320", "div_proc": "实施", "cash_div_tax": 0.5, "ex_date": "20240601", "base_share": 10000.0},
             ]
         ),
+        "financial_balance": _Collection(
+            [
+                {
+                    "ts_code": "000001.SZ",
+                    "end_date": "20251231",
+                    "money_cap": 50_000_000.0,
+                    "st_borr": 300_000_000.0,
+                    "lt_borr": 0.0,
+                    "bond_payable": 0.0,
+                    "non_cur_liab_due_1y": 0.0,
+                    "minority_int": 100_000_000.0,
+                }
+            ]
+        ),
         "stock_info": _Collection([{"ts_code": "000001.SZ", "industry": "食品饮料"}]),
     }
     finance = {
@@ -541,6 +589,21 @@ def test_valuation_section_returns_models_and_percentiles(monkeypatch):
     assert section["ddm"]["annual_dividends"][0]["total_cash_dividend_wan"] == pytest.approx(8000.0)
     assert len(section["dcf"]["scenarios"]) == 3
     assert section["dcf"]["scenarios"][1]["name"] == "base"
+    base_dcf = section["dcf"]["scenarios"][1]
+    assert base_dcf["net_debt_wan"] == pytest.approx(25000.0)
+    assert base_dcf["minority_interest_wan"] == pytest.approx(10000.0)
+    assert base_dcf["enterprise_value_wan"] == pytest.approx(
+        base_dcf["equity_value_wan"] + base_dcf["net_debt_wan"] + base_dcf["minority_interest_wan"]
+    )
+    assert section["dcf"]["net_debt_adjustment"]["applied"] is True
+    assert section["dcf"]["per_share"]["status"] == "ok"
+    assert section["dcf"]["per_share"]["shares_implied_wan"] == pytest.approx(10000.0)
+    assert section["ddm"]["dividend_quality"]["status"] == "ok"
+    assert "signals" in section["ddm"]["dividend_quality"]
+    base_ddm = section["ddm"]["scenarios"][1]
+    assert "ke_breakdown" in base_ddm
+    assert base_ddm["ke"] >= section["dcf"]["scenarios"][1]["wacc"]
+    assert base_ddm["growth"] < base_ddm["ke"]
     assert section["relative_valuation"]["method"] == "current multiples vs own 3-5y history percentile"
     assert section["model_suitability"]["recommended_model"] == "dcf"
     assert any("DDM" in reason for reason in section["model_suitability"]["reasons"])
@@ -565,9 +628,68 @@ def test_valuation_section_degrades_when_inputs_are_missing(monkeypatch):
     assert section["dcf"]["status"] == "insufficient_data"
     assert section["ddm"]["status"] == "insufficient_data"
     assert section["relative_valuation"]["status"] == "insufficient_data"
+    assert "dividend_quality" in section["ddm"]
 
 
-def test_workbench_shell_includes_valuation_section_status(monkeypatch):
+def test_valuation_dcf_skips_net_debt_for_financial_sector(monkeypatch):
+    daily_basic = []
+    for idx in range(40):
+        day = 40 - idx
+        daily_basic.append(
+            {
+                "ts_code": "600000.SH",
+                "trade_date": f"202605{day:02d}",
+                "close": 10.0,
+                "pe_ttm": 8.0,
+                "pb": 0.8,
+                "ps_ttm": 1.0,
+                "dv_ttm": 3.0,
+                "total_mv": 100000.0,
+                "circ_mv": 90000.0,
+            }
+        )
+    data = {
+        "financial_daily_basic": _Collection(daily_basic),
+        "financial_indicator": _Collection(
+            [
+                {"ts_code": "600000.SH", "end_date": "20260331", "fcff": 500000000.0, "roe": 10.0, "netprofit_yoy": 5.0},
+                {"ts_code": "600000.SH", "end_date": "20251231", "fcff": 480000000.0, "roe": 9.0, "netprofit_yoy": 4.0},
+                {"ts_code": "600000.SH", "end_date": "20250930", "fcff": 460000000.0, "roe": 8.0, "netprofit_yoy": 3.0},
+                {"ts_code": "600000.SH", "end_date": "20250630", "fcff": 440000000.0, "roe": 7.0, "netprofit_yoy": 2.0},
+                {"ts_code": "600000.SH", "end_date": "20250331", "fcff": 200000000.0, "roe": 4.0, "netprofit_yoy": 1.0},
+            ]
+        ),
+        "financial_cashflow": _Collection(
+            [{"ts_code": "600000.SH", "end_date": "20251231", "n_cashflow_act": 250000000.0}]
+        ),
+        "financial_balance": _Collection(
+            [
+                {
+                    "ts_code": "600000.SH",
+                    "end_date": "20251231",
+                    "money_cap": 0.0,
+                    "st_borr": 1_000_000_000_000.0,
+                    "lt_borr": 0.0,
+                    "bond_payable": 0.0,
+                    "non_cur_liab_due_1y": 0.0,
+                    "minority_int": 500_000_000_000.0,
+                }
+            ]
+        ),
+        "financial_dividend": _Collection([]),
+        "financial_income": _Collection([]),
+        "stock_info": _Collection([{"ts_code": "600000.SH", "industry": "银行"}]),
+    }
+    monkeypatch.setattr("routers.stock_workbench.get_data_db", lambda: data)
+    monkeypatch.setattr("routers.stock_workbench.get_db_collections", lambda: {"stock_scores": _Collection([])})
+
+    section = _valuation_section("600000.SH")
+
+    assert section["dcf"]["status"] == "ok"
+    assert section["dcf"]["net_debt_adjustment"]["skipped_financial_sector"] is True
+    base = section["dcf"]["scenarios"][1]
+    assert base["enterprise_value_wan"] == pytest.approx(base["equity_value_wan"])
+    assert base["net_debt_wan"] is None
     data = {
         "stock_info": _Collection([]),
         "stock_basic": _Collection([]),

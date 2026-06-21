@@ -4,7 +4,7 @@ from statistics import median
 from typing import Any, Dict, List, Optional
 
 
-VALUATION_SOURCE = "quant_data.financial_daily_basic + financial_* + financial_dividend + finance.stock_scores"
+VALUATION_SOURCE = "quant_data.financial_daily_basic + financial_balance + financial_* + financial_dividend + finance.stock_scores"
 
 MARKET_MULTIPLE_FIELDS = ("pe", "pe_ttm", "pb", "ps", "ps_ttm", "dv_ttm")
 
@@ -16,6 +16,9 @@ DEFAULT_VALUATION_CONFIG = {
     "growth_cap": 0.15,
     "ddm_ke": 0.085,
     "ddm_growth": 0.015,
+    "risk_free": 0.025,
+    "equity_risk_premium": 0.055,
+    "ddm_growth_cap": 0.03,
 }
 
 
@@ -225,11 +228,52 @@ def _fcff_input(indicators: List[Dict[str, Any]], cashflow: List[Dict[str, Any]]
     }
 
 
+def _financial_sector_stock(stock: Dict[str, Any]) -> bool:
+    industry_text = " ".join(
+        str(stock.get(key) or "")
+        for key in ("industry", "industry_l1", "industry_l2", "industry_l3")
+    )
+    return any(token in industry_text for token in ("银行", "保险", "证券"))
+
+
+def _net_debt_and_minority(balance: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Balance sheet amounts from Tushare are in yuan; convert to 万元 (wan)."""
+    row = balance[0] if balance else None
+    if not row:
+        return {
+            "status": "missing",
+            "end_date": None,
+            "interest_bearing_debt_wan": None,
+            "cash_wan": None,
+            "net_debt_wan": None,
+            "minority_interest_wan": None,
+        }
+    money_cap = _to_float(row.get("money_cap")) or 0.0
+    st_borr = _to_float(row.get("st_borr")) or 0.0
+    lt_borr = _to_float(row.get("lt_borr")) or 0.0
+    bond_payable = _to_float(row.get("bond_payable")) or 0.0
+    non_cur_liab_due_1y = _to_float(row.get("non_cur_liab_due_1y")) or 0.0
+    minority = _to_float(row.get("minority_int")) or 0.0
+    interest_bearing_yuan = st_borr + lt_borr + bond_payable + non_cur_liab_due_1y
+    net_debt_yuan = interest_bearing_yuan - money_cap
+    return {
+        "status": "ok",
+        "end_date": row.get("end_date"),
+        "interest_bearing_debt_wan": round(interest_bearing_yuan / 10000.0, 2),
+        "cash_wan": round(money_cap / 10000.0, 2),
+        "net_debt_wan": round(net_debt_yuan / 10000.0, 2),
+        "minority_interest_wan": round(minority / 10000.0, 2),
+    }
+
+
 def _dcf_scenarios(
     indicators: List[Dict[str, Any]],
     cashflow: List[Dict[str, Any]],
     market: Dict[str, Any],
     config: Dict[str, Any],
+    *,
+    stock: Dict[str, Any],
+    balance: List[Dict[str, Any]],
 ) -> Dict[str, Any]:
     fcff = _fcff_input(indicators, cashflow)
     current = market.get("current") or {}
@@ -243,6 +287,17 @@ def _dcf_scenarios(
             "input": fcff,
             "scenarios": [],
         }
+
+    nd = _net_debt_and_minority(balance)
+    skip_net_debt = _financial_sector_stock(stock)
+    net_debt_wan = _to_float(nd.get("net_debt_wan")) if nd.get("status") == "ok" else None
+    minority_wan = _to_float(nd.get("minority_interest_wan")) if nd.get("status") == "ok" else None
+    if skip_net_debt:
+        net_debt_wan = 0.0
+        minority_wan = 0.0
+    elif net_debt_wan is None or minority_wan is None:
+        net_debt_wan = net_debt_wan or 0.0
+        minority_wan = minority_wan or 0.0
 
     growth = _growth_assumption(indicators, config)
     base_growth = growth["normalized"]
@@ -264,11 +319,17 @@ def _dcf_scenarios(
             present_value += projected_fcf / ((1 + wacc) ** year)
         if wacc <= terminal_growth:
             terminal_value = None
-            equity_value = None
+            enterprise_value = None
         else:
             terminal_value = projected_fcf * (1 + terminal_growth) / (wacc - terminal_growth)
-            equity_value = present_value + terminal_value / ((1 + wacc) ** years)
-        equity_value_wan = equity_value / 10000 if equity_value is not None else None
+            enterprise_value = present_value + terminal_value / ((1 + wacc) ** years)
+        enterprise_value_wan = enterprise_value / 10000 if enterprise_value is not None else None
+        if enterprise_value_wan is None:
+            equity_value_wan = None
+        elif skip_net_debt:
+            equity_value_wan = enterprise_value_wan
+        else:
+            equity_value_wan = enterprise_value_wan - float(net_debt_wan) - float(minority_wan)
         fair_value_per_share = equity_value_wan / shares_wan if equity_value_wan is not None and shares_wan else None
         safety_margin = (
             round((fair_value_per_share - close) / fair_value_per_share * 100, 2)
@@ -281,17 +342,53 @@ def _dcf_scenarios(
                 "wacc": round(wacc, 4),
                 "terminal_growth": round(terminal_growth, 4),
                 "initial_growth": round(growth_rate, 4),
+                "enterprise_value_wan": round(enterprise_value_wan, 2) if enterprise_value_wan is not None else None,
+                "net_debt_wan": round(float(net_debt_wan), 2) if not skip_net_debt else None,
+                "minority_interest_wan": round(float(minority_wan), 2) if not skip_net_debt else None,
                 "equity_value_wan": round(equity_value_wan, 2) if equity_value_wan is not None else None,
                 "fair_value_per_share": round(fair_value_per_share, 2) if fair_value_per_share is not None else None,
                 "safety_margin_pct": safety_margin,
             }
         )
+    method = (
+        "FCFF discounted by WACC; enterprise value less net debt and minority interest -> equity value"
+        if not skip_net_debt
+        else "FCFF discounted by WACC; financial sector: EV shown as equity reference (no net debt adjustment)"
+    )
+    net_debt_block = {
+        **nd,
+        "applied": not skip_net_debt and nd.get("status") == "ok",
+        "skipped_financial_sector": skip_net_debt,
+    }
+    if skip_net_debt:
+        net_debt_block["reason"] = "银行/保险/证券：FCFF DCF 口径与净债务调整不匹配，不作扣减"
+    elif nd.get("status") != "ok":
+        net_debt_block["reason"] = "缺少资产负债表，净债务与少数股东权益按 0 处理"
+
+    if shares_wan is None:
+        per_share = {
+            "status": "missing_inputs",
+            "reason": "缺少 daily_basic 的 total_mv 或有效收盘价，无法用 总市值(万)/股价 推算股本（万股），每股价值无法计算",
+            "total_mv_wan": total_mv_wan,
+            "close": close,
+        }
+    else:
+        per_share = {
+            "status": "ok",
+            "shares_implied_wan": round(shares_wan, 6),
+            "formula": "股权价值(万) ÷ (total_mv÷close)；total_mv 为万元，结果为元/股",
+            "total_mv_wan": total_mv_wan,
+            "close": close,
+        }
+
     return {
         "status": "ok",
-        "method": "FCFF discounted by WACC; no net debt adjustment in v1",
+        "method": method,
         "input": fcff,
         "growth_assumption": growth,
         "config": config,
+        "net_debt_adjustment": net_debt_block,
+        "per_share": per_share,
         "scenarios": scenarios,
     }
 
@@ -398,12 +495,135 @@ def _row_by_year(rows: List[Dict[str, Any]], date_field: str) -> Dict[str, Dict[
     return out
 
 
+def _roe_decimal(roe: Optional[float]) -> Optional[float]:
+    if roe is None:
+        return None
+    if abs(roe) > 1.5:
+        return roe / 100.0
+    return roe
+
+
+def _debt_to_assets_decimal(value: Optional[float]) -> Optional[float]:
+    if value is None:
+        return None
+    if value > 1.0:
+        return value / 100.0
+    return value
+
+
+def _dividend_quality(annual: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Structured dividend sustainability signals (no single opaque score)."""
+    if not annual:
+        return {
+            "status": "insufficient_data",
+            "years_paid": 0,
+            "consecutive_years": 0,
+            "signals": {},
+            "warnings": [],
+        }
+
+    paid_rows = [row for row in annual if _to_float(row.get("total_cash_dividend_wan"))]
+    years_paid = len(paid_rows)
+    recent = annual[:5]
+    payouts = []
+    ocfs = []
+    for row in recent:
+        pr = _to_float(row.get("payout_ratio"))
+        if pr is not None:
+            payouts.append(pr)
+        oc = _to_float(row.get("ocf_coverage"))
+        if oc is not None:
+            ocfs.append(oc)
+
+    med_payout = median(payouts) if payouts else None
+    med_ocf = median(ocfs) if ocfs else None
+
+    recent_three_pr = [_to_float(row.get("payout_ratio")) for row in annual[:3]]
+    recent_three_pr = [x for x in recent_three_pr if x is not None]
+    sustained_over_100 = (
+        len(recent_three_pr) >= 2 and sum(1 for x in recent_three_pr if x > 1.0) >= 2
+    )
+
+    cashes: List[tuple[str, float]] = []
+    for row in reversed(annual[:5]):
+        v = _to_float(row.get("total_cash_dividend_wan"))
+        if v is not None and v > 0:
+            cashes.append((str(row.get("year") or ""), v))
+
+    dividend_cagr: Optional[float] = None
+    cagr_confidence = "low"
+    if len(cashes) >= 4:
+        cagr_confidence = "normal"
+        y0, v0 = cashes[0]
+        y1, v1 = cashes[-1]
+        try:
+            span = int(y1[:4]) - int(y0[:4])
+        except ValueError:
+            span = 0
+        if span > 0 and v0 > 0:
+            dividend_cagr = (v1 / v0) ** (1.0 / span) - 1.0
+
+    warnings: List[str] = []
+    if sustained_over_100:
+        warnings.append(
+            "近若干年分红率多期超过 100%，可能含特别分红或口径波动，需结合年报人工复核。"
+        )
+    if med_ocf is not None and med_ocf < 1.0:
+        warnings.append("经营现金流对现金分红的中位覆盖不足 1 倍，分红可持续性承压。")
+
+    signals = {
+        "median_payout_ratio_3y": round(med_payout, 4) if med_payout is not None else None,
+        "median_ocf_coverage_3y": round(med_ocf, 4) if med_ocf is not None else None,
+        "sustained_payout_over_100pct": sustained_over_100,
+        "dividend_cagr": round(dividend_cagr, 4) if dividend_cagr is not None else None,
+        "cagr_confidence": cagr_confidence,
+    }
+
+    return {
+        "status": "ok" if years_paid >= 2 else "insufficient_data",
+        "years_paid": years_paid,
+        "consecutive_years": len(annual),
+        "median_payout_ratio_3y": signals["median_payout_ratio_3y"],
+        "median_ocf_coverage_3y": signals["median_ocf_coverage_3y"],
+        "dividend_cagr": signals["dividend_cagr"],
+        "cagr_confidence": cagr_confidence,
+        "signals": signals,
+        "warnings": warnings,
+    }
+
+
+def _ddm_risk_adjustment(
+    dividend_quality: Dict[str, Any],
+    *,
+    roe_dec: Optional[float],
+    debt_to_assets_dec: Optional[float],
+) -> float:
+    risk_adj = 0.0
+    signals = dividend_quality.get("signals") or {}
+    if signals.get("sustained_payout_over_100pct"):
+        risk_adj += 0.005
+    med_ocf = _to_float(signals.get("median_ocf_coverage_3y"))
+    if med_ocf is not None and med_ocf < 1.0:
+        risk_adj += 0.01
+    if med_ocf is not None and med_ocf >= 1.5:
+        risk_adj -= 0.005
+    if debt_to_assets_dec is not None and debt_to_assets_dec > 0.60:
+        risk_adj += 0.01
+    if roe_dec is not None and roe_dec < 0.08:
+        risk_adj += 0.01
+    if int(dividend_quality.get("years_paid") or 0) >= 5:
+        risk_adj -= 0.003
+    return _clamp(risk_adj, -0.02, 0.04)
+
+
 def _ddm_validation(
     dividends: List[Dict[str, Any]],
     income: List[Dict[str, Any]],
     cashflow: List[Dict[str, Any]],
     market: Dict[str, Any],
     config: Dict[str, Any],
+    *,
+    indicators: List[Dict[str, Any]],
 ) -> Dict[str, Any]:
     annual = _aggregate_dividend_years(dividends)
     income_by_year = _row_by_year(income, "end_date")
@@ -417,6 +637,8 @@ def _ddm_validation(
         row["payout_ratio"] = total_cash / (net_profit / 10000) if total_cash and net_profit else None
         row["ocf_coverage"] = (operating_cashflow / 10000) / total_cash if total_cash and operating_cashflow else None
 
+    dividend_quality = _dividend_quality(annual)
+
     usable_cash = [
         _to_float(row.get("total_cash_dividend_wan"))
         for row in annual[:5]
@@ -428,43 +650,104 @@ def _ddm_validation(
             "reason": "缺少可计算年度分红总额的实施分红记录",
             "annual_dividends": annual[:5],
             "scenarios": [],
+            "dividend_quality": dividend_quality,
         }
+
+    latest_ind = indicators[0] if indicators else {}
+    roe_dec = _roe_decimal(_to_float(latest_ind.get("roe")))
+    debt_to_assets_dec = _debt_to_assets_decimal(_to_float(latest_ind.get("debt_to_assets")))
+    risk_adj = _ddm_risk_adjustment(
+        dividend_quality,
+        roe_dec=roe_dec,
+        debt_to_assets_dec=debt_to_assets_dec,
+    )
+    rf = float(config["risk_free"])
+    erp = float(config["equity_risk_premium"])
+    base_wacc = float(config["base_wacc"])
+    g_cap = float(config.get("ddm_growth_cap", 0.03))
+
+    ke_base = max(rf + erp + risk_adj, base_wacc)
+    ke_floor = base_wacc
+
+    med_payout = _to_float((dividend_quality.get("signals") or {}).get("median_payout_ratio_3y"))
+    if med_payout is None:
+        med_payout = _to_float((annual[0] if annual else {}).get("payout_ratio"))
+    if med_payout is not None:
+        med_payout = _clamp(med_payout, 0.0, 1.0)
+
+    if roe_dec is not None and med_payout is not None:
+        g_base = roe_dec * (1.0 - med_payout)
+        g_source = "sustainable_growth_roe_times_one_minus_payout"
+    elif roe_dec is not None:
+        g_base = roe_dec * (1.0 - 0.5)
+        g_source = "sustainable_growth_roe_with_default_50pct_retention"
+    else:
+        g_base = float(config["ddm_growth"])
+        g_source = "fallback_config_ddm_growth"
+
+    g_base = _clamp(g_base, 0.0, g_cap)
+    g_base = min(g_base, max(0.0, ke_base - 0.001))
+
     base_dividend = median(usable_cash[:3])
     scenario_defs = [
-        ("conservative", max(usable_cash[:3]) * 0.8, config["ddm_ke"] + 0.015, 0.0),
-        ("base", base_dividend, config["ddm_ke"], config["ddm_growth"]),
-        ("optimistic", max(usable_cash[:3]) * 1.05, max(0.01, config["ddm_ke"] - 0.01), config["ddm_growth"] + 0.01),
+        ("conservative", max(usable_cash[:3]) * 0.8, ke_base + 0.015, 0.0, "conservative_spread"),
+        ("base", base_dividend, ke_base, g_base, "base_case"),
+        ("optimistic", max(usable_cash[:3]) * 1.05, max(rf + 0.005, ke_base - 0.01), min(g_base + 0.01, g_cap), "optimistic_spread"),
     ]
     current_mv = _to_float((market.get("current") or {}).get("total_mv"))
     scenarios = []
-    for name, dividend_wan, ke, growth in scenario_defs:
+    for name, dividend_wan, ke_raw, growth_raw, spread_label in scenario_defs:
+        ke = max(ke_raw, base_wacc)
+        growth = min(growth_raw, max(0.0, ke - 0.001))
+        growth = _clamp(growth, 0.0, g_cap)
         if ke <= growth:
             value_wan = None
         else:
             value_wan = dividend_wan * (1 + growth) / (ke - growth)
         upside = (value_wan - current_mv) / current_mv * 100 if value_wan and current_mv else None
+        ke_breakdown = {
+            "method": "buildup_not_capm",
+            "note": "无 beta 的简化 buildup，仅作区间参考",
+            "risk_free": round(rf, 4),
+            "equity_risk_premium": round(erp, 4),
+            "risk_adjustment": round(risk_adj, 4),
+            "ke_before_wacc_floor": round(rf + erp + risk_adj, 4),
+            "wacc_consistency_floor": round(ke_floor, 4),
+            "scenario_spread": spread_label,
+            "final_ke": round(ke, 4),
+        }
         scenarios.append(
             {
                 "name": name,
                 "cash_dividend_wan": round(dividend_wan, 2),
                 "ke": round(ke, 4),
                 "growth": round(growth, 4),
+                "growth_source": g_source,
                 "equity_value_wan": round(value_wan, 2) if value_wan is not None else None,
                 "upside_pct": round(upside, 2) if upside is not None else None,
+                "ke_breakdown": ke_breakdown,
             }
         )
     latest = annual[0] if annual else {}
     return {
         "status": "ok",
-        "method": "Gordon dividend discount model using implemented cash dividends",
+        "method": "Gordon dividend discount model using implemented cash dividends; dynamic ke/g (buildup)",
         "annual_dividends": annual[:5],
         "latest": latest,
         "scenarios": scenarios,
+        "dividend_quality": dividend_quality,
         "sustainability": {
             "consecutive_years": len(annual),
             "median_cash_dividend_wan_3y": round(base_dividend, 2),
             "latest_payout_ratio": latest.get("payout_ratio"),
             "latest_ocf_coverage": latest.get("ocf_coverage"),
+        },
+        "ddm_assumptions": {
+            "risk_free": rf,
+            "equity_risk_premium": erp,
+            "risk_adjustment": round(risk_adj, 4),
+            "ke_base": round(ke_base, 4),
+            "g_cap": g_cap,
         },
     }
 
@@ -592,8 +875,34 @@ def build_stock_valuation(
             "c_pay_acq_const_fiolta": 1,
         },
     )
+    stock = _latest_stock_info(data_db, candidates)
+    balance = _recent_docs(
+        _collection(data_db, "financial_balance"),
+        candidates,
+        date_field="end_date",
+        limit=1,
+        projection={
+            "_id": 0,
+            "ts_code": 1,
+            "symbol": 1,
+            "end_date": 1,
+            "money_cap": 1,
+            "st_borr": 1,
+            "lt_borr": 1,
+            "bond_payable": 1,
+            "non_cur_liab_due_1y": 1,
+            "minority_int": 1,
+        },
+    )
     market = _market_multiples(daily_basic)
-    dcf = _dcf_scenarios(indicators, cashflow, market, valuation_config)
+    dcf = _dcf_scenarios(
+        indicators,
+        cashflow,
+        market,
+        valuation_config,
+        stock=stock,
+        balance=balance,
+    )
     relative = _relative_valuation(market, indicators)
     dividends = _recent_docs(
         _collection(data_db, "financial_dividend"),
@@ -621,8 +930,14 @@ def build_stock_valuation(
         limit=20,
         projection={"_id": 0, "ts_code": 1, "end_date": 1, "n_income_attr_p": 1, "n_income": 1},
     )
-    ddm = _ddm_validation(dividends, income, cashflow, market, valuation_config)
-    stock = _latest_stock_info(data_db, candidates)
+    ddm = _ddm_validation(
+        dividends,
+        income,
+        cashflow,
+        market,
+        valuation_config,
+        indicators=indicators,
+    )
     score = _latest_score(finance_db, candidates)
     suitability = _model_suitability(stock, indicators, dcf, market)
     as_of = (
@@ -642,6 +957,7 @@ def build_stock_valuation(
             "daily_basic_count": len(daily_basic),
             "indicator_count": len(indicators),
             "cashflow_count": len(cashflow),
+            "balance_count": len(balance),
             "dividend_count": len(dividends),
             "config": valuation_config,
         },
