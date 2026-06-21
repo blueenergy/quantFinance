@@ -15,6 +15,9 @@ from routers.stock_workbench import (
     _score_status,
     _shareholder_section,
     _trading_section,
+    _valuation_section,
+    _valuation_status,
+    get_stock_workbench,
 )
 
 
@@ -463,6 +466,103 @@ def test_financials_section_merges_statements_and_earnings(monkeypatch):
     assert section["indicators"][0]["roe"] == 12.3
     assert section["earnings"]["forecast"][0]["type"] == "预增"
     assert section["data_status"]["as_of"] == "20260331"
+
+
+def test_valuation_status_exposes_lazy_load_contract():
+    status = _valuation_status()
+
+    assert status["found"] is False
+    assert status["expected_freshness"] == "进入估值模型页签后按需加载"
+    assert "financial_daily_basic" in status["source"]
+
+
+def test_valuation_section_returns_models_and_percentiles(monkeypatch):
+    daily_basic = []
+    for idx in range(40):
+        day = 40 - idx
+        daily_basic.append(
+            {
+                "ts_code": "000001.SZ",
+                "trade_date": f"202605{day:02d}",
+                "close": 10.0,
+                "pe_ttm": 8.0 + idx * 0.1,
+                "pb": 0.8 + idx * 0.01,
+                "ps_ttm": 1.0 + idx * 0.02,
+                "dv_ttm": 5.0,
+                "total_mv": 100000.0,
+                "circ_mv": 90000.0,
+            }
+        )
+    data = {
+        "financial_daily_basic": _Collection(daily_basic),
+        "financial_indicator": _Collection(
+            [
+                {"ts_code": "000001.SZ", "end_date": "20260331", "fcff": 500000000.0, "roe": 12.0, "netprofit_yoy": 8.0},
+                {"ts_code": "000001.SZ", "end_date": "20251231", "fcff": 480000000.0, "roe": 11.0, "netprofit_yoy": 7.0},
+                {"ts_code": "000001.SZ", "end_date": "20250930", "fcff": 460000000.0, "roe": 10.0, "netprofit_yoy": 6.0},
+                {"ts_code": "000001.SZ", "end_date": "20250630", "fcff": 440000000.0, "roe": 9.0, "netprofit_yoy": 5.0},
+                {"ts_code": "000001.SZ", "end_date": "20250331", "fcff": 200000000.0, "roe": 4.0, "netprofit_yoy": 4.0},
+            ]
+        ),
+        "financial_cashflow": _Collection([]),
+        "stock_info": _Collection([{"ts_code": "000001.SZ", "industry": "食品饮料"}]),
+    }
+    finance = {
+        "stock_scores": _Collection(
+            [{"symbol": "000001.SZ", "score_date": "20260601", "value_score": 72.0}]
+        )
+    }
+    monkeypatch.setattr("routers.stock_workbench.get_data_db", lambda: data)
+    monkeypatch.setattr("routers.stock_workbench.get_db_collections", lambda: finance)
+
+    section = _valuation_section("000001.SZ")
+
+    assert section["data_status"]["found"] is True
+    assert section["data_status"]["as_of"] == "20260540"
+    assert section["market_multiples"]["current"]["pe_ttm"] == pytest.approx(8.0)
+    assert section["market_multiples"]["percentiles"]["pe_ttm"] is not None
+    assert section["dcf"]["status"] == "ok"
+    assert section["dcf"]["input"]["method"] == "ttm_from_cumulative_indicator"
+    assert section["dcf"]["input"]["value"] == pytest.approx(780000000.0)
+    assert len(section["dcf"]["scenarios"]) == 3
+    assert section["dcf"]["scenarios"][1]["name"] == "base"
+    assert section["relative_valuation"]["method"] == "current multiples vs own 3-5y history percentile"
+    assert section["model_suitability"]["recommended_model"] == "dcf"
+    assert any("DDM" in reason for reason in section["model_suitability"]["reasons"])
+    assert section["value_score_link"]["value_score"] == 72.0
+
+
+def test_valuation_section_degrades_when_inputs_are_missing(monkeypatch):
+    data = {
+        "financial_daily_basic": _Collection([]),
+        "financial_indicator": _Collection([]),
+        "financial_cashflow": _Collection([]),
+        "stock_info": _Collection([]),
+    }
+    monkeypatch.setattr("routers.stock_workbench.get_data_db", lambda: data)
+    monkeypatch.setattr("routers.stock_workbench.get_db_collections", lambda: {"stock_scores": _Collection([])})
+
+    section = _valuation_section("000001.SZ")
+
+    assert section["data_status"]["found"] is False
+    assert section["dcf"]["status"] == "insufficient_data"
+    assert section["relative_valuation"]["status"] == "insufficient_data"
+
+
+def test_workbench_shell_includes_valuation_section_status(monkeypatch):
+    data = {
+        "stock_info": _Collection([]),
+        "stock_basic": _Collection([]),
+        "volume_price_realtime_latest": _Collection([]),
+        "volume_price": _Collection([]),
+    }
+    monkeypatch.setattr("routers.stock_workbench.get_data_db", lambda: data)
+    monkeypatch.setattr("routers.stock_workbench.get_db_collections", lambda: {"stock_scores": _Collection([])})
+
+    response = get_stock_workbench("000001.SZ", current_user={"id": "u1"})
+
+    assert response["data"]["data_status"]["sections"]["valuation"]["found"] is False
+    assert "financial_daily_basic" in response["data"]["data_status"]["sections"]["valuation"]["source"]
 
 
 def test_analysis_history_wraps_recent_rows(monkeypatch):

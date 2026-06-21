@@ -15,6 +15,7 @@ from auth import get_current_active_user
 from db import get_analyzer_db, get_data_db, get_db_collections
 from routers.stock import _json_safe, _symbol_candidates
 from services.analysis_history import build_user_analysis_history_payload
+from services.valuation import VALUATION_SOURCE, build_stock_valuation
 try:
     from stock_data_access.indicators.nineturn import enrich_nineturn_signals, latest_signal_summary
 except ModuleNotFoundError:
@@ -1055,6 +1056,16 @@ def _financial_status(indicators: List[Dict[str, Any]]) -> Dict[str, Any]:
     )
 
 
+def _valuation_status(payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    if payload and payload.get("data_status"):
+        return payload["data_status"]
+    return _section_status(
+        found=False,
+        expected_freshness="进入估值模型页签后按需加载",
+        source=VALUATION_SOURCE,
+    )
+
+
 def _ai_status(deep_analysis: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     return _section_status(
         found=bool(deep_analysis),
@@ -1137,6 +1148,15 @@ def _financials_section(symbol: str, periods: int = 40) -> Dict[str, Any]:
         },
         "data_status": _financial_status(indicators or income),
     }
+
+
+def _valuation_section(symbol: str) -> Dict[str, Any]:
+    return build_stock_valuation(
+        symbol,
+        data_db=get_data_db(),
+        finance_db=get_db_collections(),
+        candidates=_symbol_candidates(symbol),
+    )
 
 
 def _shareholder_status(
@@ -1467,6 +1487,7 @@ def get_stock_workbench(
                 expected_freshness="进入财务业绩页签后按需加载",
                 source="quant_data.financial_* + quant_data.earnings_*",
             ),
+            "valuation": _valuation_status(),
             "ai": _section_status(
                 found=False,
                 expected_freshness="进入深度分析页签后按需加载",
@@ -1580,6 +1601,18 @@ def get_stock_workbench_financials(
     return {
         "success": True,
         "data": _json_safe(_financials_section(symbol)),
+    }
+
+
+@router.get("/{symbol}/workbench/valuation")
+def get_stock_workbench_valuation(
+    symbol: str,
+    current_user: Dict[str, Any] = Depends(get_current_active_user),
+):
+    """Valuation model section for the single-stock research workbench."""
+    return {
+        "success": True,
+        "data": _json_safe(_valuation_section(symbol)),
     }
 
 
