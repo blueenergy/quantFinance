@@ -4,7 +4,7 @@ from statistics import median
 from typing import Any, Dict, List, Optional
 
 
-VALUATION_SOURCE = "quant_data.financial_daily_basic + financial_* + finance.stock_scores"
+VALUATION_SOURCE = "quant_data.financial_daily_basic + financial_* + financial_dividend + finance.stock_scores"
 
 MARKET_MULTIPLE_FIELDS = ("pe", "pe_ttm", "pb", "ps", "ps_ttm", "dv_ttm")
 
@@ -14,6 +14,8 @@ DEFAULT_VALUATION_CONFIG = {
     "terminal_growth": 0.025,
     "growth_floor": -0.02,
     "growth_cap": 0.15,
+    "ddm_ke": 0.085,
+    "ddm_growth": 0.015,
 }
 
 
@@ -324,6 +326,149 @@ def _relative_valuation(market: Dict[str, Any], indicators: List[Dict[str, Any]]
     }
 
 
+def _implemented_dividends(dividends: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    rows = []
+    for row in dividends:
+        proc = str(row.get("div_proc") or "")
+        cash_div = _to_float(row.get("cash_div_tax"))
+        if cash_div is None:
+            cash_div = _to_float(row.get("cash_div"))
+        base_share = _to_float(row.get("base_share"))
+        if "实施" not in proc or cash_div is None or cash_div <= 0:
+            continue
+        total_cash_wan = cash_div * base_share if base_share and base_share > 0 else None
+        rows.append(
+            {
+                "ts_code": row.get("ts_code"),
+                "end_date": row.get("end_date"),
+                "ann_date": row.get("ann_date"),
+                "div_proc": row.get("div_proc"),
+                "cash_div": _to_float(row.get("cash_div")),
+                "cash_div_tax": _to_float(row.get("cash_div_tax")),
+                "record_date": row.get("record_date"),
+                "ex_date": row.get("ex_date"),
+                "pay_date": row.get("pay_date"),
+                "base_share": base_share,
+                "total_cash_dividend_wan": total_cash_wan,
+            }
+        )
+    return rows
+
+
+def _aggregate_dividend_years(dividends: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    grouped: Dict[str, Dict[str, Any]] = {}
+    for row in _implemented_dividends(dividends):
+        year = str(row.get("end_date") or "")[:4]
+        if not year:
+            continue
+        item = grouped.setdefault(
+            year,
+            {
+                "year": year,
+                "rows": [],
+                "cash_div_tax_sum": 0.0,
+                "total_cash_dividend_wan": 0.0,
+                "has_total_cash": False,
+            },
+        )
+        item["rows"].append(row)
+        item["cash_div_tax_sum"] += _to_float(row.get("cash_div_tax")) or 0.0
+        total_cash = _to_float(row.get("total_cash_dividend_wan"))
+        if total_cash is not None:
+            item["total_cash_dividend_wan"] += total_cash
+            item["has_total_cash"] = True
+    out = []
+    for item in grouped.values():
+        if not item["has_total_cash"]:
+            item["total_cash_dividend_wan"] = None
+        item["events"] = len(item["rows"])
+        item["latest_ex_date"] = max((str(row.get("ex_date") or "") for row in item["rows"]), default="")
+        item.pop("rows", None)
+        item.pop("has_total_cash", None)
+        out.append(item)
+    return sorted(out, key=lambda row: row["year"], reverse=True)
+
+
+def _row_by_year(rows: List[Dict[str, Any]], date_field: str) -> Dict[str, Dict[str, Any]]:
+    out: Dict[str, Dict[str, Any]] = {}
+    for row in rows:
+        year = str(row.get(date_field) or "")[:4]
+        if year and year not in out:
+            out[year] = row
+    return out
+
+
+def _ddm_validation(
+    dividends: List[Dict[str, Any]],
+    income: List[Dict[str, Any]],
+    cashflow: List[Dict[str, Any]],
+    market: Dict[str, Any],
+    config: Dict[str, Any],
+) -> Dict[str, Any]:
+    annual = _aggregate_dividend_years(dividends)
+    income_by_year = _row_by_year(income, "end_date")
+    cashflow_by_year = _row_by_year(cashflow, "end_date")
+    for row in annual:
+        income_row = income_by_year.get(row["year"]) or {}
+        cashflow_row = cashflow_by_year.get(row["year"]) or {}
+        total_cash = _to_float(row.get("total_cash_dividend_wan"))
+        net_profit = _to_float(income_row.get("n_income_attr_p") or income_row.get("n_income"))
+        operating_cashflow = _to_float(cashflow_row.get("n_cashflow_act"))
+        row["payout_ratio"] = total_cash / (net_profit / 10000) if total_cash and net_profit else None
+        row["ocf_coverage"] = (operating_cashflow / 10000) / total_cash if total_cash and operating_cashflow else None
+
+    usable_cash = [
+        _to_float(row.get("total_cash_dividend_wan"))
+        for row in annual[:5]
+        if _to_float(row.get("total_cash_dividend_wan")) is not None
+    ]
+    if len(usable_cash) < 2:
+        return {
+            "status": "insufficient_data",
+            "reason": "缺少可计算年度分红总额的实施分红记录",
+            "annual_dividends": annual[:5],
+            "scenarios": [],
+        }
+    base_dividend = median(usable_cash[:3])
+    scenario_defs = [
+        ("conservative", max(usable_cash[:3]) * 0.8, config["ddm_ke"] + 0.015, 0.0),
+        ("base", base_dividend, config["ddm_ke"], config["ddm_growth"]),
+        ("optimistic", max(usable_cash[:3]) * 1.05, max(0.01, config["ddm_ke"] - 0.01), config["ddm_growth"] + 0.01),
+    ]
+    current_mv = _to_float((market.get("current") or {}).get("total_mv"))
+    scenarios = []
+    for name, dividend_wan, ke, growth in scenario_defs:
+        if ke <= growth:
+            value_wan = None
+        else:
+            value_wan = dividend_wan * (1 + growth) / (ke - growth)
+        upside = (value_wan - current_mv) / current_mv * 100 if value_wan and current_mv else None
+        scenarios.append(
+            {
+                "name": name,
+                "cash_dividend_wan": round(dividend_wan, 2),
+                "ke": round(ke, 4),
+                "growth": round(growth, 4),
+                "equity_value_wan": round(value_wan, 2) if value_wan is not None else None,
+                "upside_pct": round(upside, 2) if upside is not None else None,
+            }
+        )
+    latest = annual[0] if annual else {}
+    return {
+        "status": "ok",
+        "method": "Gordon dividend discount model using implemented cash dividends",
+        "annual_dividends": annual[:5],
+        "latest": latest,
+        "scenarios": scenarios,
+        "sustainability": {
+            "consecutive_years": len(annual),
+            "median_cash_dividend_wan_3y": round(base_dividend, 2),
+            "latest_payout_ratio": latest.get("payout_ratio"),
+            "latest_ocf_coverage": latest.get("ocf_coverage"),
+        },
+    }
+
+
 def _model_suitability(
     stock: Dict[str, Any],
     indicators: List[Dict[str, Any]],
@@ -450,6 +595,33 @@ def build_stock_valuation(
     market = _market_multiples(daily_basic)
     dcf = _dcf_scenarios(indicators, cashflow, market, valuation_config)
     relative = _relative_valuation(market, indicators)
+    dividends = _recent_docs(
+        _collection(data_db, "financial_dividend"),
+        candidates,
+        date_field="end_date",
+        limit=80,
+        projection={
+            "_id": 0,
+            "ts_code": 1,
+            "end_date": 1,
+            "ann_date": 1,
+            "div_proc": 1,
+            "cash_div": 1,
+            "cash_div_tax": 1,
+            "record_date": 1,
+            "ex_date": 1,
+            "pay_date": 1,
+            "base_share": 1,
+        },
+    )
+    income = _recent_docs(
+        _collection(data_db, "financial_income"),
+        candidates,
+        date_field="end_date",
+        limit=20,
+        projection={"_id": 0, "ts_code": 1, "end_date": 1, "n_income_attr_p": 1, "n_income": 1},
+    )
+    ddm = _ddm_validation(dividends, income, cashflow, market, valuation_config)
     stock = _latest_stock_info(data_db, candidates)
     score = _latest_score(finance_db, candidates)
     suitability = _model_suitability(stock, indicators, dcf, market)
@@ -457,11 +629,12 @@ def build_stock_valuation(
         (daily_basic[0] if daily_basic else {}).get("trade_date")
         or (indicators[0] if indicators else {}).get("end_date")
     )
-    found = bool(daily_basic or indicators or cashflow or score)
+    found = bool(daily_basic or indicators or cashflow or dividends or score)
     return {
         "symbol": symbol,
         "market_multiples": market,
         "dcf": dcf,
+        "ddm": ddm,
         "relative_valuation": relative,
         "model_suitability": suitability,
         "value_score_link": score,
@@ -469,6 +642,7 @@ def build_stock_valuation(
             "daily_basic_count": len(daily_basic),
             "indicator_count": len(indicators),
             "cashflow_count": len(cashflow),
+            "dividend_count": len(dividends),
             "config": valuation_config,
         },
         "data_status": {

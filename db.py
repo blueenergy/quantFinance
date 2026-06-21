@@ -211,6 +211,7 @@ def get_data_db():
         "financial_balance": data_db["financial_balance"],
         "financial_cashflow": data_db["financial_cashflow"],
         "financial_indicator": data_db["financial_indicator"],
+        "financial_dividend": data_db["financial_dividend"],
         # Shareholder / chips data
         "stk_holdernumber": data_db["stk_holdernumber"],
         "hk_hold": data_db["hk_hold"],

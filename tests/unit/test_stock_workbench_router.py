@@ -504,7 +504,19 @@ def test_valuation_section_returns_models_and_percentiles(monkeypatch):
                 {"ts_code": "000001.SZ", "end_date": "20250331", "fcff": 200000000.0, "roe": 4.0, "netprofit_yoy": 4.0},
             ]
         ),
-        "financial_cashflow": _Collection([]),
+        "financial_cashflow": _Collection(
+            [{"ts_code": "000001.SZ", "end_date": "20251231", "n_cashflow_act": 250000000.0}]
+        ),
+        "financial_income": _Collection(
+            [{"ts_code": "000001.SZ", "end_date": "20251231", "n_income_attr_p": 120000000.0}]
+        ),
+        "financial_dividend": _Collection(
+            [
+                {"ts_code": "000001.SZ", "end_date": "20251231", "ann_date": "20260320", "div_proc": "实施", "cash_div_tax": 0.8, "ex_date": "20260601", "base_share": 10000.0},
+                {"ts_code": "000001.SZ", "end_date": "20241231", "ann_date": "20250320", "div_proc": "实施", "cash_div_tax": 0.6, "ex_date": "20250601", "base_share": 10000.0},
+                {"ts_code": "000001.SZ", "end_date": "20231231", "ann_date": "20240320", "div_proc": "实施", "cash_div_tax": 0.5, "ex_date": "20240601", "base_share": 10000.0},
+            ]
+        ),
         "stock_info": _Collection([{"ts_code": "000001.SZ", "industry": "食品饮料"}]),
     }
     finance = {
@@ -524,6 +536,9 @@ def test_valuation_section_returns_models_and_percentiles(monkeypatch):
     assert section["dcf"]["status"] == "ok"
     assert section["dcf"]["input"]["method"] == "ttm_from_cumulative_indicator"
     assert section["dcf"]["input"]["value"] == pytest.approx(780000000.0)
+    assert section["ddm"]["status"] == "ok"
+    assert len(section["ddm"]["scenarios"]) == 3
+    assert section["ddm"]["annual_dividends"][0]["total_cash_dividend_wan"] == pytest.approx(8000.0)
     assert len(section["dcf"]["scenarios"]) == 3
     assert section["dcf"]["scenarios"][1]["name"] == "base"
     assert section["relative_valuation"]["method"] == "current multiples vs own 3-5y history percentile"
@@ -537,6 +552,8 @@ def test_valuation_section_degrades_when_inputs_are_missing(monkeypatch):
         "financial_daily_basic": _Collection([]),
         "financial_indicator": _Collection([]),
         "financial_cashflow": _Collection([]),
+        "financial_dividend": _Collection([]),
+        "financial_income": _Collection([]),
         "stock_info": _Collection([]),
     }
     monkeypatch.setattr("routers.stock_workbench.get_data_db", lambda: data)
@@ -546,6 +563,7 @@ def test_valuation_section_degrades_when_inputs_are_missing(monkeypatch):
 
     assert section["data_status"]["found"] is False
     assert section["dcf"]["status"] == "insufficient_data"
+    assert section["ddm"]["status"] == "insufficient_data"
     assert section["relative_valuation"]["status"] == "insufficient_data"
 
 
