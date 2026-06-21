@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from statistics import median
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 
 VALUATION_SOURCE = "quant_data.financial_daily_basic + financial_balance + financial_* + financial_dividend + finance.stock_scores"
@@ -122,6 +122,168 @@ def _market_multiples(daily_basic: List[Dict[str, Any]]) -> Dict[str, Any]:
         "percentiles": percentiles,
         "percentile_window": "latest 1250 trading days",
     }
+
+
+def _financial_daily_mv_field(row: Dict[str, Any]) -> Tuple[Optional[float], str]:
+    """Return (万元市值, field_name) from one `financial_daily_basic` row."""
+    mv = _to_float(row.get("total_mv"))
+    if mv is not None and mv > 0:
+        return mv, "total_mv"
+    circ = _to_float(row.get("circ_mv"))
+    if circ is not None and circ > 0:
+        return circ, "circ_mv"
+    return None, ""
+
+
+def _volume_price_close_rows(data_db: Any, candidates: List[str], *, limit: int) -> List[Dict[str, Any]]:
+    coll = _collection(data_db, "volume_price")
+    if coll is None or not candidates:
+        return []
+    for field in ("symbol", "ts_code"):
+        query = {field: {"$in": candidates}}
+        try:
+            cur = coll.find(
+                query,
+                {"_id": 0, "trade_date": 1, "close": 1},
+                sort=[("trade_date", -1), ("_id", -1)],
+                limit=limit,
+            )
+            rows = list(cur)
+        except Exception:
+            continue
+        if rows:
+            return rows
+    return []
+
+
+def _volume_price_close_index(
+    data_db: Any, candidates: List[str], *, limit: int = 220
+) -> Tuple[Dict[str, float], Optional[Dict[str, Any]]]:
+    """Map trade_date -> close from `volume_price`, plus latest bar (newest trade_date)."""
+    rows = _volume_price_close_rows(data_db, candidates, limit=limit)
+    by_td: Dict[str, float] = {}
+    latest: Optional[Dict[str, Any]] = None
+    for doc in rows:
+        if latest is None:
+            latest = doc
+        td = str(doc.get("trade_date") or "")
+        if not td or td in by_td:
+            continue
+        c = _to_float(doc.get("close"))
+        if c is not None and c > 0:
+            by_td[td] = c
+    return by_td, latest
+
+
+def _stock_info_mv_wan(stock: Dict[str, Any]) -> Tuple[Optional[float], str]:
+    """万元市值：bak_basic 同步到 stock_info 的 total_mv / circ_mv 及兼容字段。"""
+    for key, label in (
+        ("total_mv", "total_mv"),
+        ("market_cap", "market_cap"),
+        ("circ_mv", "circ_mv"),
+        ("circ_market_cap", "circ_market_cap"),
+    ):
+        mv = _to_float(stock.get(key))
+        if mv is not None and mv > 0:
+            return mv, label
+    return None, ""
+
+
+def _stock_info_shares_wan(stock: Dict[str, Any]) -> Tuple[Optional[float], str]:
+    """Tushare `bak_basic` / stock list: total_share & float_share are 万股."""
+    ts = _to_float(stock.get("total_share"))
+    if ts is not None and ts > 0:
+        return ts, "stock_info.total_share"
+    fs = _to_float(stock.get("float_share"))
+    if fs is not None and fs > 0:
+        return fs, "stock_info.float_share"
+    return None, ""
+
+
+def _dcf_reference_close(
+    daily_basic: List[Dict[str, Any]],
+    market_current: Dict[str, Any],
+    data_db: Any,
+    candidates: List[str],
+) -> Tuple[Optional[float], str]:
+    """Best-effort 元/股收盘价（用于安全边际；股本来自 stock_info 时仍需要）。"""
+    for row in daily_basic[:120]:
+        c = _to_float(row.get("close"))
+        if c is not None and c > 0:
+            return c, "financial_daily_basic.close"
+    _, vp_latest = _volume_price_close_index(data_db, candidates, limit=220)
+    if vp_latest:
+        c = _to_float(vp_latest.get("close"))
+        if c is not None and c > 0:
+            return c, "volume_price.latest_close"
+    mc = market_current or {}
+    c = _to_float(mc.get("close"))
+    if c is not None and c > 0:
+        return c, "market_multiples_current.close"
+    return None, "none"
+
+
+def _dcf_shares_market_inputs(
+    daily_basic: List[Dict[str, Any]],
+    market_current: Dict[str, Any],
+    data_db: Any,
+    candidates: List[str],
+) -> Tuple[Optional[float], Optional[float], str]:
+    """Resolve 市值(万) and 收盘价 for implied 万股.
+
+    Primary source is `financial_daily_basic` (newest-first). Some deployments
+    omit `close` on that collection while `volume_price` has the session close
+    for the same `trade_date`; we fill from there. If the headline daily_basic
+    date is newer than the latest K-line bar, we skip cross-session pairing to
+    avoid mixing stale prices with fresh dates.
+    """
+    vp_by_td, vp_latest = _volume_price_close_index(data_db, candidates)
+    db0_td = str((daily_basic[0] if daily_basic else {}).get("trade_date") or "")
+    vp_td = str((vp_latest or {}).get("trade_date") or "")
+    if vp_latest and db0_td and vp_td and db0_td > vp_td:
+        vp_latest = None
+
+    for row in daily_basic[:120]:
+        mv, part = _financial_daily_mv_field(row)
+        if mv is None:
+            continue
+        td = str(row.get("trade_date") or "")
+        row_close = _to_float(row.get("close"))
+        close = row_close if row_close is not None and row_close > 0 else None
+        if close is None and td:
+            vc = _to_float(vp_by_td.get(td))
+            if vc is not None and vc > 0:
+                close = vc
+        if close is None or close <= 0:
+            continue
+        basis = f"financial_daily_basic.{part}"
+        if row_close is None or row_close <= 0:
+            basis += "+volume_price.close"
+        return mv, close, basis
+
+    if vp_latest:
+        vp_close = _to_float(vp_latest.get("close"))
+        vp_td2 = str(vp_latest.get("trade_date") or "")
+        if vp_close and vp_close > 0 and vp_td2:
+            for row in daily_basic[:120]:
+                row_td = str(row.get("trade_date") or "")
+                if row_td > vp_td2:
+                    continue
+                mv, part = _financial_daily_mv_field(row)
+                if mv is None:
+                    continue
+                return mv, vp_close, f"financial_daily_basic.{part}+volume_price.latest_session_close"
+
+    mc = market_current or {}
+    mv = _to_float(mc.get("total_mv"))
+    circ = _to_float(mc.get("circ_mv"))
+    close = _to_float(mc.get("close"))
+    if close and close > 0:
+        if mv and mv > 0:
+            return mv, close, "market_multiples_current.total_mv"
+        if circ and circ > 0:
+            return circ, close, "market_multiples_current.circ_mv"
+    return None, None, "none"
 
 
 def _growth_assumption(indicators: List[Dict[str, Any]], config: Dict[str, Any]) -> Dict[str, Any]:
@@ -274,12 +436,35 @@ def _dcf_scenarios(
     *,
     stock: Dict[str, Any],
     balance: List[Dict[str, Any]],
+    daily_basic: List[Dict[str, Any]],
+    data_db: Any,
+    candidates: List[str],
 ) -> Dict[str, Any]:
     fcff = _fcff_input(indicators, cashflow)
     current = market.get("current") or {}
-    total_mv_wan = _to_float(current.get("total_mv"))
-    close = _to_float(current.get("close"))
-    shares_wan = total_mv_wan / close if total_mv_wan and close and close > 0 else None
+    total_mv_wan, close_from_mv, shares_basis = _dcf_shares_market_inputs(
+        daily_basic, current, data_db, candidates
+    )
+    shares_wan = (
+        total_mv_wan / close_from_mv
+        if total_mv_wan and close_from_mv and close_from_mv > 0
+        else None
+    )
+    close = close_from_mv
+    if shares_wan is None:
+        si_shares, si_basis = _stock_info_shares_wan(stock)
+        if si_shares is not None and si_shares > 0:
+            shares_wan = si_shares
+            shares_basis = si_basis
+            if close is None or close <= 0:
+                close, _ = _dcf_reference_close(daily_basic, current, data_db, candidates)
+    if shares_wan is None:
+        si_mv, mv_key = _stock_info_mv_wan(stock)
+        ref_close, ref_cb = _dcf_reference_close(daily_basic, current, data_db, candidates)
+        if si_mv and ref_close and ref_close > 0:
+            shares_wan = si_mv / ref_close
+            shares_basis = f"stock_info.{mv_key}+close({ref_cb})"
+            close = ref_close
     if fcff["value"] is None:
         return {
             "status": "insufficient_data",
@@ -368,15 +553,41 @@ def _dcf_scenarios(
     if shares_wan is None:
         per_share = {
             "status": "missing_inputs",
-            "reason": "缺少 daily_basic 的 total_mv 或有效收盘价，无法用 总市值(万)/股价 推算股本（万股），每股价值无法计算",
+            "reason": (
+                "无法推算或读取万股股本：financial_daily_basic 中无有效 total_mv/circ_mv 与收盘价，"
+                "且 volume_price 未能补齐；stock_info 中也无 total_share/float_share、"
+                "total_mv/market_cap 与可用收盘价组合。"
+            ),
             "total_mv_wan": total_mv_wan,
             "close": close,
+            "shares_basis": shares_basis,
         }
     else:
+        formula_mv = (
+            "股权价值(万) ÷ (市值(万)÷股价)。市值来自 financial_daily_basic："
+            "优先 total_mv，否则 circ_mv；"
+            "收盘价优先同条 close，缺失时按 trade_date 对齐 volume_price，"
+            "必要时用最新 K 线与最近可用市值配对。"
+        )
+        formula_si = (
+            "股权价值(万) ÷ 万股股本。万股来自 stock_info：优先 total_share，否则 float_share（Tushare 口径）。"
+            "安全边际仍尽量使用 financial_daily_basic / volume_price / 行情快照的收盘价。"
+        )
+        formula_si_mv = (
+            "股权价值(万) ÷ (市值(万)÷股价)。万元市值来自 stock_info（bak_basic 同步的 total_mv/"
+            "market_cap 或 circ_mv），收盘价来自日线基本面、K 线或行情快照。"
+        )
+        if str(shares_basis).startswith("stock_info.") and "+close(" in str(shares_basis):
+            formula_pick = formula_si_mv
+        elif str(shares_basis).startswith("stock_info."):
+            formula_pick = formula_si
+        else:
+            formula_pick = formula_mv
         per_share = {
             "status": "ok",
             "shares_implied_wan": round(shares_wan, 6),
-            "formula": "股权价值(万) ÷ (total_mv÷close)；total_mv 为万元，结果为元/股",
+            "formula": formula_pick,
+            "shares_basis": shares_basis,
             "total_mv_wan": total_mv_wan,
             "close": close,
         }
@@ -902,6 +1113,9 @@ def build_stock_valuation(
         valuation_config,
         stock=stock,
         balance=balance,
+        daily_basic=daily_basic,
+        data_db=data_db,
+        candidates=candidates,
     )
     relative = _relative_valuation(market, indicators)
     dividends = _recent_docs(

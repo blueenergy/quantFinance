@@ -610,6 +610,368 @@ def test_valuation_section_returns_models_and_percentiles(monkeypatch):
     assert section["value_score_link"]["value_score"] == 72.0
 
 
+def test_valuation_dcf_scans_financial_daily_basic_when_newest_bar_missing_mv(monkeypatch):
+    """Newest `financial_daily_basic` row may lack total_mv while older rows have it."""
+    daily_basic = [
+        {
+            "ts_code": "000001.SZ",
+            "trade_date": "20260601",
+            "close": 10.0,
+            "pe_ttm": 8.0,
+            "pb": 0.8,
+            "ps_ttm": 1.0,
+            "dv_ttm": 5.0,
+        }
+    ]
+    for idx in range(1, 40):
+        day = 40 - idx
+        daily_basic.append(
+            {
+                "ts_code": "000001.SZ",
+                "trade_date": f"202605{day:02d}",
+                "close": 10.0,
+                "pe_ttm": 8.0 + idx * 0.1,
+                "pb": 0.8 + idx * 0.01,
+                "ps_ttm": 1.0 + idx * 0.02,
+                "dv_ttm": 5.0,
+                "total_mv": 100000.0,
+                "circ_mv": 90000.0,
+            }
+        )
+    data = {
+        "financial_daily_basic": _Collection(daily_basic),
+        "financial_indicator": _Collection(
+            [
+                {"ts_code": "000001.SZ", "end_date": "20260331", "fcff": 500000000.0, "roe": 12.0, "netprofit_yoy": 8.0},
+                {"ts_code": "000001.SZ", "end_date": "20251231", "fcff": 480000000.0, "roe": 11.0, "netprofit_yoy": 7.0},
+                {"ts_code": "000001.SZ", "end_date": "20250930", "fcff": 460000000.0, "roe": 10.0, "netprofit_yoy": 6.0},
+                {"ts_code": "000001.SZ", "end_date": "20250630", "fcff": 440000000.0, "roe": 9.0, "netprofit_yoy": 5.0},
+                {"ts_code": "000001.SZ", "end_date": "20250331", "fcff": 200000000.0, "roe": 4.0, "netprofit_yoy": 4.0},
+            ]
+        ),
+        "financial_cashflow": _Collection(
+            [{"ts_code": "000001.SZ", "end_date": "20251231", "n_cashflow_act": 250000000.0}]
+        ),
+        "financial_income": _Collection(
+            [{"ts_code": "000001.SZ", "end_date": "20251231", "n_income_attr_p": 120000000.0}]
+        ),
+        "financial_dividend": _Collection(
+            [
+                {"ts_code": "000001.SZ", "end_date": "20251231", "ann_date": "20260320", "div_proc": "实施", "cash_div_tax": 0.8, "ex_date": "20260601", "base_share": 10000.0},
+            ]
+        ),
+        "financial_balance": _Collection(
+            [
+                {
+                    "ts_code": "000001.SZ",
+                    "end_date": "20251231",
+                    "money_cap": 50_000_000.0,
+                    "st_borr": 300_000_000.0,
+                    "lt_borr": 0.0,
+                    "bond_payable": 0.0,
+                    "non_cur_liab_due_1y": 0.0,
+                    "minority_int": 100_000_000.0,
+                }
+            ]
+        ),
+        "stock_info": _Collection([{"ts_code": "000001.SZ", "industry": "食品饮料"}]),
+    }
+    finance = {"stock_scores": _Collection([])}
+    monkeypatch.setattr("routers.stock_workbench.get_data_db", lambda: data)
+    monkeypatch.setattr("routers.stock_workbench.get_db_collections", lambda: finance)
+
+    section = _valuation_section("000001.SZ")
+
+    assert section["dcf"]["per_share"]["status"] == "ok"
+    assert section["dcf"]["per_share"]["shares_implied_wan"] == pytest.approx(10000.0)
+    assert section["dcf"]["per_share"]["shares_basis"] == "financial_daily_basic.total_mv"
+
+
+def test_valuation_dcf_uses_circ_mv_when_total_mv_missing_on_scanned_bar(monkeypatch):
+    daily_basic = [
+        {
+            "ts_code": "000001.SZ",
+            "trade_date": "20260601",
+            "close": 10.0,
+            "pe_ttm": 8.0,
+            "pb": 0.8,
+            "ps_ttm": 1.0,
+            "dv_ttm": 5.0,
+        }
+    ]
+    for idx in range(1, 40):
+        day = 40 - idx
+        daily_basic.append(
+            {
+                "ts_code": "000001.SZ",
+                "trade_date": f"202605{day:02d}",
+                "close": 10.0,
+                "pe_ttm": 8.0 + idx * 0.1,
+                "pb": 0.8 + idx * 0.01,
+                "ps_ttm": 1.0 + idx * 0.02,
+                "dv_ttm": 5.0,
+                "circ_mv": 90000.0,
+            }
+        )
+    data = {
+        "financial_daily_basic": _Collection(daily_basic),
+        "financial_indicator": _Collection(
+            [
+                {"ts_code": "000001.SZ", "end_date": "20260331", "fcff": 500000000.0, "roe": 12.0, "netprofit_yoy": 8.0},
+                {"ts_code": "000001.SZ", "end_date": "20251231", "fcff": 480000000.0, "roe": 11.0, "netprofit_yoy": 7.0},
+            ]
+        ),
+        "financial_cashflow": _Collection(
+            [{"ts_code": "000001.SZ", "end_date": "20251231", "n_cashflow_act": 250000000.0}]
+        ),
+        "financial_income": _Collection(
+            [{"ts_code": "000001.SZ", "end_date": "20251231", "n_income_attr_p": 120000000.0}]
+        ),
+        "financial_dividend": _Collection(
+            [
+                {"ts_code": "000001.SZ", "end_date": "20251231", "ann_date": "20260320", "div_proc": "实施", "cash_div_tax": 0.8, "ex_date": "20260601", "base_share": 10000.0},
+            ]
+        ),
+        "financial_balance": _Collection(
+            [
+                {
+                    "ts_code": "000001.SZ",
+                    "end_date": "20251231",
+                    "money_cap": 50_000_000.0,
+                    "st_borr": 300_000_000.0,
+                    "lt_borr": 0.0,
+                    "bond_payable": 0.0,
+                    "non_cur_liab_due_1y": 0.0,
+                    "minority_int": 100_000_000.0,
+                }
+            ]
+        ),
+        "stock_info": _Collection([{"ts_code": "000001.SZ", "industry": "食品饮料"}]),
+    }
+    finance = {"stock_scores": _Collection([])}
+    monkeypatch.setattr("routers.stock_workbench.get_data_db", lambda: data)
+    monkeypatch.setattr("routers.stock_workbench.get_db_collections", lambda: finance)
+
+    section = _valuation_section("000001.SZ")
+
+    assert section["dcf"]["per_share"]["status"] == "ok"
+    assert section["dcf"]["per_share"]["shares_implied_wan"] == pytest.approx(9000.0)
+    assert section["dcf"]["per_share"]["shares_basis"] == "financial_daily_basic.circ_mv"
+
+
+def test_valuation_dcf_fills_close_from_volume_price_when_fba_close_missing(monkeypatch):
+    daily_basic = [
+        {
+            "ts_code": "000001.SZ",
+            "trade_date": "20260602",
+            "close": 10.0,
+            "pe_ttm": 8.0,
+            "pb": 0.8,
+            "ps_ttm": 1.0,
+            "dv_ttm": 5.0,
+        }
+    ]
+    volume_rows = []
+    for idx in range(1, 40):
+        day = 40 - idx
+        td = f"202605{day:02d}"
+        daily_basic.append(
+            {
+                "ts_code": "000001.SZ",
+                "trade_date": td,
+                "close": None,
+                "pe_ttm": 8.0 + idx * 0.1,
+                "pb": 0.8 + idx * 0.01,
+                "ps_ttm": 1.0 + idx * 0.02,
+                "dv_ttm": 5.0,
+                "total_mv": 100000.0,
+                "circ_mv": 90000.0,
+            }
+        )
+        volume_rows.append({"symbol": "000001.SZ", "trade_date": td, "close": 10.0})
+    data = {
+        "financial_daily_basic": _Collection(daily_basic),
+        "volume_price": _Collection(volume_rows),
+        "financial_indicator": _Collection(
+            [
+                {"ts_code": "000001.SZ", "end_date": "20260331", "fcff": 500000000.0, "roe": 12.0, "netprofit_yoy": 8.0},
+                {"ts_code": "000001.SZ", "end_date": "20251231", "fcff": 480000000.0, "roe": 11.0, "netprofit_yoy": 7.0},
+            ]
+        ),
+        "financial_cashflow": _Collection(
+            [{"ts_code": "000001.SZ", "end_date": "20251231", "n_cashflow_act": 250000000.0}]
+        ),
+        "financial_income": _Collection(
+            [{"ts_code": "000001.SZ", "end_date": "20251231", "n_income_attr_p": 120000000.0}]
+        ),
+        "financial_dividend": _Collection(
+            [
+                {"ts_code": "000001.SZ", "end_date": "20251231", "ann_date": "20260320", "div_proc": "实施", "cash_div_tax": 0.8, "ex_date": "20260601", "base_share": 10000.0},
+            ]
+        ),
+        "financial_balance": _Collection(
+            [
+                {
+                    "ts_code": "000001.SZ",
+                    "end_date": "20251231",
+                    "money_cap": 50_000_000.0,
+                    "st_borr": 300_000_000.0,
+                    "lt_borr": 0.0,
+                    "bond_payable": 0.0,
+                    "non_cur_liab_due_1y": 0.0,
+                    "minority_int": 100_000_000.0,
+                }
+            ]
+        ),
+        "stock_info": _Collection([{"ts_code": "000001.SZ", "industry": "食品饮料"}]),
+    }
+    finance = {"stock_scores": _Collection([])}
+    monkeypatch.setattr("routers.stock_workbench.get_data_db", lambda: data)
+    monkeypatch.setattr("routers.stock_workbench.get_db_collections", lambda: finance)
+
+    section = _valuation_section("000001.SZ")
+
+    assert section["dcf"]["per_share"]["status"] == "ok"
+    assert section["dcf"]["per_share"]["shares_implied_wan"] == pytest.approx(10000.0)
+    assert "volume_price.close" in section["dcf"]["per_share"]["shares_basis"]
+
+
+def test_valuation_dcf_uses_stock_info_total_share_when_mv_missing(monkeypatch):
+    daily_basic = []
+    for idx in range(40):
+        day = 40 - idx
+        daily_basic.append(
+            {
+                "ts_code": "000001.SZ",
+                "trade_date": f"202605{day:02d}",
+                "close": 10.0,
+                "pe_ttm": 8.0 + idx * 0.1,
+                "pb": 0.8 + idx * 0.01,
+                "ps_ttm": 1.0 + idx * 0.02,
+                "dv_ttm": 5.0,
+            }
+        )
+    data = {
+        "financial_daily_basic": _Collection(daily_basic),
+        "volume_price": _Collection([]),
+        "financial_indicator": _Collection(
+            [
+                {"ts_code": "000001.SZ", "end_date": "20260331", "fcff": 500000000.0, "roe": 12.0, "netprofit_yoy": 8.0},
+                {"ts_code": "000001.SZ", "end_date": "20251231", "fcff": 480000000.0, "roe": 11.0, "netprofit_yoy": 7.0},
+            ]
+        ),
+        "financial_cashflow": _Collection(
+            [{"ts_code": "000001.SZ", "end_date": "20251231", "n_cashflow_act": 250000000.0}]
+        ),
+        "financial_income": _Collection(
+            [{"ts_code": "000001.SZ", "end_date": "20251231", "n_income_attr_p": 120000000.0}]
+        ),
+        "financial_dividend": _Collection(
+            [
+                {"ts_code": "000001.SZ", "end_date": "20251231", "ann_date": "20260320", "div_proc": "实施", "cash_div_tax": 0.8, "ex_date": "20260601", "base_share": 10000.0},
+            ]
+        ),
+        "financial_balance": _Collection(
+            [
+                {
+                    "ts_code": "000001.SZ",
+                    "end_date": "20251231",
+                    "money_cap": 50_000_000.0,
+                    "st_borr": 300_000_000.0,
+                    "lt_borr": 0.0,
+                    "bond_payable": 0.0,
+                    "non_cur_liab_due_1y": 0.0,
+                    "minority_int": 100_000_000.0,
+                }
+            ]
+        ),
+        "stock_info": _Collection(
+            [{"ts_code": "000001.SZ", "symbol": "000001.SZ", "industry": "食品饮料", "total_share": 10000.0}]
+        ),
+    }
+    finance = {"stock_scores": _Collection([])}
+    monkeypatch.setattr("routers.stock_workbench.get_data_db", lambda: data)
+    monkeypatch.setattr("routers.stock_workbench.get_db_collections", lambda: finance)
+
+    section = _valuation_section("000001.SZ")
+
+    assert section["dcf"]["per_share"]["status"] == "ok"
+    assert section["dcf"]["per_share"]["shares_implied_wan"] == pytest.approx(10000.0)
+    assert section["dcf"]["per_share"]["shares_basis"] == "stock_info.total_share"
+
+
+def test_valuation_dcf_uses_stock_info_market_cap_when_no_total_share(monkeypatch):
+    daily_basic = []
+    for idx in range(40):
+        day = 40 - idx
+        daily_basic.append(
+            {
+                "ts_code": "000001.SZ",
+                "trade_date": f"202605{day:02d}",
+                "close": 10.0,
+                "pe_ttm": 8.0 + idx * 0.1,
+                "pb": 0.8 + idx * 0.01,
+                "ps_ttm": 1.0 + idx * 0.02,
+                "dv_ttm": 5.0,
+            }
+        )
+    data = {
+        "financial_daily_basic": _Collection(daily_basic),
+        "volume_price": _Collection([]),
+        "financial_indicator": _Collection(
+            [
+                {"ts_code": "000001.SZ", "end_date": "20260331", "fcff": 500000000.0, "roe": 12.0, "netprofit_yoy": 8.0},
+                {"ts_code": "000001.SZ", "end_date": "20251231", "fcff": 480000000.0, "roe": 11.0, "netprofit_yoy": 7.0},
+            ]
+        ),
+        "financial_cashflow": _Collection(
+            [{"ts_code": "000001.SZ", "end_date": "20251231", "n_cashflow_act": 250000000.0}]
+        ),
+        "financial_income": _Collection(
+            [{"ts_code": "000001.SZ", "end_date": "20251231", "n_income_attr_p": 120000000.0}]
+        ),
+        "financial_dividend": _Collection(
+            [
+                {"ts_code": "000001.SZ", "end_date": "20251231", "ann_date": "20260320", "div_proc": "实施", "cash_div_tax": 0.8, "ex_date": "20260601", "base_share": 10000.0},
+            ]
+        ),
+        "financial_balance": _Collection(
+            [
+                {
+                    "ts_code": "000001.SZ",
+                    "end_date": "20251231",
+                    "money_cap": 50_000_000.0,
+                    "st_borr": 300_000_000.0,
+                    "lt_borr": 0.0,
+                    "bond_payable": 0.0,
+                    "non_cur_liab_due_1y": 0.0,
+                    "minority_int": 100_000_000.0,
+                }
+            ]
+        ),
+        "stock_info": _Collection(
+            [
+                {
+                    "ts_code": "000001.SZ",
+                    "symbol": "000001.SZ",
+                    "industry": "食品饮料",
+                    "market_cap": 100000.0,
+                }
+            ]
+        ),
+    }
+    finance = {"stock_scores": _Collection([])}
+    monkeypatch.setattr("routers.stock_workbench.get_data_db", lambda: data)
+    monkeypatch.setattr("routers.stock_workbench.get_db_collections", lambda: finance)
+
+    section = _valuation_section("000001.SZ")
+
+    assert section["dcf"]["per_share"]["status"] == "ok"
+    assert section["dcf"]["per_share"]["shares_implied_wan"] == pytest.approx(10000.0)
+    assert "stock_info.market_cap" in section["dcf"]["per_share"]["shares_basis"]
+    assert "+close(" in section["dcf"]["per_share"]["shares_basis"]
+
+
 def test_valuation_section_degrades_when_inputs_are_missing(monkeypatch):
     data = {
         "financial_daily_basic": _Collection([]),
