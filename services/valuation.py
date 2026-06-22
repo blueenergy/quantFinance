@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import date, datetime
 from statistics import median
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -7,6 +8,36 @@ from typing import Any, Dict, List, Optional, Tuple
 VALUATION_SOURCE = "quant_data.financial_daily_basic + financial_balance + financial_* + financial_dividend + finance.stock_scores"
 
 MARKET_MULTIPLE_FIELDS = ("pe", "pe_ttm", "pb", "ps", "ps_ttm", "dv_ttm")
+
+INDUSTRY_KEYWORDS: Dict[str, Dict[str, Tuple[str, ...]]] = {
+    "financial": {
+        "keywords": ("银行", "保险", "证券", "信托", "金融"),
+        "whitelist": (),
+        "blacklist": (),
+    },
+    "tech": {
+        "keywords": (
+            "半导体",
+            "芯片",
+            "集成电路",
+            "软件",
+            "计算机",
+            "电子",
+            "互联网",
+            "通信",
+            "人工智能",
+            "云计算",
+            "信息技术",
+        ),
+        "whitelist": (),
+        "blacklist": (),
+    },
+    "pharma": {
+        "keywords": ("医药", "生物", "制药", "医疗器械", "创新药"),
+        "whitelist": (),
+        "blacklist": (),
+    },
+}
 
 DEFAULT_VALUATION_CONFIG = {
     "forecast_years": 5,
@@ -390,12 +421,36 @@ def _fcff_input(indicators: List[Dict[str, Any]], cashflow: List[Dict[str, Any]]
     }
 
 
-def _financial_sector_stock(stock: Dict[str, Any]) -> bool:
+def _stock_code_values(stock: Dict[str, Any]) -> set[str]:
+    return {
+        str(stock.get(key) or "").upper()
+        for key in ("symbol", "ts_code")
+        if stock.get(key)
+    }
+
+
+def _industry_tag(stock: Dict[str, Any]) -> set[str]:
     industry_text = " ".join(
         str(stock.get(key) or "")
         for key in ("industry", "industry_l1", "industry_l2", "industry_l3")
     )
-    return any(token in industry_text for token in ("银行", "保险", "证券"))
+    codes = _stock_code_values(stock)
+    tags: set[str] = set()
+    for tag, rule in INDUSTRY_KEYWORDS.items():
+        blacklist = {str(code).upper() for code in rule.get("blacklist", ())}
+        whitelist = {str(code).upper() for code in rule.get("whitelist", ())}
+        if codes & blacklist:
+            continue
+        if codes & whitelist:
+            tags.add(tag)
+            continue
+        if any(token in industry_text for token in rule.get("keywords", ())):
+            tags.add(tag)
+    return tags
+
+
+def _financial_sector_stock(stock: Dict[str, Any]) -> bool:
+    return "financial" in _industry_tag(stock)
 
 
 def _net_debt_and_minority(balance: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -425,6 +480,148 @@ def _net_debt_and_minority(balance: List[Dict[str, Any]]) -> Dict[str, Any]:
         "cash_wan": round(money_cap / 10000.0, 2),
         "net_debt_wan": round(net_debt_yuan / 10000.0, 2),
         "minority_interest_wan": round(minority / 10000.0, 2),
+    }
+
+
+def _dcf_project_values(
+    *,
+    fcff_value: float,
+    wacc: float,
+    terminal_growth: float,
+    initial_growth: float,
+    config: Dict[str, Any],
+    skip_net_debt: bool,
+    net_debt_wan: float,
+    minority_wan: float,
+    shares_wan: Optional[float],
+    close: Optional[float],
+) -> Dict[str, Optional[float]]:
+    projected_fcf = fcff_value
+    present_value = 0.0
+    years = int(config["forecast_years"])
+    growth_rate = _clamp(initial_growth, config["growth_floor"], config["growth_cap"])
+    for year in range(1, years + 1):
+        decay = year / years
+        year_growth = growth_rate * (1 - decay) + terminal_growth * decay
+        projected_fcf *= 1 + year_growth
+        present_value += projected_fcf / ((1 + wacc) ** year)
+    if wacc <= terminal_growth:
+        enterprise_value = None
+    else:
+        terminal_value = projected_fcf * (1 + terminal_growth) / (wacc - terminal_growth)
+        enterprise_value = present_value + terminal_value / ((1 + wacc) ** years)
+    enterprise_value_wan = enterprise_value / 10000 if enterprise_value is not None else None
+    if enterprise_value_wan is None:
+        equity_value_wan = None
+    elif skip_net_debt:
+        equity_value_wan = enterprise_value_wan
+    else:
+        equity_value_wan = enterprise_value_wan - float(net_debt_wan) - float(minority_wan)
+    fair_value_per_share = equity_value_wan / shares_wan if equity_value_wan is not None and shares_wan else None
+    safety_margin = (
+        (fair_value_per_share - close) / fair_value_per_share * 100
+        if fair_value_per_share and close
+        else None
+    )
+    return {
+        "enterprise_value_wan": enterprise_value_wan,
+        "equity_value_wan": equity_value_wan,
+        "fair_value_per_share": fair_value_per_share,
+        "safety_margin_pct": safety_margin,
+    }
+
+
+def _dcf_sensitivity(
+    *,
+    fcff_value: float,
+    base_wacc: float,
+    base_terminal_growth: float,
+    base_initial_growth: float,
+    config: Dict[str, Any],
+    skip_net_debt: bool,
+    net_debt_wan: float,
+    minority_wan: float,
+    shares_wan: Optional[float],
+    close: Optional[float],
+) -> Dict[str, Any]:
+    def case(
+        *,
+        label: str,
+        fcff_multiplier: float,
+        wacc: float,
+        terminal_growth: float,
+        initial_growth: float,
+    ) -> Dict[str, Any]:
+        values = _dcf_project_values(
+            fcff_value=fcff_value * fcff_multiplier,
+            wacc=wacc,
+            terminal_growth=terminal_growth,
+            initial_growth=initial_growth,
+            config=config,
+            skip_net_debt=skip_net_debt,
+            net_debt_wan=net_debt_wan,
+            minority_wan=minority_wan,
+            shares_wan=shares_wan,
+            close=close,
+        )
+        return {
+            "label": label,
+            "fcff_multiplier": round(fcff_multiplier, 4),
+            "wacc": round(wacc, 4),
+            "terminal_growth": round(terminal_growth, 4),
+            "initial_growth": round(_clamp(initial_growth, config["growth_floor"], config["growth_cap"]), 4),
+            "fair_value_per_share": (
+                round(values["fair_value_per_share"], 2)
+                if values["fair_value_per_share"] is not None
+                else None
+            ),
+            "equity_value_wan": (
+                round(values["equity_value_wan"], 2)
+                if values["equity_value_wan"] is not None
+                else None
+            ),
+        }
+
+    return {
+        "status": "ok",
+        "method": "base scenario single-variable sensitivity",
+        "base": {
+            "wacc": round(base_wacc, 4),
+            "terminal_growth": round(base_terminal_growth, 4),
+            "initial_growth": round(_clamp(base_initial_growth, config["growth_floor"], config["growth_cap"]), 4),
+            "fcff_multiplier": 1.0,
+        },
+        "variables": [
+            {
+                "key": "wacc",
+                "label": "WACC",
+                "cases": [
+                    case(label="-1pct", fcff_multiplier=1.0, wacc=max(0.01, base_wacc - 0.01), terminal_growth=base_terminal_growth, initial_growth=base_initial_growth),
+                    case(label="base", fcff_multiplier=1.0, wacc=base_wacc, terminal_growth=base_terminal_growth, initial_growth=base_initial_growth),
+                    case(label="+1pct", fcff_multiplier=1.0, wacc=base_wacc + 0.01, terminal_growth=base_terminal_growth, initial_growth=base_initial_growth),
+                ],
+            },
+            {
+                "key": "terminal_growth",
+                "label": "永续增长",
+                "cases": [
+                    case(label="-0.5pct", fcff_multiplier=1.0, wacc=base_wacc, terminal_growth=max(0.0, base_terminal_growth - 0.005), initial_growth=base_initial_growth),
+                    case(label="base", fcff_multiplier=1.0, wacc=base_wacc, terminal_growth=base_terminal_growth, initial_growth=base_initial_growth),
+                    case(label="+0.5pct", fcff_multiplier=1.0, wacc=base_wacc, terminal_growth=base_terminal_growth + 0.005, initial_growth=base_initial_growth),
+                ],
+            },
+            {
+                "key": "fcff_base",
+                "label": "FCFF 基数",
+                "cases": [
+                    case(label="-20%", fcff_multiplier=0.8, wacc=base_wacc, terminal_growth=base_terminal_growth, initial_growth=base_initial_growth),
+                    case(label="-10%", fcff_multiplier=0.9, wacc=base_wacc, terminal_growth=base_terminal_growth, initial_growth=base_initial_growth),
+                    case(label="base", fcff_multiplier=1.0, wacc=base_wacc, terminal_growth=base_terminal_growth, initial_growth=base_initial_growth),
+                    case(label="+10%", fcff_multiplier=1.1, wacc=base_wacc, terminal_growth=base_terminal_growth, initial_growth=base_initial_growth),
+                    case(label="+20%", fcff_multiplier=1.2, wacc=base_wacc, terminal_growth=base_terminal_growth, initial_growth=base_initial_growth),
+                ],
+            },
+        ],
     }
 
 
@@ -493,33 +690,18 @@ def _dcf_scenarios(
     ]
     scenarios = []
     for name, wacc, terminal_growth, initial_growth in scenario_defs:
-        projected_fcf = fcff["value"]
-        present_value = 0.0
-        years = int(config["forecast_years"])
         growth_rate = _clamp(initial_growth, config["growth_floor"], config["growth_cap"])
-        for year in range(1, years + 1):
-            decay = year / years
-            year_growth = growth_rate * (1 - decay) + terminal_growth * decay
-            projected_fcf *= 1 + year_growth
-            present_value += projected_fcf / ((1 + wacc) ** year)
-        if wacc <= terminal_growth:
-            terminal_value = None
-            enterprise_value = None
-        else:
-            terminal_value = projected_fcf * (1 + terminal_growth) / (wacc - terminal_growth)
-            enterprise_value = present_value + terminal_value / ((1 + wacc) ** years)
-        enterprise_value_wan = enterprise_value / 10000 if enterprise_value is not None else None
-        if enterprise_value_wan is None:
-            equity_value_wan = None
-        elif skip_net_debt:
-            equity_value_wan = enterprise_value_wan
-        else:
-            equity_value_wan = enterprise_value_wan - float(net_debt_wan) - float(minority_wan)
-        fair_value_per_share = equity_value_wan / shares_wan if equity_value_wan is not None and shares_wan else None
-        safety_margin = (
-            round((fair_value_per_share - close) / fair_value_per_share * 100, 2)
-            if fair_value_per_share and close
-            else None
+        values = _dcf_project_values(
+            fcff_value=fcff["value"],
+            wacc=wacc,
+            terminal_growth=terminal_growth,
+            initial_growth=initial_growth,
+            config=config,
+            skip_net_debt=skip_net_debt,
+            net_debt_wan=float(net_debt_wan),
+            minority_wan=float(minority_wan),
+            shares_wan=shares_wan,
+            close=close,
         )
         scenarios.append(
             {
@@ -527,14 +709,42 @@ def _dcf_scenarios(
                 "wacc": round(wacc, 4),
                 "terminal_growth": round(terminal_growth, 4),
                 "initial_growth": round(growth_rate, 4),
-                "enterprise_value_wan": round(enterprise_value_wan, 2) if enterprise_value_wan is not None else None,
+                "enterprise_value_wan": (
+                    round(values["enterprise_value_wan"], 2)
+                    if values["enterprise_value_wan"] is not None
+                    else None
+                ),
                 "net_debt_wan": round(float(net_debt_wan), 2) if not skip_net_debt else None,
                 "minority_interest_wan": round(float(minority_wan), 2) if not skip_net_debt else None,
-                "equity_value_wan": round(equity_value_wan, 2) if equity_value_wan is not None else None,
-                "fair_value_per_share": round(fair_value_per_share, 2) if fair_value_per_share is not None else None,
-                "safety_margin_pct": safety_margin,
+                "equity_value_wan": (
+                    round(values["equity_value_wan"], 2)
+                    if values["equity_value_wan"] is not None
+                    else None
+                ),
+                "fair_value_per_share": (
+                    round(values["fair_value_per_share"], 2)
+                    if values["fair_value_per_share"] is not None
+                    else None
+                ),
+                "safety_margin_pct": (
+                    round(values["safety_margin_pct"], 2)
+                    if values["safety_margin_pct"] is not None
+                    else None
+                ),
             }
         )
+    sensitivity = _dcf_sensitivity(
+        fcff_value=fcff["value"],
+        base_wacc=config["base_wacc"],
+        base_terminal_growth=config["terminal_growth"],
+        base_initial_growth=base_growth,
+        config=config,
+        skip_net_debt=skip_net_debt,
+        net_debt_wan=float(net_debt_wan),
+        minority_wan=float(minority_wan),
+        shares_wan=shares_wan,
+        close=close,
+    )
     method = (
         "FCFF discounted by WACC; enterprise value less net debt and minority interest -> equity value"
         if not skip_net_debt
@@ -601,6 +811,7 @@ def _dcf_scenarios(
         "net_debt_adjustment": net_debt_block,
         "per_share": per_share,
         "scenarios": scenarios,
+        "sensitivity": sensitivity,
     }
 
 
@@ -722,6 +933,30 @@ def _debt_to_assets_decimal(value: Optional[float]) -> Optional[float]:
     return value
 
 
+def _consecutive_dividend_years(annual: List[Dict[str, Any]]) -> int:
+    years = []
+    for row in annual:
+        cash = _to_float(row.get("total_cash_dividend_wan"))
+        year_text = str(row.get("year") or "")
+        if cash is None or cash <= 0 or len(year_text) < 4:
+            continue
+        try:
+            years.append(int(year_text[:4]))
+        except ValueError:
+            continue
+    if not years:
+        return 0
+    years = sorted(set(years), reverse=True)
+    count = 1
+    previous = years[0]
+    for year in years[1:]:
+        if year != previous - 1:
+            break
+        count += 1
+        previous = year
+    return count
+
+
 def _dividend_quality(annual: List[Dict[str, Any]]) -> Dict[str, Any]:
     """Structured dividend sustainability signals (no single opaque score)."""
     if not annual:
@@ -735,6 +970,7 @@ def _dividend_quality(annual: List[Dict[str, Any]]) -> Dict[str, Any]:
 
     paid_rows = [row for row in annual if _to_float(row.get("total_cash_dividend_wan"))]
     years_paid = len(paid_rows)
+    consecutive_years = _consecutive_dividend_years(annual)
     recent = annual[:5]
     payouts = []
     ocfs = []
@@ -793,7 +1029,7 @@ def _dividend_quality(annual: List[Dict[str, Any]]) -> Dict[str, Any]:
     return {
         "status": "ok" if years_paid >= 2 else "insufficient_data",
         "years_paid": years_paid,
-        "consecutive_years": len(annual),
+        "consecutive_years": consecutive_years,
         "median_payout_ratio_3y": signals["median_payout_ratio_3y"],
         "median_ocf_coverage_3y": signals["median_ocf_coverage_3y"],
         "dividend_cagr": signals["dividend_cagr"],
@@ -948,7 +1184,7 @@ def _ddm_validation(
         "scenarios": scenarios,
         "dividend_quality": dividend_quality,
         "sustainability": {
-            "consecutive_years": len(annual),
+            "consecutive_years": dividend_quality.get("consecutive_years", 0),
             "median_cash_dividend_wan_3y": round(base_dividend, 2),
             "latest_payout_ratio": latest.get("payout_ratio"),
             "latest_ocf_coverage": latest.get("ocf_coverage"),
@@ -963,48 +1199,200 @@ def _ddm_validation(
     }
 
 
+def _percent_to_decimal(value: Optional[float]) -> Optional[float]:
+    """Tushare financial_indicator 的同比增速/利润率恒为百分数口径，统一 /100。"""
+    if value is None:
+        return None
+    return value / 100.0
+
+
+def _fcff_positive_count(indicators: List[Dict[str, Any]], *, limit: int = 8) -> int:
+    count = 0
+    for row in indicators[:limit]:
+        value = _to_float(row.get("fcff"))
+        if value is not None and value > 0:
+            count += 1
+    return count
+
+
+def _applicability_item(
+    status: str,
+    *,
+    reasons: List[str],
+    signals: Dict[str, Any],
+) -> Dict[str, Any]:
+    return {
+        "status": status,
+        "reasons": reasons,
+        "signals": signals,
+    }
+
+
+def _recommended_from_applicability(
+    applicability: Dict[str, Dict[str, Any]],
+    tags: set[str],
+) -> Tuple[str, float]:
+    if "financial" in tags:
+        # 银行/保险/证券：FCFF DCF 口径不匹配，统一以 PB-ROE / DDM 为主框架；
+        # DDM 可用时置信度更高，否则给 PB-ROE 兜底，不退化为纯相对估值。
+        ddm_status = (applicability.get("ddm") or {}).get("status")
+        if ddm_status == "primary":
+            return "pb_roe_or_ddm", 0.7
+        if ddm_status == "secondary":
+            return "pb_roe_or_ddm", 0.55
+        return "pb_roe_or_ddm", 0.5
+    priority = ("dcf", "tech_ps", "ddm", "relative_valuation")
+    for key in priority:
+        if (applicability.get(key) or {}).get("status") == "primary":
+            return key, 0.7 if key != "relative_valuation" else 0.6
+    for key in priority:
+        if (applicability.get(key) or {}).get("status") == "secondary":
+            return key, 0.55
+    return "relative_valuation", 0.45
+
+
 def _model_suitability(
     stock: Dict[str, Any],
     indicators: List[Dict[str, Any]],
     dcf: Dict[str, Any],
     market: Dict[str, Any],
+    relative: Dict[str, Any],
+    ddm: Dict[str, Any],
 ) -> Dict[str, Any]:
-    industry_text = " ".join(
-        str(stock.get(key) or "")
-        for key in ("industry", "industry_l1", "industry_l2", "industry_l3")
-    )
+    tags = _industry_tag(stock)
     latest = indicators[0] if indicators else {}
     roe = _to_float(latest.get("roe"))
-    fcff_positive_count = 0
-    for row in indicators[:8]:
-        value = _to_float(row.get("fcff"))
-        if value is not None and value > 0:
-            fcff_positive_count += 1
+    fcff_positive_count = _fcff_positive_count(indicators)
     current = market.get("current") or {}
     dividend = _to_float(current.get("dv_ttm"))
     total_mv_wan = _to_float(current.get("total_mv"))
+    tr_yoy = _to_float(latest.get("tr_yoy"))
+    revenue_growth = _percent_to_decimal(tr_yoy)
+    net_margin_raw = _to_float(latest.get("netprofit_margin"))
+    if net_margin_raw is None:
+        net_margin_raw = _to_float(latest.get("net_profit_margin"))
+    if net_margin_raw is None:
+        net_margin_raw = _to_float(latest.get("net_margin"))
+    net_margin = _percent_to_decimal(net_margin_raw)
     base_scenario = next(
         (row for row in dcf.get("scenarios", []) if row.get("name") == "base"),
         {},
     )
     base_equity_value_wan = _to_float(base_scenario.get("equity_value_wan"))
-    reasons = []
-    recommended = "relative_valuation"
-    confidence = 0.45
-    if any(token in industry_text for token in ("银行", "保险", "证券")):
-        recommended = "pb_roe_or_ddm"
-        confidence = 0.65
-        reasons.append("金融行业更适合 PB-ROE 或 DDM，普通 FCFF DCF 仅作参考")
-    elif dcf.get("status") == "ok" and fcff_positive_count >= 4:
-        recommended = "dcf"
-        confidence = 0.7
-        reasons.append("近 8 期 FCFF 中至少 4 期为正，现金流可用于 DCF")
+    relative_percentiles = relative.get("percentiles") or {}
+    usable_relative_count = sum(
+        1
+        for key in ("pe_ttm", "pb", "ps_ttm")
+        if relative_percentiles.get(key) is not None
+    )
+    dividend_quality = ddm.get("dividend_quality") or {}
+    consecutive_dividend_years = int(dividend_quality.get("consecutive_years") or 0)
+    dividend_warnings = dividend_quality.get("warnings") or []
+    high_growth_unprofitable_tech = (
+        "tech" in tags
+        and revenue_growth is not None
+        and revenue_growth >= 0.20
+        and (fcff_positive_count <= 2 or (net_margin is not None and net_margin <= 0))
+    )
+
+    if "financial" in tags:
+        dcf_status = "not_recommended"
+        dcf_reasons = ["金融行业普通 FCFF DCF 口径与净债务调整不匹配，仅作参考"]
+    elif dcf.get("status") == "ok" and fcff_positive_count >= 5 and not high_growth_unprofitable_tech:
+        dcf_status = "primary"
+        dcf_reasons = ["近 8 期 FCFF 中至少 5 期为正，现金流可用于 DCF"]
+    elif dcf.get("status") == "ok" and 3 <= fcff_positive_count <= 4:
+        dcf_status = "secondary"
+        dcf_reasons = ["近 8 期 FCFF 有 3-4 期为正，DCF 可作辅助参考"]
     else:
-        reasons.append("现金流样本不足，优先参考历史分位相对估值")
+        dcf_status = "not_recommended"
+        dcf_reasons = ["现金流样本不足或波动较大，DCF 不宜作为主模型"]
+
+    if usable_relative_count >= 2:
+        relative_status = "primary"
+        relative_reasons = ["PE/PB/PS 至少 2 个历史分位可用"]
+    elif usable_relative_count == 1:
+        relative_status = "secondary"
+        relative_reasons = ["仅 1 个历史分位可用，相对估值只能辅助参考"]
+    else:
+        relative_status = "not_recommended"
+        relative_reasons = ["缺少可用 PE/PB/PS 历史分位"]
+
+    if consecutive_dividend_years >= 3 and not dividend_warnings:
+        ddm_status = "primary"
+        ddm_reasons = ["DDM：连续实施分红至少 3 年，且分红质量未触发重大告警"]
+    elif consecutive_dividend_years >= 3:
+        ddm_status = "secondary"
+        ddm_reasons = ["DDM：连续实施分红至少 3 年，但分红质量有告警，仅作辅助"]
+    elif 1 <= consecutive_dividend_years <= 2:
+        ddm_status = "secondary"
+        ddm_reasons = ["DDM：有实施分红记录，但连续年数不足 3 年"]
+    else:
+        ddm_status = "not_applicable"
+        ddm_reasons = ["DDM：缺少连续实施分红记录，暂不适用"]
+
+    if "tech" not in tags:
+        tech_status = "not_applicable"
+        tech_reasons = ["非科技行业标签"]
+    elif high_growth_unprofitable_tech:
+        tech_status = "primary"
+        tech_reasons = ["科技行业且收入增速较高，同时 DCF 因现金流或盈利性被降权"]
+    else:
+        tech_status = "secondary"
+        tech_reasons = ["科技行业但现金流/盈利性相对稳定，PS 框架作为辅助解释"]
+
+    signals = {
+        "roe": roe,
+        "fcff_positive_count_8": fcff_positive_count,
+        "dv_ttm": dividend,
+        "industry_tags": sorted(tags),
+        "tr_yoy": tr_yoy,
+        "revenue_growth": round(revenue_growth, 4) if revenue_growth is not None else None,
+        "net_margin": round(net_margin, 4) if net_margin is not None else None,
+        "relative_percentile_count": usable_relative_count,
+        "consecutive_dividend_years": consecutive_dividend_years,
+        "high_growth_unprofitable_tech": high_growth_unprofitable_tech,
+    }
+    applicability = {
+        "dcf": _applicability_item(dcf_status, reasons=dcf_reasons, signals=signals),
+        "relative_valuation": _applicability_item(
+            relative_status,
+            reasons=relative_reasons,
+            signals={"usable_percentile_count": usable_relative_count},
+        ),
+        "ddm": _applicability_item(
+            ddm_status,
+            reasons=ddm_reasons,
+            signals={
+                "consecutive_dividend_years": consecutive_dividend_years,
+                "warning_count": len(dividend_warnings),
+            },
+        ),
+        "tech_ps": _applicability_item(
+            tech_status,
+            reasons=tech_reasons,
+            signals={
+                "is_tech": "tech" in tags,
+                "tr_yoy": tr_yoy,
+                "revenue_growth": round(revenue_growth, 4) if revenue_growth is not None else None,
+                "net_margin": round(net_margin, 4) if net_margin is not None else None,
+                "fcff_positive_count_8": fcff_positive_count,
+            },
+        ),
+    }
+    recommended, confidence = _recommended_from_applicability(applicability, tags)
+
+    reasons: List[str] = []
+    for key in ("dcf", "tech_ps", "ddm", "relative_valuation"):
+        item = applicability[key]
+        if item["status"] == "primary":
+            reasons.extend(item["reasons"][:1])
+    if not reasons:
+        reasons.append("缺少主模型信号，优先把估值结果作为数据质量提示而非目标价")
     if roe is not None:
         reasons.append(f"最新 ROE 为 {roe:.2f}")
     if dividend is not None and dividend > 0:
-        reasons.append(f"dv_ttm 为 {dividend:.2f}，后续可扩展 DDM")
+        reasons.append(f"dv_ttm 为 {dividend:.2f}，可与分红质量交叉验证")
     if (
         dividend is not None and dividend >= 4
         and roe is not None and roe >= 20
@@ -1012,14 +1400,118 @@ def _model_suitability(
         and base_equity_value_wan is not None and base_equity_value_wan > total_mv_wan * 1.3
     ):
         reasons.append("高股息率与高 ROE 推高 DCF 估值，建议优先用 DDM/分红持续性进行交叉验证")
+
     return {
         "recommended_model": recommended,
         "confidence": round(confidence, 2),
         "reasons": reasons,
+        "signals": signals,
+        "model_applicability": applicability,
+    }
+
+
+def _days_since_yyyymmdd(value: Any) -> Optional[int]:
+    text = str(value or "")
+    if len(text) < 8:
+        return None
+    try:
+        parsed = datetime.strptime(text[:8], "%Y%m%d").date()
+    except ValueError:
+        return None
+    return (date.today() - parsed).days
+
+
+def _valuation_confidence(
+    *,
+    dcf: Dict[str, Any],
+    indicators: List[Dict[str, Any]],
+    daily_basic: List[Dict[str, Any]],
+    market: Dict[str, Any],
+) -> Dict[str, Any]:
+    score = 100
+    reasons: List[str] = []
+
+    per_share = dcf.get("per_share") or {}
+    shares_basis = str(per_share.get("shares_basis") or "")
+    if per_share.get("status") != "ok":
+        score -= 35
+        reasons.append("未能可靠得到每股股本口径")
+    elif shares_basis.startswith("financial_daily_basic.total_mv"):
+        reasons.append("股本由 financial_daily_basic.total_mv/close 推算，质量较高")
+    elif shares_basis.startswith("financial_daily_basic.circ_mv"):
+        score -= 8
+        reasons.append("股本由 circ_mv/close 推算，可能偏流通股口径")
+    elif shares_basis == "stock_info.total_share":
+        score -= 5
+        reasons.append("股本来自 stock_info.total_share，未依赖当日市值")
+    elif shares_basis.startswith("stock_info."):
+        score -= 12
+        reasons.append("股本来自 stock_info 兜底字段，需留意同步口径")
+    else:
+        score -= 15
+        reasons.append("股本来源不是首选口径")
+
+    fcff_values = [
+        _to_float(row.get("fcff"))
+        for row in indicators[:8]
+        if _to_float(row.get("fcff")) is not None
+    ]
+    positive_count = sum(1 for value in fcff_values if value is not None and value > 0)
+    if len(fcff_values) >= 5 and positive_count >= 5:
+        reasons.append("近 8 期 FCFF 样本较充分且多为正")
+    elif len(fcff_values) >= 3 and positive_count >= 3:
+        score -= 12
+        reasons.append("FCFF 样本可用但稳定性一般")
+    else:
+        score -= 25
+        reasons.append("FCFF 样本不足或正值比例偏低")
+
+    latest_indicator_date = (indicators[0] if indicators else {}).get("end_date")
+    freshness_days = _days_since_yyyymmdd(latest_indicator_date)
+    if freshness_days is None:
+        score -= 15
+        reasons.append("缺少最新财报日期，财务新鲜度无法判断")
+    elif freshness_days > 730:
+        score -= 25
+        reasons.append("最新财报距今超过两年")
+    elif freshness_days > 550:
+        score -= 12
+        reasons.append("最新财报距今超过约 18 个月")
+    else:
+        reasons.append("最新财报日期仍在可接受范围")
+
+    current = market.get("current") or {}
+    close = _to_float(current.get("close")) or _to_float(per_share.get("close"))
+    total_mv = _to_float(current.get("total_mv")) or _to_float(per_share.get("total_mv_wan"))
+    if close is None or close <= 0:
+        score -= 10
+        reasons.append("缺少有效收盘价")
+    if total_mv is None or total_mv <= 0:
+        score -= 10
+        reasons.append("缺少有效总市值")
+    if not daily_basic:
+        score -= 10
+        reasons.append("缺少 financial_daily_basic 历史样本")
+
+    score = int(_clamp(score, 0, 100))
+    if score >= 80:
+        level = "high"
+    elif score >= 55:
+        level = "medium"
+    else:
+        level = "low"
+    return {
+        "level": level,
+        "score": score,
+        "reasons": reasons,
         "signals": {
-            "roe": roe,
-            "fcff_positive_count_8": fcff_positive_count,
-            "dv_ttm": dividend,
+            "shares_basis": shares_basis or None,
+            "fcff_sample_count_8": len(fcff_values),
+            "fcff_positive_count_8": positive_count,
+            "latest_indicator_end_date": latest_indicator_date,
+            "latest_indicator_age_days": freshness_days,
+            "has_close": close is not None and close > 0,
+            "has_total_mv": total_mv is not None and total_mv > 0,
         },
     }
 
@@ -1069,6 +1561,9 @@ def build_stock_valuation(
             "fcfe": 1,
             "netprofit_yoy": 1,
             "tr_yoy": 1,
+            "netprofit_margin": 1,
+            "net_profit_margin": 1,
+            "net_margin": 1,
             "debt_to_assets": 1,
         },
     )
@@ -1153,7 +1648,13 @@ def build_stock_valuation(
         indicators=indicators,
     )
     score = _latest_score(finance_db, candidates)
-    suitability = _model_suitability(stock, indicators, dcf, market)
+    suitability = _model_suitability(stock, indicators, dcf, market, relative, ddm)
+    valuation_confidence = _valuation_confidence(
+        dcf=dcf,
+        indicators=indicators,
+        daily_basic=daily_basic,
+        market=market,
+    )
     as_of = (
         (daily_basic[0] if daily_basic else {}).get("trade_date")
         or (indicators[0] if indicators else {}).get("end_date")
@@ -1166,6 +1667,7 @@ def build_stock_valuation(
         "ddm": ddm,
         "relative_valuation": relative,
         "model_suitability": suitability,
+        "valuation_confidence": valuation_confidence,
         "value_score_link": score,
         "inputs": {
             "daily_basic_count": len(daily_basic),

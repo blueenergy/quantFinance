@@ -606,7 +606,17 @@ def test_valuation_section_returns_models_and_percentiles(monkeypatch):
     assert base_ddm["growth"] < base_ddm["ke"]
     assert section["relative_valuation"]["method"] == "current multiples vs own 3-5y history percentile"
     assert section["model_suitability"]["recommended_model"] == "dcf"
+    assert section["model_suitability"]["model_applicability"]["dcf"]["status"] == "primary"
+    assert section["model_suitability"]["model_applicability"]["ddm"]["status"] == "primary"
+    assert section["model_suitability"]["signals"]["consecutive_dividend_years"] == 3
     assert any("DDM" in reason for reason in section["model_suitability"]["reasons"])
+    assert section["valuation_confidence"]["level"] in {"high", "medium"}
+    assert section["dcf"]["sensitivity"]["status"] == "ok"
+    assert [item["key"] for item in section["dcf"]["sensitivity"]["variables"]] == [
+        "wacc",
+        "terminal_growth",
+        "fcff_base",
+    ]
     assert section["value_score_link"]["value_score"] == 72.0
 
 
@@ -1052,6 +1062,123 @@ def test_valuation_dcf_skips_net_debt_for_financial_sector(monkeypatch):
     base = section["dcf"]["scenarios"][1]
     assert base["enterprise_value_wan"] == pytest.approx(base["equity_value_wan"])
     assert base["net_debt_wan"] is None
+    assert section["model_suitability"]["model_applicability"]["dcf"]["status"] == "not_recommended"
+    assert "financial" in section["model_suitability"]["signals"]["industry_tags"]
+    assert section["model_suitability"]["recommended_model"] == "pb_roe_or_ddm"
+
+
+def test_valuation_ddm_demotes_to_secondary_when_quality_warnings(monkeypatch):
+    """连续分红≥3年但分红质量有告警时，DDM 应降为 secondary 而非 not_applicable。"""
+    daily_basic = []
+    for idx in range(40):
+        day = 40 - idx
+        daily_basic.append(
+            {
+                "ts_code": "000002.SZ",
+                "trade_date": f"202605{day:02d}",
+                "close": 10.0,
+                "pe_ttm": 8.0 + idx * 0.1,
+                "pb": 0.8 + idx * 0.01,
+                "ps_ttm": 1.0 + idx * 0.02,
+                "dv_ttm": 6.0,
+                "total_mv": 100000.0,
+                "circ_mv": 90000.0,
+            }
+        )
+    data = {
+        "financial_daily_basic": _Collection(daily_basic),
+        "financial_indicator": _Collection(
+            [
+                {"ts_code": "000002.SZ", "end_date": "20251231", "fcff": 80000000.0, "roe": 6.0, "netprofit_yoy": 2.0},
+                {"ts_code": "000002.SZ", "end_date": "20241231", "fcff": 60000000.0, "roe": 5.0, "netprofit_yoy": 1.0},
+            ]
+        ),
+        # 净利润很小，使现金分红的分红率远超 100%，触发分红质量告警
+        "financial_income": _Collection(
+            [
+                {"ts_code": "000002.SZ", "end_date": "20251231", "n_income_attr_p": 1_000_000.0},
+                {"ts_code": "000002.SZ", "end_date": "20241231", "n_income_attr_p": 1_000_000.0},
+                {"ts_code": "000002.SZ", "end_date": "20231231", "n_income_attr_p": 1_000_000.0},
+            ]
+        ),
+        "financial_cashflow": _Collection(
+            [{"ts_code": "000002.SZ", "end_date": "20251231", "n_cashflow_act": 1_000_000.0}]
+        ),
+        "financial_dividend": _Collection(
+            [
+                {"ts_code": "000002.SZ", "end_date": "20251231", "ann_date": "20260320", "div_proc": "实施", "cash_div_tax": 1.0, "ex_date": "20260601", "base_share": 10000.0},
+                {"ts_code": "000002.SZ", "end_date": "20241231", "ann_date": "20250320", "div_proc": "实施", "cash_div_tax": 1.0, "ex_date": "20250601", "base_share": 10000.0},
+                {"ts_code": "000002.SZ", "end_date": "20231231", "ann_date": "20240320", "div_proc": "实施", "cash_div_tax": 1.0, "ex_date": "20240601", "base_share": 10000.0},
+            ]
+        ),
+        "financial_balance": _Collection([]),
+        "stock_info": _Collection([{"ts_code": "000002.SZ", "industry": "食品饮料"}]),
+    }
+    monkeypatch.setattr("routers.stock_workbench.get_data_db", lambda: data)
+    monkeypatch.setattr("routers.stock_workbench.get_db_collections", lambda: {"stock_scores": _Collection([])})
+
+    section = _valuation_section("000002.SZ")
+
+    quality = section["ddm"]["dividend_quality"]
+    assert quality["consecutive_years"] == 3
+    assert quality["warnings"]
+    assert section["model_suitability"]["model_applicability"]["ddm"]["status"] == "secondary"
+
+
+def test_valuation_model_applicability_promotes_tech_ps_when_dcf_is_weak(monkeypatch):
+    daily_basic = []
+    for idx in range(40):
+        day = 40 - idx
+        daily_basic.append(
+            {
+                "ts_code": "688001.SH",
+                "trade_date": f"202605{day:02d}",
+                "close": 20.0,
+                "pe_ttm": 80.0 + idx,
+                "pb": 6.0 + idx * 0.02,
+                "ps_ttm": 12.0 + idx * 0.05,
+                "dv_ttm": 0.0,
+                "total_mv": 200000.0,
+                "circ_mv": 180000.0,
+            }
+        )
+    data = {
+        "financial_daily_basic": _Collection(daily_basic),
+        "financial_indicator": _Collection(
+            [
+                {
+                    "ts_code": "688001.SH",
+                    "end_date": "20260331",
+                    "fcff": -10_000_000.0,
+                    "roe": -2.0,
+                    "tr_yoy": 35.0,
+                    "netprofit_margin": -5.0,
+                },
+                {"ts_code": "688001.SH", "end_date": "20251231", "fcff": 0.0, "roe": -1.0, "tr_yoy": 30.0},
+                {"ts_code": "688001.SH", "end_date": "20250930", "fcff": -5_000_000.0, "roe": -1.5, "tr_yoy": 28.0},
+            ]
+        ),
+        "financial_cashflow": _Collection(
+            [{"ts_code": "688001.SH", "end_date": "20251231", "n_cashflow_act": 10_000_000.0, "c_pay_acq_const_fiolta": 30_000_000.0}]
+        ),
+        "financial_balance": _Collection([]),
+        "financial_dividend": _Collection([]),
+        "financial_income": _Collection([]),
+        "stock_info": _Collection([{"ts_code": "688001.SH", "industry": "半导体"}]),
+    }
+    monkeypatch.setattr("routers.stock_workbench.get_data_db", lambda: data)
+    monkeypatch.setattr("routers.stock_workbench.get_db_collections", lambda: {"stock_scores": _Collection([])})
+
+    section = _valuation_section("688001.SH")
+
+    applicability = section["model_suitability"]["model_applicability"]
+    assert section["model_suitability"]["recommended_model"] == "tech_ps"
+    assert applicability["dcf"]["status"] == "not_recommended"
+    assert applicability["tech_ps"]["status"] == "primary"
+    assert section["model_suitability"]["signals"]["high_growth_unprofitable_tech"] is True
+
+
+def test_workbench_valuation_status_remains_lazy_when_no_inputs(monkeypatch):
     data = {
         "stock_info": _Collection([]),
         "stock_basic": _Collection([]),
