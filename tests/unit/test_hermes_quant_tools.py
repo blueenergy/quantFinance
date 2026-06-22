@@ -121,6 +121,58 @@ def test_stock_valuation_metrics_builds_tech_fields_from_existing_collections():
     assert payload["derived"]["rule_of_40_net_margin"] == pytest.approx(46.0)
     assert payload["derived"]["rule_of_40_fcff_margin"] == pytest.approx(36.0)
     assert payload["missing"] == []
+    assert payload["missing_notes"] == {}
+    assert payload["series"][0]["period"] == "20260331"
+    assert payload["series"][0]["revenue_growth_pct"] == pytest.approx(28.0)
+    assert payload["series"][0]["fcff_margin_pct"] == pytest.approx(8.0)
+    assert payload["series"][0]["rd_intensity_pct"] == pytest.approx(12.0)
+    assert payload["derived"]["fcff_positive_periods"] == 1
+    assert payload["derived"]["fcff_sample_periods"] == 1
+    # 只有 1 个交易日样本，分位不足 30 应为 None
+    assert payload["valuation_percentiles"]["ps_ttm"] is None
+    assert payload["samples"]["daily_count"] == 1
+
+
+def test_stock_valuation_metrics_computes_history_percentiles():
+    daily = []
+    for idx in range(40):
+        day = 40 - idx
+        daily.append(
+            {
+                "ts_code": "688004.SH",
+                "trade_date": f"202605{day:02d}",
+                "close": 30.0,
+                "pe_ttm": 20.0 + idx,
+                "pb": 3.0 + idx * 0.05,
+                "ps_ttm": 5.0 + idx * 0.1,
+                "total_mv": 500_000.0,
+            }
+        )
+    data = {
+        "financial_daily_basic": _Collection(daily),
+        "financial_indicator": _Collection(
+            [
+                {"ts_code": "688004.SH", "end_date": "20260331", "fcff": 50_000_000.0, "tr_yoy": 25.0, "netprofit_margin": 12.0},
+                {"ts_code": "688004.SH", "end_date": "20251231", "fcff": -10_000_000.0, "tr_yoy": 20.0, "netprofit_margin": 8.0},
+            ]
+        ),
+        "financial_income": _Collection(
+            [
+                {"ts_code": "688004.SH", "end_date": "20260331", "revenue": 1_000_000_000.0},
+                {"ts_code": "688004.SH", "end_date": "20251231", "revenue": 900_000_000.0},
+            ]
+        ),
+        "stock_info": _Collection([{"ts_code": "688004.SH", "name": "历史分位样本"}]),
+    }
+
+    payload = _stock_valuation_metrics_payload("688004.SH", data_collections=data)
+
+    # 最新交易日(20260540)对应 idx=0，是样本里最低的 pe_ttm/ps_ttm，分位应接近最低
+    assert payload["valuation_percentiles"]["pe_ttm"] == pytest.approx(2.5)
+    assert payload["valuation_percentiles"]["ps_ttm"] == pytest.approx(2.5)
+    assert len(payload["series"]) == 2
+    assert payload["derived"]["fcff_positive_periods"] == 1
+    assert payload["derived"]["fcff_sample_periods"] == 2
 
 
 def test_stock_valuation_metrics_degrades_with_missing_fields():

@@ -792,12 +792,42 @@ def _valuation_symbol_candidates(symbol: str) -> List[str]:
     return list(dict.fromkeys(variants))
 
 
+_VALUATION_MISSING_NOTES = {
+    "financial_daily_basic": "缺少日线基本面快照，PE/PB/PS 与市值均无法取得",
+    "financial_daily_basic.ps_ttm": "缺少 PS(TTM)，无法做 PS/EV-Sales 估值",
+    "financial_daily_basic.pe_ttm": "缺少 PE(TTM)，无法做 PEG/PE 交叉验证",
+    "financial_daily_basic.pb": "缺少 PB，无法做 PB-ROE 参考",
+    "financial_indicator": "缺少财务指标，研发强度/利润率/现金流均不可得",
+    "financial_indicator.rd_exp": "缺少研发支出，无法计算研发强度",
+    "financial_indicator.fcff": "缺少 FCFF，无法判断现金流质量与 DCF 适用性",
+    "financial_indicator.grossprofit_margin": "缺少毛利率，盈利质量画像不完整",
+    "financial_indicator.netprofit_margin": "缺少净利率，无法算 Rule of 40(净利口径)",
+    "financial_indicator.tr_yoy/or_yoy": "缺少收入同比，无法判断成长性",
+    "financial_income": "缺少利润表，无法取营收用于研发强度/FCFF margin",
+    "financial_income.revenue/total_revenue": "缺少营收，研发强度与 FCFF margin 无法计算",
+}
+
+
+def _percentile_rank_or_none(
+    values: List[Any], current: Optional[float], *, min_samples: int = 30
+) -> Optional[float]:
+    """当前值在自身历史中的分位（0-100），样本不足返回 None。"""
+    if current is None:
+        return None
+    nums = [v for v in (_to_float_or_none(x) for x in values) if v is not None and v > 0]
+    if len(nums) < min_samples:
+        return None
+    below = sum(1 for v in nums if v <= current)
+    return round(below / len(nums) * 100, 2)
+
+
 def _stock_valuation_metrics_payload(
     symbol: str,
     *,
     data_collections: Any = None,
     indicator_limit: int = 8,
     income_limit: int = 8,
+    daily_history_limit: int = 1250,
 ) -> Dict[str, Any]:
     normalized_symbol = str(symbol or "").strip().upper()
     if not normalized_symbol:
@@ -809,7 +839,7 @@ def _stock_valuation_metrics_payload(
         _collection_from(data, "financial_daily_basic"),
         candidates,
         date_field="trade_date",
-        limit=1,
+        limit=daily_history_limit,
         projection={
             "_id": 0,
             "symbol": 1,
@@ -925,6 +955,52 @@ def _stock_valuation_metrics_payload(
     elif revenue is None:
         missing.append("financial_income.revenue/total_revenue")
 
+    missing_notes = {field: _VALUATION_MISSING_NOTES[field] for field in missing if field in _VALUATION_MISSING_NOTES}
+
+    income_by_period: Dict[str, Dict[str, Any]] = {}
+    for row in income_rows:
+        period = str(row.get("end_date") or "")
+        if period and period not in income_by_period:
+            income_by_period[period] = row
+    series: List[Dict[str, Any]] = []
+    for row in indicator_rows:
+        period = str(row.get("end_date") or "")
+        income_row = income_by_period.get(period, {})
+        period_revenue = _first_positive(income_row.get("revenue"), income_row.get("total_revenue"))
+        period_rd = _to_float_or_none(row.get("rd_exp"))
+        period_fcff = _to_float_or_none(row.get("fcff"))
+        series.append(
+            {
+                "period": period or None,
+                "revenue_growth_pct": _round_or_none(
+                    row.get("tr_yoy") if row.get("tr_yoy") is not None else row.get("or_yoy"), 2
+                ),
+                "net_margin_pct": _round_or_none(row.get("netprofit_margin"), 2),
+                "gross_margin_pct": _round_or_none(row.get("grossprofit_margin"), 2),
+                "fcff_yuan": _round_or_none(period_fcff, 2),
+                "fcff_margin_pct": round(period_fcff / period_revenue * 100, 2)
+                if period_fcff is not None and period_revenue
+                else None,
+                "rd_intensity_pct": round(period_rd / period_revenue * 100, 2)
+                if period_rd is not None and period_revenue
+                else None,
+                "roe_pct": _round_or_none(row.get("roe"), 2),
+            }
+        )
+    fcff_series_vals = [r["fcff_yuan"] for r in series if r["fcff_yuan"] is not None]
+    fcff_positive_count = sum(1 for v in fcff_series_vals if v > 0)
+    valuation_percentiles = {
+        "pe_ttm": _percentile_rank_or_none(
+            [r.get("pe_ttm") for r in daily_rows], _to_float_or_none(latest_daily.get("pe_ttm"))
+        ),
+        "pb": _percentile_rank_or_none(
+            [r.get("pb") for r in daily_rows], _to_float_or_none(latest_daily.get("pb"))
+        ),
+        "ps_ttm": _percentile_rank_or_none(
+            [r.get("ps_ttm") for r in daily_rows], _to_float_or_none(latest_daily.get("ps_ttm"))
+        ),
+    }
+
     return {
         "success": True,
         "symbol": normalized_symbol,
@@ -988,12 +1064,22 @@ def _stock_valuation_metrics_payload(
             "rule_of_40_net_margin": rule_of_40_net,
             "rule_of_40_fcff_margin": rule_of_40_fcff,
             "rule_of_40_note": "收入增速(%) + 净利率(%) / FCFF margin(%)，仅作科技企业质量粗筛",
+            "fcff_positive_periods": fcff_positive_count,
+            "fcff_sample_periods": len(fcff_series_vals),
         },
+        "series": series,
+        "valuation_percentiles": valuation_percentiles,
+        "valuation_percentile_note": (
+            "当前 PE/PB/PS(TTM) 在自身近 "
+            f"{len(daily_rows)} 个交易日历史中的分位(0-100)，样本不足 30 返回 null"
+        ),
         "samples": {
             "indicator_count": len(indicator_rows),
             "income_count": len(income_rows),
+            "daily_count": len(daily_rows),
         },
         "missing": missing,
+        "missing_notes": missing_notes,
         "source": (
             "quant_data.financial_daily_basic + financial_indicator + financial_income + stock_info; "
             "Hermes MCP read-only valuation metrics"
