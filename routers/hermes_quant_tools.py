@@ -15,6 +15,7 @@ MCP 暴露面按 route tag 拆分为 wukong-quant-read 与 wukong-quant-actions�
   GET  /hermes-tools/earnings/signals        — 财报猎手异动信号
   GET  /hermes-tools/stock/ranking            — 股票评分排行榜 Top N（按指数）
   GET  /hermes-tools/stock/score-detail       — 单股六维评分详情
+  GET  /hermes-tools/stock/valuation-metrics  — 单股科技估值结构化指标
   POST /hermes-tools/analysis/deep         — 提交深度分析任务
   POST /hermes-tools/analysis/deep-and-wait — 提交并等待完成（推荐）
   GET  /hermes-tools/analysis/task/{id}    — 轮询任务状态
@@ -669,6 +670,350 @@ async def stock_ranking(
         "count": len(result),
         "ranking": result,
     }
+
+
+# ---------------------------------------------------------------------------
+# 单股科技估值结构化指标
+# ---------------------------------------------------------------------------
+
+def _collection_from(container: Any, name: str) -> Any:
+    if isinstance(container, dict):
+        return container.get(name)
+    try:
+        return container[name]
+    except Exception:
+        return None
+
+
+def _to_float_or_none(value: Any) -> Optional[float]:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if number != number:
+        return None
+    return number
+
+
+def _round_or_none(value: Any, digits: int = 4) -> Optional[float]:
+    number = _to_float_or_none(value)
+    if number is None:
+        return None
+    return round(number, digits)
+
+
+def _recent_docs_for_valuation(
+    collection: Any,
+    candidates: List[str],
+    *,
+    date_field: str,
+    limit: int,
+    projection: Dict[str, int],
+    fields: tuple[str, ...] = ("symbol", "ts_code"),
+) -> List[Dict[str, Any]]:
+    if collection is None or not candidates:
+        return []
+    for field in fields:
+        try:
+            rows = list(
+                collection.find(
+                    {field: {"$in": candidates}},
+                    projection,
+                    sort=[(date_field, -1), ("_id", -1)],
+                    limit=limit,
+                )
+            )
+        except Exception:
+            continue
+        if rows:
+            return rows
+    return []
+
+
+def _latest_stock_info_for_valuation(collection: Any, candidates: List[str]) -> Dict[str, Any]:
+    rows = _recent_docs_for_valuation(
+        collection,
+        candidates,
+        date_field="valuation_date",
+        limit=1,
+        projection={
+            "_id": 0,
+            "symbol": 1,
+            "ts_code": 1,
+            "name": 1,
+            "industry": 1,
+            "sw_l1": 1,
+            "sw_l2": 1,
+            "sw_l3": 1,
+        },
+    )
+    if rows:
+        return rows[0]
+    # Some stock_info rows do not carry valuation_date; fall back to a plain find.
+    if collection is None:
+        return {}
+    for field in ("symbol", "ts_code"):
+        try:
+            rows = list(
+                collection.find(
+                    {field: {"$in": candidates}},
+                    {
+                        "_id": 0,
+                        "symbol": 1,
+                        "ts_code": 1,
+                        "name": 1,
+                        "industry": 1,
+                        "sw_l1": 1,
+                        "sw_l2": 1,
+                        "sw_l3": 1,
+                    },
+                    limit=1,
+                )
+            )
+        except Exception:
+            continue
+        if rows:
+            return rows[0]
+    return {}
+
+
+def _first_positive(*values: Any) -> Optional[float]:
+    for value in values:
+        number = _to_float_or_none(value)
+        if number is not None and number > 0:
+            return number
+    return None
+
+
+def _valuation_symbol_candidates(symbol: str) -> List[str]:
+    variants = list(_symbol_variants(symbol))
+    if "." not in symbol and len(symbol) == 6 and symbol.isdigit():
+        variants.extend([f"{symbol}.SH", f"{symbol}.SZ", f"{symbol}.BJ"])
+    return list(dict.fromkeys(variants))
+
+
+def _stock_valuation_metrics_payload(
+    symbol: str,
+    *,
+    data_collections: Any = None,
+    indicator_limit: int = 8,
+    income_limit: int = 8,
+) -> Dict[str, Any]:
+    normalized_symbol = str(symbol or "").strip().upper()
+    if not normalized_symbol:
+        return {"success": False, "error": "symbol 不能为空"}
+
+    data = data_collections or data_db
+    candidates = _valuation_symbol_candidates(normalized_symbol)
+    daily_rows = _recent_docs_for_valuation(
+        _collection_from(data, "financial_daily_basic"),
+        candidates,
+        date_field="trade_date",
+        limit=1,
+        projection={
+            "_id": 0,
+            "symbol": 1,
+            "ts_code": 1,
+            "trade_date": 1,
+            "close": 1,
+            "pe": 1,
+            "pe_ttm": 1,
+            "pb": 1,
+            "ps": 1,
+            "ps_ttm": 1,
+            "total_mv": 1,
+            "circ_mv": 1,
+            "dv_ttm": 1,
+        },
+    )
+    indicator_rows = _recent_docs_for_valuation(
+        _collection_from(data, "financial_indicator"),
+        candidates,
+        date_field="end_date",
+        limit=indicator_limit,
+        projection={
+            "_id": 0,
+            "symbol": 1,
+            "ts_code": 1,
+            "ann_date": 1,
+            "end_date": 1,
+            "rd_exp": 1,
+            "grossprofit_margin": 1,
+            "netprofit_margin": 1,
+            "fcff": 1,
+            "fcfe": 1,
+            "ocfps": 1,
+            "roe": 1,
+            "roic": 1,
+            "netprofit_yoy": 1,
+            "tr_yoy": 1,
+            "or_yoy": 1,
+            "debt_to_assets": 1,
+        },
+    )
+    income_rows = _recent_docs_for_valuation(
+        _collection_from(data, "financial_income"),
+        candidates,
+        date_field="end_date",
+        limit=income_limit,
+        projection={
+            "_id": 0,
+            "symbol": 1,
+            "ts_code": 1,
+            "ann_date": 1,
+            "end_date": 1,
+            "revenue": 1,
+            "total_revenue": 1,
+            "n_income_attr_p": 1,
+            "report_type": 1,
+        },
+    )
+    info = _latest_stock_info_for_valuation(_collection_from(data, "stock_info"), candidates)
+
+    latest_daily = daily_rows[0] if daily_rows else {}
+    latest_indicator = indicator_rows[0] if indicator_rows else {}
+    latest_income = income_rows[0] if income_rows else {}
+    if not (latest_daily or latest_indicator or latest_income or info):
+        return {
+            "success": False,
+            "symbol": normalized_symbol,
+            "candidates": candidates,
+            "error": "未找到单股估值指标所需的 financial_daily_basic/financial_indicator/financial_income/stock_info 数据",
+        }
+
+    revenue = _first_positive(latest_income.get("revenue"), latest_income.get("total_revenue"))
+    rd_exp = _to_float_or_none(latest_indicator.get("rd_exp"))
+    fcff = _to_float_or_none(latest_indicator.get("fcff"))
+    rd_intensity = rd_exp / revenue if rd_exp is not None and revenue else None
+    fcff_margin = fcff / revenue if fcff is not None and revenue else None
+    revenue_growth_pct = _round_or_none(
+        latest_indicator.get("tr_yoy")
+        if latest_indicator.get("tr_yoy") is not None
+        else latest_indicator.get("or_yoy"),
+        2,
+    )
+    net_margin_pct = _round_or_none(latest_indicator.get("netprofit_margin"), 2)
+    fcff_margin_pct = round(fcff_margin * 100, 2) if fcff_margin is not None else None
+    rule_of_40_net = (
+        round(revenue_growth_pct + net_margin_pct, 2)
+        if revenue_growth_pct is not None and net_margin_pct is not None
+        else None
+    )
+    rule_of_40_fcff = (
+        round(revenue_growth_pct + fcff_margin_pct, 2)
+        if revenue_growth_pct is not None and fcff_margin_pct is not None
+        else None
+    )
+
+    missing: List[str] = []
+    if not latest_daily:
+        missing.append("financial_daily_basic")
+    for field in ("ps_ttm", "pe_ttm", "pb"):
+        if latest_daily and _to_float_or_none(latest_daily.get(field)) is None:
+            missing.append(f"financial_daily_basic.{field}")
+    if not latest_indicator:
+        missing.append("financial_indicator")
+    for field in ("rd_exp", "fcff", "grossprofit_margin", "netprofit_margin", "tr_yoy/or_yoy"):
+        if latest_indicator:
+            if field == "tr_yoy/or_yoy":
+                if latest_indicator.get("tr_yoy") is None and latest_indicator.get("or_yoy") is None:
+                    missing.append("financial_indicator.tr_yoy/or_yoy")
+            elif _to_float_or_none(latest_indicator.get(field)) is None:
+                missing.append(f"financial_indicator.{field}")
+    if not latest_income:
+        missing.append("financial_income")
+    elif revenue is None:
+        missing.append("financial_income.revenue/total_revenue")
+
+    return {
+        "success": True,
+        "symbol": normalized_symbol,
+        "resolved_symbol": (
+            latest_daily.get("ts_code")
+            or latest_daily.get("symbol")
+            or latest_indicator.get("ts_code")
+            or latest_indicator.get("symbol")
+            or latest_income.get("ts_code")
+            or latest_income.get("symbol")
+            or info.get("ts_code")
+            or info.get("symbol")
+            or normalized_symbol
+        ),
+        "name": info.get("name", ""),
+        "industry": info.get("industry", ""),
+        "sw_industry": {
+            "l1": info.get("sw_l1"),
+            "l2": info.get("sw_l2"),
+            "l3": info.get("sw_l3"),
+        },
+        "market": {
+            "trade_date": latest_daily.get("trade_date"),
+            "close": _round_or_none(latest_daily.get("close"), 4),
+            "pe": _round_or_none(latest_daily.get("pe"), 4),
+            "pe_ttm": _round_or_none(latest_daily.get("pe_ttm"), 4),
+            "pb": _round_or_none(latest_daily.get("pb"), 4),
+            "ps": _round_or_none(latest_daily.get("ps"), 4),
+            "ps_ttm": _round_or_none(latest_daily.get("ps_ttm"), 4),
+            "total_mv_wan": _round_or_none(latest_daily.get("total_mv"), 2),
+            "circ_mv_wan": _round_or_none(latest_daily.get("circ_mv"), 2),
+            "dv_ttm": _round_or_none(latest_daily.get("dv_ttm"), 4),
+        },
+        "financial": {
+            "indicator_period": latest_indicator.get("end_date"),
+            "income_period": latest_income.get("end_date"),
+            "revenue_yuan": _round_or_none(revenue, 2),
+            "revenue_source": (
+                "financial_income.revenue"
+                if _first_positive(latest_income.get("revenue")) is not None
+                else ("financial_income.total_revenue" if revenue is not None else None)
+            ),
+            "rd_exp_yuan": _round_or_none(rd_exp, 2),
+            "gross_margin_pct": _round_or_none(latest_indicator.get("grossprofit_margin"), 2),
+            "net_margin_pct": net_margin_pct,
+            "fcff_yuan": _round_or_none(fcff, 2),
+            "fcfe_yuan": _round_or_none(latest_indicator.get("fcfe"), 2),
+            "ocfps": _round_or_none(latest_indicator.get("ocfps"), 4),
+            "roe_pct": _round_or_none(latest_indicator.get("roe"), 2),
+            "roic_pct": _round_or_none(latest_indicator.get("roic"), 2),
+            "revenue_growth_pct": revenue_growth_pct,
+            "netprofit_yoy_pct": _round_or_none(latest_indicator.get("netprofit_yoy"), 2),
+            "debt_to_assets_pct": _round_or_none(latest_indicator.get("debt_to_assets"), 2),
+            "n_income_attr_p_yuan": _round_or_none(latest_income.get("n_income_attr_p"), 2),
+        },
+        "derived": {
+            "rd_intensity": _round_or_none(rd_intensity, 6),
+            "rd_intensity_pct": round(rd_intensity * 100, 2) if rd_intensity is not None else None,
+            "fcff_margin": _round_or_none(fcff_margin, 6),
+            "fcff_margin_pct": fcff_margin_pct,
+            "rule_of_40_net_margin": rule_of_40_net,
+            "rule_of_40_fcff_margin": rule_of_40_fcff,
+            "rule_of_40_note": "收入增速(%) + 净利率(%) / FCFF margin(%)，仅作科技企业质量粗筛",
+        },
+        "samples": {
+            "indicator_count": len(indicator_rows),
+            "income_count": len(income_rows),
+        },
+        "missing": missing,
+        "source": (
+            "quant_data.financial_daily_basic + financial_indicator + financial_income + stock_info; "
+            "Hermes MCP read-only valuation metrics"
+        ),
+    }
+
+
+@router.get("/stock/valuation-metrics", operation_id="stock_valuation_metrics", tags=[MCP_READ_TAG])
+async def stock_valuation_metrics(
+    symbol: str = Query(..., description="股票代码，如 688111.SH 或 688111"),
+    _: bool = Depends(require_hermes_quant_internal_key),
+):
+    """
+    获取单股科技估值资料包需要的结构化指标。
+
+    直接读取 quant_data 的 financial_daily_basic、financial_indicator、
+    financial_income 和 stock_info，返回 PS、研发强度、FCFF margin、收入增速、
+    毛利率/净利率及 Rule of 40 粗值。缺字段进入 missing，不让 LLM 猜。
+    """
+    return _stock_valuation_metrics_payload(symbol)
 
 
 # ---------------------------------------------------------------------------

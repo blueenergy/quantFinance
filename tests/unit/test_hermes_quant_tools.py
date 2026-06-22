@@ -1,6 +1,6 @@
 import pytest
 
-from routers.hermes_quant_tools import _foreign_top10_floatholders_payload
+from routers.hermes_quant_tools import _foreign_top10_floatholders_payload, _stock_valuation_metrics_payload
 
 
 class _Collection:
@@ -48,6 +48,119 @@ class _Collection:
             if value != expected:
                 return False
         return True
+
+
+def test_stock_valuation_metrics_builds_tech_fields_from_existing_collections():
+    data = {
+        "financial_daily_basic": _Collection(
+            [
+                {
+                    "ts_code": "688001.SH",
+                    "trade_date": "20260619",
+                    "close": 44.33,
+                    "pe_ttm": 35.0,
+                    "pb": 4.2,
+                    "ps_ttm": 8.5,
+                    "total_mv": 1_000_000.0,
+                    "circ_mv": 800_000.0,
+                }
+            ]
+        ),
+        "financial_indicator": _Collection(
+            [
+                {
+                    "ts_code": "688001.SH",
+                    "end_date": "20260331",
+                    "rd_exp": 120_000_000.0,
+                    "grossprofit_margin": 62.5,
+                    "netprofit_margin": 18.0,
+                    "fcff": 80_000_000.0,
+                    "fcfe": 70_000_000.0,
+                    "ocfps": 0.8,
+                    "roe": 12.0,
+                    "roic": 10.0,
+                    "tr_yoy": 28.0,
+                    "netprofit_yoy": 30.0,
+                    "debt_to_assets": 32.0,
+                }
+            ]
+        ),
+        "financial_income": _Collection(
+            [
+                {
+                    "ts_code": "688001.SH",
+                    "end_date": "20260331",
+                    "revenue": 1_000_000_000.0,
+                    "n_income_attr_p": 180_000_000.0,
+                }
+            ]
+        ),
+        "stock_info": _Collection(
+            [
+                {
+                    "ts_code": "688001.SH",
+                    "symbol": "688001.SH",
+                    "name": "科技样本",
+                    "industry": "软件开发",
+                    "sw_l1": "计算机",
+                    "sw_l2": "软件开发",
+                }
+            ]
+        ),
+    }
+
+    payload = _stock_valuation_metrics_payload("688001.SH", data_collections=data)
+
+    assert payload["success"] is True
+    assert payload["resolved_symbol"] == "688001.SH"
+    assert payload["name"] == "科技样本"
+    assert payload["market"]["ps_ttm"] == pytest.approx(8.5)
+    assert payload["financial"]["revenue_growth_pct"] == pytest.approx(28.0)
+    assert payload["derived"]["rd_intensity_pct"] == pytest.approx(12.0)
+    assert payload["derived"]["fcff_margin_pct"] == pytest.approx(8.0)
+    assert payload["derived"]["rule_of_40_net_margin"] == pytest.approx(46.0)
+    assert payload["derived"]["rule_of_40_fcff_margin"] == pytest.approx(36.0)
+    assert payload["missing"] == []
+
+
+def test_stock_valuation_metrics_degrades_with_missing_fields():
+    data = {
+        "financial_daily_basic": _Collection(
+            [{"symbol": "688002.SH", "trade_date": "20260619", "pb": 3.0}]
+        ),
+        "financial_indicator": _Collection(
+            [{"symbol": "688002.SH", "end_date": "20260331", "tr_yoy": 12.0}]
+        ),
+        "financial_income": _Collection([]),
+        "stock_info": _Collection([{"symbol": "688002.SH", "name": "缺字段样本"}]),
+    }
+
+    payload = _stock_valuation_metrics_payload("688002.SH", data_collections=data)
+
+    assert payload["success"] is True
+    assert payload["market"]["pb"] == pytest.approx(3.0)
+    assert payload["market"]["ps_ttm"] is None
+    assert payload["derived"]["rd_intensity_pct"] is None
+    assert "financial_daily_basic.ps_ttm" in payload["missing"]
+    assert "financial_indicator.rd_exp" in payload["missing"]
+    assert "financial_income" in payload["missing"]
+
+
+def test_stock_valuation_metrics_matches_symbol_variants():
+    data = {
+        "financial_daily_basic": _Collection(
+            [{"ts_code": "688003.SH", "trade_date": "20260619", "ps_ttm": 6.0}]
+        ),
+        "financial_indicator": _Collection([]),
+        "financial_income": _Collection([]),
+        "stock_info": _Collection([{"ts_code": "688003.SH", "name": "变体样本"}]),
+    }
+
+    payload = _stock_valuation_metrics_payload("688003", data_collections=data)
+
+    assert payload["success"] is True
+    assert payload["resolved_symbol"] == "688003.SH"
+    assert payload["market"]["ps_ttm"] == pytest.approx(6.0)
 
 
 def test_foreign_top10_floatholders_matches_default_banks(monkeypatch):
