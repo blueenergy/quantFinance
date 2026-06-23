@@ -1,6 +1,10 @@
 import pytest
 
-from routers.hermes_quant_tools import _foreign_top10_floatholders_payload, _stock_valuation_metrics_payload
+from routers.hermes_quant_tools import (
+    _foreign_top10_floatholders_payload,
+    _stock_industry_comparison_payload,
+    _stock_valuation_metrics_payload,
+)
 
 
 class _Collection:
@@ -213,6 +217,164 @@ def test_stock_valuation_metrics_matches_symbol_variants():
     assert payload["success"] is True
     assert payload["resolved_symbol"] == "688003.SH"
     assert payload["market"]["ps_ttm"] == pytest.approx(6.0)
+
+
+def test_stock_industry_comparison_computes_peer_percentiles():
+    symbols = [f"68800{i}.SH" for i in range(1, 6)]
+    data = {
+        "stock_info": _Collection(
+            [
+                {
+                    "ts_code": ts_code,
+                    "name": f"软件{i}",
+                    "industry": "软件开发",
+                    "sw_l1": "计算机",
+                    "sw_l2": "软件开发",
+                }
+                for i, ts_code in enumerate(symbols, start=1)
+            ]
+        ),
+        "financial_daily_basic": _Collection(
+            [
+                {
+                    "ts_code": ts_code,
+                    "trade_date": "20260619",
+                    "pe_ttm": 20 + i,
+                    "pb": 2 + i,
+                    "ps_ttm": 3 + i,
+                    "total_mv": 100_000 + i * 10_000,
+                }
+                for i, ts_code in enumerate(symbols)
+            ]
+        ),
+        "financial_indicator": _Collection(
+            [
+                {
+                    "ts_code": ts_code,
+                    "end_date": "20260331",
+                    "roe": 8 + i,
+                    "netprofit_margin": 10 + i,
+                    "grossprofit_margin": 45 + i,
+                    "tr_yoy": 15 + i,
+                }
+                for i, ts_code in enumerate(symbols)
+            ]
+        ),
+    }
+
+    payload = _stock_industry_comparison_payload("688003.SH", data_collections=data)
+
+    assert payload["success"] is True
+    assert payload["resolved_symbol"] == "688003.SH"
+    assert payload["peer_level"] == "sw_l2"
+    assert payload["peer_count"] == 5
+    assert payload["as_of"]["market_trade_date"] == "20260619"
+    assert payload["metrics"]["market"]["ps_ttm"]["value"] == pytest.approx(5.0)
+    assert payload["metrics"]["market"]["ps_ttm"]["peer_median"] == pytest.approx(5.0)
+    assert payload["metrics"]["market"]["ps_ttm"]["peer_percentile"] == pytest.approx(60.0)
+    assert payload["metrics"]["financial"]["revenue_growth_pct"]["peer_percentile"] == pytest.approx(60.0)
+
+
+def test_stock_industry_comparison_includes_negative_financials():
+    symbols = [f"68820{i}.SH" for i in range(1, 6)]
+    margins = [-8, -3, 5, 12, 20]
+    data = {
+        "stock_info": _Collection(
+            [
+                {
+                    "ts_code": ts_code,
+                    "name": f"亏损样本{i}",
+                    "industry": "软件开发",
+                    "sw_l1": "计算机",
+                    "sw_l2": "软件开发",
+                }
+                for i, ts_code in enumerate(symbols, start=1)
+            ]
+        ),
+        "financial_daily_basic": _Collection(
+            [{"ts_code": ts_code, "trade_date": "20260619", "ps_ttm": 5.0} for ts_code in symbols]
+        ),
+        "financial_indicator": _Collection(
+            [
+                {"ts_code": ts_code, "end_date": "20260331", "netprofit_margin": margins[i]}
+                for i, ts_code in enumerate(symbols)
+            ]
+        ),
+    }
+
+    payload = _stock_industry_comparison_payload("688201.SH", data_collections=data)
+
+    net_margin = payload["metrics"]["financial"]["net_margin_pct"]
+    # 5 个样本含 2 个负值，不应被丢弃
+    assert net_margin["sample_count"] == 5
+    assert net_margin["value"] == pytest.approx(-8.0)
+    assert net_margin["peer_median"] == pytest.approx(5.0)
+    # 目标自身为最小值，分位应为 1/5 = 20%
+    assert net_margin["peer_percentile"] == pytest.approx(20.0)
+
+
+def test_stock_industry_comparison_falls_back_to_sw_l1_when_l2_missing():
+    symbols = [f"30000{i}.SZ" for i in range(1, 6)]
+    data = {
+        "stock_info": _Collection(
+            [
+                {
+                    "ts_code": ts_code,
+                    "name": f"硬件{i}",
+                    "industry": "电子设备",
+                    "sw_l1": "电子",
+                    "sw_l2": None,
+                }
+                for i, ts_code in enumerate(symbols, start=1)
+            ]
+        ),
+        "financial_daily_basic": _Collection(
+            [{"ts_code": ts_code, "trade_date": "20260619", "pb": 2 + i} for i, ts_code in enumerate(symbols)]
+        ),
+        "financial_indicator": _Collection(
+            [{"ts_code": ts_code, "end_date": "20260331", "roe": 5 + i} for i, ts_code in enumerate(symbols)]
+        ),
+    }
+
+    payload = _stock_industry_comparison_payload("300003.SZ", data_collections=data, level="sw_l2")
+
+    assert payload["success"] is True
+    assert payload["requested_level"] == "sw_l2"
+    assert payload["peer_level"] == "sw_l1"
+    assert payload["peer_value"] == "电子"
+    assert payload["metrics"]["market"]["pb"]["sample_count"] == 5
+
+
+def test_stock_industry_comparison_returns_null_when_peer_sample_is_small():
+    symbols = [f"68810{i}.SH" for i in range(1, 4)]
+    data = {
+        "stock_info": _Collection(
+            [
+                {
+                    "ts_code": ts_code,
+                    "name": f"小样本{i}",
+                    "industry": "软件开发",
+                    "sw_l1": "计算机",
+                    "sw_l2": "软件开发",
+                }
+                for i, ts_code in enumerate(symbols, start=1)
+            ]
+        ),
+        "financial_daily_basic": _Collection(
+            [{"ts_code": ts_code, "trade_date": "20260619", "ps_ttm": 4 + i} for i, ts_code in enumerate(symbols)]
+        ),
+        "financial_indicator": _Collection([]),
+    }
+
+    payload = _stock_industry_comparison_payload("688101.SH", data_collections=data)
+
+    assert payload["success"] is True
+    assert payload["peer_count"] == 3
+    assert payload["metrics"]["market"]["ps_ttm"]["value"] == pytest.approx(4.0)
+    assert payload["metrics"]["market"]["ps_ttm"]["peer_median"] is None
+    assert payload["metrics"]["market"]["ps_ttm"]["peer_percentile"] is None
+    assert payload["metrics"]["market"]["ps_ttm"]["sample_count"] == 3
+    assert "同业股票数少于 5" in payload["notes"][0]
 
 
 def test_foreign_top10_floatholders_matches_default_banks(monkeypatch):

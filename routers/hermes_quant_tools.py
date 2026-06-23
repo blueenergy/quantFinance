@@ -16,6 +16,7 @@ MCP 暴露面按 route tag 拆分为 wukong-quant-read 与 wukong-quant-actions�
   GET  /hermes-tools/stock/ranking            — 股票评分排行榜 Top N（按指数）
   GET  /hermes-tools/stock/score-detail       — 单股六维评分详情
   GET  /hermes-tools/stock/valuation-metrics  — 单股科技估值结构化指标
+  GET  /hermes-tools/stock/industry-comparison — 单股行业横向估值/财务分位
   POST /hermes-tools/analysis/deep         — 提交深度分析任务
   POST /hermes-tools/analysis/deep-and-wait — 提交并等待完成（推荐）
   GET  /hermes-tools/analysis/task/{id}    — 轮询任务状态
@@ -808,17 +809,383 @@ _VALUATION_MISSING_NOTES = {
 }
 
 
+def _clean_numeric(values: List[Any], *, positive_only: bool = True) -> List[float]:
+    """转 float 并去掉 None/NaN；positive_only 时仅保留正值。
+
+    PE/PB/PS、市值这类只有正值有意义的指标用 positive_only=True；
+    ROE、净利率、收入增速等可正可负的财务指标须传 positive_only=False，
+    否则负值会被静默丢弃，使同业中位数/分位口径失真。
+    """
+    nums: List[float] = []
+    for raw in values:
+        number = _to_float_or_none(raw)
+        if number is None:
+            continue
+        if positive_only and number <= 0:
+            continue
+        nums.append(number)
+    return nums
+
+
 def _percentile_rank_or_none(
-    values: List[Any], current: Optional[float], *, min_samples: int = 30
+    values: List[Any],
+    current: Optional[float],
+    *,
+    min_samples: int = 30,
+    positive_only: bool = True,
 ) -> Optional[float]:
-    """当前值在自身历史中的分位（0-100），样本不足返回 None。"""
+    """当前值在样本中的分位（0-100，含自身），样本不足返回 None。"""
     if current is None:
         return None
-    nums = [v for v in (_to_float_or_none(x) for x in values) if v is not None and v > 0]
+    nums = _clean_numeric(values, positive_only=positive_only)
     if len(nums) < min_samples:
         return None
     below = sum(1 for v in nums if v <= current)
     return round(below / len(nums) * 100, 2)
+
+
+_PEER_LEVEL_FIELDS = ("sw_l2", "sw_l1", "industry")
+
+
+def _stock_identifier(row: Dict[str, Any]) -> Optional[str]:
+    value = row.get("ts_code") or row.get("symbol")
+    if value is None:
+        return None
+    text = str(value).strip().upper()
+    return text or None
+
+
+def _latest_peer_rows_by_symbol(
+    collection: Any,
+    peer_symbols: List[str],
+    *,
+    date_field: str,
+    as_of: Optional[str],
+    projection: Dict[str, int],
+    fields: tuple[str, ...] = ("ts_code", "symbol"),
+) -> Dict[str, Dict[str, Any]]:
+    if collection is None or not peer_symbols:
+        return {}
+
+    for field in fields:
+        query: Dict[str, Any] = {field: {"$in": peer_symbols}}
+        if as_of:
+            query[date_field] = as_of
+        try:
+            rows = list(
+                collection.find(
+                    query,
+                    projection,
+                    sort=[(date_field, -1), ("_id", -1)],
+                )
+            )
+        except Exception:
+            continue
+        if not rows:
+            continue
+
+        out: Dict[str, Dict[str, Any]] = {}
+        for row in rows:
+            symbol = _stock_identifier(row)
+            if symbol and symbol not in out:
+                out[symbol] = row
+        if out:
+            return out
+    return {}
+
+
+def _median_or_none(
+    values: List[Any], *, min_samples: int = 1, positive_only: bool = True
+) -> Optional[float]:
+    nums = sorted(_clean_numeric(values, positive_only=positive_only))
+    if len(nums) < min_samples:
+        return None
+    mid = len(nums) // 2
+    if len(nums) % 2:
+        return round(nums[mid], 4)
+    return round((nums[mid - 1] + nums[mid]) / 2, 4)
+
+
+def _peer_metric_summary(
+    rows_by_symbol: Dict[str, Dict[str, Any]],
+    target_symbol: str,
+    field: str,
+    *,
+    min_peer_count: int,
+    digits: int = 4,
+    positive_only: bool = True,
+) -> Dict[str, Any]:
+    values = [row.get(field) for row in rows_by_symbol.values()]
+    target_value = _to_float_or_none((rows_by_symbol.get(target_symbol) or {}).get(field))
+    valid_values = _clean_numeric(values, positive_only=positive_only)
+    return {
+        "value": _round_or_none(target_value, digits),
+        "peer_median": _median_or_none(
+            valid_values, min_samples=min_peer_count, positive_only=positive_only
+        ),
+        "peer_percentile": _percentile_rank_or_none(
+            valid_values, target_value, min_samples=min_peer_count, positive_only=positive_only
+        ),
+        "sample_count": len(valid_values),
+    }
+
+
+def _stock_industry_comparison_payload(
+    symbol: str,
+    *,
+    level: str = "sw_l2",
+    data_collections: Any = None,
+    min_peer_count: int = 5,
+) -> Dict[str, Any]:
+    normalized_symbol = str(symbol or "").strip().upper()
+    if not normalized_symbol:
+        return {"success": False, "error": "symbol 不能为空"}
+
+    data = data_collections or data_db
+    stock_info = _collection_from(data, "stock_info")
+    candidates = _valuation_symbol_candidates(normalized_symbol)
+    info = _latest_stock_info_for_valuation(stock_info, candidates)
+    if not info:
+        return {
+            "success": False,
+            "symbol": normalized_symbol,
+            "candidates": candidates,
+            "error": "未找到 stock_info，无法确定同业集合",
+        }
+
+    requested_level = level if level in _PEER_LEVEL_FIELDS else "sw_l2"
+    fallback_order = [requested_level] + [
+        field for field in _PEER_LEVEL_FIELDS if field != requested_level
+    ]
+    peer_field = next((field for field in fallback_order if info.get(field)), None)
+    if not peer_field:
+        return {
+            "success": False,
+            "symbol": normalized_symbol,
+            "resolved_symbol": _stock_identifier(info) or normalized_symbol,
+            "name": info.get("name", ""),
+            "error": "stock_info 缺少 sw_l2/sw_l1/industry，无法确定同业集合",
+        }
+
+    peer_value = info.get(peer_field)
+    try:
+        peer_info_rows = list(
+            stock_info.find(
+                {peer_field: peer_value},
+                {
+                    "_id": 0,
+                    "symbol": 1,
+                    "ts_code": 1,
+                    "name": 1,
+                    "industry": 1,
+                    "sw_l1": 1,
+                    "sw_l2": 1,
+                    "sw_l3": 1,
+                },
+            )
+        )
+    except Exception:
+        peer_info_rows = []
+
+    peer_stock_symbols = [
+        symbol_id
+        for symbol_id in (_stock_identifier(row) for row in peer_info_rows)
+        if symbol_id
+    ]
+    peer_stock_symbols = list(dict.fromkeys(peer_stock_symbols))
+    stock_info_target_symbol = _stock_identifier(info) or normalized_symbol
+    if stock_info_target_symbol not in peer_stock_symbols:
+        peer_stock_symbols.append(stock_info_target_symbol)
+
+    peer_query_symbols: List[str] = []
+    for peer_symbol in peer_stock_symbols:
+        peer_query_symbols.extend(_valuation_symbol_candidates(peer_symbol))
+    peer_query_symbols = list(dict.fromkeys(peer_query_symbols))
+
+    daily_target_rows = _recent_docs_for_valuation(
+        _collection_from(data, "financial_daily_basic"),
+        [stock_info_target_symbol] + candidates,
+        date_field="trade_date",
+        limit=1,
+        projection={
+            "_id": 0,
+            "symbol": 1,
+            "ts_code": 1,
+            "trade_date": 1,
+            "pe_ttm": 1,
+            "pb": 1,
+            "ps_ttm": 1,
+            "total_mv": 1,
+        },
+    )
+    indicator_target_rows = _recent_docs_for_valuation(
+        _collection_from(data, "financial_indicator"),
+        [stock_info_target_symbol] + candidates,
+        date_field="end_date",
+        limit=1,
+        projection={
+            "_id": 0,
+            "symbol": 1,
+            "ts_code": 1,
+            "end_date": 1,
+            "roe": 1,
+            "netprofit_margin": 1,
+            "grossprofit_margin": 1,
+            "tr_yoy": 1,
+            "or_yoy": 1,
+        },
+    )
+    daily_as_of = str(daily_target_rows[0].get("trade_date")) if daily_target_rows else None
+    indicator_as_of = (
+        str(indicator_target_rows[0].get("end_date")) if indicator_target_rows else None
+    )
+    target_symbol = (
+        (_stock_identifier(daily_target_rows[0]) if daily_target_rows else None)
+        or (_stock_identifier(indicator_target_rows[0]) if indicator_target_rows else None)
+        or stock_info_target_symbol
+    )
+
+    # as_of 为空意味着目标股没有最新行情/财报，此时同业横截面注定为空；
+    # 直接跳过查询，避免对大行业做一次不带日期的全历史扫描。
+    daily_rows_by_symbol = (
+        _latest_peer_rows_by_symbol(
+            _collection_from(data, "financial_daily_basic"),
+            peer_query_symbols,
+            date_field="trade_date",
+            as_of=daily_as_of,
+            projection={
+                "_id": 0,
+                "symbol": 1,
+                "ts_code": 1,
+                "trade_date": 1,
+                "pe_ttm": 1,
+                "pb": 1,
+                "ps_ttm": 1,
+                "total_mv": 1,
+            },
+        )
+        if daily_as_of
+        else {}
+    )
+    indicator_rows_by_symbol = (
+        _latest_peer_rows_by_symbol(
+            _collection_from(data, "financial_indicator"),
+            peer_query_symbols,
+            date_field="end_date",
+            as_of=indicator_as_of,
+            projection={
+                "_id": 0,
+                "symbol": 1,
+                "ts_code": 1,
+                "end_date": 1,
+                "roe": 1,
+                "netprofit_margin": 1,
+                "grossprofit_margin": 1,
+                "tr_yoy": 1,
+                "or_yoy": 1,
+            },
+        )
+        if indicator_as_of
+        else {}
+    )
+
+    if target_symbol not in daily_rows_by_symbol and daily_target_rows:
+        daily_rows_by_symbol[target_symbol] = daily_target_rows[0]
+    if target_symbol not in indicator_rows_by_symbol and indicator_target_rows:
+        indicator_rows_by_symbol[target_symbol] = indicator_target_rows[0]
+
+    revenue_growth_rows: Dict[str, Dict[str, Any]] = {}
+    for sym, row in indicator_rows_by_symbol.items():
+        revenue_growth_rows[sym] = {
+            **row,
+            "revenue_growth": row.get("tr_yoy")
+            if row.get("tr_yoy") is not None
+            else row.get("or_yoy"),
+        }
+
+    metrics = {
+        "market": {
+            "pe_ttm": _peer_metric_summary(
+                daily_rows_by_symbol, target_symbol, "pe_ttm", min_peer_count=min_peer_count
+            ),
+            "pb": _peer_metric_summary(
+                daily_rows_by_symbol, target_symbol, "pb", min_peer_count=min_peer_count
+            ),
+            "ps_ttm": _peer_metric_summary(
+                daily_rows_by_symbol, target_symbol, "ps_ttm", min_peer_count=min_peer_count
+            ),
+            "total_mv_wan": _peer_metric_summary(
+                daily_rows_by_symbol, target_symbol, "total_mv", min_peer_count=min_peer_count, digits=2
+            ),
+        },
+        "financial": {
+            "roe_pct": _peer_metric_summary(
+                indicator_rows_by_symbol,
+                target_symbol,
+                "roe",
+                min_peer_count=min_peer_count,
+                digits=2,
+                positive_only=False,
+            ),
+            "net_margin_pct": _peer_metric_summary(
+                indicator_rows_by_symbol,
+                target_symbol,
+                "netprofit_margin",
+                min_peer_count=min_peer_count,
+                digits=2,
+                positive_only=False,
+            ),
+            "gross_margin_pct": _peer_metric_summary(
+                indicator_rows_by_symbol,
+                target_symbol,
+                "grossprofit_margin",
+                min_peer_count=min_peer_count,
+                digits=2,
+                positive_only=False,
+            ),
+            "revenue_growth_pct": _peer_metric_summary(
+                revenue_growth_rows,
+                target_symbol,
+                "revenue_growth",
+                min_peer_count=min_peer_count,
+                digits=2,
+                positive_only=False,
+            ),
+        },
+    }
+
+    notes: List[str] = []
+    if len(peer_stock_symbols) < min_peer_count:
+        notes.append(f"同业股票数少于 {min_peer_count}，分位与中位数返回 null")
+    if daily_as_of is None:
+        notes.append("缺少目标股最新 financial_daily_basic，市场估值横截面不可得")
+    if indicator_as_of is None:
+        notes.append("缺少目标股最新 financial_indicator，财务指标横截面不可得")
+
+    return {
+        "success": True,
+        "symbol": normalized_symbol,
+        "resolved_symbol": target_symbol,
+        "name": info.get("name", ""),
+        "requested_level": requested_level,
+        "peer_level": peer_field,
+        "peer_value": peer_value,
+        "peer_count": len(peer_stock_symbols),
+        "as_of": {
+            "market_trade_date": daily_as_of,
+            "financial_period": indicator_as_of,
+        },
+        "metrics": metrics,
+        "notes": notes,
+        "percentile_note": (
+            "peer_percentile 为目标值在同业横截面中的分位(0-100，含自身)；"
+            "估值倍数/市值仅统计正值，ROE/利润率/收入增速含负值"
+        ),
+        "source": (
+            "quant_data.stock_info + financial_daily_basic + financial_indicator; "
+            "same-industry cross-section by selected industry level"
+        ),
+    }
 
 
 def _stock_valuation_metrics_payload(
@@ -1100,6 +1467,21 @@ async def stock_valuation_metrics(
     毛利率/净利率及 Rule of 40 粗值。缺字段进入 missing，不让 LLM 猜。
     """
     return _stock_valuation_metrics_payload(symbol)
+
+
+@router.get("/stock/industry-comparison", operation_id="stock_industry_comparison", tags=[MCP_READ_TAG])
+async def stock_industry_comparison(
+    symbol: str = Query(..., description="股票代码，如 688111.SH 或 688111"),
+    level: str = Query("sw_l2", description="同业层级：sw_l2、sw_l1 或 industry；缺失时自动降级"),
+    _: bool = Depends(require_hermes_quant_internal_key),
+):
+    """
+    获取单股相对同业的估值与财务指标分位。
+
+    使用 stock_info 的申万/行业字段确定同业集合，并在目标股最新交易日/财报期
+    上计算 PE/PB/PS、市值、ROE、利润率、收入增速的行业横截面分位。
+    """
+    return _stock_industry_comparison_payload(symbol, level=level)
 
 
 # ---------------------------------------------------------------------------
