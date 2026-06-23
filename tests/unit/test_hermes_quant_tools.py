@@ -55,6 +55,18 @@ class _Collection:
         return True
 
 
+class _NoBoolData(dict):
+    def __bool__(self):
+        raise NotImplementedError("Database objects do not implement truth value testing")
+
+
+def _dq_item(payload, metric):
+    for item in payload["data_quality"]["items"]:
+        if item["metric"] == metric:
+            return item
+    raise AssertionError(f"data_quality missing metric: {metric}")
+
+
 def test_stock_valuation_metrics_builds_tech_fields_from_existing_collections():
     data = {
         "financial_daily_basic": _Collection(
@@ -157,6 +169,10 @@ def test_stock_valuation_metrics_builds_tech_fields_from_existing_collections():
     # 只有 1 个交易日样本，分位不足 30 应为 None
     assert payload["valuation_percentiles"]["ps_ttm"] is None
     assert payload["samples"]["daily_count"] == 1
+    hist_item = _dq_item(payload, "valuation_percentiles.ps_ttm")
+    assert hist_item["status"] == "insufficient_history"
+    assert hist_item["must_fix"] is True
+    assert "run_stock_daily" in hist_item["repair_command"]
 
 
 def test_stock_valuation_metrics_builds_segments_from_mainbz():
@@ -289,6 +305,19 @@ def test_stock_valuation_metrics_marks_missing_quality_fields():
     assert "financial_indicator.ocf_to_or" in payload["missing"]
     assert "financial_indicator.fixed_assets" in payload["missing"]
     assert payload["missing_notes"]["financial_indicator.q_netprofit_margin"]
+    gross_item = _dq_item(payload, "financial_indicator.grossprofit_margin")
+    assert gross_item["status"] == "missing_field"
+    assert gross_item["source_collection"] == "financial_indicator"
+    assert "run_financial_sync" in gross_item["repair_command"]
+    # 利润质量字段缺失时，profit_quality_alert 不应被误标为 not_triggered，
+    # 而应交由对应 missing_field 覆盖，避免“缺数据”与“已评估未触发”冲突。
+    alert_metrics = [
+        item for item in payload["data_quality"]["items"]
+        if item["metric"] == "derived.profit_quality_alert"
+    ]
+    assert alert_metrics == []
+    pq_item = _dq_item(payload, "financial_indicator.q_netprofit_margin")
+    assert pq_item["status"] == "missing_field"
 
 
 def test_stock_valuation_metrics_degrades_with_missing_fields():
@@ -312,6 +341,163 @@ def test_stock_valuation_metrics_degrades_with_missing_fields():
     assert "financial_daily_basic.ps_ttm" in payload["missing"]
     assert "financial_indicator.rd_exp" in payload["missing"]
     assert "financial_income" in payload["missing"]
+
+
+def test_stock_valuation_metrics_data_quality_marks_insufficient_consensus():
+    data = {
+        "financial_daily_basic": _Collection(
+            [{"ts_code": "688012.SH", "trade_date": "20260619", "pe_ttm": 40.0, "pb": 4.0, "ps_ttm": 8.0, "total_mv": 100_000.0}]
+        ),
+        "financial_indicator": _Collection(
+            [
+                {
+                    "ts_code": "688012.SH",
+                    "end_date": "20260331",
+                    "rd_exp": 100.0,
+                    "grossprofit_margin": 60.0,
+                    "netprofit_margin": 15.0,
+                    "fcff": 50.0,
+                    "tr_yoy": 20.0,
+                    "netprofit_yoy": 20.0,
+                    "q_netprofit_margin": 14.0,
+                    "dtprofit_to_profit": 95.0,
+                    "opincome_of_ebt": 96.0,
+                    "investincome_of_ebt": 3.0,
+                    "salescash_to_or": 1.0,
+                    "ocf_to_or": 0.3,
+                    "ocf_yoy": 10.0,
+                    "fixed_assets": 1000.0,
+                    "total_fa_trun": 2.0,
+                    "capitalized_to_da": 0.5,
+                    "roic_yearly": 12.0,
+                }
+            ]
+        ),
+        "financial_income": _Collection(
+            [
+                {"ts_code": "688012.SH", "end_date": "20260331", "revenue": 1_000.0, "n_income_attr_p": 100.0, "invest_income": 1.0},
+                {"ts_code": "688012.SH", "end_date": "20251231", "n_income_attr_p": 300.0},
+                {"ts_code": "688012.SH", "end_date": "20250331", "n_income_attr_p": 80.0},
+            ]
+        ),
+        "financial_mainbz": _Collection(
+            [{"ts_code": "688012.SH", "end_date": "20260331", "bz_type": "P", "bz_item": "软件", "bz_sales": 1000.0}]
+        ),
+        "earnings_report_rc": _Collection(
+            [
+                {
+                    "ts_code": "688012.SH",
+                    "report_date": "20260601",
+                    "org_name": "机构A",
+                    "quarter": "2025Q4",
+                    "np": 5_000.0,
+                }
+            ]
+        ),
+        "stock_info": _Collection([{"ts_code": "688012.SH", "name": "一致预期不足"}]),
+    }
+
+    payload = _stock_valuation_metrics_payload("688012.SH", data_collections=data)
+
+    item = _dq_item(payload, "derived.forward_peg")
+    assert item["status"] == "insufficient_consensus"
+    assert item["must_fix"] is True
+    assert "run_earnings_sync --days 365" in item["repair_command"]
+
+
+def test_stock_valuation_metrics_data_quality_overall_ok_with_info_items():
+    daily = [
+        {
+            "ts_code": "688013.SH",
+            "trade_date": f"202605{40 - idx:02d}",
+            "pe_ttm": 30.0 + idx,
+            "pb": 3.0 + idx * 0.01,
+            "ps_ttm": 8.0 + idx * 0.05,
+            "total_mv": 100_000.0,
+        }
+        for idx in range(40)
+    ]
+    data = {
+        "financial_daily_basic": _Collection(daily),
+        "financial_indicator": _Collection(
+            [
+                {
+                    "ts_code": "688013.SH",
+                    "end_date": "20260331",
+                    "rd_exp": 120.0,
+                    "grossprofit_margin": 65.0,
+                    "netprofit_margin": 20.0,
+                    "fcff": 80.0,
+                    "tr_yoy": 25.0,
+                    "netprofit_yoy": 30.0,
+                    "q_netprofit_margin": 19.0,
+                    "dtprofit_to_profit": 98.0,
+                    "opincome_of_ebt": 95.0,
+                    "investincome_of_ebt": 2.0,
+                    "salescash_to_or": 1.1,
+                    "ocf_to_or": 0.35,
+                    "ocf_yoy": 12.0,
+                    "fixed_assets": 1000.0,
+                    "total_fa_trun": 2.5,
+                    "capitalized_to_da": 0.5,
+                    "roic_yearly": 14.0,
+                }
+            ]
+        ),
+        "financial_income": _Collection(
+            [
+                {"ts_code": "688013.SH", "end_date": "20260331", "revenue": 1_000.0, "n_income_attr_p": 100.0, "invest_income": 1.0},
+                {"ts_code": "688013.SH", "end_date": "20251231", "n_income_attr_p": 300.0},
+                {"ts_code": "688013.SH", "end_date": "20250331", "n_income_attr_p": 80.0},
+            ]
+        ),
+        "financial_mainbz": _Collection(
+            [
+                {"ts_code": "688013.SH", "end_date": "20250331", "bz_type": "P", "bz_item": "软件", "bz_sales": 800.0},
+                {"ts_code": "688013.SH", "end_date": "20260331", "bz_type": "P", "bz_item": "软件", "bz_sales": 1000.0},
+            ]
+        ),
+        "earnings_report_rc": _Collection(
+            [
+                {"ts_code": "688013.SH", "report_date": "20260601", "org_name": "机构A", "quarter": "2025Q4", "np": 5_000.0},
+                {"ts_code": "688013.SH", "report_date": "20260601", "org_name": "机构A", "quarter": "2026Q4", "np": 6_000.0},
+            ]
+        ),
+        "stock_info": _Collection([{"ts_code": "688013.SH", "name": "质量正常"}]),
+    }
+
+    payload = _stock_valuation_metrics_payload("688013.SH", data_collections=data)
+
+    assert payload["data_quality"]["overall"] == "ok"
+    assert payload["data_quality"]["summary"]["must_fix_count"] == 0
+    alert = _dq_item(payload, "derived.profit_quality_alert")
+    assert alert["status"] == "not_triggered"
+    assert alert["must_fix"] is False
+
+
+def test_stock_valuation_metrics_accepts_non_truthy_testable_database_object():
+    data = _NoBoolData(
+        {
+            "financial_daily_basic": _Collection(
+                [{"ts_code": "300655.SZ", "trade_date": "20260619", "pe_ttm": 30.0, "ps_ttm": 6.0, "pb": 4.0}]
+            ),
+            "financial_indicator": _Collection(
+                [{"ts_code": "300655.SZ", "end_date": "20260331", "tr_yoy": 20.0}]
+            ),
+            "financial_income": _Collection(
+                [{"ts_code": "300655.SZ", "end_date": "20260331", "revenue": 1_000.0}]
+            ),
+            "financial_mainbz": _Collection([]),
+            "earnings_report_rc": _Collection([]),
+            "stock_info": _Collection([{"ts_code": "300655.SZ", "name": "非 bool DB"}]),
+        }
+    )
+
+    payload = _stock_valuation_metrics_payload("300655.SZ", data_collections=data)
+
+    assert payload["success"] is True
+    assert payload["resolved_symbol"] == "300655.SZ"
+    assert _dq_item(payload, "derived.forward_peg")["status"] == "insufficient_consensus"
 
 
 def test_stock_valuation_metrics_matches_symbol_variants():

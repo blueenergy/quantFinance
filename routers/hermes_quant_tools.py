@@ -36,6 +36,7 @@ MCP 暴露面按 route tag 拆分为 wukong-quant-read 与 wukong-quant-actions�
 """
 
 import asyncio
+import logging
 import os
 import re
 from datetime import datetime, timedelta
@@ -57,6 +58,7 @@ MCP_READ_TAG = "Hermes quant read tools"
 MCP_ACTION_TAG = "Hermes quant action tools"
 
 router = APIRouter(prefix="/hermes-tools")
+logger = logging.getLogger(__name__)
 MCP_ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("MCP_ACCESS_TOKEN_EXPIRE_MINUTES", "43200"))
 
 _FOREIGN_HOLDER_PATTERNS = (
@@ -711,7 +713,7 @@ def _recent_docs_for_valuation(
     date_field: str,
     limit: int,
     projection: Dict[str, int],
-    fields: tuple[str, ...] = ("symbol", "ts_code"),
+    fields: tuple[str, ...] = ("ts_code", "symbol"),
 ) -> List[Dict[str, Any]]:
     if collection is None or not candidates:
         return []
@@ -821,6 +823,39 @@ _VALUATION_MISSING_NOTES = {
     "financial_mainbz": "缺少主营构成(fina_mainbz)，无法做分部收入/SOTP 分析",
 }
 
+_QDE_COMMAND_PREFIX = "cd quant-data-engine && PYTHONPATH=src python -m "
+
+_DATA_QUALITY_STATUS_MUST_FIX = {
+    "missing_collection",
+    "missing_field",
+    "insufficient_history",
+    "insufficient_consensus",
+}
+
+_VALUATION_REPAIR_COMMANDS = {
+    "financial_daily_basic": (
+        _QDE_COMMAND_PREFIX
+        + "quant_data_engine.tasks.run_stock_daily --mode by-stock --codes {symbol} "
+        "--start {start} --end {end} --basic-only"
+    ),
+    "financial_indicator": (
+        _QDE_COMMAND_PREFIX
+        + "quant_data_engine.tasks.run_financial_sync --codes {symbol} "
+        "--start {start} --data-types financial_indicator"
+    ),
+    "financial_income": (
+        _QDE_COMMAND_PREFIX
+        + "quant_data_engine.tasks.run_financial_sync --codes {symbol} "
+        "--start {start} --data-types income"
+    ),
+    "financial_mainbz": (
+        _QDE_COMMAND_PREFIX
+        + "quant_data_engine.tasks.run_financial_sync --codes {symbol} "
+        "--start {start} --data-types mainbz"
+    ),
+    "earnings_report_rc": _QDE_COMMAND_PREFIX + "quant_data_engine.tasks.run_earnings_sync --days 365",
+}
+
 _MAINBZ_TYPE_LABELS = {"P": "按产品", "D": "按地区", "I": "按行业"}
 
 _QUALITY_PROFIT_FIELDS = (
@@ -855,6 +890,85 @@ def _append_quality_missing(missing: List[str], indicator: Dict[str, Any], field
     for field in fields:
         if _to_float_or_none(indicator.get(field)) is None:
             missing.append(f"financial_indicator.{field}")
+
+
+def _valuation_repair_start(*periods: Any, years: int = 2) -> str:
+    latest_year: Optional[int] = None
+    for period in periods:
+        year = _period_year_valuation(period)
+        if year is not None and (latest_year is None or year > latest_year):
+            latest_year = year
+    if latest_year is None:
+        latest_year = datetime.utcnow().year
+    return f"{max(latest_year - years, 2000)}0101"
+
+
+def _valuation_repair_command(
+    collection: str, symbol: str, *, start: str, end: Optional[str] = None
+) -> Optional[str]:
+    template = _VALUATION_REPAIR_COMMANDS.get(collection)
+    if not template:
+        return None
+    return template.format(symbol=symbol, start=start, end=end or datetime.utcnow().strftime("%Y%m%d"))
+
+
+def _data_quality_item(
+    *,
+    metric: str,
+    status: str,
+    problem: str,
+    source_collection: str,
+    required_fields: List[str],
+    affected_output: List[str],
+    symbol: str,
+    start: str,
+    repair_collection: Optional[str] = None,
+    repair_command: Optional[str] = None,
+    end: Optional[str] = None,
+) -> Dict[str, Any]:
+    must_fix = status in _DATA_QUALITY_STATUS_MUST_FIX
+    command = repair_command
+    if command is None and must_fix:
+        command = _valuation_repair_command(
+            repair_collection or source_collection, symbol, start=start, end=end
+        )
+    item: Dict[str, Any] = {
+        "metric": metric,
+        "status": status,
+        "must_fix": must_fix,
+        "problem": problem,
+        "source_collection": source_collection,
+        "required_fields": required_fields,
+        "affected_output": affected_output,
+    }
+    if command:
+        item["repair_command"] = command
+    return item
+
+
+def _data_quality_overall(items: List[Dict[str, Any]]) -> str:
+    must_fix_count = sum(1 for item in items if item.get("must_fix"))
+    if must_fix_count == 0:
+        return "ok"
+    severe = {"missing_collection", "missing_field"}
+    if any(item.get("status") in severe for item in items):
+        return "degraded"
+    return "partial"
+
+
+def _has_at_least_two_forward_q4(consensus_payload: Dict[str, Any], latest_period: Any) -> bool:
+    forecasts = (consensus_payload or {}).get("forecasts_by_quarter") or {}
+    min_year = _latest_completed_fiscal_year(latest_period)
+    years = []
+    for label, row in forecasts.items():
+        if len(str(label)) != 6 or not str(label)[:4].isdigit() or str(label)[4:] != "Q4":
+            continue
+        year = int(str(label)[:4])
+        if min_year is not None and year < min_year:
+            continue
+        if _to_float_or_none((row or {}).get("np_median_wan")) is not None:
+            years.append(year)
+    return len(set(years)) >= 2
 
 
 def _period_year_valuation(period: Any) -> Optional[int]:
@@ -1224,7 +1338,7 @@ def _stock_earnings_consensus_payload(
     if not normalized_symbol:
         return {"success": False, "error": "symbol 不能为空"}
 
-    data = data_collections or data_db
+    data = data_collections if data_collections is not None else data_db
     candidates = _valuation_symbol_candidates(normalized_symbol)
     collection = _collection_from(data, "earnings_report_rc")
     cutoff = (datetime.utcnow() - timedelta(days=lookback_days)).strftime("%Y%m%d")
@@ -1498,7 +1612,7 @@ def _stock_industry_comparison_payload(
     if not normalized_symbol:
         return {"success": False, "error": "symbol 不能为空"}
 
-    data = data_collections or data_db
+    data = data_collections if data_collections is not None else data_db
     stock_info = _collection_from(data, "stock_info")
     candidates = _valuation_symbol_candidates(normalized_symbol)
     info = _latest_stock_info_for_valuation(stock_info, candidates)
@@ -1890,7 +2004,7 @@ def _stock_valuation_metrics_payload(
     if not normalized_symbol:
         return {"success": False, "error": "symbol 不能为空"}
 
-    data = data_collections or data_db
+    data = data_collections if data_collections is not None else data_db
     candidates = _valuation_symbol_candidates(normalized_symbol)
     daily_rows = _recent_docs_for_valuation(
         _collection_from(data, "financial_daily_basic"),
@@ -2109,20 +2223,244 @@ def _stock_valuation_metrics_payload(
         ),
     }
 
+    resolved_symbol = (
+        latest_daily.get("ts_code")
+        or latest_daily.get("symbol")
+        or latest_indicator.get("ts_code")
+        or latest_indicator.get("symbol")
+        or latest_income.get("ts_code")
+        or latest_income.get("symbol")
+        or info.get("ts_code")
+        or info.get("symbol")
+        or normalized_symbol
+    )
+    repair_start = _valuation_repair_start(
+        latest_indicator.get("end_date"), latest_income.get("end_date")
+    )
+    today = datetime.utcnow().strftime("%Y%m%d")
+    data_quality_items: List[Dict[str, Any]] = []
+
+    def add_quality_item(**kwargs: Any) -> None:
+        data_quality_items.append(
+            _data_quality_item(
+                symbol=str(resolved_symbol),
+                start=repair_start,
+                end=today,
+                **kwargs,
+            )
+        )
+
+    if not latest_daily:
+        add_quality_item(
+            metric="market",
+            status="missing_collection",
+            problem="缺少 financial_daily_basic 最新快照，PE/PB/PS/市值与历史分位不可得",
+            source_collection="financial_daily_basic",
+            required_fields=["pe_ttm", "pb", "ps_ttm", "total_mv", "trade_date"],
+            affected_output=["market", "valuation_percentiles", "PEG/PE 交叉验证"],
+        )
+    else:
+        for field, output in (
+            ("ps_ttm", "PS TTM"),
+            ("pe_ttm", "PE TTM / PEG"),
+            ("pb", "PB-ROE 参考"),
+        ):
+            if _to_float_or_none(latest_daily.get(field)) is None:
+                add_quality_item(
+                    metric=f"market.{field}",
+                    status="missing_field",
+                    problem=f"financial_daily_basic 最新快照缺少 {field}",
+                    source_collection="financial_daily_basic",
+                    required_fields=[field],
+                    affected_output=[output],
+                )
+        for field, label in (("ps_ttm", "PS TTM"), ("pe_ttm", "PE TTM"), ("pb", "PB")):
+            if (
+                valuation_percentiles.get(field) is None
+                and _to_float_or_none(latest_daily.get(field)) is not None
+                and len(_clean_numeric([r.get(field) for r in daily_rows])) < 30
+            ):
+                add_quality_item(
+                    metric=f"valuation_percentiles.{field}",
+                    status="insufficient_history",
+                    problem=f"{label} 历史分位需要至少 30 个正值交易日样本，当前样本不足",
+                    source_collection="financial_daily_basic",
+                    required_fields=[field, "trade_date"],
+                    affected_output=[f"{label} 自身历史分位"],
+                )
+
+    indicator_field_outputs = {
+        "rd_exp": ["研发强度", "Rule of 40"],
+        "fcff": ["FCFF margin", "DCF 权重", "FCFF 季节性"],
+        "grossprofit_margin": ["毛利率", "PS 合理性判断"],
+        "netprofit_margin": ["净利率", "Rule of 40"],
+        "q_netprofit_margin": ["利润质量: 单季净利率"],
+        "dtprofit_to_profit": ["利润质量: 扣非净利润占比"],
+        "opincome_of_ebt": ["利润质量: 主业利润占比"],
+        "investincome_of_ebt": ["利润质量: 投资收益占利润总额比"],
+        "salescash_to_or": ["现金流质量: 销售收现比"],
+        "ocf_to_or": ["现金流质量: 经营现金流/营收比"],
+        "ocf_yoy": ["现金流质量: 经营现金流同比"],
+        "fixed_assets": ["资产效率 proxy: 固定资产"],
+        "total_fa_trun": ["资产效率 proxy: 固定资产周转率"],
+        "capitalized_to_da": ["资产效率 proxy: 研发资本化程度"],
+        "roic_yearly": ["资产效率 proxy: 年化 ROIC"],
+    }
+    if not latest_indicator:
+        add_quality_item(
+            metric="financial_indicator",
+            status="missing_collection",
+            problem="缺少 financial_indicator 最新财务指标，研发/利润率/现金流/质量指标不可得",
+            source_collection="financial_indicator",
+            required_fields=list(indicator_field_outputs.keys()),
+            affected_output=["财务质量", "现金流质量", "资产效率", "Rule of 40"],
+        )
+    else:
+        for field, outputs in indicator_field_outputs.items():
+            if _to_float_or_none(latest_indicator.get(field)) is None:
+                add_quality_item(
+                    metric=f"financial_indicator.{field}",
+                    status="missing_field",
+                    problem=f"financial_indicator 最新期缺少 {field}，可能需要回填新增字段",
+                    source_collection="financial_indicator",
+                    required_fields=[field],
+                    affected_output=outputs,
+                )
+        if latest_indicator.get("tr_yoy") is None and latest_indicator.get("or_yoy") is None:
+            add_quality_item(
+                metric="financial.revenue_growth_pct",
+                status="missing_field",
+                problem="financial_indicator 最新期缺少 tr_yoy/or_yoy，收入增速不可得",
+                source_collection="financial_indicator",
+                required_fields=["tr_yoy", "or_yoy"],
+                affected_output=["收入增速", "Rule of 40", "PEG/PS 增速匹配"],
+            )
+
+    if not latest_income:
+        add_quality_item(
+            metric="financial_income",
+            status="missing_collection",
+            problem="缺少 financial_income 最新利润表，营收/净利/投资收益不可得",
+            source_collection="financial_income",
+            required_fields=["revenue", "total_revenue", "n_income_attr_p", "invest_income"],
+            affected_output=["研发强度", "FCFF margin", "归一化 PE TTM", "投资收益科目"],
+        )
+    else:
+        if revenue is None:
+            add_quality_item(
+                metric="financial.revenue_yuan",
+                status="missing_field",
+                problem="financial_income 最新期缺少 revenue/total_revenue",
+                source_collection="financial_income",
+                required_fields=["revenue", "total_revenue"],
+                affected_output=["研发强度", "FCFF margin", "Rule of 40"],
+            )
+        if _to_float_or_none(latest_income.get("invest_income")) is None:
+            add_quality_item(
+                metric="financial.invest_income_yuan",
+                status="missing_field",
+                problem="financial_income 最新期缺少 invest_income，无法量化投资收益科目",
+                source_collection="financial_income",
+                required_fields=["invest_income"],
+                affected_output=["投资收益科目", "利润质量交叉验证"],
+            )
+
+    if normalized_pe_block.get("normalized_pe_ttm") is None:
+        if ttm_income_info is None:
+            add_quality_item(
+                metric="derived.normalized_pe_ttm",
+                status="insufficient_history",
+                problem="归一化 PE TTM 需要最近季度、去年年报、去年同期季度的 n_income_attr_p，当前利润表期数不足或净利为非正",
+                source_collection="financial_income",
+                required_fields=["n_income_attr_p", "end_date"],
+                affected_output=["归一化 PE TTM", "失真当期 PE 的交叉验证"],
+            )
+        elif _to_float_or_none(latest_daily.get("total_mv")) is None:
+            add_quality_item(
+                metric="derived.normalized_pe_ttm",
+                status="missing_field",
+                problem="已有 TTM 净利但缺少 total_mv，无法计算归一化 PE",
+                source_collection="financial_daily_basic",
+                required_fields=["total_mv"],
+                affected_output=["归一化 PE TTM"],
+            )
+
+    if forward_peg is None:
+        if not _has_at_least_two_forward_q4(consensus_payload, latest_indicator.get("end_date")):
+            add_quality_item(
+                metric="derived.forward_peg",
+                status="insufficient_consensus",
+                problem="前瞻 PEG 需要至少两个 Q4 全年一致预期净利中位数，当前 consensus 样本不足",
+                source_collection="earnings_report_rc",
+                required_fields=["quarter", "np", "report_date", "org_name"],
+                affected_output=["前瞻 PE", "前瞻 PEG"],
+                repair_collection="earnings_report_rc",
+            )
+        else:
+            add_quality_item(
+                metric="derived.forward_peg",
+                status="not_applicable",
+                problem="一致预期增速或前瞻 PE 为非正，PEG 口径当前不适用",
+                source_collection="earnings_report_rc",
+                required_fields=["quarter", "np"],
+                affected_output=["前瞻 PEG"],
+                repair_command=None,
+            )
+
+    if not segments.get("by_type"):
+        add_quality_item(
+            metric="segments",
+            status="missing_collection",
+            problem="缺少 financial_mainbz 主营构成，无法输出分部收入占比与分部增速",
+            source_collection="financial_mainbz",
+            required_fields=["bz_type", "bz_item", "bz_sales", "end_date"],
+            affected_output=["分部收入占比", "segments_series", "SOTP 输入"],
+        )
+
+    # 仅当利润质量判断所需字段齐全且确实未触发时才标 not_triggered；
+    # 字段缺失的情况已由对应 missing_field 项覆盖，避免“缺数据”与“已评估未触发”口径冲突。
+    profit_fields_complete = bool(latest_indicator) and all(
+        _to_float_or_none(latest_indicator.get(field)) is not None
+        for field in _QUALITY_PROFIT_FIELDS
+    )
+    if profit_quality_alert is None and profit_fields_complete:
+        add_quality_item(
+            metric="derived.profit_quality_alert",
+            status="not_triggered",
+            problem="利润质量字段齐全，未触发投资收益占比过高、扣非占比过低或单季净利率异常等告警",
+            source_collection="financial_indicator",
+            required_fields=list(_QUALITY_PROFIT_FIELDS),
+            affected_output=["利润质量告警"],
+            repair_command=None,
+        )
+    if fcff_seasonality_note is None and fcff_series_vals:
+        add_quality_item(
+            metric="derived.fcff_seasonality_note",
+            status="not_triggered",
+            problem="未触发 FCFF 季节性或结构性现金流压力提示",
+            source_collection="financial_indicator",
+            required_fields=["fcff"],
+            affected_output=["FCFF 季节性说明"],
+            repair_command=None,
+        )
+
+    data_quality = {
+        "overall": _data_quality_overall(data_quality_items),
+        "items": data_quality_items,
+        "summary": {
+            "must_fix_count": sum(1 for item in data_quality_items if item.get("must_fix")),
+            "info_count": sum(1 for item in data_quality_items if not item.get("must_fix")),
+        },
+        "status_note": (
+            "missing_collection/missing_field/insufficient_history/insufficient_consensus 需要补数；"
+            "not_triggered/not_applicable 不应进入缺失清单"
+        ),
+    }
+
     return {
         "success": True,
         "symbol": normalized_symbol,
-        "resolved_symbol": (
-            latest_daily.get("ts_code")
-            or latest_daily.get("symbol")
-            or latest_indicator.get("ts_code")
-            or latest_indicator.get("symbol")
-            or latest_income.get("ts_code")
-            or latest_income.get("symbol")
-            or info.get("ts_code")
-            or info.get("symbol")
-            or normalized_symbol
-        ),
+        "resolved_symbol": resolved_symbol,
         "name": info.get("name", ""),
         "industry": info.get("industry", ""),
         "sw_industry": {
@@ -2219,6 +2557,7 @@ def _stock_valuation_metrics_payload(
         },
         "missing": missing,
         "missing_notes": missing_notes,
+        "data_quality": data_quality,
         "source": (
             "quant_data.financial_daily_basic + financial_indicator + financial_income + "
             "financial_mainbz + stock_info; Hermes MCP read-only valuation metrics"
@@ -2238,7 +2577,12 @@ async def stock_valuation_metrics(
     financial_income 和 stock_info，返回 PS、研发强度、FCFF margin、收入增速、
     毛利率/净利率及 Rule of 40 粗值。缺字段进入 missing，不让 LLM 猜。
     """
-    return _stock_valuation_metrics_payload(symbol)
+    try:
+        return _stock_valuation_metrics_payload(symbol)
+    except Exception:
+        # 临时诊断日志：保留原 500 行为，但把真实 traceback 打到 quant-api 日志。
+        logger.exception("stock_valuation_metrics failed symbol=%s", symbol)
+        raise
 
 
 @router.get("/stock/earnings-consensus", operation_id="stock_earnings_consensus", tags=[MCP_READ_TAG])
