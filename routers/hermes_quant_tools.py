@@ -933,6 +933,61 @@ def _normalized_pe_from_ttm(
     }
 
 
+def _peg_or_none(
+    pe: Optional[Any], growth_pct: Optional[Any], *, digits: int = 4
+) -> Optional[float]:
+    """PEG = PE / 增速(%)。PE<=0 或 增速<=0 时返回 None（PEG 无意义）。"""
+    pe_v = _to_float_or_none(pe)
+    growth = _to_float_or_none(growth_pct)
+    if pe_v is None or pe_v <= 0 or growth is None or growth <= 0:
+        return None
+    return round(pe_v / growth, digits)
+
+
+def _latest_completed_fiscal_year(period: Optional[Any]) -> Optional[int]:
+    """Return latest completed fiscal year implied by a financial report period."""
+    text = str(period or "").strip()
+    if len(text) < 8 or not text[:4].isdigit():
+        return None
+    year = int(text[:4])
+    return year if text[4:8] == "1231" else year - 1
+
+
+def _forward_growth_from_consensus(
+    consensus: Dict[str, Any], *, latest_period: Optional[Any] = None
+) -> Optional[Dict[str, Any]]:
+    """从一致预期取最近两个预测财年的净利增速。
+
+    forecasts_by_quarter 形如 {"2025Q4": {"np_median_wan": ...}, ...}，
+    只取 Q4 全年预测，并从最新已完成财年开始取最近两个预测财年。
+    """
+    forecasts = (consensus or {}).get("forecasts_by_quarter") or {}
+    min_year = _latest_completed_fiscal_year(latest_period)
+    np_by_year: List[tuple[int, str, float]] = []
+    for label in sorted(forecasts.keys()):
+        if len(label) != 6 or not label[:4].isdigit() or label[4:] != "Q4":
+            continue
+        year = int(label[:4])
+        if min_year is not None and year < min_year:
+            continue
+        np_med = _to_float_or_none((forecasts.get(label) or {}).get("np_median_wan"))
+        if np_med is not None:
+            np_by_year.append((year, label, np_med))
+    if len(np_by_year) < 2:
+        return None
+    (_, cur_label, cur_np), (_, next_label, next_np) = sorted(np_by_year)[:2]
+    if cur_np <= 0:
+        return None
+    growth_pct = round((next_np - cur_np) / abs(cur_np) * 100, 2)
+    return {
+        "cur_year": cur_label,
+        "next_year": next_label,
+        "cur_np_wan": round(cur_np, 2),
+        "next_np_wan": round(next_np, 2),
+        "growth_pct": growth_pct,
+    }
+
+
 def _profit_quality_alert(indicator: Dict[str, Any]) -> Optional[str]:
     if not indicator:
         return None
@@ -1436,6 +1491,8 @@ def _stock_industry_comparison_payload(
     level: str = "sw_l2",
     data_collections: Any = None,
     min_peer_count: int = 5,
+    peer_symbols: Optional[List[str]] = None,
+    named_peer_limit: int = 5,
 ) -> Dict[str, Any]:
     normalized_symbol = str(symbol or "").strip().upper()
     if not normalized_symbol:
@@ -1533,6 +1590,7 @@ def _stock_industry_comparison_payload(
             "grossprofit_margin": 1,
             "tr_yoy": 1,
             "or_yoy": 1,
+            "netprofit_yoy": 1,
         },
     )
     daily_as_of = str(daily_target_rows[0].get("trade_date")) if daily_target_rows else None
@@ -1583,6 +1641,7 @@ def _stock_industry_comparison_payload(
                 "grossprofit_margin": 1,
                 "tr_yoy": 1,
                 "or_yoy": 1,
+                "netprofit_yoy": 1,
             },
         )
         if indicator_as_of
@@ -1603,6 +1662,13 @@ def _stock_industry_comparison_payload(
             else row.get("or_yoy"),
         }
 
+    # PEG(历史) = pe_ttm / netprofit_yoy，逐个体计算后再统计中位数/分位。
+    peg_rows: Dict[str, Dict[str, Any]] = {}
+    for sym in set(daily_rows_by_symbol) | set(indicator_rows_by_symbol):
+        pe = (daily_rows_by_symbol.get(sym) or {}).get("pe_ttm")
+        growth = (indicator_rows_by_symbol.get(sym) or {}).get("netprofit_yoy")
+        peg_rows[sym] = {"peg": _peg_or_none(pe, growth)}
+
     metrics = {
         "market": {
             "pe_ttm": _peer_metric_summary(
@@ -1613,6 +1679,9 @@ def _stock_industry_comparison_payload(
             ),
             "ps_ttm": _peer_metric_summary(
                 daily_rows_by_symbol, target_symbol, "ps_ttm", min_peer_count=min_peer_count
+            ),
+            "peg": _peer_metric_summary(
+                peg_rows, target_symbol, "peg", min_peer_count=min_peer_count
             ),
             "total_mv_wan": _peer_metric_summary(
                 daily_rows_by_symbol, target_symbol, "total_mv", min_peer_count=min_peer_count, digits=2
@@ -1654,6 +1723,117 @@ def _stock_industry_comparison_payload(
         },
     }
 
+    # 点名同业并排对比：默认取同行业市值最大的 Top N，传 peer_symbols 则用指定名单。
+    name_by_symbol: Dict[str, str] = {}
+    for row in peer_info_rows:
+        sid = _stock_identifier(row)
+        if sid:
+            name_by_symbol[sid] = str(row.get("name") or "")
+
+    def _named_peer_entry(sym: str) -> Dict[str, Any]:
+        daily = daily_rows_by_symbol.get(sym) or {}
+        ind = indicator_rows_by_symbol.get(sym) or {}
+        pe = daily.get("pe_ttm")
+        growth = ind.get("netprofit_yoy")
+        rev_growth = (
+            ind.get("tr_yoy") if ind.get("tr_yoy") is not None else ind.get("or_yoy")
+        )
+        return {
+            "symbol": sym,
+            "name": name_by_symbol.get(sym, ""),
+            "trade_date": daily.get("trade_date"),
+            "end_date": ind.get("end_date"),
+            "pe_ttm": _round_or_none(pe, 4),
+            "ps_ttm": _round_or_none(daily.get("ps_ttm"), 4),
+            "pb": _round_or_none(daily.get("pb"), 4),
+            "peg": _peg_or_none(pe, growth),
+            "net_margin_pct": _round_or_none(ind.get("netprofit_margin"), 2),
+            "netprofit_yoy_pct": _round_or_none(growth, 2),
+            "revenue_growth_pct": _round_or_none(rev_growth, 2),
+            "total_mv_wan": _round_or_none(daily.get("total_mv"), 2),
+        }
+
+    def _resolve_named_peer(raw_symbol: str) -> Optional[str]:
+        cands = _valuation_symbol_candidates(raw_symbol)
+        if not cands:
+            return None
+        info_row = _latest_stock_info_for_valuation(stock_info, cands)
+        sid = _stock_identifier(info_row) if info_row else None
+        lookup = ([sid] if sid else []) + cands
+        d_rows = _recent_docs_for_valuation(
+            _collection_from(data, "financial_daily_basic"),
+            lookup,
+            date_field="trade_date",
+            limit=1,
+            projection={
+                "_id": 0,
+                "symbol": 1,
+                "ts_code": 1,
+                "trade_date": 1,
+                "pe_ttm": 1,
+                "pb": 1,
+                "ps_ttm": 1,
+                "total_mv": 1,
+            },
+        )
+        i_rows = _recent_docs_for_valuation(
+            _collection_from(data, "financial_indicator"),
+            lookup,
+            date_field="end_date",
+            limit=1,
+            projection={
+                "_id": 0,
+                "symbol": 1,
+                "ts_code": 1,
+                "end_date": 1,
+                "netprofit_margin": 1,
+                "tr_yoy": 1,
+                "or_yoy": 1,
+                "netprofit_yoy": 1,
+            },
+        )
+        resolved = (
+            sid
+            or (_stock_identifier(d_rows[0]) if d_rows else None)
+            or (_stock_identifier(i_rows[0]) if i_rows else None)
+            or str(raw_symbol).strip().upper()
+        )
+        if d_rows:
+            daily_rows_by_symbol.setdefault(resolved, d_rows[0])
+        if i_rows:
+            indicator_rows_by_symbol.setdefault(resolved, i_rows[0])
+        if info_row and resolved not in name_by_symbol:
+            name_by_symbol[resolved] = str(info_row.get("name") or "")
+        return resolved
+
+    named_peers_source = "top_market_cap"
+    named_symbols: List[str] = []
+    if peer_symbols:
+        named_peers_source = "peer_symbols"
+        for raw in peer_symbols:
+            resolved = _resolve_named_peer(raw)
+            if resolved and resolved != target_symbol and resolved not in named_symbols:
+                named_symbols.append(resolved)
+    else:
+        ranked = sorted(
+            (
+                s
+                for s in peer_stock_symbols
+                if s != target_symbol
+                and _to_float_or_none((daily_rows_by_symbol.get(s) or {}).get("total_mv"))
+                is not None
+            ),
+            key=lambda s: _to_float_or_none(
+                (daily_rows_by_symbol.get(s) or {}).get("total_mv")
+            )
+            or 0.0,
+            reverse=True,
+        )
+        named_symbols = ranked[:named_peer_limit]
+
+    named_peers = [_named_peer_entry(sym) for sym in named_symbols]
+    target_snapshot = _named_peer_entry(target_symbol)
+
     notes: List[str] = []
     if len(peer_stock_symbols) < min_peer_count:
         notes.append(f"同业股票数少于 {min_peer_count}，分位与中位数返回 null")
@@ -1676,10 +1856,20 @@ def _stock_industry_comparison_payload(
             "financial_period": indicator_as_of,
         },
         "metrics": metrics,
+        "target_snapshot": target_snapshot,
+        "named_peers": named_peers,
+        "named_peers_source": named_peers_source,
+        "named_peers_note": (
+            "named_peers 为点名同业并排：默认取同行业市值最大的 Top N，"
+            "传 peer_symbols 则用指定名单(可跨行业)；peg 为历史 PE_ttm/净利同比，"
+            "前瞻 PEG 仅在 stock_valuation_metrics(目标股) 提供；"
+            "每行 trade_date/end_date 为该同业自身最新快照口径"
+        ),
         "notes": notes,
         "percentile_note": (
             "peer_percentile 为目标值在同业横截面中的分位(0-100，含自身)；"
-            "估值倍数/市值仅统计正值，ROE/利润率/收入增速含负值"
+            "估值倍数/市值/PEG 仅统计正值，ROE/利润率/收入增速含负值；"
+            "PEG=PE_ttm/净利同比，净利增速<=0 的个体不计入"
         ),
         "source": (
             "quant_data.stock_info + financial_daily_basic + financial_indicator; "
@@ -1890,6 +2080,23 @@ def _stock_valuation_metrics_payload(
     profit_quality_alert = _profit_quality_alert(latest_indicator)
     fcff_seasonality_note = _fcff_seasonality_note(series)
 
+    pe_ttm_val = _to_float_or_none(latest_daily.get("pe_ttm"))
+    netprofit_yoy_val = _to_float_or_none(latest_indicator.get("netprofit_yoy"))
+    peg_hist = _peg_or_none(pe_ttm_val, netprofit_yoy_val)
+
+    consensus_payload = _stock_earnings_consensus_payload(normalized_symbol, data_collections=data)
+    forward_growth = _forward_growth_from_consensus(
+        consensus_payload, latest_period=latest_indicator.get("end_date")
+    )
+    total_mv_wan_val = _to_float_or_none(latest_daily.get("total_mv"))
+    forward_pe = None
+    forward_peg = None
+    if forward_growth is not None and total_mv_wan_val and total_mv_wan_val > 0:
+        cur_np_wan = forward_growth.get("cur_np_wan")
+        if cur_np_wan and cur_np_wan > 0:
+            forward_pe = round(total_mv_wan_val / cur_np_wan, 4)
+            forward_peg = _peg_or_none(forward_pe, forward_growth.get("growth_pct"))
+
     valuation_percentiles = {
         "pe_ttm": _percentile_rank_or_none(
             [r.get("pe_ttm") for r in daily_rows], _to_float_or_none(latest_daily.get("pe_ttm"))
@@ -1971,6 +2178,20 @@ def _stock_valuation_metrics_payload(
             "fcff_sample_periods": len(fcff_series_vals),
             "profit_quality_alert": profit_quality_alert,
             "fcff_seasonality_note": fcff_seasonality_note,
+            "peg_hist": peg_hist,
+            "peg_hist_note": (
+                "PEG(历史) = market.pe_ttm / financial.netprofit_yoy_pct；"
+                "PE<=0 或净利增速<=0 时为 null"
+            ),
+            "forward_pe": forward_pe,
+            "forward_peg": forward_peg,
+            "forward_growth": forward_growth,
+            "forward_peg_note": (
+                "forward_pe = 总市值 / 最近预测财年一致净利(中位数)；"
+                "forward_peg = forward_pe / 一致净利增速(%)；"
+                "增速取最新已完成财年起最近两个 Q4 全年一致净利中位数；"
+                "无一致预期时为 null"
+            ),
             **normalized_pe_block,
         },
         "series": series,
@@ -2042,15 +2263,32 @@ async def stock_industry_comparison(
     min_peer_count: int = Query(
         5, ge=2, le=100, description="计算中位数/分位所需的最少同业样本数，低于该值返回 null"
     ),
+    peer_symbols: Optional[str] = Query(
+        None,
+        description="点名同业并排对比的代码，逗号分隔，如 603039.SH,600588.SH；留空则取同行业市值 Top N",
+    ),
+    named_peer_limit: int = Query(
+        5, ge=1, le=20, description="未指定 peer_symbols 时，按市值返回的点名同业数量"
+    ),
     _: bool = Depends(require_hermes_quant_internal_key),
 ):
     """
     获取单股相对同业的估值与财务指标分位。
 
     使用 stock_info 的申万/行业字段确定同业集合，并在目标股最新交易日/财报期
-    上计算 PE/PB/PS、市值、ROE、利润率、收入增速的行业横截面分位。
+    上计算 PE/PB/PS/PEG、市值、ROE、利润率、收入增速的行业横截面分位；
+    named_peers 额外给出点名同业(默认市值 Top N 或 peer_symbols 指定)的并排数值。
     """
-    return _stock_industry_comparison_payload(symbol, level=level, min_peer_count=min_peer_count)
+    parsed_peer_symbols = (
+        [s.strip() for s in peer_symbols.split(",") if s.strip()] if peer_symbols else None
+    )
+    return _stock_industry_comparison_payload(
+        symbol,
+        level=level,
+        min_peer_count=min_peer_count,
+        peer_symbols=parsed_peer_symbols,
+        named_peer_limit=named_peer_limit,
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -705,6 +705,168 @@ def test_stock_industry_comparison_returns_null_when_peer_sample_is_small():
     assert relaxed["notes"][0:1] != ["同业股票数少于 5，分位与中位数返回 null"]
 
 
+def test_stock_valuation_metrics_computes_peg_and_forward_peg():
+    data = {
+        "financial_daily_basic": _Collection(
+            [{"ts_code": "688111.SH", "trade_date": "20260619", "pe_ttm": 40.0, "total_mv": 100_000.0}]
+        ),
+        "financial_indicator": _Collection(
+            [{"ts_code": "688111.SH", "end_date": "20260331", "netprofit_yoy": 20.0, "tr_yoy": 24.0}]
+        ),
+        "financial_income": _Collection(
+            [{"ts_code": "688111.SH", "end_date": "20260331", "revenue": 1_000.0}]
+        ),
+        "stock_info": _Collection([{"ts_code": "688111.SH", "name": "PEG样本"}]),
+        "financial_mainbz": _Collection([]),
+        "earnings_report_rc": _Collection(
+            [
+                {
+                    "ts_code": "688111.SH",
+                    "report_date": "20260601",
+                    "org_name": "机构A",
+                    "quarter": "2024Q4",
+                    "np": 4_000.0,
+                },
+                {
+                    "ts_code": "688111.SH",
+                    "report_date": "20260601",
+                    "org_name": "机构A",
+                    "quarter": "2025Q4",
+                    "np": 5_000.0,
+                },
+                {
+                    "ts_code": "688111.SH",
+                    "report_date": "20260601",
+                    "org_name": "机构A",
+                    "quarter": "2026Q4",
+                    "np": 6_000.0,
+                },
+            ]
+        ),
+    }
+
+    payload = _stock_valuation_metrics_payload("688111.SH", data_collections=data)
+
+    # peg_hist = pe_ttm / netprofit_yoy = 40 / 20
+    assert payload["derived"]["peg_hist"] == pytest.approx(2.0)
+    # forward_pe = 总市值(万) / 最近预测财年一致净利(万) = 100000 / 5000
+    assert payload["derived"]["forward_growth"]["cur_year"] == "2025Q4"
+    assert payload["derived"]["forward_growth"]["next_year"] == "2026Q4"
+    assert payload["derived"]["forward_growth"]["growth_pct"] == pytest.approx(20.0)
+    assert payload["derived"]["forward_pe"] == pytest.approx(20.0)
+    assert payload["derived"]["forward_peg"] == pytest.approx(1.0)
+
+
+def test_stock_industry_comparison_computes_peg_and_named_peers():
+    symbols = [f"68830{i}.SH" for i in range(1, 6)]
+    data = {
+        "stock_info": _Collection(
+            [
+                {
+                    "ts_code": ts_code,
+                    "name": f"软件{i}",
+                    "industry": "软件开发",
+                    "sw_l1": "计算机",
+                    "sw_l2": "软件开发",
+                }
+                for i, ts_code in enumerate(symbols, start=1)
+            ]
+        ),
+        "financial_daily_basic": _Collection(
+            [
+                {
+                    "ts_code": ts_code,
+                    "trade_date": "20260619",
+                    "pe_ttm": 20 + i,
+                    "ps_ttm": 3 + i,
+                    "total_mv": 100_000 + i * 10_000,
+                }
+                for i, ts_code in enumerate(symbols)
+            ]
+        ),
+        "financial_indicator": _Collection(
+            [
+                {
+                    "ts_code": ts_code,
+                    "end_date": "20260331",
+                    "netprofit_yoy": 10.0,
+                    "netprofit_margin": 12 + i,
+                    "tr_yoy": 15 + i,
+                }
+                for i, ts_code in enumerate(symbols)
+            ]
+        ),
+    }
+
+    payload = _stock_industry_comparison_payload("688303.SH", data_collections=data)
+
+    # 目标 688303 → pe_ttm 22, netprofit_yoy 10 → peg 2.2；同业 peg 中位数 2.2
+    assert payload["metrics"]["market"]["peg"]["value"] == pytest.approx(2.2)
+    assert payload["metrics"]["market"]["peg"]["peer_median"] == pytest.approx(2.2)
+    # 默认点名取市值 Top N，排除目标自身，共 4 个，市值最大者在前
+    assert payload["named_peers_source"] == "top_market_cap"
+    assert len(payload["named_peers"]) == 4
+    top = payload["named_peers"][0]
+    assert top["symbol"] == "688305.SH"
+    assert top["ps_ttm"] == pytest.approx(7.0)
+    assert top["peg"] == pytest.approx(2.4)
+    assert all(p["symbol"] != "688303.SH" for p in payload["named_peers"])
+
+
+def test_stock_industry_comparison_named_peers_by_explicit_symbols():
+    symbols = [f"68830{i}.SH" for i in range(1, 6)]
+    data = {
+        "stock_info": _Collection(
+            [
+                {
+                    "ts_code": ts_code,
+                    "name": f"软件{i}",
+                    "industry": "软件开发",
+                    "sw_l1": "计算机",
+                    "sw_l2": "软件开发",
+                }
+                for i, ts_code in enumerate(symbols, start=1)
+            ]
+        ),
+        "financial_daily_basic": _Collection(
+            [
+                {
+                    "ts_code": ts_code,
+                    "trade_date": "20260620" if ts_code == "688305.SH" else "20260618",
+                    "pe_ttm": 20 + i,
+                    "ps_ttm": 3 + i,
+                    "total_mv": 100_000 + i * 10_000,
+                }
+                for i, ts_code in enumerate(symbols)
+            ]
+        ),
+        "financial_indicator": _Collection(
+            [
+                {
+                    "ts_code": ts_code,
+                    "end_date": "20251231" if ts_code == "688301.SH" else "20260331",
+                    "netprofit_yoy": 10.0,
+                }
+                for ts_code in symbols
+            ]
+        ),
+    }
+
+    payload = _stock_industry_comparison_payload(
+        "688303.SH", data_collections=data, peer_symbols=["688305.SH", "688301.SH"]
+    )
+
+    assert payload["named_peers_source"] == "peer_symbols"
+    named = {p["symbol"]: p for p in payload["named_peers"]}
+    assert set(named) == {"688305.SH", "688301.SH"}
+    assert named["688305.SH"]["peg"] == pytest.approx(2.4)
+    assert named["688305.SH"]["trade_date"] == "20260620"
+    assert named["688305.SH"]["end_date"] == "20260331"
+    assert named["688301.SH"]["peg"] == pytest.approx(2.0)
+    assert named["688301.SH"]["trade_date"] == "20260618"
+    assert named["688301.SH"]["end_date"] == "20251231"
+
+
 def test_foreign_top10_floatholders_matches_default_banks(monkeypatch):
     collection = _Collection(
         [
