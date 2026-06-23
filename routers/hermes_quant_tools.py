@@ -804,12 +804,56 @@ _VALUATION_MISSING_NOTES = {
     "financial_indicator.grossprofit_margin": "缺少毛利率，盈利质量画像不完整",
     "financial_indicator.netprofit_margin": "缺少净利率，无法算 Rule of 40(净利口径)",
     "financial_indicator.tr_yoy/or_yoy": "缺少收入同比，无法判断成长性",
+    "financial_indicator.q_netprofit_margin": "缺少单季度净利率，无法交叉验证异常净利率",
+    "financial_indicator.dtprofit_to_profit": "缺少扣非净利润占比，无法判断利润质量",
+    "financial_indicator.opincome_of_ebt": "缺少营业利润/利润总额比，无法判断主业利润占比",
+    "financial_indicator.investincome_of_ebt": "缺少投资收益/利润总额比，无法识别非主业利润贡献",
+    "financial_indicator.salescash_to_or": "缺少销售收现比，无法判断收入变现质量",
+    "financial_indicator.ocf_to_or": "缺少经营现金流/营收比，无法判断现金流质量",
+    "financial_indicator.ocf_yoy": "缺少经营现金流同比，无法判断现金流趋势",
+    "financial_indicator.fixed_assets": "缺少固定资产，无法做资产效率 proxy 分析",
+    "financial_indicator.total_fa_trun": "缺少固定资产周转率，无法做资产效率分析",
+    "financial_indicator.capitalized_to_da": "缺少资本化/折旧摊销比，无法判断研发资本化程度",
+    "financial_indicator.roic_yearly": "缺少年化 ROIC，无法做投入资本回报分析",
     "financial_income": "缺少利润表，无法取营收用于研发强度/FCFF margin",
     "financial_income.revenue/total_revenue": "缺少营收，研发强度与 FCFF margin 无法计算",
     "financial_mainbz": "缺少主营构成(fina_mainbz)，无法做分部收入/SOTP 分析",
 }
 
 _MAINBZ_TYPE_LABELS = {"P": "按产品", "D": "按地区", "I": "按行业"}
+
+_QUALITY_PROFIT_FIELDS = (
+    "q_netprofit_margin",
+    "dtprofit_to_profit",
+    "opincome_of_ebt",
+    "investincome_of_ebt",
+)
+_QUALITY_CASH_FLOW_FIELDS = ("salescash_to_or", "ocf_to_or", "ocf_yoy")
+_QUALITY_ASSET_EFFICIENCY_FIELDS = (
+    "fixed_assets",
+    "total_fa_trun",
+    "capitalized_to_da",
+    "roic_yearly",
+)
+_QUALITY_NOTES = (
+    "profit_quality: 单季净利率/扣非比/利润结构用于交叉验证异常净利率与非经常性损益；"
+    "cash_flow_quality: 销售收现比与经营现金流/营收比偏低时应降权利润表口径；"
+    "asset_efficiency: fixed_assets/total_fa_trun 仅为资产效率 proxy，不得直接断言为产能利用率"
+)
+
+
+def _quality_metric_block(
+    indicator: Dict[str, Any], fields: tuple[str, ...], *, digits: int = 4
+) -> Dict[str, Any]:
+    return {field: _round_or_none(indicator.get(field), digits) for field in fields}
+
+
+def _append_quality_missing(missing: List[str], indicator: Dict[str, Any], fields: tuple[str, ...]) -> None:
+    if not indicator:
+        return
+    for field in fields:
+        if _to_float_or_none(indicator.get(field)) is None:
+            missing.append(f"financial_indicator.{field}")
 
 
 def _mainbz_segments_for_valuation(
@@ -1314,6 +1358,17 @@ def _stock_valuation_metrics_payload(
             "tr_yoy": 1,
             "or_yoy": 1,
             "debt_to_assets": 1,
+            "q_netprofit_margin": 1,
+            "dtprofit_to_profit": 1,
+            "opincome_of_ebt": 1,
+            "investincome_of_ebt": 1,
+            "salescash_to_or": 1,
+            "ocf_to_or": 1,
+            "ocf_yoy": 1,
+            "fixed_assets": 1,
+            "total_fa_trun": 1,
+            "capitalized_to_da": 1,
+            "roic_yearly": 1,
         },
     )
     income_rows = _recent_docs_for_valuation(
@@ -1389,6 +1444,10 @@ def _stock_valuation_metrics_payload(
         missing.append("financial_income")
     elif revenue is None:
         missing.append("financial_income.revenue/total_revenue")
+
+    _append_quality_missing(missing, latest_indicator, _QUALITY_PROFIT_FIELDS)
+    _append_quality_missing(missing, latest_indicator, _QUALITY_CASH_FLOW_FIELDS)
+    _append_quality_missing(missing, latest_indicator, _QUALITY_ASSET_EFFICIENCY_FIELDS)
 
     segments = _mainbz_segments_for_valuation(_collection_from(data, "financial_mainbz"), candidates)
     if not segments.get("by_type"):
@@ -1517,6 +1576,12 @@ def _stock_valuation_metrics_payload(
             "当前 PE/PB/PS(TTM) 在自身近 "
             f"{len(daily_rows)} 个交易日历史中的分位(0-100)，样本不足 30 返回 null"
         ),
+        "quality": {
+            "profit_quality": _quality_metric_block(latest_indicator, _QUALITY_PROFIT_FIELDS),
+            "cash_flow_quality": _quality_metric_block(latest_indicator, _QUALITY_CASH_FLOW_FIELDS),
+            "asset_efficiency": _quality_metric_block(latest_indicator, _QUALITY_ASSET_EFFICIENCY_FIELDS, digits=2),
+        },
+        "quality_notes": _QUALITY_NOTES,
         "samples": {
             "indicator_count": len(indicator_rows),
             "income_count": len(income_rows),

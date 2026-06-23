@@ -86,6 +86,17 @@ def test_stock_valuation_metrics_builds_tech_fields_from_existing_collections():
                     "tr_yoy": 28.0,
                     "netprofit_yoy": 30.0,
                     "debt_to_assets": 32.0,
+                    "q_netprofit_margin": 17.5,
+                    "dtprofit_to_profit": 98.5,
+                    "opincome_of_ebt": 95.0,
+                    "investincome_of_ebt": 2.0,
+                    "salescash_to_or": 1.05,
+                    "ocf_to_or": 0.35,
+                    "ocf_yoy": 12.0,
+                    "fixed_assets": 500_000_000.0,
+                    "total_fa_trun": 2.5,
+                    "capitalized_to_da": 0.8,
+                    "roic_yearly": 11.0,
                 }
             ]
         ),
@@ -130,6 +141,10 @@ def test_stock_valuation_metrics_builds_tech_fields_from_existing_collections():
     assert payload["derived"]["fcff_margin_pct"] == pytest.approx(8.0)
     assert payload["derived"]["rule_of_40_net_margin"] == pytest.approx(46.0)
     assert payload["derived"]["rule_of_40_fcff_margin"] == pytest.approx(36.0)
+    assert payload["quality"]["profit_quality"]["q_netprofit_margin"] == pytest.approx(17.5)
+    assert payload["quality"]["cash_flow_quality"]["ocf_to_or"] == pytest.approx(0.35)
+    assert payload["quality"]["asset_efficiency"]["roic_yearly"] == pytest.approx(11.0)
+    assert payload["quality_notes"]
     assert payload["missing"] == []
     assert payload["missing_notes"] == {}
     assert payload["series"][0]["period"] == "20260331"
@@ -246,6 +261,33 @@ def test_stock_valuation_metrics_computes_history_percentiles():
     assert len(payload["series"]) == 2
     assert payload["derived"]["fcff_positive_periods"] == 1
     assert payload["derived"]["fcff_sample_periods"] == 2
+
+
+def test_stock_valuation_metrics_marks_missing_quality_fields():
+    data = {
+        "financial_daily_basic": _Collection(
+            [{"ts_code": "688010.SH", "trade_date": "20260619", "ps_ttm": 7.0}]
+        ),
+        "financial_indicator": _Collection(
+            [{"ts_code": "688010.SH", "end_date": "20260331", "netprofit_margin": 15.0, "tr_yoy": 10.0}]
+        ),
+        "financial_income": _Collection(
+            [{"ts_code": "688010.SH", "end_date": "20260331", "revenue": 1_000.0}]
+        ),
+        "stock_info": _Collection([{"ts_code": "688010.SH", "name": "质量缺字段"}]),
+        "financial_mainbz": _Collection(
+            [{"ts_code": "688010.SH", "end_date": "20260331", "bz_type": "P", "bz_item": "软件", "bz_sales": 1_000.0}]
+        ),
+    }
+
+    payload = _stock_valuation_metrics_payload("688010.SH", data_collections=data)
+
+    assert payload["success"] is True
+    assert payload["quality"]["profit_quality"]["q_netprofit_margin"] is None
+    assert "financial_indicator.q_netprofit_margin" in payload["missing"]
+    assert "financial_indicator.ocf_to_or" in payload["missing"]
+    assert "financial_indicator.fixed_assets" in payload["missing"]
+    assert payload["missing_notes"]["financial_indicator.q_netprofit_margin"]
 
 
 def test_stock_valuation_metrics_degrades_with_missing_fields():
