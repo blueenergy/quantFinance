@@ -806,7 +806,75 @@ _VALUATION_MISSING_NOTES = {
     "financial_indicator.tr_yoy/or_yoy": "缺少收入同比，无法判断成长性",
     "financial_income": "缺少利润表，无法取营收用于研发强度/FCFF margin",
     "financial_income.revenue/total_revenue": "缺少营收，研发强度与 FCFF margin 无法计算",
+    "financial_mainbz": "缺少主营构成(fina_mainbz)，无法做分部收入/SOTP 分析",
 }
+
+_MAINBZ_TYPE_LABELS = {"P": "按产品", "D": "按地区", "I": "按行业"}
+
+
+def _mainbz_segments_for_valuation(
+    collection: Any, candidates: List[str], *, limit: int = 300
+) -> Dict[str, Any]:
+    """读取最新一期主营构成，按 P/D/I 维度归一化为分部收入占比。
+
+    占比以该维度内 bz_sales 净额(含抵消负项)为分母，使各项占比之和约等于 100；
+    分母 <= 0 时不输出占比。无数据返回空结构。
+    """
+    rows = _recent_docs_for_valuation(
+        collection,
+        candidates,
+        date_field="end_date",
+        limit=limit,
+        projection={
+            "_id": 0,
+            "symbol": 1,
+            "ts_code": 1,
+            "end_date": 1,
+            "bz_type": 1,
+            "bz_item": 1,
+            "bz_sales": 1,
+            "bz_profit": 1,
+        },
+    )
+    if not rows:
+        return {"period": None, "by_type": {}}
+
+    latest_period = str(rows[0].get("end_date") or "")
+    latest_rows = [r for r in rows if str(r.get("end_date") or "") == latest_period]
+
+    by_type: Dict[str, Any] = {}
+    for bz_type in ("P", "D", "I"):
+        type_rows = [r for r in latest_rows if str(r.get("bz_type") or "") == bz_type]
+        if not type_rows:
+            continue
+        total_sales = sum(
+            v for v in (_to_float_or_none(r.get("bz_sales")) for r in type_rows) if v is not None
+        )
+        items: List[Dict[str, Any]] = []
+        for r in type_rows:
+            sales = _to_float_or_none(r.get("bz_sales"))
+            items.append(
+                {
+                    "bz_item": r.get("bz_item"),
+                    "bz_sales_yuan": _round_or_none(sales, 2),
+                    "bz_profit_yuan": _round_or_none(r.get("bz_profit"), 2),
+                    "share_pct": round(sales / total_sales * 100, 2)
+                    if sales is not None and total_sales and total_sales > 0
+                    else None,
+                }
+            )
+        items.sort(
+            key=lambda it: it["bz_sales_yuan"] if it["bz_sales_yuan"] is not None else float("-inf"),
+            reverse=True,
+        )
+        by_type[bz_type] = {
+            "label": _MAINBZ_TYPE_LABELS[bz_type],
+            "total_sales_yuan": _round_or_none(total_sales, 2),
+            "item_count": len(items),
+            "items": items,
+        }
+
+    return {"period": latest_period or None, "by_type": by_type}
 
 
 def _clean_numeric(values: List[Any], *, positive_only: bool = True) -> List[float]:
@@ -1322,6 +1390,10 @@ def _stock_valuation_metrics_payload(
     elif revenue is None:
         missing.append("financial_income.revenue/total_revenue")
 
+    segments = _mainbz_segments_for_valuation(_collection_from(data, "financial_mainbz"), candidates)
+    if not segments.get("by_type"):
+        missing.append("financial_mainbz")
+
     missing_notes = {field: _VALUATION_MISSING_NOTES[field] for field in missing if field in _VALUATION_MISSING_NOTES}
 
     income_by_period: Dict[str, Dict[str, Any]] = {}
@@ -1435,6 +1507,11 @@ def _stock_valuation_metrics_payload(
             "fcff_sample_periods": len(fcff_series_vals),
         },
         "series": series,
+        "segments": segments,
+        "segments_note": (
+            "最新一期主营构成(fina_mainbz)按产品(P)/地区(D)/行业(I)拆分；"
+            "share_pct 为该维度内 bz_sales 净额占比，利润/估值倍数需研究员另行确认"
+        ),
         "valuation_percentiles": valuation_percentiles,
         "valuation_percentile_note": (
             "当前 PE/PB/PS(TTM) 在自身近 "
@@ -1448,8 +1525,8 @@ def _stock_valuation_metrics_payload(
         "missing": missing,
         "missing_notes": missing_notes,
         "source": (
-            "quant_data.financial_daily_basic + financial_indicator + financial_income + stock_info; "
-            "Hermes MCP read-only valuation metrics"
+            "quant_data.financial_daily_basic + financial_indicator + financial_income + "
+            "financial_mainbz + stock_info; Hermes MCP read-only valuation metrics"
         ),
     }
 

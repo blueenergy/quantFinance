@@ -111,6 +111,11 @@ def test_stock_valuation_metrics_builds_tech_fields_from_existing_collections():
                 }
             ]
         ),
+        "financial_mainbz": _Collection(
+            [
+                {"ts_code": "688001.SH", "end_date": "20260331", "bz_type": "P", "bz_item": "软件", "bz_sales": 1_000.0},
+            ]
+        ),
     }
 
     payload = _stock_valuation_metrics_payload("688001.SH", data_collections=data)
@@ -118,6 +123,7 @@ def test_stock_valuation_metrics_builds_tech_fields_from_existing_collections():
     assert payload["success"] is True
     assert payload["resolved_symbol"] == "688001.SH"
     assert payload["name"] == "科技样本"
+    assert payload["segments"]["by_type"]["P"]["items"][0]["share_pct"] == pytest.approx(100.0)
     assert payload["market"]["ps_ttm"] == pytest.approx(8.5)
     assert payload["financial"]["revenue_growth_pct"] == pytest.approx(28.0)
     assert payload["derived"]["rd_intensity_pct"] == pytest.approx(12.0)
@@ -135,6 +141,69 @@ def test_stock_valuation_metrics_builds_tech_fields_from_existing_collections():
     # 只有 1 个交易日样本，分位不足 30 应为 None
     assert payload["valuation_percentiles"]["ps_ttm"] is None
     assert payload["samples"]["daily_count"] == 1
+
+
+def test_stock_valuation_metrics_builds_segments_from_mainbz():
+    data = {
+        "financial_daily_basic": _Collection(
+            [{"ts_code": "688001.SH", "trade_date": "20260619", "ps_ttm": 8.0}]
+        ),
+        "financial_indicator": _Collection(
+            [{"ts_code": "688001.SH", "end_date": "20260331", "tr_yoy": 20.0}]
+        ),
+        "financial_income": _Collection(
+            [{"ts_code": "688001.SH", "end_date": "20260331", "revenue": 1_000.0}]
+        ),
+        "stock_info": _Collection([{"ts_code": "688001.SH", "name": "分部样本"}]),
+        "financial_mainbz": _Collection(
+            [
+                # 旧一期，应被忽略
+                {"ts_code": "688001.SH", "end_date": "20251231", "bz_type": "P", "bz_item": "旧品", "bz_sales": 50.0},
+                # 最新一期 按产品
+                {"ts_code": "688001.SH", "end_date": "20260331", "bz_type": "P", "bz_item": "芯片", "bz_sales": 600.0, "bz_profit": 120.0},
+                {"ts_code": "688001.SH", "end_date": "20260331", "bz_type": "P", "bz_item": "模组", "bz_sales": 400.0, "bz_profit": 40.0},
+                # 最新一期 按地区
+                {"ts_code": "688001.SH", "end_date": "20260331", "bz_type": "D", "bz_item": "境内", "bz_sales": 700.0},
+                {"ts_code": "688001.SH", "end_date": "20260331", "bz_type": "D", "bz_item": "境外", "bz_sales": 300.0},
+            ]
+        ),
+    }
+
+    payload = _stock_valuation_metrics_payload("688001.SH", data_collections=data)
+
+    segments = payload["segments"]
+    assert segments["period"] == "20260331"
+    assert set(segments["by_type"].keys()) == {"P", "D"}
+    product = segments["by_type"]["P"]
+    assert product["item_count"] == 2
+    assert product["total_sales_yuan"] == pytest.approx(1000.0)
+    # 排序后第一项为占比最大的芯片
+    assert product["items"][0]["bz_item"] == "芯片"
+    assert product["items"][0]["share_pct"] == pytest.approx(60.0)
+    assert product["items"][1]["share_pct"] == pytest.approx(40.0)
+    assert "financial_mainbz" not in payload["missing"]
+
+
+def test_stock_valuation_metrics_marks_missing_mainbz():
+    data = {
+        "financial_daily_basic": _Collection(
+            [{"ts_code": "688009.SH", "trade_date": "20260619", "ps_ttm": 8.0}]
+        ),
+        "financial_indicator": _Collection(
+            [{"ts_code": "688009.SH", "end_date": "20260331", "tr_yoy": 20.0}]
+        ),
+        "financial_income": _Collection(
+            [{"ts_code": "688009.SH", "end_date": "20260331", "revenue": 1_000.0}]
+        ),
+        "stock_info": _Collection([{"ts_code": "688009.SH", "name": "无分部样本"}]),
+        "financial_mainbz": _Collection([]),
+    }
+
+    payload = _stock_valuation_metrics_payload("688009.SH", data_collections=data)
+
+    assert payload["segments"]["by_type"] == {}
+    assert "financial_mainbz" in payload["missing"]
+    assert "financial_mainbz" in payload["missing_notes"]
 
 
 def test_stock_valuation_metrics_computes_history_percentiles():
