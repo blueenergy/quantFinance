@@ -463,6 +463,20 @@ def test_stock_valuation_metrics_data_quality_overall_ok_with_info_items():
                 {"ts_code": "688013.SH", "report_date": "20260601", "org_name": "机构A", "quarter": "2026Q4", "np": 6_000.0},
             ]
         ),
+        "financial_cashflow": _Collection(
+            [
+                {
+                    "ts_code": "688013.SH",
+                    "end_date": "20260331",
+                    "report_type": 1,
+                    "n_cashflow_act": 120.0,
+                    "c_pay_acq_const_fiolta": 40.0,
+                    "free_cashflow": 80.0,
+                    "net_profit": 100.0,
+                    "decr_oper_payable": -10.0,
+                }
+            ]
+        ),
         "stock_info": _Collection([{"ts_code": "688013.SH", "name": "质量正常"}]),
     }
 
@@ -1247,3 +1261,144 @@ def test_foreign_top10_floatholders_reports_period_changes(monkeypatch):
     assert changes[("000002.SZ", "UBS")]["change_type"] == "decreased"
     assert changes[("000003.SZ", "Barclays")]["change_type"] == "new"
     assert changes[("000004.SZ", "MorganStanley")]["change_type"] == "exited"
+
+
+def test_stock_valuation_metrics_cash_flow_bridge_attribution():
+    # 长海股份(300196.SZ) 2025 年报口径，验证多口径桥接与负 FCF 归因不误判恶化。
+    data = {
+        "financial_daily_basic": _Collection(
+            [{"ts_code": "300196.SZ", "trade_date": "20251231", "pe_ttm": 18.0, "total_mv": 595091.0}]
+        ),
+        "financial_indicator": _Collection(
+            [
+                {
+                    "ts_code": "300196.SZ",
+                    "end_date": "20251231",
+                    "ebitda": 717_121_000.0,
+                    "daa": 338_948_202.97,
+                    "ocfps": 0.3416,
+                    "fcff_ps": -0.3793,
+                    "fcfe_ps": 0.3327,
+                    "cfps": -0.3766,
+                    "fcff": -155_021_209.50,
+                }
+            ]
+        ),
+        "financial_cashflow": _Collection(
+            [
+                {
+                    "ts_code": "300196.SZ",
+                    "end_date": "20251231",
+                    "report_type": 1,
+                    "n_cashflow_act": 139_632_834.31,
+                    "c_pay_acq_const_fiolta": 362_724_649.75,
+                    "free_cashflow": -155_021_209.50,
+                    "net_profit": 325_577_664.9,
+                    "depr_fa_coga_dpba": 302_124_233.42,
+                    "amort_intang_assets": 12_057_059.03,
+                    "decr_inventories": -47_839_464.03,
+                    "decr_oper_payable": -472_665_691.73,
+                    "incr_oper_payable": -54_307_864.11,
+                    "c_fr_oth_operate_a": 1_193_195_533.34,
+                    "oth_cash_pay_oper_act": 1_472_354_758.48,
+                    "oth_pay_ral_inv_act": 428_005_000.0,
+                    "oth_recp_ral_inv_act": 388_201_610.54,
+                }
+            ]
+        ),
+        "financial_income": _Collection(
+            [{"ts_code": "300196.SZ", "end_date": "20251231", "revenue": 2_500_000_000.0}]
+        ),
+        "stock_info": _Collection([{"ts_code": "300196.SZ", "name": "长海股份"}]),
+        "financial_mainbz": _Collection([]),
+    }
+
+    payload = _stock_valuation_metrics_payload("300196.SZ", data_collections=data)
+    cf = payload["cash_flow"]
+
+    assert cf["available"] is True
+    # 每股口径直接取 Tushare，不可混用
+    assert cf["per_share"]["ocfps"] == pytest.approx(0.3416)
+    assert cf["per_share"]["fcff_ps"] == pytest.approx(-0.3793)
+    # 三口径绝对额(亿元)
+    assert cf["absolute_yi"]["ebitda"] == pytest.approx(7.1712, abs=1e-3)
+    assert cf["absolute_yi"]["ocf"] == pytest.approx(1.3963, abs=1e-3)
+    assert cf["absolute_yi"]["capex"] == pytest.approx(3.6272, abs=1e-3)
+    assert cf["absolute_yi"]["fcf_strict"] == pytest.approx(-2.2309, abs=1e-3)
+    assert cf["absolute_yi"]["working_capital_change"] == pytest.approx(-5.7481, abs=1e-3)
+    # 理财/定存在投资活动，归因勿张冠李戴
+    assert cf["absolute_yi"]["invest_wealth_mgmt_pay"] == pytest.approx(4.2801, abs=1e-3)
+    # 桥接恒等式：末步 = fcf_strict
+    last_step = cf["bridge"][-1]
+    assert last_step["value_yi"] == pytest.approx(-2.2309, abs=1e-3)
+    # 负 FCF 但 EBITDA 为正：必须归因为占用，禁止判定盈利恶化
+    assert "不得据此判定盈利恶化" in cf["note"]
+    assert "营运资本占用" in cf["note"]
+    assert "资本开支" in cf["note"]
+
+
+def test_stock_valuation_metrics_cash_flow_note_handles_missing_ebitda():
+    # 季度口径常缺 EBITDA：负 FCF 不得被判定为盈利恶化。
+    data = {
+        "financial_daily_basic": _Collection(
+            [{"ts_code": "300196.SZ", "trade_date": "20260331", "pe_ttm": 18.0, "total_mv": 595091.0}]
+        ),
+        "financial_indicator": _Collection(
+            [
+                {
+                    "ts_code": "300196.SZ",
+                    "end_date": "20260331",
+                    "ocfps": -0.163,
+                    "fcff_ps": -0.5447,
+                    "ebitda": None,
+                    "daa": None,
+                }
+            ]
+        ),
+        "financial_cashflow": _Collection(
+            [
+                {
+                    "ts_code": "300196.SZ",
+                    "end_date": "20260331",
+                    "report_type": 1,
+                    "n_cashflow_act": -66_632_030.92,
+                    "c_pay_acq_const_fiolta": 30_846_845.85,
+                    "free_cashflow": -222_608_480.35,
+                }
+            ]
+        ),
+        "financial_income": _Collection(
+            [{"ts_code": "300196.SZ", "end_date": "20260331", "revenue": 600_000_000.0}]
+        ),
+        "stock_info": _Collection([{"ts_code": "300196.SZ", "name": "长海股份"}]),
+        "financial_mainbz": _Collection([]),
+    }
+
+    payload = _stock_valuation_metrics_payload("300196.SZ", data_collections=data)
+    note = payload["cash_flow"]["note"]
+
+    assert note is not None
+    assert "缺 EBITDA" in note
+    assert "DCF 应降权" not in note  # 不得因缺 EBITDA 误判恶化
+
+
+def test_stock_valuation_metrics_cash_flow_missing_collection_flagged():
+    data = {
+        "financial_daily_basic": _Collection(
+            [{"ts_code": "688111.SH", "trade_date": "20251231", "pe_ttm": 30.0, "total_mv": 3500.0}]
+        ),
+        "financial_indicator": _Collection(
+            [{"ts_code": "688111.SH", "end_date": "20251231", "ocfps": 1.2}]
+        ),
+        "financial_income": _Collection(
+            [{"ts_code": "688111.SH", "end_date": "20251231", "revenue": 1000.0}]
+        ),
+        "stock_info": _Collection([{"ts_code": "688111.SH", "name": "样本"}]),
+        "financial_mainbz": _Collection([]),
+    }
+
+    payload = _stock_valuation_metrics_payload("688111.SH", data_collections=data)
+
+    assert payload["cash_flow"]["available"] is False
+    cash_flow_items = [it for it in payload["data_quality"]["items"] if it["metric"] == "cash_flow"]
+    assert cash_flow_items and cash_flow_items[0]["status"] == "missing_collection"

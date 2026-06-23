@@ -1160,8 +1160,221 @@ def _fcff_seasonality_note(series: List[Dict[str, Any]]) -> Optional[str]:
             "偏向季节性；不宜单季否定全年现金流"
         )
     if positive == 0:
-        return f"样本期内 FCFF 均为负（{len(vals)} 期），偏向结构性现金流压力，DCF 应降权"
+        return (
+            f"样本期内 Tushare 口径 FCFF(≈OCF-资本开支) 均为负（{len(vals)} 期）；"
+            "需结合 cash_flow 桥接区分营运资本占用/扩张资本开支与真实盈利下滑，"
+            "勿仅凭此判定现金流恶化"
+        )
     return f"最新期 FCFF 为负但历史有 {positive} 期为正，需核实是否一次性因素"
+
+
+_YI = 1e8
+
+_CASHFLOW_VALUATION_FIELDS = {
+    "_id": 0,
+    "symbol": 1,
+    "ts_code": 1,
+    "ann_date": 1,
+    "end_date": 1,
+    "report_type": 1,
+    "n_cashflow_act": 1,
+    "c_pay_acq_const_fiolta": 1,
+    "free_cashflow": 1,
+    "net_profit": 1,
+    "finan_exp": 1,
+    "depr_fa_coga_dpba": 1,
+    "amort_intang_assets": 1,
+    "lt_amort_deferred_exp": 1,
+    "decr_inventories": 1,
+    "decr_oper_payable": 1,
+    "incr_oper_payable": 1,
+    "c_fr_oth_operate_a": 1,
+    "oth_cash_pay_oper_act": 1,
+    "oth_pay_ral_inv_act": 1,
+    "oth_recp_ral_inv_act": 1,
+}
+
+
+def _yi(value: Any) -> Optional[float]:
+    """Convert a yuan amount to 亿元 (rounded), preserving sign; None-safe."""
+    number = _to_float_or_none(value)
+    return round(number / _YI, 4) if number is not None else None
+
+
+def _cashflow_rows_for_valuation(
+    collection: Any, candidates: List[str], *, limit: int = 8
+) -> List[Dict[str, Any]]:
+    """Latest cumulative (report_type=1) cash-flow rows for the bridge block."""
+    if collection is None or not candidates:
+        return []
+    for field in ("ts_code", "symbol"):
+        try:
+            rows = list(
+                collection.find(
+                    {field: {"$in": candidates}, "report_type": 1},
+                    _CASHFLOW_VALUATION_FIELDS,
+                    sort=[("end_date", -1), ("_id", -1)],
+                    limit=limit,
+                )
+            )
+        except Exception:
+            continue
+        if rows:
+            return rows
+    # Fallback: report_type may be absent in older docs.
+    return _recent_docs_for_valuation(
+        collection,
+        candidates,
+        date_field="end_date",
+        limit=limit,
+        projection=_CASHFLOW_VALUATION_FIELDS,
+    )
+
+
+def _cash_flow_bridge_steps(
+    ebitda: Optional[float],
+    wc_change: Optional[float],
+    residual: Optional[float],
+    ocf: Optional[float],
+    capex: Optional[float],
+    fcf_strict: Optional[float],
+) -> List[Dict[str, Any]]:
+    steps: List[Dict[str, Any]] = []
+    if ebitda is not None:
+        steps.append({"step": "EBITDA(经营造血潜力)", "value_yi": _yi(ebitda)})
+    if wc_change is not None:
+        steps.append({"step": "+ 营运资本变化(负=占用现金)", "value_yi": _yi(wc_change)})
+    if residual is not None:
+        steps.append({"step": "+ 税费/利息/其他经营调整", "value_yi": _yi(residual)})
+    if ocf is not None:
+        steps.append({"step": "= 经营现金流(OCF)", "value_yi": _yi(ocf)})
+    if capex is not None:
+        steps.append({"step": "- 资本开支(capex)", "value_yi": _yi(capex)})
+    if fcf_strict is not None:
+        steps.append({"step": "= 自由现金流(扣全额capex)", "value_yi": _yi(fcf_strict)})
+    return steps
+
+
+def _cash_flow_attribution_note(
+    *,
+    ebitda: Optional[float],
+    ocf: Optional[float],
+    capex: Optional[float],
+    fcf_strict: Optional[float],
+    wc_change: Optional[float],
+) -> Optional[str]:
+    """Non-misleading attribution: never call growth/working-capital-driven
+    negative FCF a profitability deterioration."""
+    if fcf_strict is None:
+        return None
+    if fcf_strict >= 0:
+        return f"自由现金流(扣全额capex)为正({_yi(fcf_strict)}亿)，现金可自我覆盖资本开支"
+    drivers: List[str] = []
+    if wc_change is not None and wc_change < 0:
+        drivers.append(f"营运资本占用{abs(_yi(wc_change))}亿")
+    if capex is not None and capex > 0:
+        drivers.append(f"资本开支{_yi(capex)}亿")
+    driver_text = " + ".join(drivers) if drivers else "经营性现金流不足"
+    if ebitda is None:
+        return (
+            f"自由现金流(扣全额capex)为负({_yi(fcf_strict)}亿)，主因{driver_text}；"
+            "当期缺 EBITDA(季度口径常缺)，无法判断造血强弱，"
+            "勿仅凭负 FCF 判定盈利恶化，请用年报口径或结合 OCF 交叉验证"
+        )
+    if ebitda > 0:
+        return (
+            f"自由现金流(扣全额capex)为负({_yi(fcf_strict)}亿)，主因{driver_text}；"
+            f"但 EBITDA 造血仍为正({_yi(ebitda)}亿)，属投入/营运资本占用型负FCF，"
+            "不得据此判定盈利恶化"
+        )
+    return (
+        f"自由现金流(扣全额capex)为负({_yi(fcf_strict)}亿)，且 EBITDA 非正({_yi(ebitda)}亿)，"
+        "存在真实盈利与现金流压力，DCF 应降权"
+    )
+
+
+def _cash_flow_caliber_block(
+    cashflow_row: Optional[Dict[str, Any]], latest_indicator: Optional[Dict[str, Any]]
+) -> Dict[str, Any]:
+    """Multi-caliber cash flow: EBITDA -> OCF -> FCF bridge with attribution.
+
+    口径声明：
+    - per_share 取自 Tushare fina_indicator(ocfps/fcff_ps/fcfe_ps/cfps)，其
+      fcff_ps 为现金流口径(≈OCF-资本开支)，与同花顺/学术 FCFF(加回折旧摊销、
+      仅扣维持性capex)不同，数值可能大幅不同，不可混用。
+    - absolute_yi 绝对额(亿元)来自 financial_cashflow，桥接满足恒等式
+      EBITDA + ΔWC + (税/利息/其他) = OCF；OCF - capex = FCF。
+    """
+    cf = cashflow_row or {}
+    ind = latest_indicator or {}
+
+    ocf = _to_float_or_none(cf.get("n_cashflow_act"))
+    capex = _to_float_or_none(cf.get("c_pay_acq_const_fiolta"))
+    ebitda = _to_float_or_none(ind.get("ebitda"))
+    net_profit = _to_float_or_none(cf.get("net_profit"))
+    daa = _to_float_or_none(ind.get("daa"))
+
+    wc_items = [
+        _to_float_or_none(cf.get("decr_inventories")),
+        _to_float_or_none(cf.get("decr_oper_payable")),
+        _to_float_or_none(cf.get("incr_oper_payable")),
+    ]
+    wc_present = [v for v in wc_items if v is not None]
+    wc_change = sum(wc_present) if wc_present else None
+
+    fcf_strict = ocf - capex if ocf is not None and capex is not None else None
+
+    recv = _to_float_or_none(cf.get("c_fr_oth_operate_a"))
+    pay = _to_float_or_none(cf.get("oth_cash_pay_oper_act"))
+    other_oper_net = recv - pay if recv is not None and pay is not None else None
+
+    invest_wm_pay = _to_float_or_none(cf.get("oth_pay_ral_inv_act"))
+    invest_wm_recv = _to_float_or_none(cf.get("oth_recp_ral_inv_act"))
+
+    bridge_residual = None
+    if ocf is not None and ebitda is not None and wc_change is not None:
+        bridge_residual = ocf - ebitda - wc_change
+
+    return {
+        "period": cf.get("end_date") or ind.get("end_date"),
+        "report_type": cf.get("report_type"),
+        "available": bool(cf),
+        "per_share": {
+            "ocfps": _round_or_none(ind.get("ocfps"), 4),
+            "fcff_ps": _round_or_none(ind.get("fcff_ps"), 4),
+            "fcfe_ps": _round_or_none(ind.get("fcfe_ps"), 4),
+            "cfps": _round_or_none(ind.get("cfps"), 4),
+        },
+        "per_share_caliber_note": (
+            "ocfps=每股经营现金流；fcff_ps/fcfe_ps 为 Tushare 现金流口径每股自由现金流"
+            "(≈OCF-资本开支)，与同花顺/学术 FCFF(加回折旧摊销、仅扣维持性capex)不同口径，"
+            "不可混用；不得用 ocfps 代替自由现金流"
+        ),
+        "absolute_yi": {
+            "ebitda": _yi(ebitda),
+            "net_profit": _yi(net_profit),
+            "depr_amort": _yi(daa),
+            "ocf": _yi(ocf),
+            "working_capital_change": _yi(wc_change),
+            "capex": _yi(capex),
+            "fcf_strict": _yi(fcf_strict),
+            "free_cashflow_tushare": _yi(cf.get("free_cashflow")),
+            "other_operating_net": _yi(other_oper_net),
+            "invest_wealth_mgmt_pay": _yi(invest_wm_pay),
+            "invest_wealth_mgmt_recv": _yi(invest_wm_recv),
+        },
+        "absolute_caliber_note": (
+            "单位亿元。fcf_strict=OCF-全额capex(≈Tushare口径，对扩张期重资产偏保守)；"
+            "EBITDA=经营造血潜力(同花顺式自由现金流口径，对应不扣capex/营运资本，偏激进)；"
+            "理财/定存进出多在投资活动(invest_wealth_mgmt_*)，不影响 OCF，归因勿张冠李戴"
+        ),
+        "bridge": _cash_flow_bridge_steps(
+            ebitda, wc_change, bridge_residual, ocf, capex, fcf_strict
+        ),
+        "note": _cash_flow_attribution_note(
+            ebitda=ebitda, ocf=ocf, capex=capex, fcf_strict=fcf_strict, wc_change=wc_change
+        ),
+    }
 
 
 def _mainbz_segments_for_valuation(
@@ -2044,6 +2257,11 @@ def _stock_valuation_metrics_payload(
             "fcff": 1,
             "fcfe": 1,
             "ocfps": 1,
+            "fcff_ps": 1,
+            "fcfe_ps": 1,
+            "cfps": 1,
+            "ebitda": 1,
+            "daa": 1,
             "roe": 1,
             "roic": 1,
             "netprofit_yoy": 1,
@@ -2193,6 +2411,12 @@ def _stock_valuation_metrics_payload(
     )
     profit_quality_alert = _profit_quality_alert(latest_indicator)
     fcff_seasonality_note = _fcff_seasonality_note(series)
+
+    cashflow_rows = _cashflow_rows_for_valuation(
+        _collection_from(data, "financial_cashflow"), candidates
+    )
+    latest_cashflow = cashflow_rows[0] if cashflow_rows else {}
+    cash_flow_block = _cash_flow_caliber_block(latest_cashflow, latest_indicator)
 
     pe_ttm_val = _to_float_or_none(latest_daily.get("pe_ttm"))
     netprofit_yoy_val = _to_float_or_none(latest_indicator.get("netprofit_yoy"))
@@ -2443,6 +2667,29 @@ def _stock_valuation_metrics_payload(
             affected_output=["FCFF 季节性说明"],
             repair_command=None,
         )
+    if not cash_flow_block.get("available"):
+        add_quality_item(
+            metric="cash_flow",
+            status="missing_collection",
+            problem="缺少 financial_cashflow 数据，EBITDA→OCF→FCF 桥接与现金流归因不可得",
+            source_collection="financial_cashflow",
+            required_fields=[
+                "n_cashflow_act",
+                "c_pay_acq_const_fiolta",
+                "decr_oper_payable",
+                "oth_pay_ral_inv_act",
+            ],
+            affected_output=["cash_flow 桥接", "自由现金流口径归因"],
+        )
+    elif cash_flow_block.get("note") is None:
+        add_quality_item(
+            metric="cash_flow.note",
+            status="missing_field",
+            problem="financial_cashflow 缺少经营现金流/资本开支关键科目，无法给出自由现金流口径结论",
+            source_collection="financial_cashflow",
+            required_fields=["n_cashflow_act", "c_pay_acq_const_fiolta"],
+            affected_output=["自由现金流口径归因"],
+        )
 
     data_quality = {
         "overall": _data_quality_overall(data_quality_items),
@@ -2514,6 +2761,11 @@ def _stock_valuation_metrics_payload(
             "rule_of_40_note": "收入增速(%) + 净利率(%) / FCFF margin(%)，仅作科技企业质量粗筛",
             "fcff_positive_periods": fcff_positive_count,
             "fcff_sample_periods": len(fcff_series_vals),
+            "fcff_caliber_note": (
+                "financial.fcff_yuan / derived.fcff_margin* 基于 financial_indicator.fcff"
+                "(Tushare 现金流口径自由现金流≈OCF-资本开支)，非同花顺/学术 FCFF；"
+                "现金流口径分析与每股值请以 cash_flow 块为准"
+            ),
             "profit_quality_alert": profit_quality_alert,
             "fcff_seasonality_note": fcff_seasonality_note,
             "peg_hist": peg_hist,
@@ -2532,6 +2784,7 @@ def _stock_valuation_metrics_payload(
             ),
             **normalized_pe_block,
         },
+        "cash_flow": cash_flow_block,
         "series": series,
         "segments": segments,
         "segments_series": segments_series,
