@@ -16,6 +16,7 @@ MCP 暴露面按 route tag 拆分为 wukong-quant-read 与 wukong-quant-actions�
   GET  /hermes-tools/stock/ranking            — 股票评分排行榜 Top N（按指数）
   GET  /hermes-tools/stock/score-detail       — 单股六维评分详情
   GET  /hermes-tools/stock/valuation-metrics  — 单股科技估值结构化指标
+  GET  /hermes-tools/stock/earnings-consensus — 单股卖方一致预期
   GET  /hermes-tools/stock/industry-comparison — 单股行业横向估值/财务分位
   POST /hermes-tools/analysis/deep         — 提交深度分析任务
   POST /hermes-tools/analysis/deep-and-wait — 提交并等待完成（推荐）
@@ -856,6 +857,144 @@ def _append_quality_missing(missing: List[str], indicator: Dict[str, Any], field
             missing.append(f"financial_indicator.{field}")
 
 
+def _period_year_valuation(period: Any) -> Optional[int]:
+    text = str(period or "")
+    if len(text) < 8:
+        return None
+    try:
+        return int(text[:4])
+    except ValueError:
+        return None
+
+
+def _period_suffix_valuation(period: Any) -> str:
+    return str(period or "")[4:8]
+
+
+def _ttm_from_cumulative_income(
+    rows: List[Dict[str, Any]], field: str = "n_income_attr_p"
+) -> Optional[Dict[str, Any]]:
+    """Build TTM net income from cumulative income statement rows."""
+    by_period = {str(row.get("end_date") or ""): row for row in rows if row.get("end_date")}
+    for row in rows:
+        period = str(row.get("end_date") or "")
+        value = _to_float_or_none(row.get(field))
+        if value is None or value <= 0:
+            continue
+        suffix = _period_suffix_valuation(period)
+        year = _period_year_valuation(period)
+        if suffix == "1231":
+            return {
+                "value": value,
+                "field": f"financial_income.{field}",
+                "method": "latest_full_year",
+                "period": period,
+            }
+        if year is None or suffix not in {"0331", "0630", "0930"}:
+            continue
+        prev_year_row = by_period.get(f"{year - 1}1231")
+        prev_same_row = by_period.get(f"{year - 1}{suffix}")
+        prev_year_value = _to_float_or_none((prev_year_row or {}).get(field))
+        prev_same_value = _to_float_or_none((prev_same_row or {}).get(field))
+        if prev_year_value is None or prev_same_value is None:
+            continue
+        ttm = value + prev_year_value - prev_same_value
+        if ttm > 0:
+            return {
+                "value": ttm,
+                "field": f"financial_income.{field}",
+                "method": "ttm_from_cumulative_income",
+                "period": period,
+                "formula": f"{period} + {year - 1}1231 - {year - 1}{suffix}",
+            }
+    return None
+
+
+def _normalized_pe_from_ttm(
+    total_mv_wan: Optional[float], ttm_info: Optional[Dict[str, Any]]
+) -> Dict[str, Any]:
+    """PE using total market cap (万元) and TTM net income (元)."""
+    if ttm_info is None:
+        return {
+            "normalized_pe_ttm": None,
+            "normalized_pe_method": None,
+            "normalized_pe_period": None,
+            "ttm_net_income_yuan": None,
+        }
+    ttm_net = _to_float_or_none(ttm_info.get("value"))
+    mv = _to_float_or_none(total_mv_wan)
+    pe = round(mv * 10000 / ttm_net, 4) if ttm_net and mv and ttm_net > 0 else None
+    return {
+        "normalized_pe_ttm": pe,
+        "normalized_pe_method": ttm_info.get("method"),
+        "normalized_pe_period": ttm_info.get("period"),
+        "ttm_net_income_yuan": _round_or_none(ttm_net, 2),
+        "normalized_pe_formula": ttm_info.get("formula"),
+    }
+
+
+def _profit_quality_alert(indicator: Dict[str, Any]) -> Optional[str]:
+    if not indicator:
+        return None
+    alerts: List[str] = []
+    invest_pct = _to_float_or_none(indicator.get("investincome_of_ebt"))
+    dt_pct = _to_float_or_none(indicator.get("dtprofit_to_profit"))
+    q_margin = _to_float_or_none(indicator.get("q_netprofit_margin"))
+    net_margin = _to_float_or_none(indicator.get("netprofit_margin"))
+    # indicator 字段为累计口径；非年报期(1231)即为年内累计，提示用 TTM/归一化 PE。
+    is_annual = _period_suffix_valuation(indicator.get("end_date")) == "1231"
+    period_caliber = "全年" if is_annual else "年内累计"
+    pe_hint = "PE" if is_annual else "当期 PE"
+    if invest_pct is not None and abs(invest_pct) > 50:
+        direction = "贡献" if invest_pct > 0 else "拖累"
+        alerts.append(
+            f"投资收益占利润总额 {invest_pct:.1f}%（{direction}主导），"
+            f"{period_caliber}利润表口径失真，{pe_hint}不可作主估值依据，建议用 derived.normalized_pe_ttm"
+        )
+    if dt_pct is not None and dt_pct < 60:
+        alerts.append(f"扣非净利润占比仅 {dt_pct:.1f}%，非经常性损益影响较大")
+    if (
+        q_margin is not None
+        and net_margin is not None
+        and net_margin > 0
+        and q_margin > net_margin * 2
+        and q_margin > 30
+    ):
+        alerts.append(
+            f"单季净利率({q_margin:.1f}%)显著高于累计净利率({net_margin:.1f}%)，"
+            "建议用 derived.normalized_pe_ttm 交叉验证"
+        )
+    return "；".join(alerts) if alerts else None
+
+
+def _fcff_seasonality_note(series: List[Dict[str, Any]]) -> Optional[str]:
+    vals = [
+        (str(row.get("period") or ""), _to_float_or_none(row.get("fcff_yuan")))
+        for row in series
+        if row.get("fcff_yuan") is not None
+    ]
+    if not vals:
+        return None
+    latest_period, latest_fcff = vals[0]
+    if latest_fcff is None:
+        return None
+    positive = sum(1 for _, value in vals if value is not None and value > 0)
+    negative = sum(1 for _, value in vals if value is not None and value < 0)
+    if latest_fcff >= 0:
+        if negative > 0 and positive > 0:
+            return f"最新期 FCFF 为正，但样本中有 {negative} 期为负，存在季节性波动"
+        return None
+    suffix = _period_suffix_valuation(latest_period)
+    if positive > 0 and suffix == "0331":
+        return (
+            f"Q1 FCFF 为负（{latest_fcff:.2f} 元）但样本中另有 {positive} 期为正，"
+            "偏向季节性；不宜单季否定全年现金流"
+        )
+    if positive == 0:
+        return f"样本期内 FCFF 均为负（{len(vals)} 期），偏向结构性现金流压力，DCF 应降权"
+    return f"最新期 FCFF 为负但历史有 {positive} 期为正，需核实是否一次性因素"
+
+
 def _mainbz_segments_for_valuation(
     collection: Any, candidates: List[str], *, limit: int = 300
 ) -> Dict[str, Any]:
@@ -919,6 +1058,255 @@ def _mainbz_segments_for_valuation(
         }
 
     return {"period": latest_period or None, "by_type": by_type}
+
+
+def _mainbz_segments_series(
+    collection: Any, candidates: List[str], *, limit: int = 600
+) -> Dict[str, Any]:
+    """Multi-period mainbz with YoY sales growth per bz_item."""
+    rows = _recent_docs_for_valuation(
+        collection,
+        candidates,
+        date_field="end_date",
+        limit=limit,
+        projection={
+            "_id": 0,
+            "symbol": 1,
+            "ts_code": 1,
+            "end_date": 1,
+            "bz_type": 1,
+            "bz_item": 1,
+            "bz_sales": 1,
+            "bz_profit": 1,
+        },
+    )
+    if not rows:
+        return {"latest_period": None, "prior_period": None, "by_type": {}}
+
+    latest_period = str(rows[0].get("end_date") or "")
+    year = _period_year_valuation(latest_period)
+    suffix = _period_suffix_valuation(latest_period)
+    prior_period = f"{year - 1}{suffix}" if year else ""
+    latest_rows = [r for r in rows if str(r.get("end_date") or "") == latest_period]
+    prior_rows = [r for r in rows if prior_period and str(r.get("end_date") or "") == prior_period]
+
+    prior_sales: Dict[tuple[str, str], float] = {}
+    for row in prior_rows:
+        key = (str(row.get("bz_type") or ""), str(row.get("bz_item") or ""))
+        sales = _to_float_or_none(row.get("bz_sales"))
+        if sales is not None:
+            prior_sales[key] = sales
+
+    by_type: Dict[str, Any] = {}
+    for bz_type in ("P", "D", "I"):
+        type_rows = [r for r in latest_rows if str(r.get("bz_type") or "") == bz_type]
+        if not type_rows:
+            continue
+        items: List[Dict[str, Any]] = []
+        for row in type_rows:
+            bz_item = str(row.get("bz_item") or "")
+            sales = _to_float_or_none(row.get("bz_sales"))
+            prior = prior_sales.get((bz_type, bz_item))
+            yoy_pct = (
+                round((sales - prior) / abs(prior) * 100, 2)
+                if sales is not None and prior is not None and prior != 0
+                else None
+            )
+            items.append(
+                {
+                    "bz_item": bz_item,
+                    "bz_sales_yuan": _round_or_none(sales, 2),
+                    "bz_profit_yuan": _round_or_none(row.get("bz_profit"), 2),
+                    "yoy_pct": yoy_pct,
+                    "prior_period": prior_period or None if prior is not None else None,
+                }
+            )
+        items.sort(
+            key=lambda it: it["bz_sales_yuan"] if it["bz_sales_yuan"] is not None else float("-inf"),
+            reverse=True,
+        )
+        by_type[bz_type] = {
+            "label": _MAINBZ_TYPE_LABELS[bz_type],
+            "item_count": len(items),
+            "items": items,
+        }
+
+    return {
+        "latest_period": latest_period or None,
+        "prior_period": prior_period or None,
+        "by_type": by_type,
+        "note": (
+            "yoy_pct 为最新期 bz_sales 相对去年同期同季度的同比增速；"
+            "无对应产品线或去年同期无数据时为 null"
+        ),
+    }
+
+
+_CONSENSUS_MISSING_NOTES = {
+    "earnings_report_rc": "缺少卖方研报一致预期，无法给出机构预测中位数",
+}
+
+_CONSENSUS_RATING_BUCKETS = ("买入", "增持", "中性", "减持", "卖出")
+
+
+def _median_or_none_values(values: List[Any], *, digits: int = 4) -> Optional[float]:
+    nums = sorted(v for v in (_to_float_or_none(x) for x in values) if v is not None)
+    if not nums:
+        return None
+    mid = len(nums) // 2
+    if len(nums) % 2:
+        return round(nums[mid], digits)
+    return round((nums[mid - 1] + nums[mid]) / 2, digits)
+
+
+def _stock_earnings_consensus_payload(
+    symbol: str,
+    *,
+    data_collections: Any = None,
+    lookback_days: int = 180,
+) -> Dict[str, Any]:
+    normalized_symbol = str(symbol or "").strip().upper()
+    if not normalized_symbol:
+        return {"success": False, "error": "symbol 不能为空"}
+
+    data = data_collections or data_db
+    candidates = _valuation_symbol_candidates(normalized_symbol)
+    collection = _collection_from(data, "earnings_report_rc")
+    cutoff = (datetime.utcnow() - timedelta(days=lookback_days)).strftime("%Y%m%d")
+
+    rows: List[Dict[str, Any]] = []
+    if collection is not None:
+        for field in ("ts_code", "symbol"):
+            try:
+                rows = list(
+                    collection.find(
+                        {field: {"$in": candidates}, "report_date": {"$gte": cutoff}},
+                        {
+                            "_id": 0,
+                            "ts_code": 1,
+                            "symbol": 1,
+                            "name": 1,
+                            "report_date": 1,
+                            "org_name": 1,
+                            "quarter": 1,
+                            "np": 1,
+                            "op_rt": 1,
+                            "eps": 1,
+                            "pe": 1,
+                            "roe": 1,
+                            "rating": 1,
+                            "report_title": 1,
+                        },
+                        sort=[("report_date", -1)],
+                    )
+                )
+            except Exception:
+                continue
+            if rows:
+                break
+
+    missing: List[str] = []
+    if not rows:
+        missing.append("earnings_report_rc")
+        return {
+            "success": True,
+            "symbol": normalized_symbol,
+            "resolved_symbol": normalized_symbol,
+            "lookback_days": lookback_days,
+            "report_count": 0,
+            "deduped_report_count": 0,
+            "forecasts_by_quarter": {},
+            "rating_distribution": {},
+            "org_names": [],
+            "org_count": 0,
+            "latest_report_date": None,
+            "missing": missing,
+            "missing_notes": {
+                key: _CONSENSUS_MISSING_NOTES[key] for key in missing if key in _CONSENSUS_MISSING_NOTES
+            },
+            "note": (
+                "np/revenue 单位为万元(与 Tushare report_rc 一致)；"
+                "quarter 如 2025Q4 表示预测财年；按 org+quarter 去重取最新研报"
+            ),
+            "source": "quant_data.earnings_report_rc; Hermes MCP read-only earnings consensus",
+        }
+
+    resolved_symbol = str(rows[0].get("ts_code") or rows[0].get("symbol") or normalized_symbol)
+    latest_report_date = max(str(row.get("report_date") or "") for row in rows)
+
+    # Latest report per (org, quarter) to avoid duplicate stale entries.
+    latest_by_org_quarter: Dict[tuple[str, str], Dict[str, Any]] = {}
+    for row in rows:
+        org = str(row.get("org_name") or "").strip()
+        quarter = str(row.get("quarter") or "").strip()
+        if not org or not quarter:
+            continue
+        key = (org, quarter)
+        existing = latest_by_org_quarter.get(key)
+        if existing is None or str(row.get("report_date") or "") >= str(existing.get("report_date") or ""):
+            latest_by_org_quarter[key] = row
+
+    deduped = list(latest_by_org_quarter.values())
+    org_names = sorted({str(row.get("org_name") or "") for row in deduped if row.get("org_name")})
+
+    rating_distribution: Dict[str, int] = {bucket: 0 for bucket in _CONSENSUS_RATING_BUCKETS}
+    other_ratings = 0
+    for row in deduped:
+        rating = str(row.get("rating") or "").strip()
+        if rating in rating_distribution:
+            rating_distribution[rating] += 1
+        elif rating:
+            other_ratings += 1
+    if other_ratings:
+        rating_distribution["其他"] = other_ratings
+
+    by_quarter: Dict[str, List[Dict[str, Any]]] = {}
+    for row in deduped:
+        quarter = str(row.get("quarter") or "").strip()
+        if quarter:
+            by_quarter.setdefault(quarter, []).append(row)
+
+    def _valid_count(rows_: List[Dict[str, Any]], field: str) -> int:
+        return sum(1 for r in rows_ if _to_float_or_none(r.get(field)) is not None)
+
+    forecasts_by_quarter: Dict[str, Any] = {}
+    for quarter in sorted(by_quarter.keys()):
+        q_rows = by_quarter[quarter]
+        forecasts_by_quarter[quarter] = {
+            "fiscal_label": quarter,
+            "sample_count": len(q_rows),
+            "np_median_wan": _median_or_none_values([r.get("np") for r in q_rows], digits=2),
+            "np_sample_count": _valid_count(q_rows, "np"),
+            "revenue_median_wan": _median_or_none_values([r.get("op_rt") for r in q_rows], digits=2),
+            "revenue_sample_count": _valid_count(q_rows, "op_rt"),
+            "eps_median": _median_or_none_values([r.get("eps") for r in q_rows], digits=4),
+            "eps_sample_count": _valid_count(q_rows, "eps"),
+            "pe_median": _median_or_none_values([r.get("pe") for r in q_rows], digits=4),
+            "roe_median_pct": _median_or_none_values([r.get("roe") for r in q_rows], digits=2),
+            "orgs": sorted({str(r.get("org_name") or "") for r in q_rows if r.get("org_name")}),
+        }
+
+    return {
+        "success": True,
+        "symbol": normalized_symbol,
+        "resolved_symbol": resolved_symbol,
+        "lookback_days": lookback_days,
+        "report_count": len(rows),
+        "deduped_report_count": len(deduped),
+        "forecasts_by_quarter": forecasts_by_quarter,
+        "rating_distribution": rating_distribution,
+        "org_names": org_names,
+        "org_count": len(org_names),
+        "latest_report_date": latest_report_date or None,
+        "missing": missing,
+        "missing_notes": {key: _CONSENSUS_MISSING_NOTES[key] for key in missing if key in _CONSENSUS_MISSING_NOTES},
+        "note": (
+            "np/revenue 单位为万元(与 Tushare report_rc 一致)；"
+            "quarter 如 2025Q4 表示预测财年；按 org+quarter 去重取最新研报；"
+            "sample_count 为该财年研报条数，各指标实际有效值数见对应 *_sample_count"
+        ),
+        "source": "quant_data.earnings_report_rc; Hermes MCP read-only earnings consensus",
+    }
 
 
 def _clean_numeric(values: List[Any], *, positive_only: bool = True) -> List[float]:
@@ -1385,6 +1773,7 @@ def _stock_valuation_metrics_payload(
             "revenue": 1,
             "total_revenue": 1,
             "n_income_attr_p": 1,
+            "invest_income": 1,
             "report_type": 1,
         },
     )
@@ -1450,8 +1839,14 @@ def _stock_valuation_metrics_payload(
     _append_quality_missing(missing, latest_indicator, _QUALITY_ASSET_EFFICIENCY_FIELDS)
 
     segments = _mainbz_segments_for_valuation(_collection_from(data, "financial_mainbz"), candidates)
+    segments_series = _mainbz_segments_series(_collection_from(data, "financial_mainbz"), candidates)
     if not segments.get("by_type"):
         missing.append("financial_mainbz")
+
+    invest_income = _to_float_or_none(latest_income.get("invest_income"))
+    invest_income_to_revenue_pct = (
+        round(invest_income / revenue * 100, 2) if invest_income is not None and revenue else None
+    )
 
     missing_notes = {field: _VALUATION_MISSING_NOTES[field] for field in missing if field in _VALUATION_MISSING_NOTES}
 
@@ -1487,6 +1882,14 @@ def _stock_valuation_metrics_payload(
         )
     fcff_series_vals = [r["fcff_yuan"] for r in series if r["fcff_yuan"] is not None]
     fcff_positive_count = sum(1 for v in fcff_series_vals if v > 0)
+
+    ttm_income_info = _ttm_from_cumulative_income(income_rows, "n_income_attr_p")
+    normalized_pe_block = _normalized_pe_from_ttm(
+        _to_float_or_none(latest_daily.get("total_mv")), ttm_income_info
+    )
+    profit_quality_alert = _profit_quality_alert(latest_indicator)
+    fcff_seasonality_note = _fcff_seasonality_note(series)
+
     valuation_percentiles = {
         "pe_ttm": _percentile_rank_or_none(
             [r.get("pe_ttm") for r in daily_rows], _to_float_or_none(latest_daily.get("pe_ttm"))
@@ -1553,6 +1956,8 @@ def _stock_valuation_metrics_payload(
             "netprofit_yoy_pct": _round_or_none(latest_indicator.get("netprofit_yoy"), 2),
             "debt_to_assets_pct": _round_or_none(latest_indicator.get("debt_to_assets"), 2),
             "n_income_attr_p_yuan": _round_or_none(latest_income.get("n_income_attr_p"), 2),
+            "invest_income_yuan": _round_or_none(invest_income, 2),
+            "invest_income_to_revenue_pct": invest_income_to_revenue_pct,
         },
         "derived": {
             "rd_intensity": _round_or_none(rd_intensity, 6),
@@ -1564,9 +1969,13 @@ def _stock_valuation_metrics_payload(
             "rule_of_40_note": "收入增速(%) + 净利率(%) / FCFF margin(%)，仅作科技企业质量粗筛",
             "fcff_positive_periods": fcff_positive_count,
             "fcff_sample_periods": len(fcff_series_vals),
+            "profit_quality_alert": profit_quality_alert,
+            "fcff_seasonality_note": fcff_seasonality_note,
+            **normalized_pe_block,
         },
         "series": series,
         "segments": segments,
+        "segments_series": segments_series,
         "segments_note": (
             "最新一期主营构成(fina_mainbz)按产品(P)/地区(D)/行业(I)拆分；"
             "share_pct 为该维度内 bz_sales 净额占比，利润/估值倍数需研究员另行确认"
@@ -1609,6 +2018,21 @@ async def stock_valuation_metrics(
     毛利率/净利率及 Rule of 40 粗值。缺字段进入 missing，不让 LLM 猜。
     """
     return _stock_valuation_metrics_payload(symbol)
+
+
+@router.get("/stock/earnings-consensus", operation_id="stock_earnings_consensus", tags=[MCP_READ_TAG])
+async def stock_earnings_consensus(
+    symbol: str = Query(..., description="股票代码，如 688111.SH 或 688111"),
+    lookback_days: int = Query(180, ge=30, le=730, description="回溯研报天数，默认 180"),
+    _: bool = Depends(require_hermes_quant_internal_key),
+):
+    """
+    获取单股卖方研报一致预期（按预测财年聚合）。
+
+    读取 quant_data.earnings_report_rc，按 quarter（如 2025Q4）聚合净利/营收/EPS
+    中位数、评级分布与覆盖机构列表。缺数据进入 missing。
+    """
+    return _stock_earnings_consensus_payload(symbol, lookback_days=lookback_days)
 
 
 @router.get("/stock/industry-comparison", operation_id="stock_industry_comparison", tags=[MCP_READ_TAG])

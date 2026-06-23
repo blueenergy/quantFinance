@@ -2,6 +2,7 @@ import pytest
 
 from routers.hermes_quant_tools import (
     _foreign_top10_floatholders_payload,
+    _stock_earnings_consensus_payload,
     _stock_industry_comparison_payload,
     _stock_valuation_metrics_payload,
 )
@@ -328,6 +329,214 @@ def test_stock_valuation_metrics_matches_symbol_variants():
     assert payload["success"] is True
     assert payload["resolved_symbol"] == "688003.SH"
     assert payload["market"]["ps_ttm"] == pytest.approx(6.0)
+
+
+def test_stock_valuation_metrics_computes_normalized_pe_and_profit_alert():
+    data = {
+        "financial_daily_basic": _Collection(
+            [
+                {
+                    "ts_code": "688111.SH",
+                    "trade_date": "20260619",
+                    "pe_ttm": 29.0,
+                    "total_mv": 3_500.0,
+                }
+            ]
+        ),
+        "financial_indicator": _Collection(
+            [
+                {
+                    "ts_code": "688111.SH",
+                    "end_date": "20260331",
+                    "netprofit_margin": 30.0,
+                    "q_netprofit_margin": 136.0,
+                    "investincome_of_ebt": 80.5,
+                    "dtprofit_to_profit": 98.9,
+                    "tr_yoy": 24.0,
+                    "fcff": -18_400_000.0,
+                },
+                {
+                    "ts_code": "688111.SH",
+                    "end_date": "20251231",
+                    "fcff": 500_000_000.0,
+                },
+            ]
+        ),
+        "financial_income": _Collection(
+            [
+                {"ts_code": "688111.SH", "end_date": "20260331", "revenue": 1_000.0, "n_income_attr_p": 100.0},
+                {"ts_code": "688111.SH", "end_date": "20251231", "n_income_attr_p": 300.0},
+                {"ts_code": "688111.SH", "end_date": "20250331", "n_income_attr_p": 50.0},
+            ]
+        ),
+        "stock_info": _Collection([{"ts_code": "688111.SH", "name": "金山样本"}]),
+        "financial_mainbz": _Collection([]),
+    }
+
+    payload = _stock_valuation_metrics_payload("688111.SH", data_collections=data)
+
+    assert payload["derived"]["ttm_net_income_yuan"] == pytest.approx(350.0)
+    assert payload["derived"]["normalized_pe_ttm"] == pytest.approx(100_000.0)
+    assert payload["derived"]["normalized_pe_method"] == "ttm_from_cumulative_income"
+    assert payload["derived"]["profit_quality_alert"] is not None
+    assert "投资收益" in payload["derived"]["profit_quality_alert"]
+    # Q1 累计口径文案应避免说“全年”，并提示归一化 PE
+    assert "年内累计" in payload["derived"]["profit_quality_alert"]
+    assert "normalized_pe_ttm" in payload["derived"]["profit_quality_alert"]
+    assert payload["derived"]["fcff_seasonality_note"] is not None
+    assert "Q1" in payload["derived"]["fcff_seasonality_note"]
+
+
+def test_profit_quality_alert_annual_caliber_wording():
+    from routers.hermes_quant_tools import _profit_quality_alert
+
+    annual = _profit_quality_alert(
+        {"end_date": "20251231", "investincome_of_ebt": 70.0, "netprofit_margin": 30.0}
+    )
+    assert annual is not None
+    assert "全年" in annual
+    # 投资亏损主导也应触发
+    loss = _profit_quality_alert(
+        {"end_date": "20251231", "investincome_of_ebt": -80.0, "netprofit_margin": 10.0}
+    )
+    assert loss is not None
+    assert "拖累" in loss
+
+
+def test_stock_valuation_metrics_exposes_invest_income_and_segments_series():
+    data = {
+        "financial_daily_basic": _Collection(
+            [{"ts_code": "688111.SH", "trade_date": "20260619", "ps_ttm": 7.0}]
+        ),
+        "financial_indicator": _Collection(
+            [{"ts_code": "688111.SH", "end_date": "20260331", "tr_yoy": 24.0}]
+        ),
+        "financial_income": _Collection(
+            [
+                {
+                    "ts_code": "688111.SH",
+                    "end_date": "20260331",
+                    "revenue": 1_000.0,
+                    "invest_income": 200.0,
+                }
+            ]
+        ),
+        "stock_info": _Collection([{"ts_code": "688111.SH", "name": "分部增速"}]),
+        "financial_mainbz": _Collection(
+            [
+                {"ts_code": "688111.SH", "end_date": "20250331", "bz_type": "P", "bz_item": "WPS", "bz_sales": 400.0},
+                {"ts_code": "688111.SH", "end_date": "20260331", "bz_type": "P", "bz_item": "WPS", "bz_sales": 500.0},
+            ]
+        ),
+    }
+
+    payload = _stock_valuation_metrics_payload("688111.SH", data_collections=data)
+
+    assert payload["financial"]["invest_income_yuan"] == pytest.approx(200.0)
+    assert payload["financial"]["invest_income_to_revenue_pct"] == pytest.approx(20.0)
+    wps = payload["segments_series"]["by_type"]["P"]["items"][0]
+    assert wps["bz_item"] == "WPS"
+    assert wps["yoy_pct"] == pytest.approx(25.0)
+
+
+def test_stock_earnings_consensus_aggregates_forecasts_by_quarter():
+    data = {
+        "earnings_report_rc": _Collection(
+            [
+                {
+                    "ts_code": "688111.SH",
+                    "report_date": "20260601",
+                    "org_name": "中信建投",
+                    "quarter": "2025Q4",
+                    "np": 300_000.0,
+                    "op_rt": 1_000_000.0,
+                    "eps": 6.5,
+                    "rating": "买入",
+                },
+                {
+                    "ts_code": "688111.SH",
+                    "report_date": "20260520",
+                    "org_name": "华泰证券",
+                    "quarter": "2025Q4",
+                    "np": 310_000.0,
+                    "op_rt": 1_050_000.0,
+                    "eps": 6.8,
+                    "rating": "增持",
+                },
+                {
+                    "ts_code": "688111.SH",
+                    "report_date": "20260610",
+                    "org_name": "中信建投",
+                    "quarter": "2026Q4",
+                    "np": 350_000.0,
+                    "op_rt": 1_200_000.0,
+                    "eps": 7.2,
+                    "rating": "买入",
+                },
+            ]
+        )
+    }
+
+    payload = _stock_earnings_consensus_payload("688111.SH", data_collections=data, lookback_days=365)
+
+    assert payload["success"] is True
+    assert payload["org_count"] == 2
+    q4 = payload["forecasts_by_quarter"]["2025Q4"]
+    assert q4["np_median_wan"] == pytest.approx(305_000.0)
+    assert q4["sample_count"] == 2
+    assert q4["np_sample_count"] == 2
+    assert q4["revenue_sample_count"] == 2
+    assert payload["rating_distribution"]["买入"] == 2
+    assert payload["rating_distribution"]["增持"] == 1
+    assert payload["missing"] == []
+
+
+def test_stock_earnings_consensus_partial_metric_sample_count():
+    data = {
+        "earnings_report_rc": _Collection(
+            [
+                {
+                    "ts_code": "688111.SH",
+                    "report_date": "20260601",
+                    "org_name": "机构A",
+                    "quarter": "2025Q4",
+                    "np": 300_000.0,
+                    "eps": 6.5,
+                    "rating": "买入",
+                },
+                {
+                    "ts_code": "688111.SH",
+                    "report_date": "20260520",
+                    "org_name": "机构B",
+                    "quarter": "2025Q4",
+                    "eps": 6.8,
+                    "rating": "买入",
+                },
+            ]
+        )
+    }
+
+    payload = _stock_earnings_consensus_payload("688111.SH", data_collections=data, lookback_days=365)
+    q4 = payload["forecasts_by_quarter"]["2025Q4"]
+    assert q4["sample_count"] == 2
+    assert q4["np_sample_count"] == 1
+    assert q4["eps_sample_count"] == 2
+    assert q4["np_median_wan"] == pytest.approx(300_000.0)
+
+
+def test_stock_earnings_consensus_degrades_when_empty():
+    data = {"earnings_report_rc": _Collection([])}
+
+    payload = _stock_earnings_consensus_payload("688111.SH", data_collections=data)
+
+    assert payload["success"] is True
+    assert payload["report_count"] == 0
+    # 空响应与正常响应 schema 对齐
+    assert payload["deduped_report_count"] == 0
+    assert payload["org_count"] == 0
+    assert "note" in payload
+    assert "earnings_report_rc" in payload["missing"]
+    assert payload["missing_notes"]["earnings_report_rc"]
 
 
 def test_stock_industry_comparison_computes_peer_percentiles():
