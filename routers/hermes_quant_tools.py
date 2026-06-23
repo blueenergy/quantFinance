@@ -1473,6 +1473,9 @@ async def stock_valuation_metrics(
 async def stock_industry_comparison(
     symbol: str = Query(..., description="股票代码，如 688111.SH 或 688111"),
     level: str = Query("sw_l2", description="同业层级：sw_l2、sw_l1 或 industry；缺失时自动降级"),
+    min_peer_count: int = Query(
+        5, ge=2, le=100, description="计算中位数/分位所需的最少同业样本数，低于该值返回 null"
+    ),
     _: bool = Depends(require_hermes_quant_internal_key),
 ):
     """
@@ -1481,7 +1484,7 @@ async def stock_industry_comparison(
     使用 stock_info 的申万/行业字段确定同业集合，并在目标股最新交易日/财报期
     上计算 PE/PB/PS、市值、ROE、利润率、收入增速的行业横截面分位。
     """
-    return _stock_industry_comparison_payload(symbol, level=level)
+    return _stock_industry_comparison_payload(symbol, level=level, min_peer_count=min_peer_count)
 
 
 # ---------------------------------------------------------------------------

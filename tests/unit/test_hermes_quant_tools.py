@@ -376,6 +376,14 @@ def test_stock_industry_comparison_returns_null_when_peer_sample_is_small():
     assert payload["metrics"]["market"]["ps_ttm"]["sample_count"] == 3
     assert "同业股票数少于 5" in payload["notes"][0]
 
+    # 放宽 min_peer_count 后，3 个样本即可算出中位数与分位
+    relaxed = _stock_industry_comparison_payload(
+        "688101.SH", data_collections=data, min_peer_count=3
+    )
+    assert relaxed["metrics"]["market"]["ps_ttm"]["peer_median"] is not None
+    assert relaxed["metrics"]["market"]["ps_ttm"]["peer_percentile"] is not None
+    assert relaxed["notes"][0:1] != ["同业股票数少于 5，分位与中位数返回 null"]
+
 
 def test_foreign_top10_floatholders_matches_default_banks(monkeypatch):
     collection = _Collection(
