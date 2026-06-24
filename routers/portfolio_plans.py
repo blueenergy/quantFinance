@@ -129,6 +129,15 @@ class GeneratePlanRequest(BaseModel):
     params_override: Dict[str, Any] = Field(default_factory=dict)
 
 
+class ManualRebalanceRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    anchor_plan_id: str
+    base_date: Optional[str] = None
+    targets: Dict[str, int] = Field(default_factory=dict)
+    exclude_after: bool = Field(default=False)
+
+
 class ParamPresetRequest(BaseModel):
     strategy_template_id: str
     name: str
@@ -1144,6 +1153,123 @@ async def generate_portfolio_plan(request: GeneratePlanRequest, current_user: di
     return {"success": True, "data": _jsonable(task)}
 
 
+@router.post("/plans/manual-rebalance")
+async def create_manual_rebalance_plan(request: ManualRebalanceRequest, current_user: dict = Depends(get_current_user)):
+    user_id = _current_user_id(current_user)
+    collections = get_trading_db_collections()
+    anchor = _require_plan(collections, request.anchor_plan_id, current_user)
+    if not request.targets:
+        raise HTTPException(status_code=400, detail="targets must include at least one symbol")
+    # Heavy plan generation (capital baseline, pricing, lot-size, risk review) lives
+    # in stock-scoring-system; enqueue a task for the plan-generation worker instead
+    # of importing it into the API process.
+    now = datetime.utcnow()
+    task = {
+        "task_id": str(uuid.uuid4()),
+        "task_type": "generate_manual_rebalance_plan",
+        "user_id": user_id,
+        "strategy_template_id": anchor.get("strategy_template_id"),
+        "params_hash": anchor.get("params_hash"),
+        "base_date": request.base_date or anchor.get("base_date"),
+        "anchor_plan_id": request.anchor_plan_id,
+        "targets": {str(symbol): int(shares) for symbol, shares in request.targets.items()},
+        "exclude_after": bool(request.exclude_after),
+        "operation_type": "manual_rebalance",
+        "status": "pending",
+        "attempts": 0,
+        "plan_id": None,
+        "error_message": None,
+        "created_at": now,
+        "updated_at": now,
+    }
+    collections["portfolio_plan_generation_tasks"].insert_one(task)
+    return {"success": True, "data": _jsonable(task)}
+
+
+@router.post("/plans/{plan_id}/holdings-risk")
+async def enqueue_portfolio_holdings_risk(plan_id: str, current_user: dict = Depends(get_current_user)):
+    """Enqueue a holdings-level AI risk review for the worker.
+
+    Position sourcing (paper snapshot or live fills) stays in the API; the actual
+    rule evaluation (ai_risk_review) runs in the plan-generation worker and writes
+    its result onto the task, which the client polls.
+    """
+    collections = get_trading_db_collections()
+    finance_collections = get_db_collections()
+    data_collections = get_data_db()
+    user_id = _current_user_id(current_user)
+    plan = _require_plan(collections, plan_id, current_user)
+    snapshot = _latest_lineage_paper_snapshot(collections, plan, user_id)
+    positions = [row for row in (snapshot.get("positions") or []) if _int_value(row.get("shares")) > 0]
+    base_date = _normalize_yyyymmdd(snapshot.get("as_of_date")) or _normalize_yyyymmdd(plan.get("base_date"))
+    if not positions and _lineage_has_live_fills(collections, finance_collections, plan, user_id):
+        _, _, executions = _lineage_live_signal_execution_bundle(collections, finance_collections, plan, user_id)
+        grouped = group_executions_by_order(executions)
+        symbols = sorted({str(row.get("symbol")) for row in grouped if row.get("symbol")})
+        prices, _ = _load_fresh_market_prices(data_collections, symbols)
+        live_payload = build_lineage_live_positions(grouped, prices)
+        positions = [row for row in (live_payload.get("positions") or []) if _int_value(row.get("shares")) > 0]
+    if not base_date:
+        base_date = datetime.now().strftime("%Y%m%d")
+    control = _get_lineage_control_doc(
+        collections,
+        str(plan.get("strategy_template_id") or ""),
+        str(plan.get("params_hash") or ""),
+        user_id,
+    )
+    review_positions = [
+        {"symbol": row.get("symbol"), "shares": _int_value(row.get("shares")), "name": row.get("name", "")}
+        for row in positions
+    ]
+    now = datetime.utcnow()
+    task = {
+        "task_id": str(uuid.uuid4()),
+        "task_type": "holdings_risk_review",
+        "user_id": user_id,
+        "plan_id": plan_id,
+        "strategy_template_id": plan.get("strategy_template_id"),
+        "params_hash": plan.get("params_hash"),
+        "base_date": base_date,
+        "positions": review_positions,
+        "status": "pending",
+        "attempts": 0,
+        "error_message": None,
+        "created_at": now,
+        "updated_at": now,
+    }
+    collections["portfolio_plan_generation_tasks"].insert_one(task)
+    return {
+        "success": True,
+        "data": _jsonable(
+            {
+                "task_id": task["task_id"],
+                "anchor_plan_id": plan_id,
+                "strategy_template_id": plan.get("strategy_template_id"),
+                "params_hash": plan.get("params_hash"),
+                "base_date": base_date,
+                "position_count": len(review_positions),
+                "paused": bool(control.get("paused")),
+                "excluded_symbols": control.get("excluded_symbols") or [],
+            }
+        ),
+    }
+
+
+@router.post("/plans/{plan_id}/resume-lineage")
+async def resume_portfolio_lineage(plan_id: str, current_user: dict = Depends(get_current_user)):
+    collections = get_trading_db_collections()
+    user_id = _current_user_id(current_user)
+    plan = _require_plan(collections, plan_id, current_user)
+    control = _resume_lineage_native(
+        collections,
+        str(plan.get("strategy_template_id") or ""),
+        str(plan.get("params_hash") or ""),
+        user_id,
+        resumed_by=user_id,
+    )
+    return {"success": True, "data": _jsonable(control)}
+
+
 PLAN_RESELECT_STATUSES = {"draft", "generated", "needs_review"}
 
 
@@ -1974,6 +2100,120 @@ def _portfolio_param_summary(params_snapshot: Optional[Dict[str, Any]]) -> str:
     return " · ".join(parts)
 
 
+def _get_lineage_control_doc(
+    collections: Dict[str, Any],
+    strategy_template_id: str,
+    params_hash: str,
+    user_id: str,
+) -> Dict[str, Any]:
+    coll = collections.get("portfolio_lineage_controls")
+    if coll is None:
+        return {"paused": False, "excluded_symbols": []}
+    doc = coll.find_one(
+        {
+            "strategy_template_id": strategy_template_id,
+            "params_hash": params_hash,
+            "user_id": user_id,
+        },
+        {"_id": 0},
+    )
+    if doc:
+        return doc
+    return {"paused": False, "excluded_symbols": []}
+
+
+def _lineage_control_key(strategy_template_id: str, params_hash: str, user_id: Optional[str]) -> Dict[str, Any]:
+    return {
+        "strategy_template_id": strategy_template_id,
+        "params_hash": params_hash,
+        "user_id": user_id,
+    }
+
+
+def _resume_lineage_native(
+    collections: Dict[str, Any],
+    strategy_template_id: str,
+    params_hash: str,
+    user_id: Optional[str],
+    *,
+    resumed_by: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Clear the pause flag on a lineage. Pure Mongo write; no cross-repo import."""
+    coll = collections.get("portfolio_lineage_controls")
+    key = _lineage_control_key(strategy_template_id, params_hash, user_id)
+    now = datetime.utcnow()
+    if coll is not None:
+        coll.update_one(
+            key,
+            {
+                "$set": {**key, "paused": False, "resumed_at": now, "resumed_by": resumed_by, "updated_at": now},
+                "$unset": {"paused_at": "", "paused_by": "", "paused_reason": ""},
+            },
+            upsert=True,
+        )
+    return {**key, "paused": False}
+
+
+def _apply_manual_lineage_effects_native(
+    collections: Dict[str, Any],
+    plan: Dict[str, Any],
+    *,
+    final_positions: Optional[List[Dict[str, Any]]] = None,
+    acted_by: Optional[str] = None,
+    pause_on_empty: bool = True,
+) -> Dict[str, Any]:
+    """Mirror of tools.portfolio_trading.apply_manual_plan_lineage_effects.
+
+    Kept native in quant-api (pure Mongo on portfolio_lineage_controls) so the API
+    does not import stock-scoring-system. ``pause_on_empty`` must be False until
+    fills are settled (e.g. live signal publishing only).
+    """
+    if str(plan.get("origin") or "") != "manual":
+        return {}
+    coll = collections.get("portfolio_lineage_controls")
+    if coll is None:
+        return {}
+    key = _lineage_control_key(
+        str(plan.get("strategy_template_id") or ""),
+        str(plan.get("params_hash") or ""),
+        plan.get("user_id"),
+    )
+    now = datetime.utcnow()
+    effects: Dict[str, Any] = {}
+    if plan.get("exclude_after"):
+        symbols = sorted({str(s) for s in (plan.get("manual_exclude_symbols") or []) if s})
+        if symbols:
+            existing = (coll.find_one(key, {"_id": 0}) or {}).get("excluded_symbols") or []
+            merged = sorted({str(s) for s in existing} | set(symbols))
+            coll.update_one(
+                key,
+                {"$set": {**key, "excluded_symbols": merged, "updated_at": now}, "$setOnInsert": {"paused": False}},
+                upsert=True,
+            )
+            effects["excluded"] = merged
+    if not pause_on_empty:
+        return effects
+    positions = list(final_positions or [])
+    if not any(_int_value(row.get("shares")) > 0 for row in positions):
+        coll.update_one(
+            key,
+            {
+                "$set": {
+                    **key,
+                    "paused": True,
+                    "paused_at": now,
+                    "paused_by": acted_by,
+                    "paused_reason": "manual_liquidation",
+                    "updated_at": now,
+                },
+                "$unset": {"resumed_at": ""},
+            },
+            upsert=True,
+        )
+        effects["paused"] = True
+    return effects
+
+
 def _latest_lineage_paper_snapshot(
     collections: Dict[str, Any],
     plan: Dict[str, Any],
@@ -2036,6 +2276,7 @@ def _build_portfolio_entry(
     paper_snapshot = _latest_lineage_paper_snapshot(trading_collections, sample_plan, user_id)
     paper_positions = list(paper_snapshot.get("positions") or [])
     paper_holding_count = sum(1 for row in paper_positions if _int_value(row.get("shares")) > 0)
+    lineage_control = _get_lineage_control_doc(trading_collections, strategy_template_id, params_hash, user_id)
 
     return {
         "strategy_template_id": strategy_template_id,
@@ -2060,6 +2301,8 @@ def _build_portfolio_entry(
         "paper_snapshot_date": paper_snapshot.get("as_of_date"),
         "paper_holding_count": paper_holding_count,
         "paper_equity": paper_snapshot.get("equity"),
+        "paused": bool(lineage_control.get("paused")),
+        "excluded_symbols": lineage_control.get("excluded_symbols") or [],
     }
 
 
@@ -2831,6 +3074,17 @@ async def publish_portfolio_plan_live_signals(
                 }
             },
         )
+        if plan.get("origin") == "manual":
+            # Publishing live signals does NOT mean the orders filled. Only apply the
+            # forward-looking exclusion here; pausing the lineage (which would stop
+            # daily maintenance of a real book) must wait until fills are confirmed.
+            _apply_manual_lineage_effects_native(
+                trading_collections,
+                plan,
+                final_positions=[{"symbol": item.get("symbol"), "shares": _int_value(item.get("target_shares"))} for item in items],
+                acted_by=user_id,
+                pause_on_empty=False,
+            )
 
     return {
         "success": True,
@@ -3289,6 +3543,12 @@ def _apply_paper_execution(collections: Dict[str, Any], data_collections: Dict[s
     if user_id:
         plan_update_query["user_id"] = user_id
     collections["portfolio_trade_plans"].update_one(plan_update_query, {"$set": {"status": status, "paper_executed_at": now}})
+    lineage_effects = _apply_manual_lineage_effects_native(
+        collections,
+        plan,
+        final_positions=position_rows,
+        acted_by=user_id,
+    )
     return {
         "plan_id": plan_id,
         "status": status,
@@ -3297,6 +3557,7 @@ def _apply_paper_execution(collections: Dict[str, Any], data_collections: Dict[s
         "inherited_from_plan_id": inherited_snapshot.get("plan_id"),
         "inherited_from_as_of_date": inherited_snapshot.get("as_of_date"),
         "inherited_equity": inherited_equity,
+        "lineage_effects": lineage_effects,
     }
 
 
