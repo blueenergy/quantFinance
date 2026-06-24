@@ -1662,6 +1662,62 @@ async def get_portfolio_plan_lineage_equity(
     }
 
 
+@router.get("/plans/{plan_id}/lineage-paper-positions")
+async def get_lineage_paper_positions(plan_id: str, current_user: dict = Depends(get_current_user)):
+    """Latest paper position snapshot across the plan's params_hash lineage."""
+
+    collections = get_trading_db_collections()
+    user_id = _current_user_id(current_user)
+    plan = _require_plan(collections, plan_id, current_user)
+    snapshot = _latest_lineage_paper_snapshot(collections, plan, user_id)
+    positions: List[Dict[str, Any]] = []
+    total_market_value = 0.0
+    for row in sorted(snapshot.get("positions") or [], key=lambda item: str(item.get("symbol") or "")):
+        shares = _int_value(row.get("shares"))
+        if shares <= 0:
+            continue
+        market_value = _numeric(row.get("market_value"))
+        total_market_value += market_value
+        avg_cost = _numeric(row.get("cost_basis") or row.get("mark_price"))
+        last_price = _numeric(row.get("mark_price") or row.get("cost_basis"))
+        positions.append(
+            {
+                "symbol": row.get("symbol"),
+                "name": row.get("name", ""),
+                "shares": shares,
+                "avg_cost": avg_cost,
+                "last_price": last_price,
+                "market_value": market_value,
+                "realized_pnl": 0.0,
+                "unrealized_pnl": (last_price - avg_cost) * shares if last_price and avg_cost else 0.0,
+                "unrealized_pnl_pct": last_price / avg_cost - 1 if last_price > 0 and avg_cost > 0 else None,
+            }
+        )
+    equity = _numeric(snapshot.get("equity"))
+    cash = _numeric(snapshot.get("cash"))
+    return {
+        "success": True,
+        "data": _jsonable(
+            {
+                "anchor_plan_id": plan_id,
+                "strategy_template_id": plan.get("strategy_template_id"),
+                "params_hash": plan.get("params_hash"),
+                "as_of_date": snapshot.get("as_of_date"),
+                "source_plan_id": snapshot.get("plan_id"),
+                "positions": positions,
+                "summary": {
+                    "holding_count": len(positions),
+                    "total_market_value": total_market_value,
+                    "total_realized_pnl": 0.0,
+                    "total_unrealized_pnl": sum(_numeric(row.get("unrealized_pnl")) for row in positions),
+                    "equity": equity,
+                    "cash": cash,
+                },
+            }
+        ),
+    }
+
+
 @router.get("/plans/{plan_id}/live-executions")
 async def get_portfolio_plan_live_executions(plan_id: str, current_user: dict = Depends(get_current_user)):
     trading_collections = get_trading_db_collections()
@@ -1822,6 +1878,33 @@ def _portfolio_funding_mode(
     return "paper"
 
 
+def _portfolio_param_summary(params_snapshot: Optional[Dict[str, Any]]) -> str:
+    params = params_snapshot or {}
+    parts: List[str] = []
+    universe = params.get("universe_index")
+    if universe:
+        parts.append(str(universe))
+    top_n = params.get("top_n")
+    if top_n is not None:
+        parts.append(f"Top{int(top_n)}")
+    rebalance_days = params.get("rebalance_days")
+    if rebalance_days is not None:
+        parts.append(f"{int(rebalance_days)}d")
+    mode = params.get("construction_mode")
+    if mode:
+        parts.append(str(mode))
+    return " · ".join(parts)
+
+
+def _latest_lineage_paper_snapshot(
+    collections: Dict[str, Any],
+    plan: Dict[str, Any],
+    user_id: str,
+) -> Dict[str, Any]:
+    query = _lineage_query_for_plan(collections, plan, user_id)
+    return collections["portfolio_paper_positions"].find_one(query, sort=[("as_of_date", -1)]) or {}
+
+
 def _build_portfolio_entry(
     trading_collections: Dict[str, Any],
     finance_collections: Dict[str, Any],
@@ -1836,7 +1919,15 @@ def _build_portfolio_entry(
                 "strategy_template_id": strategy_template_id,
                 "params_hash": params_hash,
             },
-            {"_id": 0, "plan_id": 1, "base_date": 1, "strategy_name": 1, "status": 1},
+            {
+                "_id": 0,
+                "plan_id": 1,
+                "base_date": 1,
+                "strategy_name": 1,
+                "status": 1,
+                "plan_type": 1,
+                "params_snapshot": 1,
+            },
         )
     )
     if not all_lineage:
@@ -1858,16 +1949,33 @@ def _build_portfolio_entry(
             trading_collections, finance_collections, sample_plan, user_id
         )
 
+    params = dict(latest.get("params_snapshot") or {})
+    paper_snapshot = _latest_lineage_paper_snapshot(trading_collections, sample_plan, user_id)
+    paper_positions = list(paper_snapshot.get("positions") or [])
+    paper_holding_count = sum(1 for row in paper_positions if _int_value(row.get("shares")) > 0)
+
     return {
         "strategy_template_id": strategy_template_id,
         "params_hash": params_hash,
+        "params_hash_short": str(params_hash or "")[:8],
         "latest_plan_id": latest.get("plan_id"),
+        "latest_plan_status": latest.get("status"),
+        "latest_plan_type": latest.get("plan_type"),
+        "param_summary": _portfolio_param_summary(params),
+        "universe_index": params.get("universe_index"),
+        "top_n": params.get("top_n"),
+        "rebalance_days": params.get("rebalance_days"),
+        "construction_mode": params.get("construction_mode"),
+        "initial_capital": params.get("initial_capital"),
         "plan_count": len(all_lineage),
         "first_base_date": earliest.get("base_date"),
         "last_base_date": latest.get("base_date"),
         "strategy_name": latest.get("strategy_name") or earliest.get("strategy_name") or "",
         "securities_account_id": sec_id,
         "funding_mode": "live" if has_live else "paper",
+        "paper_snapshot_date": paper_snapshot.get("as_of_date"),
+        "paper_holding_count": paper_holding_count,
+        "paper_equity": paper_snapshot.get("equity"),
     }
 
 

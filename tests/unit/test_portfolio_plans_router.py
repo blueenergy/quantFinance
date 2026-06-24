@@ -1544,6 +1544,7 @@ def test_list_portfolios_includes_live_and_paper_lineages(monkeypatch):
                 "status": "executed_paper",
                 "params_hash": "hx-live",
                 "strategy_name": "LiveCombo",
+                "params_snapshot": {"top_n": 20, "rebalance_days": 20, "construction_mode": "top_n", "universe_index": "csi1000"},
             },
             {
                 "plan_id": "live-b",
@@ -1553,6 +1554,7 @@ def test_list_portfolios_includes_live_and_paper_lineages(monkeypatch):
                 "status": "executed_paper",
                 "params_hash": "hx-live",
                 "strategy_name": "LiveCombo",
+                "params_snapshot": {"top_n": 20, "rebalance_days": 20, "construction_mode": "top_n", "universe_index": "csi1000"},
             },
             {
                 "plan_id": "paper-a",
@@ -1562,6 +1564,7 @@ def test_list_portfolios_includes_live_and_paper_lineages(monkeypatch):
                 "status": "executed_paper",
                 "params_hash": "hx-paper",
                 "strategy_name": "PaperOnly",
+                "params_snapshot": {"top_n": 30, "rebalance_days": 10, "construction_mode": "industry_capped", "universe_index": "csi500"},
             },
             {
                 "plan_id": "paper-b",
@@ -1571,6 +1574,7 @@ def test_list_portfolios_includes_live_and_paper_lineages(monkeypatch):
                 "status": "partially_executed",
                 "params_hash": "hx-paper",
                 "strategy_name": "PaperOnly",
+                "params_snapshot": {"top_n": 30, "rebalance_days": 10, "construction_mode": "industry_capped", "universe_index": "csi500"},
             },
             {
                 "plan_id": "inactive",
@@ -1611,8 +1615,10 @@ def test_list_portfolios_includes_live_and_paper_lineages(monkeypatch):
     paper = next(row for row in ports if row["params_hash"] == "hx-paper")
     assert live["funding_mode"] == "live"
     assert live["latest_plan_id"] == "live-b"
+    assert live["param_summary"] == "Top20 · 20d · top_n · csi1000"
     assert paper["funding_mode"] == "paper"
     assert paper["latest_plan_id"] == "paper-b"
+    assert paper["param_summary"] == "Top30 · 10d · industry_capped · csi500"
 
 
 def test_list_portfolios_treats_unfilled_live_signals_as_paper(monkeypatch):
@@ -1648,6 +1654,55 @@ def test_list_portfolios_treats_unfilled_live_signals_as_paper(monkeypatch):
     assert len(ports) == 1
     assert ports[0]["funding_mode"] == "paper"
     assert ports[0]["securities_account_id"] == ""
+
+
+def test_lineage_paper_positions_uses_latest_snapshot(monkeypatch):
+    cols = _collections()
+    fin = _finance_collections()
+    data = _data_collections()
+    cols["portfolio_trade_plans"] = _Collection(
+        [
+            {
+                "plan_id": "paper-old",
+                "strategy_template_id": "stx",
+                "user_id": "user-1",
+                "base_date": "20250110",
+                "status": "executed_paper",
+                "params_hash": "hx",
+            },
+            {
+                "plan_id": "paper-new",
+                "strategy_template_id": "stx",
+                "user_id": "user-1",
+                "base_date": "20250120",
+                "status": "generated",
+                "params_hash": "hx",
+                "plan_type": "monitor",
+            },
+        ]
+    )
+    cols["portfolio_paper_positions"].docs = [
+        {
+            "strategy_template_id": "stx",
+            "user_id": "user-1",
+            "params_hash": "hx",
+            "plan_id": "paper-old",
+            "as_of_date": "20250111",
+            "equity": 1_000_000,
+            "cash": 100_000,
+            "positions": [
+                {"symbol": "000001.SZ", "name": "Ping", "shares": 100, "cost_basis": 10.0, "mark_price": 11.0, "market_value": 1100},
+            ],
+        },
+    ]
+    _patch_lineage_live_env(monkeypatch, cols, fin, data)
+    resp = asyncio.run(
+        portfolio_plans.get_lineage_paper_positions("paper-new", current_user={"id": "user-1"})
+    )
+    assert resp["data"]["as_of_date"] == "20250111"
+    assert resp["data"]["source_plan_id"] == "paper-old"
+    assert len(resp["data"]["positions"]) == 1
+    assert resp["data"]["positions"][0]["shares"] == 100
 
 
 def test_lineage_timeline_monitor_drift_and_action_required(monkeypatch):
@@ -1861,3 +1916,113 @@ def test_lineage_timeline_drift_summary_uses_items_when_monitor_summary_zero(mon
     assert drift["buy_count"] == 1
     assert drift["estimated_buy_amount"] == 1000.0
     assert drift["estimated_turnover"] == pytest.approx(0.001)
+
+
+def test_list_portfolios_includes_param_summary_and_paper_holdings(monkeypatch):
+    cols = _collections()
+    fin = _finance_collections()
+    data = _data_collections()
+    cols["portfolio_trade_plans"] = _Collection(
+        [
+            {
+                "plan_id": "paper-a",
+                "strategy_template_id": "st-paper",
+                "user_id": "user-1",
+                "base_date": "20250118",
+                "status": "executed_paper",
+                "params_hash": "hx-a",
+                "strategy_name": "ComboA",
+                "plan_type": "rebalance",
+                "params_snapshot": {
+                    "universe_index": "csi1000",
+                    "top_n": 20,
+                    "rebalance_days": 20,
+                    "construction_mode": "top_n",
+                },
+            },
+            {
+                "plan_id": "paper-b",
+                "strategy_template_id": "st-paper",
+                "user_id": "user-1",
+                "base_date": "20250125",
+                "status": "generated",
+                "params_hash": "hx-b",
+                "strategy_name": "ComboB",
+                "plan_type": "monitor",
+                "params_snapshot": {
+                    "universe_index": "csi500",
+                    "top_n": 30,
+                    "rebalance_days": 10,
+                    "construction_mode": "industry_capped",
+                },
+            },
+        ]
+    )
+    cols["portfolio_paper_positions"].docs = [
+        {
+            "strategy_template_id": "st-paper",
+            "user_id": "user-1",
+            "params_hash": "hx-a",
+            "plan_id": "paper-a",
+            "as_of_date": "20250118",
+            "equity": 1_000_000,
+            "cash": 100_000,
+            "positions": [
+                {"symbol": "000001.SZ", "name": "Ping", "shares": 100, "cost_basis": 10.0, "mark_price": 11.0, "market_value": 1100},
+            ],
+        },
+    ]
+    _patch_lineage_live_env(monkeypatch, cols, fin, data)
+    resp = asyncio.run(portfolio_plans.list_portfolios(current_user={"id": "user-1"}))
+    ports = {row["params_hash"]: row for row in resp["data"]["portfolios"]}
+    assert ports["hx-a"]["param_summary"] == "csi1000 · Top20 · 20d · top_n"
+    assert ports["hx-a"]["paper_holding_count"] == 1
+    assert ports["hx-b"]["param_summary"] == "csi500 · Top30 · 10d · industry_capped"
+    assert ports["hx-b"]["paper_holding_count"] == 0
+
+
+def test_lineage_paper_positions_returns_latest_snapshot(monkeypatch):
+    cols = _collections()
+    fin = _finance_collections()
+    data = _data_collections()
+    cols["portfolio_trade_plans"] = _Collection(
+        [
+            {
+                "plan_id": "paper-a",
+                "strategy_template_id": "st-paper",
+                "user_id": "user-1",
+                "base_date": "20250118",
+                "status": "executed_paper",
+                "params_hash": "hx-a",
+            },
+            {
+                "plan_id": "paper-b",
+                "strategy_template_id": "st-paper",
+                "user_id": "user-1",
+                "base_date": "20250125",
+                "status": "generated",
+                "params_hash": "hx-a",
+            },
+        ]
+    )
+    cols["portfolio_paper_positions"].docs = [
+        {
+            "strategy_template_id": "st-paper",
+            "user_id": "user-1",
+            "params_hash": "hx-a",
+            "plan_id": "paper-a",
+            "as_of_date": "20250118",
+            "equity": 1_000_000,
+            "cash": 100_000,
+            "positions": [
+                {"symbol": "000001.SZ", "name": "Ping", "shares": 100, "cost_basis": 10.0, "mark_price": 11.0, "market_value": 1100},
+            ],
+        },
+    ]
+    _patch_lineage_live_env(monkeypatch, cols, fin, data)
+    resp = asyncio.run(portfolio_plans.get_lineage_paper_positions("paper-b", current_user={"id": "user-1"}))
+    data = resp["data"]
+    assert data["as_of_date"] == "20250118"
+    assert data["source_plan_id"] == "paper-a"
+    assert len(data["positions"]) == 1
+    assert data["summary"]["holding_count"] == 1
