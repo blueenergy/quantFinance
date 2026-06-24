@@ -37,6 +37,10 @@ from services.portfolio_lineage_live import (
     build_lineage_live_trades,
     merge_lineage_live_executions,
 )
+from services.portfolio_lineage_paper import (
+    build_lineage_paper_trades,
+    merge_lineage_paper_executions,
+)
 from services.trade_ledger import group_executions_by_order
 from services.portfolio_plan_remainder import (
     LIVE_SIGNAL_SOURCE_PLAN_TOPUP,
@@ -1718,6 +1722,79 @@ async def get_lineage_paper_positions(plan_id: str, current_user: dict = Depends
     }
 
 
+@router.get("/plans/{plan_id}/lineage-paper-executions")
+async def get_lineage_paper_executions(plan_id: str, current_user: dict = Depends(get_current_user)):
+    """FIFO round-trip trade rows from paper executions across the plan lineage."""
+
+    trading_collections = get_trading_db_collections()
+    data_collections = get_data_db()
+    user_id = _current_user_id(current_user)
+    plan = _require_plan(trading_collections, plan_id, current_user)
+    lineage_ids = _lineage_plan_ids_for_plan(trading_collections, plan, user_id)
+    if not lineage_ids:
+        return {
+            "success": True,
+            "data": _jsonable(
+                {
+                    "anchor_plan_id": plan_id,
+                    "lineage_plan_ids": [],
+                    "strategy_template_id": plan.get("strategy_template_id"),
+                    "params_hash": plan.get("params_hash"),
+                    "executions": [],
+                    "trades": [],
+                    "execution_count": 0,
+                    "trade_count": 0,
+                }
+            ),
+        }
+
+    # Source of truth is ``portfolio_paper_executions`` (the actual paper fills):
+    # its prices match each holding's cost basis and its quantities reflect
+    # partial/blocked fills. Inheritance is now scoped by params_hash and the
+    # rebuild tool repaired historical lineages, so executions once again carry
+    # the full buy/sell history rather than a stale all-buy establishment.
+    execution_rows = list(
+        trading_collections["portfolio_paper_executions"]
+        .find({"user_id": user_id, "plan_id": {"$in": lineage_ids}})
+        .sort([("execute_date", 1), ("created_at", 1)])
+    )
+    plan_rows = list(
+        trading_collections["portfolio_trade_plans"].find(
+            {"user_id": user_id, "plan_id": {"$in": lineage_ids}},
+            {"_id": 0, "plan_id": 1, "base_date": 1},
+        )
+    )
+    plan_meta = {str(row.get("plan_id")): dict(row) for row in plan_rows if row.get("plan_id")}
+    merged = merge_lineage_paper_executions(execution_rows, plan_meta)
+    symbols = sorted({str(row.get("symbol")) for row in merged if row.get("symbol")})
+    prices, _realtime_docs = _load_fresh_market_prices(data_collections, symbols)
+    name_map = {
+        str(row.get("symbol")): str(row.get("name") or "")
+        for row in merged
+        if row.get("symbol") and row.get("name")
+    }
+    for symbol, name in list(name_map.items()):
+        name_map.setdefault(symbol.split(".", 1)[0], name)
+    trades = build_lineage_paper_trades(merged, prices, name_map=name_map)
+
+    return {
+        "success": True,
+        "data": _jsonable(
+            {
+                "anchor_plan_id": plan_id,
+                "lineage_plan_ids": lineage_ids,
+                "strategy_template_id": plan.get("strategy_template_id"),
+                "params_hash": plan.get("params_hash"),
+                "trade_source": "paper_executions",
+                "executions": merged,
+                "trades": trades,
+                "execution_count": len(merged),
+                "trade_count": len(trades),
+            }
+        ),
+    }
+
+
 @router.get("/plans/{plan_id}/live-executions")
 async def get_portfolio_plan_live_executions(plan_id: str, current_user: dict = Depends(get_current_user)):
     trading_collections = get_trading_db_collections()
@@ -2045,6 +2122,17 @@ def _drift_action_from_item(item: Dict[str, Any]) -> str:
     return "skip"
 
 
+def _executable_action_from_item(item: Dict[str, Any]) -> str:
+    delta = _int_value(item.get("delta_shares"))
+    if delta > 0:
+        return "buy"
+    if delta < 0:
+        return "sell"
+    if _int_value(item.get("current_shares")) > 0:
+        return "hold"
+    return "skip"
+
+
 def _compute_drift_summary(items: List[Dict[str, Any]], equity: Optional[float] = None) -> Dict[str, Any]:
     buy_count = sell_count = hold_count = skip_count = 0
     buy_amount = sell_amount = 0.0
@@ -2177,6 +2265,11 @@ def _timeline_node_drift_brief(
             {"plan_id": plan.get("plan_id"), "user_id": user_id},
             {
                 "_id": 0,
+                "symbol": 1,
+                "name": 1,
+                "rank": 1,
+                "action": 1,
+                "delta_shares": 1,
                 "drift_delta_shares": 1,
                 "estimated_price": 1,
                 "current_shares": 1,
@@ -2186,10 +2279,46 @@ def _timeline_node_drift_brief(
     )
     equity = _numeric((plan.get("summary") or {}).get("equity"), default=0.0)
     summary = _compute_drift_summary(items, equity=equity or None)
+    executable = bool(plan.get("executable"))
+    trade_items: List[Dict[str, Any]] = []
+    for item in sorted(
+        items,
+        key=lambda row: (
+            row.get("rank") if row.get("rank") is not None else 999,
+            str(row.get("symbol") or ""),
+        ),
+    ):
+        if executable:
+            delta = _int_value(item.get("delta_shares"))
+            action = str(item.get("action") or _executable_action_from_item(item))
+        else:
+            delta = _int_value(item.get("drift_delta_shares"))
+            action = _drift_action_from_item(item)
+        if action not in {"buy", "sell"}:
+            continue
+        price = _numeric(item.get("estimated_price"), default=0.0)
+        trade_items.append(
+            {
+                "symbol": item.get("symbol"),
+                "name": item.get("name"),
+                "action": action,
+                "delta_shares": delta,
+                "current_shares": _int_value(item.get("current_shares")),
+                "target_shares": _int_value(item.get("target_shares")),
+                "estimated_amount": abs(delta) * price if price and delta else None,
+            }
+        )
     return {
         "estimated_turnover": summary.get("estimated_turnover"),
         "buy_count": summary.get("buy_count"),
         "sell_count": summary.get("sell_count"),
+        "hold_count": summary.get("hold_count"),
+        "estimated_buy_amount": summary.get("estimated_buy_amount"),
+        "estimated_sell_amount": summary.get("estimated_sell_amount"),
+        "new_entrant_count": summary.get("new_entrant_count"),
+        "dropped_count": summary.get("dropped_count"),
+        "mode": "executable" if executable else "drift",
+        "items": trade_items,
     }
 
 

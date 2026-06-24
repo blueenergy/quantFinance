@@ -1793,6 +1793,10 @@ def test_lineage_timeline_monitor_drift_and_action_required(monkeypatch):
             "plan_id": "reb-2",
             "user_id": "user-1",
             "symbol": "000001.SZ",
+            "name": "PingAn",
+            "rank": 1,
+            "action": "buy",
+            "delta_shares": 50,
             "drift_delta_shares": 50,
             "estimated_price": 10.0,
             "current_shares": 100,
@@ -1818,6 +1822,8 @@ def test_lineage_timeline_monitor_drift_and_action_required(monkeypatch):
     assert monitor_node["action_required"] is False
     assert monitor_node["drift_brief"]["buy_count"] == 1
     assert monitor_node["drift_brief"]["sell_count"] == 1
+    assert monitor_node["drift_brief"]["mode"] == "drift"
+    assert len(monitor_node["drift_brief"]["items"]) == 2
     assert monitor_data["current_cycle"]["latest_rebalance_plan_id"] == "reb-2"
     assert monitor_data["current_cycle"]["latest_monitor_plan_id"] == "mon-1"
 
@@ -1831,6 +1837,11 @@ def test_lineage_timeline_monitor_drift_and_action_required(monkeypatch):
     assert review_data["today_state"] == "调仓日：等待审核"
     assert len(review_data["timeline"]) == 3
     assert review_data["timeline"][0]["plan_id"] == "reb-2"
+    reb2_brief = review_data["timeline"][0]["drift_brief"]
+    assert reb2_brief["mode"] == "executable"
+    assert len(reb2_brief["items"]) == 1
+    assert reb2_brief["items"][0]["symbol"] == "000001.SZ"
+    assert reb2_brief["items"][0]["delta_shares"] == 50
 
 
 def test_lineage_timeline_monitor_can_trade_label(monkeypatch):
@@ -2028,3 +2039,82 @@ def test_lineage_paper_positions_returns_latest_snapshot(monkeypatch):
     assert data["source_plan_id"] == "paper-a"
     assert len(data["positions"]) == 1
     assert data["summary"]["holding_count"] == 1
+
+
+def test_lineage_paper_executions_returns_fifo_trades(monkeypatch):
+    cols = _collections()
+    fin = _finance_collections()
+    data = _data_collections()
+    cols["portfolio_trade_plans"] = _Collection(
+        [
+            {
+                "plan_id": "paper-a",
+                "strategy_template_id": "st-paper",
+                "user_id": "user-1",
+                "base_date": "20250106",
+                "plan_type": "rebalance",
+                "status": "executed_paper",
+                "params_hash": "hx-a",
+                "execute_date": "20250107",
+            },
+            {
+                "plan_id": "paper-b",
+                "strategy_template_id": "st-paper",
+                "user_id": "user-1",
+                "base_date": "20250120",
+                "plan_type": "rebalance",
+                "status": "executed_paper",
+                "params_hash": "hx-a",
+                "execute_date": "20250121",
+            },
+        ]
+    )
+    # Trade ledger is derived from the actual paper fills, so buy/sell prices
+    # match each holding's cost basis.
+    cols["portfolio_paper_executions"].docs = [
+        {
+            "execution_id": "ex-1",
+            "plan_id": "paper-a",
+            "user_id": "user-1",
+            "symbol": "000001.SZ",
+            "name": "Ping",
+            "action": "buy",
+            "quantity": 100,
+            "price": 10.0,
+            "amount": 1000.0,
+            "execute_date": "20250107",
+            "created_at": "2025-01-07T01:30:00",
+        },
+        {
+            "execution_id": "ex-2",
+            "plan_id": "paper-b",
+            "user_id": "user-1",
+            "symbol": "000001.SZ",
+            "name": "Ping",
+            "action": "sell",
+            "quantity": 40,
+            "price": 12.0,
+            "amount": 480.0,
+            "execute_date": "20250121",
+            "created_at": "2025-01-21T01:30:00",
+        },
+    ]
+    _patch_lineage_live_env(monkeypatch, cols, fin, data)
+    resp = asyncio.run(
+        portfolio_plans.get_lineage_paper_executions("paper-b", current_user={"id": "user-1"})
+    )
+    payload = resp["data"]
+    assert payload["trade_source"] == "paper_executions"
+    assert payload["execution_count"] == 2
+    assert payload["trade_count"] == 2
+    statuses = {row["status"] for row in payload["trades"]}
+    assert statuses == {"closed", "open"}
+    closed = next(row for row in payload["trades"] if row["status"] == "closed")
+    assert closed["quantity"] == 40
+    assert closed["buy_price"] == 10.0
+    assert closed["buy_date"] == "20250107"
+    assert closed["sell_date"] == "20250121"
+    assert closed["rebalance_date"] == "20250106"
+    open_row = next(row for row in payload["trades"] if row["status"] == "open")
+    assert open_row["quantity"] == 60
+    assert open_row["buy_price"] == 10.0
