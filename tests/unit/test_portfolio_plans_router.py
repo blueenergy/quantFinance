@@ -2118,3 +2118,219 @@ def test_lineage_paper_executions_returns_fifo_trades(monkeypatch):
     open_row = next(row for row in payload["trades"] if row["status"] == "open")
     assert open_row["quantity"] == 60
     assert open_row["buy_price"] == 10.0
+
+
+def _live_rebalance_env():
+    """Lineage (plan 'pla') holding 500 shares of 600000.SH from a live buy fill."""
+    cols = _collections()
+    fin = _finance_collections()
+    data = _data_collections()
+    data["volume_price_realtime_latest"] = _Collection(
+        [
+            {"symbol": "600000", "close": 12.0, "trade_date": "20250131"},
+            {"symbol": "600000.SH", "close": 12.0, "trade_date": "20250131"},
+        ]
+    )
+    cols["portfolio_trade_plans"] = _Collection(
+        [
+            {
+                "plan_id": "pla",
+                "strategy_template_id": "stx",
+                "user_id": "user-1",
+                "params_hash": "hx",
+                "base_date": "20250101",
+                "status": "approved",
+                "strategy_name": "L1",
+                "params_snapshot": {"initial_capital": 1_000_000, "lot_size": 100},
+            }
+        ]
+    )
+    fin["trade_signals"].docs = [
+        {"order_id": "o-buy-1", "user_id": "user-1", "mode": "live", "plan_id": "pla", "symbol": "600000.SH", "name": "浦发银行", "created_at": 1},
+    ]
+    fin["trade_executions"].docs = [
+        {"order_id": "o-buy-1", "user_id": "user-1", "symbol": "600000.SH", "side": "BUY", "status": "filled", "filled_size": 500, "filled_price": 11.0, "timestamp": 1.0},
+    ]
+    # Broker can sell the full 500 shares -> no insufficient_available_position.
+    fin["trader_positions"].docs = [
+        {"user_id": "user-1", "securities_account_id": "acct-1", "symbol": "600000.SH", "can_use_volume": 500}
+    ]
+    return cols, fin, data
+
+
+def test_live_rebalance_dry_run_builds_sell_signals(monkeypatch):
+    cols, fin, data = _live_rebalance_env()
+    _patch_lineage_live_env(monkeypatch, cols, fin, data)
+
+    resp = asyncio.run(
+        portfolio_plans.live_rebalance_portfolio(
+            "pla",
+            portfolio_plans.LiveRebalanceRequest(
+                securities_account_id="acct-1", targets={"600000.SH": 0}, dry_run=True
+            ),
+            current_user={"id": "user-1"},
+        )
+    )
+
+    data_out = resp["data"]
+    assert data_out["dry_run"] is True
+    assert data_out["manual_action"] == "liquidate"
+    assert data_out["changed_symbols"] == ["600000.SH"]
+    assert len(data_out["signals"]) == 1
+    signal = data_out["signals"][0]
+    assert signal["action"] == "sell"
+    assert signal["size"] == 500
+    assert signal["mode"] == "live"
+    assert signal["execution_phase"] == "sell"
+    # Nothing persisted on a dry run: only the seed buy signal remains.
+    assert len(fin["trade_signals"].docs) == 1
+    assert fin["trade_signals"].docs[0]["order_id"] == "o-buy-1"
+    assert not [p for p in cols["portfolio_trade_plans"].docs if p.get("origin") == "manual"]
+
+
+def test_live_rebalance_liquidation_publishes_and_creates_manual_plan(monkeypatch):
+    cols, fin, data = _live_rebalance_env()
+    _patch_lineage_live_env(monkeypatch, cols, fin, data)
+
+    resp = asyncio.run(
+        portfolio_plans.live_rebalance_portfolio(
+            "pla",
+            portfolio_plans.LiveRebalanceRequest(
+                securities_account_id="acct-1", targets={"600000.SH": 0}, dry_run=False
+            ),
+            current_user={"id": "user-1"},
+        )
+    )
+
+    data_out = resp["data"]
+    assert data_out["dry_run"] is False
+    assert data_out["inserted_count"] == 1
+    # Seed buy signal + the new sell signal.
+    assert len(fin["trade_signals"].docs) == 2
+    new_sell = next(d for d in fin["trade_signals"].docs if d.get("action") == "sell")
+    assert new_sell["size"] == 500
+    assert new_sell["mode"] == "live"
+    # Manual liquidation plan + item persisted for audit.
+    manual_plans = [p for p in cols["portfolio_trade_plans"].docs if p.get("origin") == "manual"]
+    assert len(manual_plans) == 1
+    plan = manual_plans[0]
+    assert plan["manual_action"] == "liquidate"
+    assert plan["is_liquidation"] is True
+    assert plan["status"] == "approved"
+    assert plan["plan_type"] == "rebalance"
+    assert plan["live_signals_published_at"]
+    items = [i for i in cols["portfolio_trade_plan_items"].docs if i["plan_id"] == plan["plan_id"]]
+    assert len(items) == 1
+    assert items[0]["action"] == "sell"
+    assert items[0]["target_shares"] == 0
+    assert items[0]["delta_shares"] == -500
+
+
+def test_live_rebalance_partial_reduce(monkeypatch):
+    cols, fin, data = _live_rebalance_env()
+    _patch_lineage_live_env(monkeypatch, cols, fin, data)
+
+    resp = asyncio.run(
+        portfolio_plans.live_rebalance_portfolio(
+            "pla",
+            portfolio_plans.LiveRebalanceRequest(
+                securities_account_id="acct-1", targets={"600000.SH": 200}, dry_run=False
+            ),
+            current_user={"id": "user-1"},
+        )
+    )
+
+    data_out = resp["data"]
+    assert data_out["manual_action"] == "rebalance"
+    sells = [d for d in fin["trade_signals"].docs if d.get("action") == "sell"]
+    assert len(sells) == 1
+    assert sells[0]["size"] == 300  # 500 -> 200
+    plan = next(p for p in cols["portfolio_trade_plans"].docs if p.get("origin") == "manual")
+    item = next(i for i in cols["portfolio_trade_plan_items"].docs if i["plan_id"] == plan["plan_id"])
+    assert item["action"] == "sell"
+    assert item["target_shares"] == 200
+    assert item["delta_shares"] == -300
+
+
+def test_live_rebalance_add_position_builds_buy(monkeypatch):
+    cols, fin, data = _live_rebalance_env()
+    _patch_lineage_live_env(monkeypatch, cols, fin, data)
+
+    resp = asyncio.run(
+        portfolio_plans.live_rebalance_portfolio(
+            "pla",
+            portfolio_plans.LiveRebalanceRequest(
+                securities_account_id="acct-1", targets={"600000.SH": 700}, dry_run=False
+            ),
+            current_user={"id": "user-1"},
+        )
+    )
+
+    data_out = resp["data"]
+    assert data_out["manual_action"] == "rebalance"
+    assert data_out["blocked"] is False
+    buys = [d for d in fin["trade_signals"].docs if d.get("action") == "buy"]
+    assert len(buys) == 1
+    assert buys[0]["size"] == 200  # 500 -> 700
+    item = next(
+        i
+        for i in cols["portfolio_trade_plan_items"].docs
+        if i.get("action") == "buy"
+    )
+    assert item["target_shares"] == 700
+    assert item["delta_shares"] == 200
+
+
+def test_live_rebalance_hard_block_when_live_disabled(monkeypatch):
+    cols, fin, data = _live_rebalance_env()
+    _patch_lineage_live_env(monkeypatch, cols, fin, data)
+
+    with pytest.raises(portfolio_plans.HTTPException) as excinfo:
+        asyncio.run(
+            portfolio_plans.live_rebalance_portfolio(
+                "pla",
+                portfolio_plans.LiveRebalanceRequest(
+                    securities_account_id="acct-off", targets={"600000.SH": 0}, dry_run=False
+                ),
+                current_user={"id": "user-1"},
+            )
+        )
+
+    assert excinfo.value.status_code == 409
+    # Nothing persisted when blocked by account configuration.
+    assert len(fin["trade_signals"].docs) == 1
+    assert not [p for p in cols["portfolio_trade_plans"].docs if p.get("origin") == "manual"]
+
+
+def test_live_rebalance_no_targets_returns_400(monkeypatch):
+    cols, fin, data = _live_rebalance_env()
+    _patch_lineage_live_env(monkeypatch, cols, fin, data)
+
+    with pytest.raises(portfolio_plans.HTTPException) as excinfo:
+        asyncio.run(
+            portfolio_plans.live_rebalance_portfolio(
+                "pla",
+                portfolio_plans.LiveRebalanceRequest(securities_account_id="acct-1", targets={}, dry_run=False),
+                current_user={"id": "user-1"},
+            )
+        )
+
+    assert excinfo.value.status_code == 400
+
+
+def test_live_rebalance_no_change_returns_400(monkeypatch):
+    cols, fin, data = _live_rebalance_env()
+    _patch_lineage_live_env(monkeypatch, cols, fin, data)
+
+    with pytest.raises(portfolio_plans.HTTPException) as excinfo:
+        asyncio.run(
+            portfolio_plans.live_rebalance_portfolio(
+                "pla",
+                portfolio_plans.LiveRebalanceRequest(
+                    securities_account_id="acct-1", targets={"600000.SH": 500}, dry_run=False
+                ),
+                current_user={"id": "user-1"},
+            )
+        )
+
+    assert excinfo.value.status_code == 400
