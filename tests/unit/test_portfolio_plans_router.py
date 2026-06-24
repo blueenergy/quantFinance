@@ -1615,10 +1615,10 @@ def test_list_portfolios_includes_live_and_paper_lineages(monkeypatch):
     paper = next(row for row in ports if row["params_hash"] == "hx-paper")
     assert live["funding_mode"] == "live"
     assert live["latest_plan_id"] == "live-b"
-    assert live["param_summary"] == "Top20 · 20d · top_n · csi1000"
+    assert live["param_summary"] == "csi1000 · Top20 · 20d · top_n"
     assert paper["funding_mode"] == "paper"
     assert paper["latest_plan_id"] == "paper-b"
-    assert paper["param_summary"] == "Top30 · 10d · industry_capped · csi500"
+    assert paper["param_summary"] == "csi500 · Top30 · 10d · industry_capped"
 
 
 def test_list_portfolios_treats_unfilled_live_signals_as_paper(monkeypatch):
@@ -1945,7 +1945,7 @@ def test_list_portfolios_includes_param_summary_and_paper_holdings(monkeypatch):
                 "strategy_template_id": "st-paper",
                 "user_id": "user-1",
                 "base_date": "20250125",
-                "status": "generated",
+                "status": "executed_paper",
                 "params_hash": "hx-b",
                 "strategy_name": "ComboB",
                 "plan_type": "monitor",
