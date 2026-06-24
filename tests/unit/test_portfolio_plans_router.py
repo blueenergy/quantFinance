@@ -6,11 +6,32 @@ import pytest
 from routers import portfolio_plans
 
 
+def _sort_key(value):
+    """Type-stable sort key so the fake can order mixed/missing values without
+    raising on cross-type comparisons (mirrors a real Mongo multi-key sort)."""
+    if value is None:
+        return (0, 0.0)
+    if isinstance(value, bool):
+        return (1, float(value))
+    if isinstance(value, (int, float)):
+        return (1, float(value))
+    return (2, str(value))
+
+
 class _Cursor(list):
     def sort(self, field, direction=None):
-        if isinstance(field, list):
-            field, direction = field[0]
-        return _Cursor(sorted(self, key=lambda row: row.get(field) or "", reverse=direction == -1))
+        keys = field if isinstance(field, list) else [(field, direction)]
+        rows = list(self)
+        # Apply sort keys from least to most significant. Python's sort is
+        # stable, so this reproduces a real multi-key sort (e.g. as_of_date desc
+        # then updated_at desc to break same-day ties).
+        for sort_field, sort_dir in reversed(keys):
+            rows = sorted(
+                rows,
+                key=lambda row, f=sort_field: _sort_key(row.get(f)),
+                reverse=sort_dir == -1,
+            )
+        return _Cursor(rows)
 
     def limit(self, n):
         return _Cursor(list(self)[:n])
@@ -1703,6 +1724,61 @@ def test_lineage_paper_positions_uses_latest_snapshot(monkeypatch):
     assert resp["data"]["source_plan_id"] == "paper-old"
     assert len(resp["data"]["positions"]) == 1
     assert resp["data"]["positions"][0]["shares"] == 100
+
+
+def test_lineage_paper_positions_breaks_as_of_date_ties_by_updated_at(monkeypatch):
+    # Same-day intraday rebalance: a manual snapshot shares as_of_date with the
+    # morning strategy mark and must win the tie via the newer updated_at, so the
+    # holdings view reflects the rebalance instead of the stale strategy snapshot.
+    cols = _collections()
+    fin = _finance_collections()
+    data = _data_collections()
+    cols["portfolio_trade_plans"] = _Collection(
+        [
+            {
+                "plan_id": "paper-anchor",
+                "strategy_template_id": "st-tie",
+                "user_id": "user-1",
+                "base_date": "20250120",
+                "status": "generated",
+                "params_hash": "hx-tie",
+            },
+        ]
+    )
+    cols["portfolio_paper_positions"].docs = [
+        {
+            "strategy_template_id": "st-tie",
+            "user_id": "user-1",
+            "params_hash": "hx-tie",
+            "plan_id": "paper-strategy-mark",
+            "as_of_date": "20250120",
+            "equity": 1_000_000,
+            "cash": 100_000,
+            "updated_at": datetime(2025, 1, 20, 10, 30, 0),
+            "positions": [
+                {"symbol": "000001.SZ", "name": "Ping", "shares": 100, "cost_basis": 10.0, "mark_price": 11.0, "market_value": 1100},
+            ],
+        },
+        {
+            "strategy_template_id": "st-tie",
+            "user_id": "user-1",
+            "params_hash": "hx-tie",
+            "plan_id": "paper-manual-rebalance",
+            "as_of_date": "20250120",
+            "equity": 1_050_000,
+            "cash": 1_050_000,
+            "updated_at": datetime(2025, 1, 20, 14, 45, 0),
+            "positions": [],
+        },
+    ]
+    _patch_lineage_live_env(monkeypatch, cols, fin, data)
+    resp = asyncio.run(
+        portfolio_plans.get_lineage_paper_positions("paper-anchor", current_user={"id": "user-1"})
+    )
+    assert resp["data"]["as_of_date"] == "20250120"
+    assert resp["data"]["source_plan_id"] == "paper-manual-rebalance"
+    assert resp["data"]["positions"] == []
+    assert resp["data"]["summary"]["holding_count"] == 0
 
 
 def test_lineage_timeline_monitor_drift_and_action_required(monkeypatch):

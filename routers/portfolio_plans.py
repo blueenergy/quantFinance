@@ -396,7 +396,12 @@ def _latest_lineage_position_snapshot(
         query["plan_id"] = {"$ne": plan.get("plan_id")}
     if before_or_on:
         query["as_of_date"] = {"$lte": before_or_on}
-    return collections["portfolio_paper_positions"].find_one(query, sort=[("as_of_date", -1)]) or {}
+    return (
+        collections["portfolio_paper_positions"].find_one(
+            query, sort=[("as_of_date", -1), ("updated_at", -1)]
+        )
+        or {}
+    )
 
 
 PLAN_LIST_PROJECTION = {
@@ -2862,7 +2867,12 @@ def _latest_lineage_paper_snapshot(
     user_id: str,
 ) -> Dict[str, Any]:
     query = _lineage_query_for_plan(collections, plan, user_id)
-    return collections["portfolio_paper_positions"].find_one(query, sort=[("as_of_date", -1)]) or {}
+    return (
+        collections["portfolio_paper_positions"].find_one(
+            query, sort=[("as_of_date", -1), ("updated_at", -1)]
+        )
+        or {}
+    )
 
 
 def _build_portfolio_entry(
@@ -3961,7 +3971,7 @@ async def get_portfolio_strategy_realtime_equity(
     _require_strategy(collections, strategy_template_id)
     snapshot = collections["portfolio_paper_positions"].find_one(
         {"strategy_template_id": strategy_template_id, "user_id": _current_user_id(current_user)},
-        sort=[("as_of_date", -1)],
+        sort=[("as_of_date", -1), ("updated_at", -1)],
     )
     if not snapshot:
         return {"success": True, "data": None}
