@@ -1350,7 +1350,24 @@ def test_list_live_portfolios_finds_lineage_with_live_signals(monkeypatch):
         ]
     )
     fin["trade_signals"].docs = [
-        {"user_id": "user-1", "mode": "live", "plan_id": "pla", "securities_account_id": "acct-1"},
+        {
+            "order_id": "oa",
+            "user_id": "user-1",
+            "mode": "live",
+            "plan_id": "pla",
+            "securities_account_id": "acct-1",
+        },
+    ]
+    fin["trade_executions"].docs = [
+        {
+            "order_id": "oa",
+            "user_id": "user-1",
+            "symbol": "000001.SZ",
+            "side": "BUY",
+            "filled_size": 100,
+            "filled_price": 10.0,
+            "timestamp": 1.0,
+        },
     ]
     _patch_lineage_live_env(monkeypatch, cols, fin, data)
     resp = asyncio.run(portfolio_plans.list_live_portfolios(current_user={"id": "user-1"}))
@@ -1567,7 +1584,24 @@ def test_list_portfolios_includes_live_and_paper_lineages(monkeypatch):
         ]
     )
     fin["trade_signals"].docs = [
-        {"user_id": "user-1", "mode": "live", "plan_id": "live-a", "securities_account_id": "acct-1"},
+        {
+            "order_id": "live-order",
+            "user_id": "user-1",
+            "mode": "live",
+            "plan_id": "live-a",
+            "securities_account_id": "acct-1",
+        },
+    ]
+    fin["trade_executions"].docs = [
+        {
+            "order_id": "live-order",
+            "user_id": "user-1",
+            "symbol": "000001.SZ",
+            "side": "BUY",
+            "filled_size": 100,
+            "filled_price": 10.0,
+            "timestamp": 1.0,
+        },
     ]
     _patch_lineage_live_env(monkeypatch, cols, fin, data)
     resp = asyncio.run(portfolio_plans.list_portfolios(current_user={"id": "user-1"}))
@@ -1579,6 +1613,41 @@ def test_list_portfolios_includes_live_and_paper_lineages(monkeypatch):
     assert live["latest_plan_id"] == "live-b"
     assert paper["funding_mode"] == "paper"
     assert paper["latest_plan_id"] == "paper-b"
+
+
+def test_list_portfolios_treats_unfilled_live_signals_as_paper(monkeypatch):
+    cols = _collections()
+    fin = _finance_collections()
+    data = _data_collections()
+    cols["portfolio_trade_plans"] = _Collection(
+        [
+            {
+                "plan_id": "signal-only",
+                "strategy_template_id": "st-live",
+                "user_id": "user-1",
+                "base_date": "20250120",
+                "status": "executed_paper",
+                "params_hash": "hx-signal-only",
+                "strategy_name": "SignalOnly",
+            },
+        ]
+    )
+    fin["trade_signals"].docs = [
+        {
+            "order_id": "pending-order",
+            "user_id": "user-1",
+            "mode": "live",
+            "plan_id": "signal-only",
+            "securities_account_id": "acct-1",
+            "status": "cancelled",
+        },
+    ]
+    _patch_lineage_live_env(monkeypatch, cols, fin, data)
+    resp = asyncio.run(portfolio_plans.list_portfolios(current_user={"id": "user-1"}))
+    ports = resp["data"]["portfolios"]
+    assert len(ports) == 1
+    assert ports[0]["funding_mode"] == "paper"
+    assert ports[0]["securities_account_id"] == ""
 
 
 def test_lineage_timeline_monitor_drift_and_action_required(monkeypatch):

@@ -1736,12 +1736,52 @@ async def get_portfolio_plan_live_realtime_equity(plan_id: str, current_user: di
 PAPER_ACTIVE_STATUSES = frozenset({"executed_paper", "partially_executed"})
 
 
-def _live_plan_ids_for_user(finance_collections: Dict[str, Any], user_id: str) -> set:
-    rows = finance_collections["trade_signals"].find(
-        {"user_id": user_id, "mode": "live", "plan_id": {"$exists": True}},
-        {"_id": 0, "plan_id": 1},
+def _execution_fill_quantity(execution: Dict[str, Any]) -> float:
+    for key in ("filled_size", "quantity", "filled_qty"):
+        qty = _numeric(execution.get(key), default=-1.0)
+        if qty > 0:
+            return qty
+    return 0.0
+
+
+def _lineage_has_live_fills(
+    trading_collections: Dict[str, Any],
+    finance_collections: Dict[str, Any],
+    plan: Dict[str, Any],
+    user_id: str,
+) -> bool:
+    """True when the lineage has at least one live fill in trade_executions."""
+
+    _lineage_ids, _signals, executions = _lineage_live_signal_execution_bundle(
+        trading_collections, finance_collections, plan, user_id
     )
-    return {str(row["plan_id"]) for row in rows if row.get("plan_id")}
+    return any(_execution_fill_quantity(row) > 0 for row in executions)
+
+
+def _lineage_live_account_id_from_fills(
+    trading_collections: Dict[str, Any],
+    finance_collections: Dict[str, Any],
+    plan: Dict[str, Any],
+    user_id: str,
+) -> str:
+    """Prefer the securities account tied to signals that actually received fills."""
+
+    _lineage_ids, signals, executions = _lineage_live_signal_execution_bundle(
+        trading_collections, finance_collections, plan, user_id
+    )
+    filled_order_ids = {
+        str(row.get("order_id"))
+        for row in executions
+        if row.get("order_id") and _execution_fill_quantity(row) > 0
+    }
+    for signal in reversed(signals):
+        order_id = str(signal.get("order_id") or "")
+        if order_id not in filled_order_ids:
+            continue
+        account_id = str(signal.get("securities_account_id") or "")
+        if account_id:
+            return account_id
+    return ""
 
 
 def _portfolio_plan_groups(
@@ -1776,12 +1816,10 @@ def _portfolio_funding_mode(
     finance_collections: Dict[str, Any],
     plan: Dict[str, Any],
     user_id: str,
-    live_plan_ids: Optional[set] = None,
 ) -> str:
-    lineage_ids = set(_lineage_plan_ids_for_plan(trading_collections, plan, user_id))
-    if live_plan_ids is None:
-        live_plan_ids = _live_plan_ids_for_user(finance_collections, user_id)
-    return "live" if lineage_ids & live_plan_ids else "paper"
+    if _lineage_has_live_fills(trading_collections, finance_collections, plan, user_id):
+        return "live"
+    return "paper"
 
 
 def _build_portfolio_entry(
@@ -1790,7 +1828,6 @@ def _build_portfolio_entry(
     user_id: str,
     strategy_template_id: str,
     params_hash: str,
-    live_plan_ids: set,
 ) -> Optional[Dict[str, Any]]:
     all_lineage = list(
         trading_collections["portfolio_trade_plans"].find(
@@ -1805,8 +1842,10 @@ def _build_portfolio_entry(
     if not all_lineage:
         return None
 
-    lineage_ids = set(_lineage_plan_ids_for_plan(trading_collections, all_lineage[0], user_id))
-    has_live = bool(lineage_ids & live_plan_ids)
+    sample_plan = dict(all_lineage[0])
+    sample_plan["strategy_template_id"] = strategy_template_id
+    sample_plan["params_hash"] = params_hash
+    has_live = _lineage_has_live_fills(trading_collections, finance_collections, sample_plan, user_id)
     has_paper = any(row.get("status") in PAPER_ACTIVE_STATUSES for row in all_lineage)
     if not has_live and not has_paper:
         return None
@@ -1815,11 +1854,9 @@ def _build_portfolio_entry(
     earliest = min(all_lineage, key=lambda row: str(row.get("base_date") or ""))
     sec_id = ""
     if has_live:
-        sig = finance_collections["trade_signals"].find_one(
-            {"user_id": user_id, "mode": "live", "plan_id": {"$in": list(lineage_ids)}},
-            {"_id": 0, "securities_account_id": 1},
+        sec_id = _lineage_live_account_id_from_fills(
+            trading_collections, finance_collections, sample_plan, user_id
         )
-        sec_id = str(sig.get("securities_account_id") or "") if sig else ""
 
     return {
         "strategy_template_id": strategy_template_id,
@@ -1839,7 +1876,6 @@ def _list_portfolios_payload(
     finance_collections: Dict[str, Any],
     user_id: str,
 ) -> List[Dict[str, Any]]:
-    live_plan_ids = _live_plan_ids_for_user(finance_collections, user_id)
     groups = _portfolio_plan_groups(trading_collections, user_id)
     portfolios: List[Dict[str, Any]] = []
     for (strategy_template_id, params_hash) in groups:
@@ -1849,7 +1885,6 @@ def _list_portfolios_payload(
             user_id,
             strategy_template_id,
             params_hash,
-            live_plan_ids,
         )
         if entry:
             portfolios.append(entry)
@@ -2071,9 +2106,11 @@ def _build_lineage_timeline_payload(
         None,
     )
     latest_monitor = next((row for row in plans if row.get("plan_type") == "monitor"), None)
-    live_plan_ids = _live_plan_ids_for_user(finance_collections, user_id)
     funding_mode = _portfolio_funding_mode(
-        trading_collections, finance_collections, latest_plan, user_id, live_plan_ids
+        trading_collections, finance_collections, latest_plan, user_id
+    )
+    live_account_id = _lineage_live_account_id_from_fills(
+        trading_collections, finance_collections, latest_plan, user_id
     )
 
     latest_items = list(
@@ -2128,16 +2165,7 @@ def _build_lineage_timeline_payload(
             "strategy_name": latest_plan.get("strategy_name"),
             "latest_plan_id": latest_plan.get("plan_id"),
             "funding_mode": funding_mode,
-            "securities_account_id": (
-                finance_collections["trade_signals"].find_one(
-                    {
-                        "user_id": user_id,
-                        "mode": "live",
-                        "plan_id": {"$in": _lineage_plan_ids_for_plan(trading_collections, latest_plan, user_id)},
-                    },
-                    {"_id": 0, "securities_account_id": 1},
-                ) or {}
-            ).get("securities_account_id"),
+            "securities_account_id": live_account_id or None,
         },
         "current_cycle": _compute_current_cycle(
             latest_plan, latest_rebalance, latest_monitor, data_collections
