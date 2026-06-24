@@ -1661,6 +1661,7 @@ async def get_portfolio_plan_lineage_equity(
                 "params_hash": plan.get("params_hash"),
                 "rows": enriched,
                 "source_plan_ids": plan_ids,
+                "initial_capital": _lineage_initial_capital(plan),
             }
         ),
     }
