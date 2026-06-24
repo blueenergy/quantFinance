@@ -2334,3 +2334,176 @@ def test_live_rebalance_no_change_returns_400(monkeypatch):
         )
 
     assert excinfo.value.status_code == 400
+
+
+def _paper_rebalance_env():
+    """Paper lineage (anchor 'pla') with a prior snapshot: 500 shares 600000.SH, 880k cash."""
+    cols = _collections()
+    fin = _finance_collections()
+    data = _data_collections()
+    data["volume_price_realtime_latest"] = _Collection(
+        [
+            {"symbol": "600000", "close": 12.0, "trade_date": "20250131"},
+            {"symbol": "600000.SH", "close": 12.0, "trade_date": "20250131"},
+            {"symbol": "000001", "close": 10.0, "trade_date": "20250131"},
+            {"symbol": "000001.SZ", "close": 10.0, "trade_date": "20250131"},
+        ]
+    )
+    cols["portfolio_trade_plans"] = _Collection(
+        [
+            {
+                "plan_id": "pla",
+                "strategy_template_id": "stx",
+                "user_id": "user-1",
+                "params_hash": "hx",
+                "base_date": "20250101",
+                "status": "executed_paper",
+                "strategy_name": "L1",
+                "params_snapshot": {"initial_capital": 1_000_000, "lot_size": 100},
+            }
+        ]
+    )
+    # Prior paper snapshot lives under a *different* plan_id in the same lineage so
+    # _latest_lineage_position_snapshot (which excludes the anchor plan_id) sees it.
+    cols["portfolio_paper_positions"] = _Collection(
+        [
+            {
+                "plan_id": "pla-exec",
+                "strategy_template_id": "stx",
+                "user_id": "user-1",
+                "params_hash": "hx",
+                "as_of_date": "20250105",
+                "cash": 880_000.0,
+                "market_value": 120_000.0,
+                "equity": 1_000_000.0,
+                "positions": [{"symbol": "600000.SH", "name": "浦发银行", "shares": 500, "cost_basis": 11.0}],
+            }
+        ]
+    )
+    return cols, fin, data
+
+
+def test_paper_rebalance_clear_dry_run_does_not_persist(monkeypatch):
+    cols, fin, data = _paper_rebalance_env()
+    _patch_lineage_live_env(monkeypatch, cols, fin, data)
+
+    resp = asyncio.run(
+        portfolio_plans.paper_rebalance_portfolio(
+            "pla",
+            portfolio_plans.PaperRebalanceRequest(targets={"600000.SH": 0}, dry_run=True),
+            current_user={"id": "user-1"},
+        )
+    )
+
+    data_out = resp["data"]
+    assert data_out["dry_run"] is True
+    assert data_out["manual_action"] == "liquidate"
+    assert data_out["status"] == "executed_paper"
+    sells = [ex for ex in data_out["executions"] if ex["action"] == "sell"]
+    assert len(sells) == 1 and sells[0]["quantity"] == 500
+    assert data_out["position_snapshot"]["positions"] == []
+    # 880k cash + 500*12 sale = 886k
+    assert data_out["position_snapshot"]["equity"] == 886_000.0
+    # Nothing persisted on dry run.
+    assert len(cols["portfolio_paper_positions"].docs) == 1
+    assert not [p for p in cols["portfolio_trade_plans"].docs if p.get("origin") == "manual"]
+
+
+def test_paper_rebalance_clear_persists_snapshot_and_plan(monkeypatch):
+    cols, fin, data = _paper_rebalance_env()
+    _patch_lineage_live_env(monkeypatch, cols, fin, data)
+
+    resp = asyncio.run(
+        portfolio_plans.paper_rebalance_portfolio(
+            "pla",
+            portfolio_plans.PaperRebalanceRequest(targets={"600000.SH": 0}, dry_run=False),
+            current_user={"id": "user-1"},
+        )
+    )
+
+    plan_id = resp["data"]["plan_id"]
+    manual_plans = [p for p in cols["portfolio_trade_plans"].docs if p.get("origin") == "manual"]
+    assert len(manual_plans) == 1
+    plan = manual_plans[0]
+    assert plan["status"] == "executed_paper"
+    assert plan["manual_action"] == "liquidate"
+    assert plan["paper_executed_at"]
+    # New snapshot + equity row written under the new plan_id.
+    snap = next(s for s in cols["portfolio_paper_positions"].docs if s["plan_id"] == plan_id)
+    assert snap["positions"] == []
+    assert snap["equity"] == 886_000.0
+    assert any(e["plan_id"] == plan_id for e in cols["portfolio_paper_equity"].docs)
+    assert [ex for ex in cols["portfolio_paper_executions"].docs if ex["plan_id"] == plan_id]
+
+
+def test_paper_rebalance_partial_reduce(monkeypatch):
+    cols, fin, data = _paper_rebalance_env()
+    _patch_lineage_live_env(monkeypatch, cols, fin, data)
+
+    resp = asyncio.run(
+        portfolio_plans.paper_rebalance_portfolio(
+            "pla",
+            portfolio_plans.PaperRebalanceRequest(targets={"600000.SH": 200}, dry_run=False),
+            current_user={"id": "user-1"},
+        )
+    )
+
+    data_out = resp["data"]
+    assert data_out["manual_action"] == "rebalance"
+    pos = data_out["position_snapshot"]["positions"]
+    held = next(p for p in pos if p["symbol"] == "600000.SH")
+    assert held["shares"] == 200
+    sells = [ex for ex in data_out["executions"] if ex["action"] == "sell"]
+    assert sells[0]["quantity"] == 300
+
+
+def test_paper_rebalance_add_new_symbol_builds_buy(monkeypatch):
+    cols, fin, data = _paper_rebalance_env()
+    _patch_lineage_live_env(monkeypatch, cols, fin, data)
+
+    resp = asyncio.run(
+        portfolio_plans.paper_rebalance_portfolio(
+            "pla",
+            portfolio_plans.PaperRebalanceRequest(targets={"000001.SZ": 300}, dry_run=False),
+            current_user={"id": "user-1"},
+        )
+    )
+
+    data_out = resp["data"]
+    pos = {p["symbol"]: p for p in data_out["position_snapshot"]["positions"]}
+    assert pos["000001.SZ"]["shares"] == 300
+    assert pos["600000.SH"]["shares"] == 500  # untouched
+    buys = [ex for ex in data_out["executions"] if ex["action"] == "buy"]
+    assert buys[0]["quantity"] == 300
+
+
+def test_paper_rebalance_no_targets_returns_400(monkeypatch):
+    cols, fin, data = _paper_rebalance_env()
+    _patch_lineage_live_env(monkeypatch, cols, fin, data)
+
+    with pytest.raises(portfolio_plans.HTTPException) as excinfo:
+        asyncio.run(
+            portfolio_plans.paper_rebalance_portfolio(
+                "pla",
+                portfolio_plans.PaperRebalanceRequest(targets={}, dry_run=False),
+                current_user={"id": "user-1"},
+            )
+        )
+
+    assert excinfo.value.status_code == 400
+
+
+def test_paper_rebalance_no_change_returns_400(monkeypatch):
+    cols, fin, data = _paper_rebalance_env()
+    _patch_lineage_live_env(monkeypatch, cols, fin, data)
+
+    with pytest.raises(portfolio_plans.HTTPException) as excinfo:
+        asyncio.run(
+            portfolio_plans.paper_rebalance_portfolio(
+                "pla",
+                portfolio_plans.PaperRebalanceRequest(targets={"600000.SH": 500}, dry_run=False),
+                current_user={"id": "user-1"},
+            )
+        )
+
+    assert excinfo.value.status_code == 400

@@ -152,6 +152,16 @@ class LiveRebalanceRequest(BaseModel):
     dry_run: bool = Field(default=False)
 
 
+class PaperRebalanceRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    # Per-symbol target shares against the current paper book; see
+    # LiveRebalanceRequest. Liquidation is every held symbol mapped to 0.
+    targets: Dict[str, int] = Field(default_factory=dict)
+    exclude_after: bool = Field(default=False)
+    dry_run: bool = Field(default=False)
+
+
 class ParamPresetRequest(BaseModel):
     strategy_template_id: str
     name: str
@@ -1531,6 +1541,287 @@ async def live_rebalance_portfolio(
                 "existing_count": len(existing_signals),
                 "changed_symbols": changed_symbols,
                 "blocked": bool(blocked),
+                "lineage_effects": lineage_effects,
+            }
+        ),
+    }
+
+
+@router.post("/plans/{plan_id}/paper-rebalance")
+async def paper_rebalance_portfolio(
+    plan_id: str,
+    request: PaperRebalanceRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    """One-click intraday PAPER position change (reduce / clear / add) for a lineage.
+
+    The paper-book mirror of ``live-rebalance``: computes per-symbol deltas from
+    ``targets`` against the latest lineage paper snapshot, fills them immediately
+    at the realtime price (no next-day-open cron), and writes the new paper
+    position snapshot / equity / executions plus a manual (origin=manual) plan for
+    audit. Liquidation is just every held symbol mapped to 0.
+    """
+    trading_collections = get_trading_db_collections()
+    data_collections = get_data_db()
+    user_id = _current_user_id(current_user)
+
+    plan = _require_plan(trading_collections, plan_id, current_user)
+    if not request.targets:
+        raise HTTPException(status_code=400, detail="targets must include at least one symbol")
+
+    strategy_template_id = str(plan.get("strategy_template_id") or "")
+    params_hash = str(plan.get("params_hash") or "")
+    if not strategy_template_id:
+        raise HTTPException(status_code=400, detail="plan is missing strategy_template_id")
+
+    params_snapshot = plan.get("params_snapshot") or {}
+    lot_size = _int_value(params_snapshot.get("lot_size"), 100) or 100
+    initial_capital = _numeric(params_snapshot.get("initial_capital"), 1_000_000.0)
+
+    now = datetime.utcnow()
+    base_date = datetime.now().strftime("%Y%m%d")
+
+    inherited = _latest_lineage_position_snapshot(trading_collections, plan, user_id, base_date)
+    positions: Dict[str, Dict[str, Any]] = {
+        str(row.get("symbol")): dict(row)
+        for row in (inherited.get("positions") or [])
+        if row.get("symbol")
+    }
+    cash = _numeric(inherited.get("cash"), initial_capital)
+
+    target_symbols = {str(s) for s in request.targets.keys() if s}
+    all_symbols = sorted(target_symbols | set(positions.keys()))
+    price_map, _realtime_docs = _load_fresh_market_prices(data_collections, all_symbols)
+
+    def _price_for(symbol: str, pos: Dict[str, Any]) -> Optional[float]:
+        return (
+            _numeric(price_map.get(symbol))
+            or _numeric(price_map.get(_symbol_key(symbol)))
+            or _numeric(pos.get("last_price"))
+            or _numeric(pos.get("mark_price"))
+            or _numeric(pos.get("cost_basis"))
+            or None
+        )
+
+    items: List[Dict[str, Any]] = []
+    manual_exclude_symbols: List[str] = []
+    estimated_buy = 0.0
+    estimated_sell = 0.0
+    rank = 0
+    for symbol in sorted(target_symbols):
+        pos = positions.get(symbol, {})
+        current_shares = _int_value(pos.get("shares"))
+        target_shares, blockers = _normalize_live_target_shares(current_shares, request.targets[symbol], lot_size)
+        delta = target_shares - current_shares
+        if delta == 0:
+            continue
+        rank += 1
+        price = _price_for(symbol, pos)
+        item_blockers = list(blockers)
+        if not price:
+            item_blockers.append("missing_price")
+        action = "buy" if delta > 0 else "sell"
+        if action == "buy":
+            estimated_buy += abs(delta) * float(price or 0)
+        else:
+            estimated_sell += abs(delta) * float(price or 0)
+        if target_shares < current_shares and request.exclude_after:
+            manual_exclude_symbols.append(symbol)
+        items.append(
+            {
+                "plan_id": None,  # filled after plan_id is built
+                "strategy_template_id": strategy_template_id,
+                "user_id": user_id,
+                "params_hash": params_hash,
+                "base_date": base_date,
+                "execute_date": base_date,
+                "rank": rank,
+                "symbol": symbol,
+                "name": pos.get("name", ""),
+                "industry": pos.get("industry", ""),
+                "action": action,
+                "current_shares": current_shares,
+                "target_shares": target_shares,
+                "delta_shares": delta,
+                "drift_delta_shares": delta,
+                "estimated_price": price,
+                "estimated_amount": abs(delta) * float(price or 0) if price else None,
+                "blockers": item_blockers,
+                "created_at": now,
+            }
+        )
+
+    if not items:
+        raise HTTPException(status_code=400, detail="targets produced no executable changes after lot-size normalization")
+
+    is_liquidation = all(item["action"] == "sell" and item["target_shares"] == 0 for item in items)
+    manual_action = "liquidate" if is_liquidation else "rebalance"
+
+    stamp = now.strftime("%Y%m%d%H%M%S")
+    new_plan_id = f"{strategy_template_id}_{(params_hash or 'na')[:8]}_{user_id}_paperrb_{stamp}{uuid.uuid4().hex[:6]}"
+    for item in items:
+        item["plan_id"] = new_plan_id
+
+    plan_doc = {
+        "plan_id": new_plan_id,
+        "strategy_template_id": strategy_template_id,
+        "user_id": user_id,
+        "preset_id": plan.get("preset_id"),
+        "params_hash": params_hash,
+        "params_snapshot": params_snapshot,
+        "params_override": plan.get("params_override") or {},
+        "strategy_name": plan.get("strategy_name"),
+        "base_date": base_date,
+        "execute_date": base_date,
+        "plan_type": "rebalance",
+        "origin": "manual",
+        "manual_action": manual_action,
+        "is_liquidation": is_liquidation,
+        "is_rebalance_day": True,
+        "monitor_can_trade": False,
+        "trading_enabled": True,
+        "executable": True,
+        "non_executable_reason": None,
+        "exclude_after": bool(request.exclude_after),
+        "manual_exclude_symbols": sorted(set(manual_exclude_symbols)),
+        "anchor_plan_id": plan_id,
+        "created_at": now,
+        "updated_at": now,
+    }
+
+    # Simulate fills immediately at the realtime price.
+    work_positions = {sym: dict(pos) for sym, pos in positions.items()}
+    work_cash = cash
+    executions: List[Dict[str, Any]] = []
+    partial = False
+    for item in items:
+        symbol = item["symbol"]
+        delta = int(item["delta_shares"])
+        price = item.get("estimated_price")
+        current = work_positions.get(
+            symbol,
+            {"symbol": symbol, "name": item.get("name", ""), "industry": item.get("industry", ""), "shares": 0, "cost_basis": 0.0},
+        )
+        if not price:
+            executions.append(_execution_doc(plan_doc, item, "blocked", 0, 0.0, 0.0, "missing_price", now))
+            partial = True
+            continue
+        if delta < 0:
+            quantity = min(abs(delta), int(current.get("shares", 0) or 0))
+            amount = quantity * price
+            work_cash += amount
+            current["shares"] = int(current.get("shares", 0) or 0) - quantity
+            executions.append(_execution_doc(plan_doc, item, "sell", quantity, price, amount, None, now))
+        else:
+            quantity = delta
+            amount = quantity * price
+            if amount > work_cash:
+                quantity = (int(work_cash // price) // max(1, lot_size)) * max(1, lot_size)
+                amount = quantity * price
+                partial = True
+            if quantity <= 0:
+                executions.append(_execution_doc(plan_doc, item, "blocked", 0, price, 0.0, "insufficient_cash", now))
+                partial = True
+                continue
+            work_cash -= amount
+            old_shares = int(current.get("shares", 0) or 0)
+            old_cost = float(current.get("cost_basis", 0) or 0)
+            current["cost_basis"] = ((old_shares * old_cost) + amount) / (old_shares + quantity) if old_shares + quantity else price
+            current["shares"] = old_shares + quantity
+            executions.append(_execution_doc(plan_doc, item, "buy", quantity, price, amount, None, now))
+        if int(current.get("shares", 0) or 0) > 0:
+            work_positions[symbol] = current
+        elif symbol in work_positions:
+            del work_positions[symbol]
+
+    position_rows = []
+    market_value = 0.0
+    for symbol, pos in sorted(work_positions.items()):
+        mark_price = _price_for(symbol, pos) or float(pos.get("cost_basis", 0) or 0)
+        value = int(pos.get("shares", 0) or 0) * mark_price
+        market_value += value
+        position_rows.append({**pos, "mark_price": mark_price, "market_value": value})
+    equity = work_cash + market_value
+    status = "partially_executed" if partial else "executed_paper"
+
+    snapshot = {
+        "strategy_template_id": strategy_template_id,
+        "user_id": user_id,
+        "params_hash": params_hash,
+        "as_of_date": base_date,
+        "plan_id": new_plan_id,
+        "inherited_from_plan_id": inherited.get("plan_id"),
+        "inherited_from_as_of_date": inherited.get("as_of_date"),
+        "cash": work_cash,
+        "market_value": market_value,
+        "equity": equity,
+        "positions": position_rows,
+        "updated_at": now,
+    }
+
+    changed_symbols = sorted({item["symbol"] for item in items})
+    if request.dry_run:
+        return {
+            "success": True,
+            "data": _jsonable(
+                {
+                    "dry_run": True,
+                    "plan_id": new_plan_id,
+                    "plan": plan_doc,
+                    "items": items,
+                    "executions": executions,
+                    "position_snapshot": snapshot,
+                    "manual_action": manual_action,
+                    "changed_symbols": changed_symbols,
+                    "status": status,
+                }
+            ),
+        }
+
+    plan_doc["status"] = status
+    plan_doc["paper_executed_at"] = now
+    trading_collections["portfolio_trade_plans"].insert_one(dict(plan_doc))
+    trading_collections["portfolio_trade_plan_items"].insert_many([dict(item) for item in items])
+    if executions:
+        trading_collections["portfolio_paper_executions"].insert_many([dict(ex) for ex in executions])
+    trading_collections["portfolio_paper_positions"].replace_one(
+        {"plan_id": new_plan_id, "as_of_date": base_date, "user_id": user_id}, snapshot, upsert=True
+    )
+    trading_collections["portfolio_paper_equity"].replace_one(
+        {"plan_id": new_plan_id, "date": base_date, "user_id": user_id},
+        {
+            "strategy_template_id": strategy_template_id,
+            "user_id": user_id,
+            "params_hash": params_hash,
+            "date": base_date,
+            "plan_id": new_plan_id,
+            "inherited_from_plan_id": inherited.get("plan_id"),
+            "inherited_from_as_of_date": inherited.get("as_of_date"),
+            "equity": equity,
+            "cash": work_cash,
+            "market_value": market_value,
+            "updated_at": now,
+        },
+        upsert=True,
+    )
+    lineage_effects = _apply_manual_lineage_effects_native(
+        trading_collections,
+        plan_doc,
+        final_positions=position_rows,
+        acted_by=user_id,
+    )
+
+    return {
+        "success": True,
+        "data": _jsonable(
+            {
+                "dry_run": False,
+                "plan_id": new_plan_id,
+                "status": status,
+                "manual_action": manual_action,
+                "executions": executions,
+                "position_snapshot": snapshot,
+                "changed_symbols": changed_symbols,
                 "lineage_effects": lineage_effects,
             }
         ),
