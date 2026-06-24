@@ -1950,6 +1950,11 @@ def _build_portfolio_entry(
         )
 
     params = dict(latest.get("params_snapshot") or {})
+    paper_execution_mode = params.get("paper_execution_mode")
+    if not paper_execution_mode and latest.get("paper_execution_mode"):
+        paper_execution_mode = latest.get("paper_execution_mode")
+    if not paper_execution_mode:
+        paper_execution_mode = "manual_review" if has_live else "auto_shadow"
     paper_snapshot = _latest_lineage_paper_snapshot(trading_collections, sample_plan, user_id)
     paper_positions = list(paper_snapshot.get("positions") or [])
     paper_holding_count = sum(1 for row in paper_positions if _int_value(row.get("shares")) > 0)
@@ -1973,6 +1978,7 @@ def _build_portfolio_entry(
         "strategy_name": latest.get("strategy_name") or earliest.get("strategy_name") or "",
         "securities_account_id": sec_id,
         "funding_mode": "live" if has_live else "paper",
+        "paper_execution_mode": paper_execution_mode,
         "paper_snapshot_date": paper_snapshot.get("as_of_date"),
         "paper_holding_count": paper_holding_count,
         "paper_equity": paper_snapshot.get("equity"),

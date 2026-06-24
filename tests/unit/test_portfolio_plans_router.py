@@ -1977,8 +1977,10 @@ def test_list_portfolios_includes_param_summary_and_paper_holdings(monkeypatch):
     ports = {row["params_hash"]: row for row in resp["data"]["portfolios"]}
     assert ports["hx-a"]["param_summary"] == "csi1000 · Top20 · 20d · top_n"
     assert ports["hx-a"]["paper_holding_count"] == 1
+    assert ports["hx-a"]["paper_execution_mode"] == "auto_shadow"
     assert ports["hx-b"]["param_summary"] == "csi500 · Top30 · 10d · industry_capped"
     assert ports["hx-b"]["paper_holding_count"] == 0
+    assert ports["hx-b"]["paper_execution_mode"] == "auto_shadow"
 
 
 def test_lineage_paper_positions_returns_latest_snapshot(monkeypatch):
