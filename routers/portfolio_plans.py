@@ -12,7 +12,7 @@ import uuid
 
 from bson import ObjectId
 from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from auth import get_current_user
 from db import db as finance_db
@@ -150,6 +150,40 @@ class LiveRebalanceRequest(BaseModel):
     # strategy rebalance does not buy them back.
     exclude_after: bool = Field(default=False)
     dry_run: bool = Field(default=False)
+
+
+class ExternalManualFill(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    symbol: str
+    action: str = Field(default="sell")
+    filled_size: int = Field(..., gt=0)
+    filled_price: float = Field(..., gt=0)
+    timestamp: Optional[float] = Field(default=None)
+    commission: float = Field(default=0.0, ge=0)
+    total_fee: Optional[float] = Field(default=None, ge=0)
+    broker_order_id: Optional[str] = None
+    name: str = Field(default="")
+
+    @field_validator("action")
+    def _normalize_action(cls, value: str) -> str:
+        normalized = str(value or "").lower()
+        if normalized not in {"buy", "sell"}:
+            raise ValueError("action must be buy or sell")
+        return normalized
+
+
+class ExternalManualRecordRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    securities_account_id: str
+    fills: List[ExternalManualFill] = Field(default_factory=list)
+    # When True, pause the lineage only if the resulting holdings are empty
+    # (i.e. a full liquidation). Partial reduce/add never pauses.
+    pause_lineage: bool = Field(default=True)
+    exclude_after: bool = Field(default=False)
+    reason: str = Field(default="miniQMT manual operation")
+    external_batch_id: Optional[str] = None
 
 
 class PaperRebalanceRequest(BaseModel):
@@ -1547,6 +1581,334 @@ async def live_rebalance_portfolio(
                 "changed_symbols": changed_symbols,
                 "blocked": bool(blocked),
                 "lineage_effects": lineage_effects,
+            }
+        ),
+    }
+
+
+@router.post("/plans/{plan_id}/external-manual-record")
+async def record_external_manual_record(
+    plan_id: str,
+    request: ExternalManualRecordRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    """Record broker-side manual fills (e.g. miniQMT direct operation) into the
+    plan lineage book.
+
+    This does not publish executable orders; it writes already-filled buy/sell
+    signals + executions so the live lineage ledger reflects what was done in
+    miniQMT. Supports partial reduce / add as well as a full liquidation; the
+    resulting holdings are simply current + manual buys - manual sells. The
+    lineage is paused only when ``pause_lineage`` is set and the resulting book
+    becomes empty.
+    """
+    trading_collections = get_trading_db_collections()
+    finance_collections = get_db_collections()
+    data_collections = get_data_db()
+    user_id = _current_user_id(current_user)
+
+    if not request.fills:
+        raise HTTPException(status_code=400, detail="fills must include at least one fill")
+
+    plan = _require_plan(trading_collections, plan_id, current_user)
+    account = _require_securities_account(finance_collections, request.securities_account_id, user_id)
+
+    if request.external_batch_id:
+        existing = trading_collections["portfolio_trade_plans"].find_one(
+            {
+                "user_id": user_id,
+                "anchor_plan_id": plan_id,
+                "manual_action": "external_manual",
+                "external_batch_id": request.external_batch_id,
+            }
+        )
+        if existing:
+            return {
+                "success": True,
+                "data": _jsonable(
+                    {
+                        "plan_id": existing.get("plan_id"),
+                        "external_batch_id": request.external_batch_id,
+                        "already_recorded": True,
+                        "inserted_signal_count": 0,
+                        "inserted_execution_count": 0,
+                    }
+                ),
+            }
+
+    strategy_template_id = str(plan.get("strategy_template_id") or "")
+    params_hash = str(plan.get("params_hash") or "")
+    if not strategy_template_id:
+        raise HTTPException(status_code=400, detail="plan is missing strategy_template_id")
+
+    holdings = _lineage_live_holdings(
+        trading_collections, finance_collections, data_collections, plan, user_id
+    )
+    holdings_by_key = {_symbol_key(row.get("symbol")): row for row in holdings}
+
+    # Aggregate signed deltas per symbol to validate sells and to build a
+    # per-symbol audit view + the resulting holdings used for lineage effects.
+    delta_by_key: Dict[str, int] = defaultdict(int)
+    name_by_key: Dict[str, str] = {}
+    symbol_by_key: Dict[str, str] = {}
+    for fill in request.fills:
+        key = _symbol_key(fill.symbol)
+        signed = int(fill.filled_size) if fill.action == "buy" else -int(fill.filled_size)
+        delta_by_key[key] += signed
+        if fill.name:
+            name_by_key.setdefault(key, fill.name)
+        symbol_by_key.setdefault(key, str(fill.symbol))
+
+    oversells = []
+    for key, delta in delta_by_key.items():
+        current_shares = _int_value((holdings_by_key.get(key) or {}).get("shares"))
+        if current_shares + delta < 0:
+            oversells.append(
+                {
+                    "symbol": (holdings_by_key.get(key) or {}).get("symbol") or symbol_by_key.get(key),
+                    "current_shares": current_shares,
+                    "net_delta_shares": delta,
+                }
+            )
+    if oversells:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "manual sells exceed current lineage holdings",
+                "oversells": oversells,
+            },
+        )
+
+    now = datetime.utcnow()
+    base_date = datetime.now().strftime("%Y%m%d")
+    stamp = now.strftime("%Y%m%d%H%M%S")
+    new_plan_id = f"{strategy_template_id}_{(params_hash or 'na')[:8]}_{user_id}_extman_{stamp}{uuid.uuid4().hex[:6]}"
+
+    # Resulting holdings over the union of held + touched symbols (untouched
+    # holdings keep their current shares, so a full liquidation is detected
+    # correctly only when every held symbol nets to zero).
+    final_by_key: Dict[str, int] = {
+        key: _int_value(row.get("shares")) for key, row in holdings_by_key.items()
+    }
+    for key, delta in delta_by_key.items():
+        final_by_key[key] = final_by_key.get(key, 0) + delta
+
+    final_positions = [
+        {
+            "symbol": str((holdings_by_key.get(key) or {}).get("symbol") or symbol_by_key.get(key) or key),
+            "shares": shares,
+        }
+        for key, shares in sorted(final_by_key.items())
+    ]
+    cleared_symbols = sorted(
+        str((holdings_by_key.get(key) or {}).get("symbol") or symbol_by_key.get(key) or key)
+        for key, delta in delta_by_key.items()
+        if delta < 0 and final_by_key.get(key, 0) == 0
+    )
+    is_liquidation = bool(final_by_key) and all(shares == 0 for shares in final_by_key.values())
+
+    items: List[Dict[str, Any]] = []
+    for rank, key in enumerate(sorted(delta_by_key.keys()), start=1):
+        delta = delta_by_key[key]
+        if delta == 0:
+            continue
+        held = holdings_by_key.get(key) or {}
+        symbol = held.get("symbol") or symbol_by_key.get(key) or key
+        current_shares = _int_value(held.get("shares"))
+        items.append(
+            {
+                "plan_id": new_plan_id,
+                "strategy_template_id": strategy_template_id,
+                "user_id": user_id,
+                "params_hash": params_hash,
+                "base_date": base_date,
+                "execute_date": base_date,
+                "rank": rank,
+                "symbol": symbol,
+                "name": held.get("name") or name_by_key.get(key, ""),
+                "action": "buy" if delta > 0 else "sell",
+                "current_shares": current_shares,
+                "target_shares": current_shares + delta,
+                "delta_shares": delta,
+                "drift_delta_shares": delta,
+                "estimated_price": held.get("last_price"),
+                "estimated_amount": abs(delta) * _numeric(held.get("last_price")),
+                "blockers": [],
+                "created_at": now,
+            }
+        )
+
+    changed_symbols = sorted({str(it["symbol"]) for it in items})
+    estimated_buy_amount = sum(
+        float(f.filled_size) * float(f.filled_price) for f in request.fills if f.action == "buy"
+    )
+    estimated_sell_amount = sum(
+        float(f.filled_size) * float(f.filled_price) for f in request.fills if f.action == "sell"
+    )
+    manual_action = "external_liquidation" if is_liquidation else "external_manual"
+
+    plan_doc = {
+        "plan_id": new_plan_id,
+        "strategy_template_id": strategy_template_id,
+        "user_id": user_id,
+        "preset_id": plan.get("preset_id"),
+        "params_hash": params_hash,
+        "params_snapshot": plan.get("params_snapshot") or {},
+        "params_override": plan.get("params_override") or {},
+        "strategy_name": plan.get("strategy_name"),
+        "base_date": base_date,
+        "execute_date": base_date,
+        "plan_type": "rebalance",
+        "origin": "manual",
+        # manual_action stays "external_manual" for idempotency/query keying;
+        # is_liquidation flags the full-clear case for downstream display.
+        "manual_action": "external_manual",
+        "manual_action_detail": manual_action,
+        "is_liquidation": is_liquidation,
+        "is_rebalance_day": True,
+        "monitor_can_trade": False,
+        "trading_enabled": False,
+        "executable": False,
+        "non_executable_reason": "external_manual_fills_already_completed",
+        "exclude_after": bool(request.exclude_after),
+        "manual_exclude_symbols": cleared_symbols if request.exclude_after else [],
+        "status": "filled",
+        "approved_by": user_id,
+        "approved_at": now,
+        "anchor_plan_id": plan_id,
+        "securities_account_id": str(account.get("_id") or request.securities_account_id),
+        "account_id": account.get("account_id"),
+        "broker": account.get("broker"),
+        "external_batch_id": request.external_batch_id,
+        "external_reason": request.reason,
+        "summary": {
+            "buy_count": sum(1 for it in items if it["action"] == "buy"),
+            "sell_count": sum(1 for it in items if it["action"] == "sell"),
+            "hold_count": 0,
+            "skip_count": 0,
+            "estimated_buy_amount": estimated_buy_amount,
+            "estimated_sell_amount": estimated_sell_amount,
+            "manual_action": manual_action,
+        },
+        "created_at": now,
+        "updated_at": now,
+        "live_signals_published_at": now,
+        "live_signal_count": len(request.fills),
+        "live_signal_inserted_count": len(request.fills),
+        "live_signal_status_summary": {"filled": len(request.fills)},
+    }
+
+    signals: List[Dict[str, Any]] = []
+    executions: List[Dict[str, Any]] = []
+    for idx, fill in enumerate(request.fills, start=1):
+        key = _symbol_key(fill.symbol)
+        held = holdings_by_key.get(key) or {}
+        ts = float(fill.timestamp) if fill.timestamp is not None else now.timestamp()
+        dt = datetime.fromtimestamp(ts)
+        order_id = f"external-manual-{new_plan_id}-{idx:03d}"
+        broker_order_id = fill.broker_order_id or order_id
+        fee = fill.total_fee if fill.total_fee is not None else fill.commission
+        symbol = str(held.get("symbol") or fill.symbol)
+        name = fill.name or held.get("name") or ""
+        action = fill.action
+        side = action.upper()
+        signal = {
+            "order_id": order_id,
+            "user_id": user_id,
+            "securities_account_id": str(account.get("_id") or request.securities_account_id),
+            "account_id": str(account.get("account_id") or ""),
+            "broker": str(account.get("broker") or ""),
+            "mode": "live",
+            "is_executable": False,
+            "source": "external_manual_record",
+            "plan_id": new_plan_id,
+            "strategy_template_id": strategy_template_id,
+            "symbol": symbol,
+            "name": name,
+            "action": action,
+            "size": int(fill.filled_size),
+            "price": float(fill.filled_price),
+            "order_type": "external_manual",
+            "execution_phase": action,
+            "execution_priority": (-10000 if action == "sell" else 10000) + idx,
+            "plan_item_rank": idx,
+            "reference_price": float(fill.filled_price),
+            "reference_price_source": "external_manual_fill",
+            "effective_limit_price": float(fill.filled_price),
+            "status": "filled",
+            "created_at": now,
+            "updated_at": ts,
+            "submitted_at": ts,
+            "executed_at": ts,
+            "timestamp": now.timestamp(),
+            "datetime": now,
+            "filled_qty": int(fill.filled_size),
+            "avg_price": float(fill.filled_price),
+        }
+        execution = {
+            "order_id": order_id,
+            "broker_order_id": broker_order_id,
+            "qmt_order_id": broker_order_id,
+            "user_id": user_id,
+            "plan_id": new_plan_id,
+            "strategy_template_id": strategy_template_id,
+            "source": "external_manual_record",
+            "securities_account_id": str(account.get("_id") or request.securities_account_id),
+            "account_id": str(account.get("account_id") or ""),
+            "broker": str(account.get("broker") or ""),
+            "mode": "live",
+            "symbol": symbol,
+            "name": name,
+            "side": side,
+            "action": side,
+            "status": "filled",
+            "quantity": int(fill.filled_size),
+            "filled_size": int(fill.filled_size),
+            "filled_qty": int(fill.filled_size),
+            "filled_price": float(fill.filled_price),
+            "avg_price": float(fill.filled_price),
+            "commission": float(fill.commission),
+            "total_fee": float(fee or 0.0),
+            "timestamp": ts,
+            "date": dt.strftime("%Y%m%d"),
+            "datetime": dt.strftime("%Y-%m-%d %H:%M:%S"),
+            "external_batch_id": request.external_batch_id,
+            "external_reason": request.reason,
+        }
+        signals.append(signal)
+        executions.append(execution)
+
+    trading_collections["portfolio_trade_plans"].insert_one(dict(plan_doc))
+    if items:
+        trading_collections["portfolio_trade_plan_items"].insert_many([dict(item) for item in items])
+    finance_collections["trade_signals"].insert_many(signals)
+    finance_collections["trade_executions"].insert_many(executions)
+
+    lineage_effects = _apply_manual_lineage_effects_native(
+        trading_collections,
+        plan_doc,
+        final_positions=final_positions,
+        acted_by=user_id,
+        pause_on_empty=bool(request.pause_lineage),
+    )
+
+    return {
+        "success": True,
+        "data": _jsonable(
+            {
+                "plan_id": new_plan_id,
+                "anchor_plan_id": plan_id,
+                "manual_action": manual_action,
+                "is_liquidation": is_liquidation,
+                "changed_symbols": changed_symbols,
+                "cleared_symbols": cleared_symbols,
+                "final_positions": [p for p in final_positions if p["shares"] > 0],
+                "inserted_signal_count": len(signals),
+                "inserted_execution_count": len(executions),
+                "signals": signals,
+                "executions": executions,
+                "lineage_effects": lineage_effects,
+                "already_recorded": False,
             }
         ),
     }

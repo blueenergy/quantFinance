@@ -56,11 +56,18 @@ class _Collection:
     def insert_many(self, docs):
         self.docs.extend(dict(doc) for doc in docs)
 
-    def update_one(self, query, update):
+    def update_one(self, query, update, upsert=False):
         for doc in self.docs:
             if self._matches(doc, query):
                 doc.update(update.get("$set", {}))
+                for key in update.get("$unset", {}):
+                    doc.pop(key, None)
                 return
+        if upsert:
+            new_doc = dict(query)
+            new_doc.update(update.get("$setOnInsert", {}))
+            new_doc.update(update.get("$set", {}))
+            self.docs.append(new_doc)
 
     def replace_one(self, query, new_doc, upsert=False):
         for idx, doc in enumerate(self.docs):
@@ -146,6 +153,7 @@ def _collections():
         "portfolio_plan_generation_tasks": _Collection(),
         "portfolio_plan_operation_logs": _Collection(),
         "portfolio_worker_status": _Collection(),
+        "portfolio_lineage_controls": _Collection(),
         "portfolio_strategy_param_presets": _Collection(
             [
                 {
@@ -2300,6 +2308,128 @@ def test_live_rebalance_liquidation_publishes_and_creates_manual_plan(monkeypatc
     assert items[0]["action"] == "sell"
     assert items[0]["target_shares"] == 0
     assert items[0]["delta_shares"] == -500
+
+
+def test_external_manual_record_full_sell_clears_lineage_book(monkeypatch):
+    cols, fin, data = _live_rebalance_env()
+    _patch_lineage_live_env(monkeypatch, cols, fin, data)
+
+    resp = asyncio.run(
+        portfolio_plans.record_external_manual_record(
+            "pla",
+            portfolio_plans.ExternalManualRecordRequest(
+                securities_account_id="acct-1",
+                exclude_after=True,
+                fills=[
+                    portfolio_plans.ExternalManualFill(
+                        symbol="600000.SH",
+                        action="sell",
+                        filled_size=500,
+                        filled_price=12.2,
+                        timestamp=2.0,
+                        commission=5.0,
+                        broker_order_id="qmt-manual-1",
+                    )
+                ],
+                external_batch_id="manual-clear-20250131",
+            ),
+            current_user={"id": "user-1"},
+        )
+    )
+
+    data_out = resp["data"]
+    assert data_out["manual_action"] == "external_liquidation"
+    assert data_out["is_liquidation"] is True
+    assert data_out["inserted_signal_count"] == 1
+    assert data_out["inserted_execution_count"] == 1
+    assert data_out["lineage_effects"]["paused"] is True
+    assert "600000.SH" in data_out["lineage_effects"]["excluded"]
+
+    manual_plan = next(p for p in cols["portfolio_trade_plans"].docs if p.get("manual_action") == "external_manual")
+    assert manual_plan["origin"] == "manual"
+    assert manual_plan["status"] == "filled"
+    assert manual_plan["trading_enabled"] is False
+    assert manual_plan["external_batch_id"] == "manual-clear-20250131"
+
+    sell_signal = next(s for s in fin["trade_signals"].docs if s.get("source") == "external_manual_record")
+    assert sell_signal["status"] == "filled"
+    assert sell_signal["is_executable"] is False
+    assert sell_signal["plan_id"] == manual_plan["plan_id"]
+
+    sell_execution = next(e for e in fin["trade_executions"].docs if e.get("source") == "external_manual_record")
+    assert sell_execution["side"] == "SELL"
+    assert sell_execution["filled_size"] == 500
+    assert sell_execution["broker_order_id"] == "qmt-manual-1"
+
+    positions_resp = asyncio.run(
+        portfolio_plans.get_lineage_live_positions("pla", current_user={"id": "user-1"})
+    )
+    positive_positions = [row for row in positions_resp["data"]["positions"] if row["shares"] > 0]
+    assert positive_positions == []
+    assert manual_plan["plan_id"] in positions_resp["data"]["lineage_plan_ids"]
+
+
+def test_external_manual_record_partial_sell_keeps_remainder(monkeypatch):
+    cols, fin, data = _live_rebalance_env()
+    _patch_lineage_live_env(monkeypatch, cols, fin, data)
+
+    resp = asyncio.run(
+        portfolio_plans.record_external_manual_record(
+            "pla",
+            portfolio_plans.ExternalManualRecordRequest(
+                securities_account_id="acct-1",
+                fills=[
+                    portfolio_plans.ExternalManualFill(
+                        symbol="600000.SH",
+                        action="sell",
+                        filled_size=200,
+                        filled_price=12.2,
+                    )
+                ],
+            ),
+            current_user={"id": "user-1"},
+        )
+    )
+
+    data_out = resp["data"]
+    assert data_out["manual_action"] == "external_manual"
+    assert data_out["is_liquidation"] is False
+    # Partial reduce leaves a position, so the lineage is not paused.
+    assert "paused" not in (data_out["lineage_effects"] or {})
+
+    positions_resp = asyncio.run(
+        portfolio_plans.get_lineage_live_positions("pla", current_user={"id": "user-1"})
+    )
+    pos = next(row for row in positions_resp["data"]["positions"] if row["symbol"] == "600000.SH")
+    assert pos["shares"] == 300
+
+
+def test_external_manual_record_rejects_oversell(monkeypatch):
+    cols, fin, data = _live_rebalance_env()
+    _patch_lineage_live_env(monkeypatch, cols, fin, data)
+
+    with pytest.raises(portfolio_plans.HTTPException) as excinfo:
+        asyncio.run(
+            portfolio_plans.record_external_manual_record(
+                "pla",
+                portfolio_plans.ExternalManualRecordRequest(
+                    securities_account_id="acct-1",
+                    fills=[
+                        portfolio_plans.ExternalManualFill(
+                            symbol="600000.SH",
+                            action="sell",
+                            filled_size=600,
+                            filled_price=12.2,
+                        )
+                    ],
+                ),
+                current_user={"id": "user-1"},
+            )
+        )
+
+    assert excinfo.value.status_code == 409
+    assert not [p for p in cols["portfolio_trade_plans"].docs if p.get("manual_action") == "external_manual"]
+    assert not [s for s in fin["trade_signals"].docs if s.get("source") == "external_manual_record"]
 
 
 def test_live_rebalance_partial_reduce(monkeypatch):
