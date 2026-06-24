@@ -1511,3 +1511,284 @@ def test_lineage_live_equity_prefers_account_daily_equity(monkeypatch):
     assert [row["date"] for row in resp["data"]["rows"]] == ["20250129", "20250130"]
     assert [row["equity"] for row in resp["data"]["rows"]] == [1_010_000, 1_020_000]
     assert resp["data"]["rows"][0]["account_ids"] == ["acct-1"]
+
+
+def test_list_portfolios_includes_live_and_paper_lineages(monkeypatch):
+    cols = _collections()
+    fin = _finance_collections()
+    data = _data_collections()
+    cols["portfolio_trade_plans"] = _Collection(
+        [
+            {
+                "plan_id": "live-a",
+                "strategy_template_id": "st-live",
+                "user_id": "user-1",
+                "base_date": "20250120",
+                "status": "executed_paper",
+                "params_hash": "hx-live",
+                "strategy_name": "LiveCombo",
+            },
+            {
+                "plan_id": "live-b",
+                "strategy_template_id": "st-live",
+                "user_id": "user-1",
+                "base_date": "20250125",
+                "status": "executed_paper",
+                "params_hash": "hx-live",
+                "strategy_name": "LiveCombo",
+            },
+            {
+                "plan_id": "paper-a",
+                "strategy_template_id": "st-paper",
+                "user_id": "user-1",
+                "base_date": "20250118",
+                "status": "executed_paper",
+                "params_hash": "hx-paper",
+                "strategy_name": "PaperOnly",
+            },
+            {
+                "plan_id": "paper-b",
+                "strategy_template_id": "st-paper",
+                "user_id": "user-1",
+                "base_date": "20250122",
+                "status": "partially_executed",
+                "params_hash": "hx-paper",
+                "strategy_name": "PaperOnly",
+            },
+            {
+                "plan_id": "inactive",
+                "strategy_template_id": "st-inactive",
+                "user_id": "user-1",
+                "base_date": "20250110",
+                "status": "generated",
+                "params_hash": "hx-inactive",
+                "strategy_name": "Inactive",
+            },
+        ]
+    )
+    fin["trade_signals"].docs = [
+        {"user_id": "user-1", "mode": "live", "plan_id": "live-a", "securities_account_id": "acct-1"},
+    ]
+    _patch_lineage_live_env(monkeypatch, cols, fin, data)
+    resp = asyncio.run(portfolio_plans.list_portfolios(current_user={"id": "user-1"}))
+    ports = resp["data"]["portfolios"]
+    assert len(ports) == 2
+    live = next(row for row in ports if row["params_hash"] == "hx-live")
+    paper = next(row for row in ports if row["params_hash"] == "hx-paper")
+    assert live["funding_mode"] == "live"
+    assert live["latest_plan_id"] == "live-b"
+    assert paper["funding_mode"] == "paper"
+    assert paper["latest_plan_id"] == "paper-b"
+
+
+def test_lineage_timeline_monitor_drift_and_action_required(monkeypatch):
+    cols = _collections()
+    fin = _finance_collections()
+    data = _data_collections()
+    data["volume_price"].docs = [
+        {"trade_date": f"202501{d:02d}"} for d in range(1, 32)
+    ]
+    cols["portfolio_trade_plans"] = _Collection(
+        [
+            {
+                "plan_id": "reb-1",
+                "strategy_template_id": "stx",
+                "user_id": "user-1",
+                "base_date": "20250102",
+                "status": "executed_paper",
+                "params_hash": "hx",
+                "strategy_name": "Combo",
+                "plan_type": "rebalance",
+                "is_rebalance_day": True,
+                "previous_rebalance_date": None,
+                "params_snapshot": {"rebalance_days": 20},
+                "summary": {"equity": 1_000_000, "buy_count": 2, "estimated_turnover": 0.12},
+                "executable": True,
+            },
+            {
+                "plan_id": "mon-1",
+                "strategy_template_id": "stx",
+                "user_id": "user-1",
+                "base_date": "20250110",
+                "status": "generated",
+                "params_hash": "hx",
+                "strategy_name": "Combo",
+                "plan_type": "monitor",
+                "is_rebalance_day": False,
+                "previous_rebalance_date": "20250102",
+                "previous_rebalance_plan_id": "reb-1",
+                "params_snapshot": {"rebalance_days": 20},
+                "summary": {
+                    "equity": 1_000_000,
+                    "buy_count": 0,
+                    "sell_count": 0,
+                    "estimated_buy_amount": 0,
+                    "estimated_turnover": 0,
+                },
+                "executable": False,
+                "non_executable_reason": "monitor_no_trade",
+            },
+            {
+                "plan_id": "reb-2",
+                "strategy_template_id": "stx",
+                "user_id": "user-1",
+                "base_date": "20250125",
+                "status": "needs_review",
+                "params_hash": "hx",
+                "strategy_name": "Combo",
+                "plan_type": "rebalance",
+                "is_rebalance_day": True,
+                "previous_rebalance_date": "20250102",
+                "previous_rebalance_plan_id": "reb-1",
+                "params_snapshot": {"rebalance_days": 20},
+                "summary": {"equity": 1_050_000, "buy_count": 1, "estimated_turnover": 0.08},
+                "executable": True,
+            },
+        ]
+    )
+    cols["portfolio_trade_plan_items"].docs = [
+        {
+            "plan_id": "mon-1",
+            "user_id": "user-1",
+            "symbol": "000001.SZ",
+            "drift_delta_shares": 100,
+            "estimated_price": 10.0,
+            "current_shares": 0,
+            "target_shares": 100,
+        },
+        {
+            "plan_id": "mon-1",
+            "user_id": "user-1",
+            "symbol": "600000.SH",
+            "drift_delta_shares": -200,
+            "estimated_price": 12.0,
+            "current_shares": 200,
+            "target_shares": 0,
+        },
+        {
+            "plan_id": "reb-2",
+            "user_id": "user-1",
+            "symbol": "000001.SZ",
+            "drift_delta_shares": 50,
+            "estimated_price": 10.0,
+            "current_shares": 100,
+            "target_shares": 150,
+        },
+    ]
+    _patch_lineage_live_env(monkeypatch, cols, fin, data)
+
+    monitor_resp = asyncio.run(
+        portfolio_plans.get_portfolio_plan_lineage_timeline(
+            "mon-1", limit=60, offset=0, current_user={"id": "user-1"}
+        )
+    )
+    monitor_data = monitor_resp["data"]
+    assert monitor_data["action_required"] is True
+    assert monitor_data["today_state"] == "调仓日：等待审核"
+    drift = monitor_data["latest_drift_summary"]
+    assert drift["plan_id"] == "reb-2"
+    assert drift["buy_count"] == 1
+    assert drift["estimated_buy_amount"] == 500.0
+    monitor_node = next(row for row in monitor_data["timeline"] if row["plan_id"] == "mon-1")
+    assert monitor_node["today_state"] == "观察日：不交易"
+    assert monitor_node["action_required"] is False
+    assert monitor_node["drift_brief"]["buy_count"] == 1
+    assert monitor_node["drift_brief"]["sell_count"] == 1
+    assert monitor_data["current_cycle"]["latest_rebalance_plan_id"] == "reb-2"
+    assert monitor_data["current_cycle"]["latest_monitor_plan_id"] == "mon-1"
+
+    review_resp = asyncio.run(
+        portfolio_plans.get_portfolio_plan_lineage_timeline(
+            "reb-2", limit=60, offset=0, current_user={"id": "user-1"}
+        )
+    )
+    review_data = review_resp["data"]
+    assert review_data["action_required"] is True
+    assert review_data["today_state"] == "调仓日：等待审核"
+    assert len(review_data["timeline"]) == 3
+    assert review_data["timeline"][0]["plan_id"] == "reb-2"
+
+
+def test_lineage_timeline_monitor_can_trade_label(monkeypatch):
+    cols = _collections()
+    fin = _finance_collections()
+    data = _data_collections()
+    cols["portfolio_trade_plans"] = _Collection(
+        [
+            {
+                "plan_id": "mon-trade",
+                "strategy_template_id": "stx",
+                "user_id": "user-1",
+                "base_date": "20250110",
+                "status": "needs_review",
+                "params_hash": "hx",
+                "strategy_name": "Combo",
+                "plan_type": "monitor",
+                "is_rebalance_day": False,
+                "monitor_can_trade": True,
+                "params_snapshot": {"rebalance_days": 20, "monitor_can_trade": True},
+                "summary": {"equity": 1_000_000},
+                "executable": True,
+            },
+        ]
+    )
+    _patch_lineage_live_env(monkeypatch, cols, fin, data)
+    resp = asyncio.run(
+        portfolio_plans.get_portfolio_plan_lineage_timeline(
+            "mon-trade", limit=60, offset=0, current_user={"id": "user-1"}
+        )
+    )
+    assert resp["data"]["today_state"] == "观察日（已开启日内再平衡）：可交易，等待审核"
+    assert resp["data"]["action_required"] is True
+
+
+def test_lineage_timeline_drift_summary_uses_items_when_monitor_summary_zero(monkeypatch):
+    cols = _collections()
+    fin = _finance_collections()
+    data = _data_collections()
+    cols["portfolio_trade_plans"] = _Collection(
+        [
+            {
+                "plan_id": "mon-latest",
+                "strategy_template_id": "stx",
+                "user_id": "user-1",
+                "base_date": "20250110",
+                "status": "generated",
+                "params_hash": "hx",
+                "strategy_name": "Combo",
+                "plan_type": "monitor",
+                "is_rebalance_day": False,
+                "params_snapshot": {"rebalance_days": 20},
+                "summary": {
+                    "equity": 1_000_000,
+                    "buy_count": 0,
+                    "sell_count": 0,
+                    "estimated_buy_amount": 0,
+                    "estimated_turnover": 0,
+                },
+                "executable": False,
+                "non_executable_reason": "monitor_no_trade",
+            },
+        ]
+    )
+    cols["portfolio_trade_plan_items"].docs = [
+        {
+            "plan_id": "mon-latest",
+            "user_id": "user-1",
+            "symbol": "000001.SZ",
+            "drift_delta_shares": 100,
+            "estimated_price": 10.0,
+            "current_shares": 0,
+            "target_shares": 100,
+        },
+    ]
+    _patch_lineage_live_env(monkeypatch, cols, fin, data)
+    resp = asyncio.run(
+        portfolio_plans.get_portfolio_plan_lineage_timeline(
+            "mon-latest", limit=60, offset=0, current_user={"id": "user-1"}
+        )
+    )
+    drift = resp["data"]["latest_drift_summary"]
+    assert drift["buy_count"] == 1
+    assert drift["estimated_buy_amount"] == 1000.0
+    assert drift["estimated_turnover"] == pytest.approx(0.001)

@@ -1733,22 +1733,20 @@ async def get_portfolio_plan_live_realtime_equity(plan_id: str, current_user: di
     return {"success": True, "data": _jsonable(row)}
 
 
-@router.get("/live-portfolios")
-async def list_live_portfolios(current_user: dict = Depends(get_current_user)):
-    """Enumerate live-traded plan lineages (strategy_template_id + params_hash) for the user."""
+PAPER_ACTIVE_STATUSES = frozenset({"executed_paper", "partially_executed"})
 
-    trading_collections = get_trading_db_collections()
-    finance_collections = get_db_collections()
-    user_id = _current_user_id(current_user)
 
-    live_rows = finance_collections["trade_signals"].find(
+def _live_plan_ids_for_user(finance_collections: Dict[str, Any], user_id: str) -> set:
+    rows = finance_collections["trade_signals"].find(
         {"user_id": user_id, "mode": "live", "plan_id": {"$exists": True}},
         {"_id": 0, "plan_id": 1},
     )
-    live_plan_ids = {str(r["plan_id"]) for r in live_rows if r.get("plan_id")}
-    if not live_plan_ids:
-        return {"success": True, "data": _jsonable({"portfolios": []})}
+    return {str(row["plan_id"]) for row in rows if row.get("plan_id")}
 
+
+def _portfolio_plan_groups(
+    trading_collections: Dict[str, Any], user_id: str
+) -> Dict[tuple, List[Dict[str, Any]]]:
     plans = list(
         trading_collections["portfolio_trade_plans"].find(
             {"user_id": user_id, "params_hash": {"$exists": True, "$nin": [None, ""]}},
@@ -1759,56 +1757,446 @@ async def list_live_portfolios(current_user: dict = Depends(get_current_user)):
                 "params_hash": 1,
                 "base_date": 1,
                 "strategy_name": 1,
+                "status": 1,
             },
         )
     )
     groups: Dict[tuple, List[Dict[str, Any]]] = defaultdict(list)
-    for p in plans:
-        stid = p.get("strategy_template_id")
-        ph = p.get("params_hash")
-        if not stid or not ph:
+    for plan in plans:
+        stid = plan.get("strategy_template_id")
+        phash = plan.get("params_hash")
+        if not stid or not phash:
             continue
-        groups[(str(stid), str(ph))].append(p)
+        groups[(str(stid), str(phash))].append(plan)
+    return groups
 
-    portfolios: List[Dict[str, Any]] = []
-    for (stid, phash), _plist in groups.items():
-        sample = max(_plist, key=lambda x: str(x.get("base_date") or ""))
-        lineage_ids = set(_lineage_plan_ids_for_plan(trading_collections, sample, user_id))
-        if not lineage_ids & live_plan_ids:
-            continue
 
-        all_lineage = list(
-            trading_collections["portfolio_trade_plans"].find(
-                {"user_id": user_id, "strategy_template_id": stid, "params_hash": phash},
-                {"_id": 0, "plan_id": 1, "base_date": 1, "strategy_name": 1},
-            )
+def _portfolio_funding_mode(
+    trading_collections: Dict[str, Any],
+    finance_collections: Dict[str, Any],
+    plan: Dict[str, Any],
+    user_id: str,
+    live_plan_ids: Optional[set] = None,
+) -> str:
+    lineage_ids = set(_lineage_plan_ids_for_plan(trading_collections, plan, user_id))
+    if live_plan_ids is None:
+        live_plan_ids = _live_plan_ids_for_user(finance_collections, user_id)
+    return "live" if lineage_ids & live_plan_ids else "paper"
+
+
+def _build_portfolio_entry(
+    trading_collections: Dict[str, Any],
+    finance_collections: Dict[str, Any],
+    user_id: str,
+    strategy_template_id: str,
+    params_hash: str,
+    live_plan_ids: set,
+) -> Optional[Dict[str, Any]]:
+    all_lineage = list(
+        trading_collections["portfolio_trade_plans"].find(
+            {
+                "user_id": user_id,
+                "strategy_template_id": strategy_template_id,
+                "params_hash": params_hash,
+            },
+            {"_id": 0, "plan_id": 1, "base_date": 1, "strategy_name": 1, "status": 1},
         )
-        if not all_lineage:
-            continue
-        latest = max(all_lineage, key=lambda x: str(x.get("base_date") or ""))
-        earliest = min(all_lineage, key=lambda x: str(x.get("base_date") or ""))
+    )
+    if not all_lineage:
+        return None
 
+    lineage_ids = set(_lineage_plan_ids_for_plan(trading_collections, all_lineage[0], user_id))
+    has_live = bool(lineage_ids & live_plan_ids)
+    has_paper = any(row.get("status") in PAPER_ACTIVE_STATUSES for row in all_lineage)
+    if not has_live and not has_paper:
+        return None
+
+    latest = max(all_lineage, key=lambda row: str(row.get("base_date") or ""))
+    earliest = min(all_lineage, key=lambda row: str(row.get("base_date") or ""))
+    sec_id = ""
+    if has_live:
         sig = finance_collections["trade_signals"].find_one(
             {"user_id": user_id, "mode": "live", "plan_id": {"$in": list(lineage_ids)}},
             {"_id": 0, "securities_account_id": 1},
         )
         sec_id = str(sig.get("securities_account_id") or "") if sig else ""
 
-        portfolios.append(
+    return {
+        "strategy_template_id": strategy_template_id,
+        "params_hash": params_hash,
+        "latest_plan_id": latest.get("plan_id"),
+        "plan_count": len(all_lineage),
+        "first_base_date": earliest.get("base_date"),
+        "last_base_date": latest.get("base_date"),
+        "strategy_name": latest.get("strategy_name") or earliest.get("strategy_name") or "",
+        "securities_account_id": sec_id,
+        "funding_mode": "live" if has_live else "paper",
+    }
+
+
+def _list_portfolios_payload(
+    trading_collections: Dict[str, Any],
+    finance_collections: Dict[str, Any],
+    user_id: str,
+) -> List[Dict[str, Any]]:
+    live_plan_ids = _live_plan_ids_for_user(finance_collections, user_id)
+    groups = _portfolio_plan_groups(trading_collections, user_id)
+    portfolios: List[Dict[str, Any]] = []
+    for (strategy_template_id, params_hash) in groups:
+        entry = _build_portfolio_entry(
+            trading_collections,
+            finance_collections,
+            user_id,
+            strategy_template_id,
+            params_hash,
+            live_plan_ids,
+        )
+        if entry:
+            portfolios.append(entry)
+    portfolios.sort(key=lambda row: str(row.get("last_base_date") or ""), reverse=True)
+    return portfolios
+
+
+def _trading_dates_between(data_collections: Dict[str, Any], start_date: str, end_date: str) -> List[str]:
+    start = _normalize_yyyymmdd(start_date) or ""
+    end = _normalize_yyyymmdd(end_date) or ""
+    if not start or not end or start > end:
+        return []
+    rows = data_collections["volume_price"].find(
+        {"trade_date": {"$gte": start, "$lte": end}},
+        {"_id": 0, "trade_date": 1},
+    )
+    return sorted({str(row.get("trade_date")) for row in rows if row.get("trade_date")})
+
+
+def _advance_trading_days(data_collections: Dict[str, Any], from_date: str, trading_day_offset: int) -> Optional[str]:
+    if trading_day_offset <= 0:
+        return _normalize_yyyymmdd(from_date)
+    anchor = _normalize_yyyymmdd(from_date) or ""
+    if not anchor:
+        return None
+    rows = data_collections["volume_price"].find(
+        {"trade_date": {"$gt": anchor}},
+        {"_id": 0, "trade_date": 1},
+    )
+    future_dates = sorted({str(row.get("trade_date")) for row in rows if row.get("trade_date")})
+    if len(future_dates) < trading_day_offset:
+        return future_dates[-1] if future_dates else None
+    return future_dates[trading_day_offset - 1]
+
+
+def _drift_action_from_item(item: Dict[str, Any]) -> str:
+    drift = _int_value(item.get("drift_delta_shares"))
+    if drift > 0:
+        return "buy"
+    if drift < 0:
+        return "sell"
+    if _int_value(item.get("current_shares")) > 0:
+        return "hold"
+    return "skip"
+
+
+def _compute_drift_summary(items: List[Dict[str, Any]], equity: Optional[float] = None) -> Dict[str, Any]:
+    buy_count = sell_count = hold_count = skip_count = 0
+    buy_amount = sell_amount = 0.0
+    new_entrants = dropped = 0
+    for item in items:
+        drift = _int_value(item.get("drift_delta_shares"))
+        price = _numeric(item.get("estimated_price"), default=0.0)
+        action = _drift_action_from_item(item)
+        if action == "buy":
+            buy_count += 1
+        elif action == "sell":
+            sell_count += 1
+        elif action == "hold":
+            hold_count += 1
+        else:
+            skip_count += 1
+        if drift > 0 and price:
+            buy_amount += abs(drift) * price
+        elif drift < 0 and price:
+            sell_amount += abs(drift) * price
+        current_shares = _int_value(item.get("current_shares"))
+        target_shares = _int_value(item.get("target_shares"))
+        if current_shares == 0 and target_shares > 0:
+            new_entrants += 1
+        elif current_shares > 0 and target_shares == 0:
+            dropped += 1
+    resolved_equity = _numeric(equity) if equity is not None else 0.0
+    turnover = (buy_amount + sell_amount) / resolved_equity if resolved_equity > 0 else None
+    return {
+        "buy_count": buy_count,
+        "sell_count": sell_count,
+        "hold_count": hold_count,
+        "skip_count": skip_count,
+        "estimated_buy_amount": buy_amount,
+        "estimated_sell_amount": sell_amount,
+        "estimated_turnover": turnover,
+        "new_entrant_count": new_entrants,
+        "dropped_count": dropped,
+    }
+
+
+def _plan_today_state_label(plan: Dict[str, Any]) -> str:
+    status = str(plan.get("status") or "")
+    plan_type = str(plan.get("plan_type") or "")
+    non_executable_reason = str(plan.get("non_executable_reason") or "")
+    monitor_can_trade = bool(plan.get("monitor_can_trade"))
+
+    if status == "needs_review":
+        if plan_type == "monitor" and monitor_can_trade:
+            return "观察日（已开启日内再平衡）：可交易，等待审核"
+        return "调仓日：等待审核"
+    if status == "approved":
+        return "已批准，等待执行/发布"
+    if status == "executed_paper":
+        return "纸面已执行"
+    if status == "partially_executed":
+        return "部分执行"
+    if plan.get("live_signals_published_at"):
+        return "实盘信号已发布"
+    if (
+        status == "generated"
+        and plan_type == "monitor"
+        and non_executable_reason == "monitor_no_trade"
+    ):
+        return "观察日：不交易"
+    if plan_type == "monitor" and plan.get("executable"):
+        return "观察日（已开启日内再平衡）：可交易"
+    if plan_type == "rebalance" or plan.get("is_rebalance_day"):
+        return "调仓日"
+    return status or "未知状态"
+
+
+def _plan_action_required(plan: Dict[str, Any]) -> bool:
+    status = str(plan.get("status") or "")
+    if status in {"needs_review", "approved", "partially_executed"}:
+        return True
+    if bool(plan.get("executable")) and status in {"needs_review", "approved"}:
+        return True
+    return False
+
+
+def _rebalance_days_from_plan(plan: Dict[str, Any]) -> int:
+    params = plan.get("params_snapshot") or {}
+    return max(1, _int_value(params.get("rebalance_days"), 20))
+
+
+def _compute_current_cycle(
+    latest_plan: Dict[str, Any],
+    latest_rebalance_plan: Optional[Dict[str, Any]],
+    latest_monitor_plan: Optional[Dict[str, Any]],
+    data_collections: Dict[str, Any],
+) -> Dict[str, Any]:
+    previous_rebalance_date = latest_plan.get("previous_rebalance_date")
+    if latest_rebalance_plan and latest_rebalance_plan.get("base_date"):
+        previous_rebalance_date = latest_rebalance_plan.get("base_date")
+    base_date = latest_plan.get("base_date")
+    rebalance_days = _rebalance_days_from_plan(latest_plan)
+    elapsed_trading_days = 0
+    if previous_rebalance_date and base_date:
+        trading_dates = _trading_dates_between(data_collections, str(previous_rebalance_date), str(base_date))
+        elapsed_trading_days = max(0, len(trading_dates) - 1)
+    remaining_days = max(0, rebalance_days - elapsed_trading_days)
+    next_rebalance_estimate = None
+    if base_date and remaining_days:
+        next_rebalance_estimate = _advance_trading_days(data_collections, str(base_date), remaining_days)
+    return {
+        "previous_rebalance_date": previous_rebalance_date,
+        "previous_rebalance_plan_id": (
+            (latest_rebalance_plan or {}).get("plan_id")
+            or latest_plan.get("previous_rebalance_plan_id")
+        ),
+        "rebalance_days": rebalance_days,
+        "elapsed_trading_days": elapsed_trading_days,
+        "next_rebalance_estimate": next_rebalance_estimate,
+        "latest_monitor_plan_id": (latest_monitor_plan or {}).get("plan_id"),
+        "latest_rebalance_plan_id": (latest_rebalance_plan or {}).get("plan_id"),
+        "latest_base_date": base_date,
+        "is_rebalance_day": bool(latest_plan.get("is_rebalance_day")),
+        "plan_type": latest_plan.get("plan_type"),
+    }
+
+
+def _timeline_node_drift_brief(
+    trading_collections: Dict[str, Any],
+    plan: Dict[str, Any],
+    user_id: str,
+) -> Dict[str, Any]:
+    items = list(
+        trading_collections["portfolio_trade_plan_items"].find(
+            {"plan_id": plan.get("plan_id"), "user_id": user_id},
             {
-                "strategy_template_id": stid,
-                "params_hash": phash,
-                "latest_plan_id": latest.get("plan_id"),
-                "plan_count": len(all_lineage),
-                "first_base_date": earliest.get("base_date"),
-                "last_base_date": latest.get("base_date"),
-                "strategy_name": latest.get("strategy_name") or earliest.get("strategy_name") or "",
-                "securities_account_id": sec_id,
+                "_id": 0,
+                "drift_delta_shares": 1,
+                "estimated_price": 1,
+                "current_shares": 1,
+                "target_shares": 1,
+            },
+        )
+    )
+    equity = _numeric((plan.get("summary") or {}).get("equity"), default=0.0)
+    summary = _compute_drift_summary(items, equity=equity or None)
+    return {
+        "estimated_turnover": summary.get("estimated_turnover"),
+        "buy_count": summary.get("buy_count"),
+        "sell_count": summary.get("sell_count"),
+    }
+
+
+def _build_lineage_timeline_payload(
+    trading_collections: Dict[str, Any],
+    finance_collections: Dict[str, Any],
+    data_collections: Dict[str, Any],
+    plan: Dict[str, Any],
+    user_id: str,
+    *,
+    limit: int = 60,
+    offset: int = 0,
+) -> Dict[str, Any]:
+    lineage_query = _lineage_query_for_plan(trading_collections, plan, user_id)
+    projection = dict(PLAN_LIST_PROJECTION)
+    projection["live_signals_published_at"] = 1
+    plans = list(
+        trading_collections["portfolio_trade_plans"]
+        .find(lineage_query, projection)
+        .sort("base_date", -1)
+    )
+    if not plans:
+        raise HTTPException(status_code=404, detail="lineage plans not found")
+
+    latest_plan = plans[0]
+    latest_rebalance = next(
+        (row for row in plans if row.get("plan_type") == "rebalance" or row.get("is_rebalance_day")),
+        None,
+    )
+    latest_monitor = next((row for row in plans if row.get("plan_type") == "monitor"), None)
+    live_plan_ids = _live_plan_ids_for_user(finance_collections, user_id)
+    funding_mode = _portfolio_funding_mode(
+        trading_collections, finance_collections, latest_plan, user_id, live_plan_ids
+    )
+
+    latest_items = list(
+        trading_collections["portfolio_trade_plan_items"].find(
+            {"plan_id": latest_plan.get("plan_id"), "user_id": user_id},
+            {
+                "_id": 0,
+                "drift_delta_shares": 1,
+                "estimated_price": 1,
+                "current_shares": 1,
+                "target_shares": 1,
+            },
+        )
+    )
+    latest_equity = _numeric((latest_plan.get("summary") or {}).get("equity"), default=0.0)
+    latest_drift_summary = _compute_drift_summary(latest_items, equity=latest_equity or None)
+    latest_drift_summary.update(
+        {
+            "executable": bool(latest_plan.get("executable")),
+            "non_executable_reason": latest_plan.get("non_executable_reason"),
+            "plan_id": latest_plan.get("plan_id"),
+            "base_date": latest_plan.get("base_date"),
+        }
+    )
+
+    total = len(plans)
+    page_plans = plans[offset : offset + limit]
+    timeline: List[Dict[str, Any]] = []
+    for row in page_plans:
+        node_type = "rebalance" if row.get("plan_type") == "rebalance" or row.get("is_rebalance_day") else "monitor"
+        drift_brief = _timeline_node_drift_brief(trading_collections, row, user_id)
+        timeline.append(
+            {
+                "date": row.get("base_date"),
+                "plan_id": row.get("plan_id"),
+                "node_type": node_type,
+                "status": row.get("status"),
+                "executable": bool(row.get("executable")),
+                "non_executable_reason": row.get("non_executable_reason"),
+                "plan_type": row.get("plan_type"),
+                "is_rebalance_day": bool(row.get("is_rebalance_day")),
+                "today_state": _plan_today_state_label(row),
+                "action_required": _plan_action_required(row),
+                "drift_brief": drift_brief,
             }
         )
 
-    portfolios.sort(key=lambda x: str(x.get("last_base_date") or ""), reverse=True)
+    return {
+        "portfolio_identity": {
+            "strategy_template_id": latest_plan.get("strategy_template_id"),
+            "params_hash": latest_plan.get("params_hash"),
+            "strategy_name": latest_plan.get("strategy_name"),
+            "latest_plan_id": latest_plan.get("plan_id"),
+            "funding_mode": funding_mode,
+            "securities_account_id": (
+                finance_collections["trade_signals"].find_one(
+                    {
+                        "user_id": user_id,
+                        "mode": "live",
+                        "plan_id": {"$in": _lineage_plan_ids_for_plan(trading_collections, latest_plan, user_id)},
+                    },
+                    {"_id": 0, "securities_account_id": 1},
+                ) or {}
+            ).get("securities_account_id"),
+        },
+        "current_cycle": _compute_current_cycle(
+            latest_plan, latest_rebalance, latest_monitor, data_collections
+        ),
+        "today_state": _plan_today_state_label(latest_plan),
+        "latest_drift_summary": latest_drift_summary,
+        "timeline": timeline,
+        "timeline_pagination": {"total": total, "limit": limit, "offset": offset},
+        "action_required": _plan_action_required(latest_plan),
+    }
+
+
+@router.get("/portfolios")
+async def list_portfolios(current_user: dict = Depends(get_current_user)):
+    """Enumerate live and paper portfolio lineages (strategy_template_id + params_hash)."""
+
+    trading_collections = get_trading_db_collections()
+    finance_collections = get_db_collections()
+    user_id = _current_user_id(current_user)
+    portfolios = _list_portfolios_payload(trading_collections, finance_collections, user_id)
     return {"success": True, "data": _jsonable({"portfolios": portfolios})}
+
+
+@router.get("/live-portfolios")
+async def list_live_portfolios(current_user: dict = Depends(get_current_user)):
+    """Enumerate live-traded plan lineages (strategy_template_id + params_hash) for the user."""
+
+    trading_collections = get_trading_db_collections()
+    finance_collections = get_db_collections()
+    user_id = _current_user_id(current_user)
+    portfolios = [
+        row for row in _list_portfolios_payload(trading_collections, finance_collections, user_id)
+        if row.get("funding_mode") == "live"
+    ]
+    return {"success": True, "data": _jsonable({"portfolios": portfolios})}
+
+
+@router.get("/plans/{plan_id}/lineage-timeline")
+async def get_portfolio_plan_lineage_timeline(
+    plan_id: str,
+    limit: int = Query(default=60, ge=1, le=240),
+    offset: int = Query(default=0, ge=0),
+    current_user: dict = Depends(get_current_user),
+):
+    trading_collections = get_trading_db_collections()
+    finance_collections = get_db_collections()
+    data_collections = get_data_db()
+    user_id = _current_user_id(current_user)
+    plan = _require_plan(trading_collections, plan_id, current_user)
+    payload = _build_lineage_timeline_payload(
+        trading_collections,
+        finance_collections,
+        data_collections,
+        plan,
+        user_id,
+        limit=limit,
+        offset=offset,
+    )
+    return {"success": True, "data": _jsonable(payload)}
 
 
 @router.get("/plans/{plan_id}/lineage-live-executions")
