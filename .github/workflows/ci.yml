@@ -90,6 +90,35 @@ jobs:
           log_step "Ensuring shared Docker network"
           docker network inspect quant-network >/dev/null 2>&1 || docker network create quant-network
 
+          log_step "Ensuring portfolio plan MongoDB indexes"
+          # Self-migrating: drops the legacy unconditional unique lineage index
+          # and (re)creates the partial unique / query-acceleration indexes used
+          # by the quant-api plan APIs. Non-fatal so an index issue never blocks
+          # the API rollout.
+          timeout 120 docker run --rm \
+            --network quant-network \
+            --add-host=host.docker.internal:host-gateway \
+            --env-file /home/deployuser/quantFinance/.env \
+            -e TZ=Asia/Shanghai \
+            -v /home/deployuser/quantFinance/.env:/app/.env:ro \
+            "$IMAGE" \
+            python tools/check_portfolio_plan_indexes.py --apply \
+            || log_step "WARN: portfolio index maintenance failed (continuing deploy)"
+
+          log_step "Ensuring general performance MongoDB indexes"
+          # Broad finance / quant_analyzer / quant_data query-acceleration indexes.
+          # Idempotent (skips existing) and per-index fault tolerant. Non-fatal so
+          # an index issue never blocks the API rollout.
+          timeout 600 docker run --rm \
+            --network quant-network \
+            --add-host=host.docker.internal:host-gateway \
+            --env-file /home/deployuser/quantFinance/.env \
+            -e TZ=Asia/Shanghai \
+            -v /home/deployuser/quantFinance/.env:/app/.env:ro \
+            "$IMAGE" \
+            python tools/check_and_fix_indexes.py --apply \
+            || log_step "WARN: general index maintenance failed (continuing deploy)"
+
           log_step "Stopping existing containers"
           timeout 30 docker stop -t 20 quant-mcp-actions 2>/dev/null || true
           timeout 30 docker rm quant-mcp-actions 2>/dev/null || true

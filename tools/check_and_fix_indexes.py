@@ -295,9 +295,14 @@ def print_report(missing: Dict[str, List[IndexSpec]]) -> int:
 
 
 def apply_indexes(client: MongoClient, missing: Dict[str, List[IndexSpec]],
-                  verbose: bool = True) -> None:
+                  verbose: bool = True) -> int:
+    """Create the missing indexes and return the number of failures so callers
+    can surface a non-zero exit code. Per-index fault tolerant: one failure
+    (e.g. a unique constraint that conflicts with existing data) never aborts
+    the rest."""
     total = sum(len(v) for v in missing.values())
     done = 0
+    failed = 0
     for db_name, specs in missing.items():
         db: Database = client[db_name]
         for spec in specs:
@@ -316,14 +321,18 @@ def apply_indexes(client: MongoClient, missing: Dict[str, List[IndexSpec]],
                 if verbose:
                     print(f"  ✓  [{db_name}] {spec.collection}  →  {idx_name}")
             except Exception as e:
+                failed += 1
                 print(f"  ✗  [{db_name}] {spec.collection} {spec.key_str}: {e}",
                       file=sys.stderr)
     print(f"\n✅  完成：建立 {done}/{total} 个索引。")
+    if failed:
+        print(f"⚠️  {failed}/{total} 个索引创建失败，详见上方 stderr。", file=sys.stderr)
+    return failed
 
 
 # ─── 主程序 ───────────────────────────────────────────────────────────────
 
-def main() -> None:
+def main() -> int:
     parser = argparse.ArgumentParser(description="检查并修复 MongoDB 索引")
     parser.add_argument("--dry-run", action="store_true",
                         help="仅扫描报告，不创建索引")
@@ -339,30 +348,33 @@ def main() -> None:
         client.admin.command("ping")
     except Exception as e:
         print(f"❌  无法连接 MongoDB: {e}", file=sys.stderr)
-        sys.exit(1)
+        return 1
 
-    print("\n🔍  扫描索引中…")
-    missing = scan_missing(client)
-    total = print_report(missing)
+    failed = 0
+    try:
+        print("\n🔍  扫描索引中…")
+        missing = scan_missing(client)
+        total = print_report(missing)
 
-    if total == 0 or args.dry_run:
-        client.close()
-        return
+        if total == 0 or args.dry_run:
+            return 0
 
-    if args.apply:
-        print("\n⚙️  --apply 模式，直接创建索引…\n")
-        apply_indexes(client, missing)
-    else:
-        print("\n是否立即创建以上缺失索引？(y/N) ", end="", flush=True)
-        ans = input().strip().lower()
-        if ans in ("y", "yes"):
-            print()
-            apply_indexes(client, missing)
+        if args.apply:
+            print("\n⚙️  --apply 模式，直接创建索引…\n")
+            failed = apply_indexes(client, missing)
         else:
-            print("已取消，未做任何修改。")
+            print("\n是否立即创建以上缺失索引？(y/N) ", end="", flush=True)
+            ans = input().strip().lower()
+            if ans in ("y", "yes"):
+                print()
+                failed = apply_indexes(client, missing)
+            else:
+                print("已取消，未做任何修改。")
+    finally:
+        client.close()
 
-    client.close()
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

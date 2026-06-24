@@ -31,6 +31,10 @@ class ExpectedIndex:
     name: str
     reason: str
     unique: bool = False
+    # When set, the unique constraint applies only to documents matching this
+    # filter (MongoDB partial index). Used so manual (origin=manual) plans can
+    # coexist with the day's strategy plan on the same lineage tuple.
+    partial_filter: Optional[Dict[str, Any]] = None
 
 
 def _load_env() -> None:
@@ -70,9 +74,10 @@ def _expected_indexes() -> List[ExpectedIndex]:
                 ("params_hash", ASCENDING),
                 ("base_date", ASCENDING),
             ],
-            "user_strategy_params_base_date_1",
-            "lineage lookup and same-day plan dedupe",
+            "user_strategy_params_base_date_strategy_origin",
+            "same-day plan dedupe (strategy plans only; manual plans exempt)",
             unique=True,
+            partial_filter={"origin": "strategy"},
         ),
         ExpectedIndex(
             "trading",
@@ -319,12 +324,49 @@ def _find_covering_index(indexes: Dict[str, Dict[str, Any]], spec: ExpectedIndex
             continue
         if spec.unique and not index_info.get("unique"):
             continue
+        existing_partial = index_info.get("partialFilterExpression")
+        if spec.partial_filter is not None:
+            # The legacy unconditional unique index does NOT satisfy a partial
+            # spec; it must be replaced so manual plans can coexist.
+            if existing_partial != spec.partial_filter:
+                continue
+        elif existing_partial:
+            # A non-partial requirement is not covered by a partial index.
+            continue
         return index_name
     return None
 
 
+def _drop_conflicting_indexes(collection: Collection, spec: ExpectedIndex) -> List[str]:
+    """Drop indexes whose key pattern equals ``spec.keys`` but whose options
+    conflict with ``spec`` (e.g. a legacy non-partial unique index that blocks
+    creating the partial replacement). MongoDB rejects two indexes that share a
+    key pattern but differ only in options, so the legacy one must go first."""
+    dropped: List[str] = []
+    try:
+        indexes = collection.index_information()
+    except Exception:  # noqa: BLE001
+        return dropped
+    for name, info in indexes.items():
+        if name == "_id_":
+            continue
+        if list(info.get("key") or []) != list(spec.keys):
+            continue
+        if name == spec.name and info.get("partialFilterExpression") == spec.partial_filter:
+            continue
+        try:
+            collection.drop_index(name)
+            dropped.append(name)
+        except Exception:  # noqa: BLE001
+            pass
+    return dropped
+
+
 def _create_index(collection: Collection, spec: ExpectedIndex) -> str:
-    return collection.create_index(spec.keys, name=spec.name, unique=spec.unique, background=True)
+    kwargs: Dict[str, Any] = {"name": spec.name, "unique": spec.unique, "background": True}
+    if spec.partial_filter is not None:
+        kwargs["partialFilterExpression"] = spec.partial_filter
+    return collection.create_index(spec.keys, **kwargs)
 
 
 def _mongo_client() -> MongoClient:
@@ -350,6 +392,8 @@ def _check_indexes(*, apply: bool = False) -> Dict[str, Any]:
     missing: List[Dict[str, Any]] = []
     present: List[Dict[str, Any]] = []
     created: List[Dict[str, Any]] = []
+    dropped: List[Dict[str, Any]] = []
+    failed: List[Dict[str, Any]] = []
 
     try:
         client.admin.command("ping")
@@ -383,8 +427,16 @@ def _check_indexes(*, apply: bool = False) -> Dict[str, Any]:
                 continue
             missing.append(row)
             if apply:
-                created_name = _create_index(collection, spec)
-                created.append({**row, "created_index": created_name})
+                try:
+                    for dropped_name in _drop_conflicting_indexes(collection, spec):
+                        dropped.append({**row, "dropped_index": dropped_name})
+                    created_name = _create_index(collection, spec)
+                    created.append({**row, "created_index": created_name})
+                except Exception as exc:  # noqa: BLE001
+                    # Keep going so one bad index (e.g. a unique constraint that
+                    # conflicts with existing data) never blocks the rest. The
+                    # failure is surfaced in the report and via a non-zero exit.
+                    failed.append({**row, "error": str(exc)})
     finally:
         client.close()
 
@@ -394,9 +446,13 @@ def _check_indexes(*, apply: bool = False) -> Dict[str, Any]:
         "present_count": len(present),
         "missing_count": len(missing),
         "created_count": len(created),
+        "dropped_count": len(dropped),
+        "failed_count": len(failed),
         "present": present,
         "missing": missing,
         "created": created,
+        "dropped": dropped,
+        "failed": failed,
     }
 
 
@@ -421,11 +477,21 @@ def _print_report(result: Dict[str, Any]) -> None:
                 print(f"  error: {row['error']}")
     else:
         print("All expected indexes are present.")
+    if result.get("dropped"):
+        print()
+        print("Dropped conflicting indexes:")
+        for row in result["dropped"]:
+            print(f"- {row['db']}.{row['collection']} {row['dropped_index']}")
     if result["created"]:
         print()
         print("Created indexes:")
         for row in result["created"]:
             print(f"- {row['db']}.{row['collection']} {row['created_index']}")
+    if result.get("failed"):
+        print()
+        print("Failed indexes:")
+        for row in result["failed"]:
+            print(f"- {row['db']}.{row['collection']} {row['name']}: {row.get('error')}")
 
 
 def main() -> int:
@@ -439,6 +505,8 @@ def main() -> int:
         print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
     else:
         _print_report(result)
+    if result.get("failed"):
+        return 1
     return 1 if result["missing"] and not args.apply else 0
 
 
