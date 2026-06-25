@@ -345,6 +345,56 @@ def test_review_plan_writes_user_id(monkeypatch):
     assert collections["portfolio_trade_plans"].find_one({"plan_id": "plan-user-1"})["status"] == "approved"
 
 
+def test_cancel_plan_cancels_unfilled_live_signals(monkeypatch):
+    collections = _collections()
+    finance_collections = _finance_collections()
+    collections["portfolio_trade_plans"].docs[0]["status"] = "approved"
+    finance_collections["trade_signals"].insert_one(
+        {
+            "order_id": "order-1",
+            "plan_id": "plan-user-1",
+            "user_id": "user-1",
+            "mode": "live",
+            "status": "pending",
+        }
+    )
+    monkeypatch.setattr(portfolio_plans, "get_trading_db_collections", lambda: collections)
+    monkeypatch.setattr(portfolio_plans, "get_db_collections", lambda: finance_collections)
+
+    response = portfolio_plans._cancel_plan("plan-user-1", "clicked by mistake", {"id": "user-1", "username": "alice"})
+
+    assert response["success"] is True
+    assert collections["portfolio_trade_plans"].find_one({"plan_id": "plan-user-1"})["status"] == "cancelled"
+    assert collections["portfolio_plan_reviews"].docs[0]["decision"] == "cancelled"
+    assert finance_collections["trade_signals"].find_one({"order_id": "order-1"})["status"] == "cancelled"
+    assert collections["portfolio_plan_operation_logs"].docs[0]["operation_type"] == "cancel_plan"
+
+
+def test_cancel_plan_rejects_live_fills(monkeypatch):
+    collections = _collections()
+    finance_collections = _finance_collections()
+    collections["portfolio_trade_plans"].docs[0]["status"] = "approved"
+    finance_collections["trade_signals"].insert_one(
+        {
+            "order_id": "order-1",
+            "plan_id": "plan-user-1",
+            "user_id": "user-1",
+            "mode": "live",
+            "status": "partial_filled",
+            "filled_qty": 100,
+        }
+    )
+    monkeypatch.setattr(portfolio_plans, "get_trading_db_collections", lambda: collections)
+    monkeypatch.setattr(portfolio_plans, "get_db_collections", lambda: finance_collections)
+
+    with pytest.raises(portfolio_plans.HTTPException) as exc:
+        portfolio_plans._cancel_plan("plan-user-1", "too late", {"id": "user-1", "username": "alice"})
+
+    assert exc.value.status_code == 409
+    assert "live fills" in exc.value.detail
+    assert collections["portfolio_trade_plans"].find_one({"plan_id": "plan-user-1"})["status"] == "approved"
+
+
 def test_generate_portfolio_plan_uses_current_user(monkeypatch):
     collections = _collections()
     monkeypatch.setattr(portfolio_plans, "get_trading_db_collections", lambda: collections)

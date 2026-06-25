@@ -23,6 +23,7 @@ from services.live_trade_signals import (
     ACTIVE_SIGNAL_STATUSES,
     PLAN_PHASE_APPROVED_PUBLISHED,
     PLAN_PHASE_SELLING,
+    TERMINAL_SIGNAL_STATUSES,
     active_signal_query_for_order_ids,
     build_portfolio_plan_live_signal,
     derive_execution_phase_state,
@@ -3258,6 +3259,11 @@ async def reject_portfolio_plan(plan_id: str, request: ReviewRequest, current_us
     return _review_plan(plan_id, "rejected", request.comment, current_user)
 
 
+@router.post("/plans/{plan_id}/cancel")
+async def cancel_portfolio_plan(plan_id: str, request: ReviewRequest, current_user: dict = Depends(get_current_user)):
+    return _cancel_plan(plan_id, request.comment, current_user)
+
+
 def _review_plan(plan_id: str, decision: str, comment: str, current_user: Dict[str, Any]):
     collections = get_trading_db_collections()
     plan = _require_plan(collections, plan_id, current_user)
@@ -3280,6 +3286,86 @@ def _review_plan(plan_id: str, decision: str, comment: str, current_user: Dict[s
         {"$set": {"status": decision, "reviewer": review["reviewer"], "reviewed_at": now}},
     )
     return {"success": True, "data": _jsonable(review)}
+
+
+def _cancel_plan(plan_id: str, comment: str, current_user: Dict[str, Any]):
+    trading_collections = get_trading_db_collections()
+    finance_collections = get_db_collections()
+    plan = _require_plan(trading_collections, plan_id, current_user)
+    user_id = _current_user_id(current_user)
+    status = str(plan.get("status") or "")
+    if status not in ACTIVE_PLAN_STATUSES:
+        raise HTTPException(status_code=400, detail=f"plan is not cancellable in status {status}")
+    if plan.get("paper_executed_at") or trading_collections["portfolio_paper_executions"].find_one({"plan_id": plan_id, "user_id": user_id}):
+        raise HTTPException(status_code=409, detail="plan already has paper executions; cannot cancel")
+
+    signal_query = {"plan_id": plan_id, "user_id": user_id, "mode": "live"}
+    signals = list(finance_collections["trade_signals"].find(signal_query))
+    order_ids = [row.get("order_id") for row in signals if row.get("order_id")]
+    executions = (
+        list(finance_collections["trade_executions"].find({"user_id": user_id, "order_id": {"$in": order_ids}}))
+        if order_ids
+        else []
+    )
+    if any(_signal_filled_qty(row) > 0 for row in signals) or any(_execution_fill_quantity(row) > 0 for row in executions):
+        raise HTTPException(status_code=409, detail="plan already has live fills; cannot cancel")
+
+    now = datetime.utcnow()
+    reviewer = _reviewer(current_user)
+    reason = comment or "plan cancelled by user"
+    cancelled_signal_count = 0
+    terminal_signal_statuses = TERMINAL_SIGNAL_STATUSES | {"cancelled", "canceled"}
+    for signal in signals:
+        order_id = signal.get("order_id")
+        if not order_id or str(signal.get("status") or "") in terminal_signal_statuses:
+            continue
+        result = finance_collections["trade_signals"].update_one(
+            {"user_id": user_id, "order_id": order_id},
+            {
+                "$set": {
+                    "status": "cancelled",
+                    "cancelled_at": now,
+                    "cancelled_by": reviewer,
+                    "cancel_reason": reason,
+                    "updated_at": now,
+                }
+            },
+        )
+        cancelled_signal_count += int(getattr(result, "modified_count", 0) or 0)
+
+    review = {
+        "plan_id": plan_id,
+        "strategy_template_id": plan.get("strategy_template_id"),
+        "user_id": user_id,
+        "decision": "cancelled",
+        "reviewer": reviewer,
+        "comment": comment,
+        "created_at": now,
+    }
+    trading_collections["portfolio_plan_reviews"].insert_one(review)
+    trading_collections["portfolio_trade_plans"].update_one(
+        {"plan_id": plan_id, "user_id": user_id},
+        {
+            "$set": {
+                "status": "cancelled",
+                "cancelled_at": now,
+                "cancelled_by": reviewer,
+                "cancel_comment": comment,
+                "reviewer": reviewer,
+                "reviewed_at": now,
+            }
+        },
+    )
+    _append_plan_operation_log(
+        trading_collections,
+        plan_id=plan_id,
+        user_id=user_id,
+        operation_type="cancel_plan",
+        status="success",
+        message=reason,
+        payload={"previous_status": status, "cancelled_signal_count": cancelled_signal_count},
+    )
+    return {"success": True, "data": _jsonable({**review, "cancelled_signal_count": cancelled_signal_count})}
 
 
 @router.get("/plans/{plan_id}/executions")
@@ -3602,6 +3688,7 @@ async def get_portfolio_plan_live_realtime_equity(plan_id: str, current_user: di
 
 
 PAPER_ACTIVE_STATUSES = frozenset({"executed_paper", "partially_executed"})
+ACTIVE_PLAN_STATUSES = frozenset({"needs_review", "approved"})
 
 
 def _execution_fill_quantity(execution: Dict[str, Any]) -> float:
@@ -4090,6 +4177,12 @@ def _plan_today_state_label(plan: Dict[str, Any]) -> str:
         return "纸面已执行"
     if status == "partially_executed":
         return "部分执行"
+    if status == "cancelled":
+        return "计划已作废"
+    if status == "superseded":
+        return "已被新周期计划替代"
+    if status == "expired":
+        return "计划已过期"
     if plan.get("live_signals_published_at"):
         return "实盘信号已发布"
     if (
