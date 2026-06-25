@@ -1646,15 +1646,15 @@ def test_list_portfolios_includes_live_and_paper_lineages(monkeypatch):
     assert len(ports) == 2
     live = next(row for row in ports if row["params_hash"] == "hx-live")
     paper = next(row for row in ports if row["params_hash"] == "hx-paper")
-    assert live["funding_mode"] == "live"
+    assert live["execution_venue"] == "live"
     assert live["latest_plan_id"] == "live-b"
     assert live["param_summary"] == "csi1000 · Top20 · 20d · top_n"
-    assert paper["funding_mode"] == "paper"
+    assert paper["execution_venue"] == "paper"
     assert paper["latest_plan_id"] == "paper-b"
     assert paper["param_summary"] == "csi500 · Top30 · 10d · industry_capped"
 
 
-def test_list_portfolios_treats_unfilled_live_signals_as_paper(monkeypatch):
+def test_list_portfolios_treats_unfilled_live_signals_as_live(monkeypatch):
     cols = _collections()
     fin = _finance_collections()
     data = _data_collections()
@@ -1685,8 +1685,8 @@ def test_list_portfolios_treats_unfilled_live_signals_as_paper(monkeypatch):
     resp = asyncio.run(portfolio_plans.list_portfolios(current_user={"id": "user-1"}))
     ports = resp["data"]["portfolios"]
     assert len(ports) == 1
-    assert ports[0]["funding_mode"] == "paper"
-    assert ports[0]["securities_account_id"] == ""
+    assert ports[0]["execution_venue"] == "live"
+    assert ports[0]["securities_account_id"] == "acct-1"
 
 
 def test_lineage_paper_positions_uses_latest_snapshot(monkeypatch):

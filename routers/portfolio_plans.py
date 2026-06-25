@@ -3565,6 +3565,45 @@ def _lineage_has_live_fills(
     return any(_execution_fill_quantity(row) > 0 for row in executions)
 
 
+def _lineage_live_signals(
+    trading_collections: Dict[str, Any],
+    finance_collections: Dict[str, Any],
+    plan: Dict[str, Any],
+    user_id: str,
+) -> List[Dict[str, Any]]:
+    lineage_ids = _lineage_plan_ids_for_plan(trading_collections, plan, user_id)
+    if not lineage_ids:
+        return []
+    return list(
+        finance_collections["trade_signals"]
+        .find({"user_id": user_id, "plan_id": {"$in": lineage_ids}, "mode": "live"})
+        .sort("created_at", 1)
+    )
+
+
+def _lineage_has_live_signals(
+    trading_collections: Dict[str, Any],
+    finance_collections: Dict[str, Any],
+    plan: Dict[str, Any],
+    user_id: str,
+) -> bool:
+    """True when any plan in the lineage has been published to live trading."""
+    return bool(_lineage_live_signals(trading_collections, finance_collections, plan, user_id))
+
+
+def _lineage_live_account_id_from_signals(
+    trading_collections: Dict[str, Any],
+    finance_collections: Dict[str, Any],
+    plan: Dict[str, Any],
+    user_id: str,
+) -> str:
+    for signal in reversed(_lineage_live_signals(trading_collections, finance_collections, plan, user_id)):
+        account_id = str(signal.get("securities_account_id") or "")
+        if account_id:
+            return account_id
+    return ""
+
+
 def _lineage_live_account_id_from_fills(
     trading_collections: Dict[str, Any],
     finance_collections: Dict[str, Any],
@@ -3606,13 +3645,21 @@ def _portfolio_plan_groups(
     return groups
 
 
-def _portfolio_funding_mode(
+def _portfolio_execution_venue(
     trading_collections: Dict[str, Any],
     finance_collections: Dict[str, Any],
     plan: Dict[str, Any],
     user_id: str,
 ) -> str:
-    if _lineage_has_live_fills(trading_collections, finance_collections, plan, user_id):
+    """Where the lineage trades: 'live' (broker) vs 'paper' (paper book).
+
+    A lineage counts as live once it has published any live signal, not only
+    after a fill is reported back — otherwise a placed-but-unfilled live order
+    would be misclassified as paper and vanish from the live overview.
+    """
+    if _lineage_has_live_signals(
+        trading_collections, finance_collections, plan, user_id
+    ) or _lineage_has_live_fills(trading_collections, finance_collections, plan, user_id):
         return "live"
     return "paper"
 
@@ -3794,7 +3841,9 @@ def _build_portfolio_entry(
     sample_plan = dict(all_lineage[0])
     sample_plan["strategy_template_id"] = strategy_template_id
     sample_plan["params_hash"] = params_hash
-    has_live = _lineage_has_live_fills(trading_collections, finance_collections, sample_plan, user_id)
+    has_live_fills = _lineage_has_live_fills(trading_collections, finance_collections, sample_plan, user_id)
+    has_live_signals = _lineage_has_live_signals(trading_collections, finance_collections, sample_plan, user_id)
+    has_live = has_live_fills or has_live_signals
     has_paper = any(row.get("status") in PAPER_ACTIVE_STATUSES for row in all_lineage)
     if not has_live and not has_paper:
         return None
@@ -3804,6 +3853,8 @@ def _build_portfolio_entry(
     sec_id = ""
     if has_live:
         sec_id = _lineage_live_account_id_from_fills(
+            trading_collections, finance_collections, sample_plan, user_id
+        ) or _lineage_live_account_id_from_signals(
             trading_collections, finance_collections, sample_plan, user_id
         )
 
@@ -3836,7 +3887,7 @@ def _build_portfolio_entry(
         "last_base_date": latest.get("base_date"),
         "strategy_name": latest.get("strategy_name") or earliest.get("strategy_name") or "",
         "securities_account_id": sec_id,
-        "funding_mode": "live" if has_live else "paper",
+        "execution_venue": "live" if has_live else "paper",
         "paper_execution_mode": paper_execution_mode,
         "paper_snapshot_date": paper_snapshot.get("as_of_date"),
         "paper_holding_count": paper_holding_count,
@@ -4153,7 +4204,7 @@ def _build_lineage_timeline_payload(
         None,
     )
     latest_monitor = next((row for row in plans if row.get("plan_type") == "monitor"), None)
-    funding_mode = _portfolio_funding_mode(
+    execution_venue = _portfolio_execution_venue(
         trading_collections, finance_collections, latest_plan, user_id
     )
     live_account_id = _lineage_live_account_id_from_fills(
@@ -4217,7 +4268,7 @@ def _build_lineage_timeline_payload(
             "params_hash": latest_plan.get("params_hash"),
             "strategy_name": latest_plan.get("strategy_name"),
             "latest_plan_id": latest_plan.get("plan_id"),
-            "funding_mode": funding_mode,
+            "execution_venue": execution_venue,
             "securities_account_id": live_account_id or None,
         },
         "current_cycle": _compute_current_cycle(
@@ -4251,7 +4302,7 @@ async def list_live_portfolios(current_user: dict = Depends(get_current_user)):
     user_id = _current_user_id(current_user)
     portfolios = [
         row for row in _list_portfolios_payload(trading_collections, finance_collections, user_id)
-        if row.get("funding_mode") == "live"
+        if row.get("execution_venue") == "live"
     ]
     return {"success": True, "data": _jsonable({"portfolios": portfolios})}
 
