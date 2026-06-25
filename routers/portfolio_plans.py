@@ -178,9 +178,9 @@ class ExternalManualRecordRequest(BaseModel):
 
     securities_account_id: str
     fills: List[ExternalManualFill] = Field(default_factory=list)
-    # When True, pause the lineage only if the resulting holdings are empty
-    # (i.e. a full liquidation). Partial reduce/add never pauses.
-    pause_lineage: bool = Field(default=True)
+    # Manual broker-side fills are ledger facts, not strategy decisions. Keep
+    # automated cadence intact unless the caller explicitly asks to pause.
+    pause_lineage: bool = Field(default=False)
     exclude_after: bool = Field(default=False)
     reason: str = Field(default="miniQMT manual operation")
     external_batch_id: Optional[str] = None
@@ -451,6 +451,9 @@ PLAN_LIST_PROJECTION = {
     "score_date": 1,
     "execute_date": 1,
     "plan_type": 1,
+    "origin": 1,
+    "manual_action": 1,
+    "is_liquidation": 1,
     "is_rebalance_day": 1,
     "previous_rebalance_date": 1,
     "previous_rebalance_plan_id": 1,
@@ -1758,14 +1761,14 @@ async def record_external_manual_record(
         "strategy_name": plan.get("strategy_name"),
         "base_date": base_date,
         "execute_date": base_date,
-        "plan_type": "rebalance",
+        "plan_type": "manual",
         "origin": "manual",
         # manual_action stays "external_manual" for idempotency/query keying;
         # is_liquidation flags the full-clear case for downstream display.
         "manual_action": "external_manual",
         "manual_action_detail": manual_action,
         "is_liquidation": is_liquidation,
-        "is_rebalance_day": True,
+        "is_rebalance_day": False,
         "monitor_can_trade": False,
         "trading_enabled": False,
         "executable": False,
@@ -3438,6 +3441,10 @@ def _plan_today_state_label(plan: Dict[str, Any]) -> str:
     non_executable_reason = str(plan.get("non_executable_reason") or "")
     monitor_can_trade = bool(plan.get("monitor_can_trade"))
 
+    if plan.get("origin") == "manual" and plan.get("manual_action") == "external_manual":
+        if plan.get("is_liquidation"):
+            return "已补录手工清仓"
+        return "已补录手工操作"
     if status == "needs_review":
         if plan_type == "monitor" and monitor_can_trade:
             return "观察日（已开启日内再平衡）：可交易，等待审核"
@@ -3593,17 +3600,33 @@ def _build_lineage_timeline_payload(
     lineage_query = _lineage_query_for_plan(trading_collections, plan, user_id)
     projection = dict(PLAN_LIST_PROJECTION)
     projection["live_signals_published_at"] = 1
+    projection["origin"] = 1
+    projection["manual_action"] = 1
     plans = list(
         trading_collections["portfolio_trade_plans"]
         .find(lineage_query, projection)
-        .sort("base_date", -1)
+        # created_at breaks same-base_date ties so "latest" is deterministic
+        # (a manual ledger record and a strategy plan can share base_date).
+        .sort([("base_date", -1), ("created_at", -1)])
     )
     if not plans:
         raise HTTPException(status_code=404, detail="lineage plans not found")
 
     latest_plan = plans[0]
+    # Manual broker-side records (origin=manual) are ledger facts, not strategy
+    # decisions, so cadence / drift / headline must look past them to the latest
+    # real strategy plan. headline prefers whatever still needs human action so a
+    # same-day manual record never hides a rebalance awaiting approval.
+    cadence_plan = next((row for row in plans if row.get("origin") != "manual"), latest_plan)
+    headline_plan = next((row for row in plans if _plan_action_required(row)), latest_plan)
+
+    def is_strategy_rebalance(row: Dict[str, Any]) -> bool:
+        if row.get("origin") == "manual":
+            return False
+        return row.get("plan_type") == "rebalance" or row.get("is_rebalance_day")
+
     latest_rebalance = next(
-        (row for row in plans if row.get("plan_type") == "rebalance" or row.get("is_rebalance_day")),
+        (row for row in plans if is_strategy_rebalance(row)),
         None,
     )
     latest_monitor = next((row for row in plans if row.get("plan_type") == "monitor"), None)
@@ -3614,9 +3637,10 @@ def _build_lineage_timeline_payload(
         trading_collections, finance_collections, latest_plan, user_id
     )
 
-    latest_items = list(
+    drift_plan = cadence_plan
+    drift_items = list(
         trading_collections["portfolio_trade_plan_items"].find(
-            {"plan_id": latest_plan.get("plan_id"), "user_id": user_id},
+            {"plan_id": drift_plan.get("plan_id"), "user_id": user_id},
             {
                 "_id": 0,
                 "drift_delta_shares": 1,
@@ -3626,14 +3650,14 @@ def _build_lineage_timeline_payload(
             },
         )
     )
-    latest_equity = _numeric((latest_plan.get("summary") or {}).get("equity"), default=0.0)
-    latest_drift_summary = _compute_drift_summary(latest_items, equity=latest_equity or None)
+    drift_equity = _numeric((drift_plan.get("summary") or {}).get("equity"), default=0.0)
+    latest_drift_summary = _compute_drift_summary(drift_items, equity=drift_equity or None)
     latest_drift_summary.update(
         {
-            "executable": bool(latest_plan.get("executable")),
-            "non_executable_reason": latest_plan.get("non_executable_reason"),
-            "plan_id": latest_plan.get("plan_id"),
-            "base_date": latest_plan.get("base_date"),
+            "executable": bool(drift_plan.get("executable")),
+            "non_executable_reason": drift_plan.get("non_executable_reason"),
+            "plan_id": drift_plan.get("plan_id"),
+            "base_date": drift_plan.get("base_date"),
         }
     )
 
@@ -3641,7 +3665,12 @@ def _build_lineage_timeline_payload(
     page_plans = plans[offset : offset + limit]
     timeline: List[Dict[str, Any]] = []
     for row in page_plans:
-        node_type = "rebalance" if row.get("plan_type") == "rebalance" or row.get("is_rebalance_day") else "monitor"
+        if row.get("origin") == "manual":
+            node_type = "manual"
+        elif row.get("plan_type") == "rebalance" or row.get("is_rebalance_day"):
+            node_type = "rebalance"
+        else:
+            node_type = "monitor"
         drift_brief = _timeline_node_drift_brief(trading_collections, row, user_id)
         timeline.append(
             {
@@ -3669,13 +3698,13 @@ def _build_lineage_timeline_payload(
             "securities_account_id": live_account_id or None,
         },
         "current_cycle": _compute_current_cycle(
-            latest_plan, latest_rebalance, latest_monitor, data_collections
+            cadence_plan, latest_rebalance, latest_monitor, data_collections
         ),
-        "today_state": _plan_today_state_label(latest_plan),
+        "today_state": _plan_today_state_label(headline_plan),
+        "action_required": _plan_action_required(headline_plan),
         "latest_drift_summary": latest_drift_summary,
         "timeline": timeline,
         "timeline_pagination": {"total": total, "limit": limit, "offset": offset},
-        "action_required": _plan_action_required(latest_plan),
     }
 
 

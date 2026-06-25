@@ -97,9 +97,13 @@ class _Collection:
                     return False
                 if "$ne" in expected and value == expected["$ne"]:
                     return False
-                if "$gte" in expected and not (value >= expected["$gte"]):
+                if "$gte" in expected and not (value is not None and value >= expected["$gte"]):
                     return False
-                if "$lte" in expected and not (value <= expected["$lte"]):
+                if "$lte" in expected and not (value is not None and value <= expected["$lte"]):
+                    return False
+                if "$gt" in expected and not (value is not None and value > expected["$gt"]):
+                    return False
+                if "$lt" in expected and not (value is not None and value < expected["$lt"]):
                     return False
                 if "$exists" in expected:
                     has_key = key in doc and doc.get(key) is not None
@@ -1928,6 +1932,121 @@ def test_lineage_timeline_monitor_drift_and_action_required(monkeypatch):
     assert reb2_brief["items"][0]["delta_shares"] == 50
 
 
+def test_lineage_timeline_ignores_manual_records_for_rebalance_cadence(monkeypatch):
+    cols = _collections()
+    fin = _finance_collections()
+    data = _data_collections()
+    data["volume_price"].docs = [
+        {"trade_date": f"202501{d:02d}"} for d in range(1, 32)
+    ]
+    cols["portfolio_trade_plans"] = _Collection(
+        [
+            {
+                "plan_id": "reb-1",
+                "strategy_template_id": "stx",
+                "user_id": "user-1",
+                "base_date": "20250102",
+                "status": "executed",
+                "params_hash": "hx",
+                "strategy_name": "Combo",
+                "origin": "strategy",
+                "plan_type": "rebalance",
+                "is_rebalance_day": True,
+                "params_snapshot": {"rebalance_days": 10},
+                "summary": {"equity": 1_000_000},
+                "executable": True,
+            },
+            {
+                "plan_id": "manual-clear",
+                "strategy_template_id": "stx",
+                "user_id": "user-1",
+                "base_date": "20250110",
+                "status": "filled",
+                "params_hash": "hx",
+                "strategy_name": "Combo",
+                "origin": "manual",
+                "manual_action": "external_manual",
+                "plan_type": "rebalance",
+                "is_rebalance_day": True,
+                "is_liquidation": True,
+                "params_snapshot": {"rebalance_days": 10},
+                "summary": {"equity": 1_000_000},
+                "executable": False,
+            },
+        ]
+    )
+    _patch_lineage_live_env(monkeypatch, cols, fin, data)
+
+    resp = asyncio.run(
+        portfolio_plans.get_portfolio_plan_lineage_timeline(
+            "manual-clear", limit=60, offset=0, current_user={"id": "user-1"}
+        )
+    )
+
+    payload = resp["data"]
+    assert payload["today_state"] == "已补录手工清仓"
+    assert payload["current_cycle"]["latest_rebalance_plan_id"] == "reb-1"
+    # 20250102 anchor + 10 trading days (now that the fake Mongo honours $gt).
+    assert payload["current_cycle"]["next_rebalance_estimate"] == "20250112"
+    manual_node = next(row for row in payload["timeline"] if row["plan_id"] == "manual-clear")
+    assert manual_node["node_type"] == "manual"
+
+
+def test_lineage_timeline_manual_record_does_not_mask_pending_rebalance(monkeypatch):
+    cols = _collections()
+    fin = _finance_collections()
+    data = _data_collections()
+    data["volume_price"].docs = [{"trade_date": f"202501{d:02d}"} for d in range(1, 32)]
+    cols["portfolio_trade_plans"] = _Collection(
+        [
+            {
+                "plan_id": "reb-pending",
+                "strategy_template_id": "stx",
+                "user_id": "user-1",
+                "base_date": "20250110",
+                "status": "needs_review",
+                "params_hash": "hx",
+                "strategy_name": "Combo",
+                "origin": "strategy",
+                "plan_type": "rebalance",
+                "is_rebalance_day": True,
+                "params_snapshot": {"rebalance_days": 10},
+                "summary": {"equity": 1_000_000},
+                "executable": True,
+            },
+            {
+                "plan_id": "manual-same-day",
+                "strategy_template_id": "stx",
+                "user_id": "user-1",
+                "base_date": "20250110",
+                "status": "filled",
+                "params_hash": "hx",
+                "strategy_name": "Combo",
+                "origin": "manual",
+                "manual_action": "external_manual",
+                "plan_type": "manual",
+                "is_rebalance_day": False,
+                "is_liquidation": False,
+                "params_snapshot": {"rebalance_days": 10},
+                "summary": {"equity": 1_000_000},
+                "executable": False,
+            },
+        ]
+    )
+    _patch_lineage_live_env(monkeypatch, cols, fin, data)
+
+    resp = asyncio.run(
+        portfolio_plans.get_portfolio_plan_lineage_timeline(
+            "manual-same-day", limit=60, offset=0, current_user={"id": "user-1"}
+        )
+    )
+
+    payload = resp["data"]
+    # A same-day manual ledger record must not hide a rebalance awaiting review.
+    assert payload["action_required"] is True
+    assert "手工" not in payload["today_state"]
+
+
 def test_lineage_timeline_monitor_can_trade_label(monkeypatch):
     cols = _collections()
     fin = _finance_collections()
@@ -2310,7 +2429,7 @@ def test_live_rebalance_liquidation_publishes_and_creates_manual_plan(monkeypatc
     assert items[0]["delta_shares"] == -500
 
 
-def test_external_manual_record_full_sell_clears_lineage_book(monkeypatch):
+def test_external_manual_record_full_sell_clears_book_without_pausing_by_default(monkeypatch):
     cols, fin, data = _live_rebalance_env()
     _patch_lineage_live_env(monkeypatch, cols, fin, data)
 
@@ -2319,7 +2438,6 @@ def test_external_manual_record_full_sell_clears_lineage_book(monkeypatch):
             "pla",
             portfolio_plans.ExternalManualRecordRequest(
                 securities_account_id="acct-1",
-                exclude_after=True,
                 fills=[
                     portfolio_plans.ExternalManualFill(
                         symbol="600000.SH",
@@ -2342,11 +2460,12 @@ def test_external_manual_record_full_sell_clears_lineage_book(monkeypatch):
     assert data_out["is_liquidation"] is True
     assert data_out["inserted_signal_count"] == 1
     assert data_out["inserted_execution_count"] == 1
-    assert data_out["lineage_effects"]["paused"] is True
-    assert "600000.SH" in data_out["lineage_effects"]["excluded"]
+    assert data_out["lineage_effects"] == {}
 
     manual_plan = next(p for p in cols["portfolio_trade_plans"].docs if p.get("manual_action") == "external_manual")
     assert manual_plan["origin"] == "manual"
+    assert manual_plan["plan_type"] == "manual"
+    assert manual_plan["is_rebalance_day"] is False
     assert manual_plan["status"] == "filled"
     assert manual_plan["trading_enabled"] is False
     assert manual_plan["external_batch_id"] == "manual-clear-20250131"
