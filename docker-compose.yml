@@ -8,7 +8,7 @@ services:
     ports:
       - "3001:3001"
     environment:
-      - MONGO_URI=${MONGO_URI:-mongodb://host.docker.internal:27017/}
+      - MONGO_URI=${MONGO_URI:-mongodb://quant-mongodb:27017/}
       - DB_NAME=${MONGO_DB}
       - ANALYZER_DB_NAME=${ANALYZER_DB_NAME:-quant_analyzer}
       - REALTIME_DB_NAME=${REALTIME_DB_NAME:-quant_realtime}
@@ -52,7 +52,7 @@ services:
     ports:
       - "3002:3002"
     environment:
-      - MONGO_URI=${MONGO_URI:-mongodb://host.docker.internal:27017/}
+      - MONGO_URI=${MONGO_URI:-mongodb://quant-mongodb:27017/}
       - DB_NAME=${MONGO_DB}
       - ANALYZER_DB_NAME=${ANALYZER_DB_NAME:-quant_analyzer}
       - REALTIME_DB_NAME=${REALTIME_DB_NAME:-quant_realtime}
@@ -90,7 +90,7 @@ services:
     ports:
       - "3003:3003"
     environment:
-      - MONGO_URI=${MONGO_URI:-mongodb://host.docker.internal:27017/}
+      - MONGO_URI=${MONGO_URI:-mongodb://quant-mongodb:27017/}
       - DB_NAME=${MONGO_DB}
       - ANALYZER_DB_NAME=${ANALYZER_DB_NAME:-quant_analyzer}
       - REALTIME_DB_NAME=${REALTIME_DB_NAME:-quant_realtime}
@@ -125,7 +125,7 @@ services:
     container_name: quant-scheduler
     command: [ "python", "scheduler_runner.py" ]
     environment:
-      - MONGO_URI=${MONGO_URI:-mongodb://host.docker.internal:27017/}
+      - MONGO_URI=${MONGO_URI:-mongodb://quant-mongodb:27017/}
       - DB_NAME=${MONGO_DB}
       - ANALYZER_DB_NAME=${ANALYZER_DB_NAME:-quant_analyzer}
       - REALTIME_DB_NAME=${REALTIME_DB_NAME:-quant_realtime}
@@ -165,7 +165,7 @@ services:
       context: ../quantAnalyzer
       dockerfile: Dockerfile
     environment:
-      - MONGO_URI=${MONGO_URI:-mongodb://host.docker.internal:27017/}
+      - MONGO_URI=${MONGO_URI:-mongodb://quant-mongodb:27017/}
       - DB_NAME=${MONGO_DB}
       - ANALYZER_DB_NAME=${ANALYZER_DB_NAME:-quant_analyzer}
       - TUSHARE_TOKEN=${TUSHARE_TOKEN}
@@ -186,8 +186,8 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     restart: unless-stopped
-    # networks:
-    #   - quant-network
+    networks:
+      - quant-network
     volumes:
       # Each replica writes to logs/analyzer-<WORKER_ID>.log, so multiple
       # replicas on the same host each get their own file — no conflicts.
@@ -208,7 +208,7 @@ services:
     container_name: quant-data-engine
     environment:
       # Use same DB as API
-      - MONGO_URI=${MONGO_URI:-mongodb://host.docker.internal:27017/}
+      - MONGO_URI=${MONGO_URI:-mongodb://quant-mongodb:27017/}
       - DB_NAME=${MONGO_DB}
       - REALTIME_DB_NAME=${REALTIME_DB_NAME:-quant_realtime}
       - TUSHARE_TOKEN=${TUSHARE_TOKEN}
@@ -230,11 +230,11 @@ services:
       - REALTIME_DAILY_K_BATCH_SIZE=${REALTIME_DAILY_K_BATCH_SIZE:-500}
       - REALTIME_DAILY_K_MA_PERIOD=${REALTIME_DAILY_K_MA_PERIOD:-5}
       # Trigger quant-api to generate intraday T+0 signals after realtime daily K sync.
-      # quant-data-engine uses host networking, so call the host-published API port.
-      - INTRADAY_T0_TRIGGER_URL=${INTRADAY_T0_TRIGGER_URL:-http://127.0.0.1:3001/api/intraday-t0/signals/generate-all}
+      # quant-data-engine runs on quant-network, so call quant-api by service name.
+      - INTRADAY_T0_TRIGGER_URL=${INTRADAY_T0_TRIGGER_URL:-http://quant-api:3001/api/intraday-t0/signals/generate-all}
       - INTRADAY_T0_TRIGGER_KEY=${INTRADAY_T0_TRIGGER_KEY:-${HERMES_QUANT_INTERNAL_KEY:-}}
       # Trigger market insight event generation after realtime sector strength is materialized.
-      - MARKET_INSIGHT_TRIGGER_URL=${MARKET_INSIGHT_TRIGGER_URL:-http://127.0.0.1:3001/api/market-insights/generate-internal}
+      - MARKET_INSIGHT_TRIGGER_URL=${MARKET_INSIGHT_TRIGGER_URL:-http://quant-api:3001/api/market-insights/generate-internal}
       - MARKET_INSIGHT_TRIGGER_KEY=${MARKET_INSIGHT_TRIGGER_KEY:-${HERMES_QUANT_INTERNAL_KEY:-}}
       # Pipeline catalog ships inside the image (bundled via data-access-lib);
       # no env override or host mount needed.
@@ -250,7 +250,8 @@ services:
       # Weekly fund holdings (Tushare fund_portfolio); default Sun 19:00 in crontab
       - CRON_FUND_PORTFOLIO=${CRON_FUND_PORTFOLIO:-}
     restart: unless-stopped
-    network_mode: host
+    networks:
+      - quant-network
     volumes:
       - ../quant-data-engine/logs:/app/logs
       - ../quant-data-engine/src/quant_data_engine:/app/src/quant_data_engine
@@ -278,7 +279,7 @@ services:
       - EMBEDDINGS_MODEL=${EMBEDDINGS_MODEL:-text-embedding-v3}
       - EMBEDDINGS_DIMENSIONS=${EMBEDDINGS_DIMENSIONS:-1024}
       # MongoDB for assistant logic
-      - MONGO_URI=${MONGO_URI:-mongodb://host.docker.internal:27017/}
+      - MONGO_URI=${MONGO_URI:-mongodb://quant-mongodb:27017/}
       - MONGO_DB=assistant
       # users 集合所在库（与 quantAnalyzer / quantFinance 一致），用于解析每用户 LLM 配置
       - USERS_DB_NAME=${MONGO_DB:-finance}
@@ -306,7 +307,7 @@ services:
       dockerfile: backtest-worker/Dockerfile
     container_name: backtest-worker
     environment:
-      - MONGO_URI=${MONGO_URI:-mongodb://host.docker.internal:27017/}
+      - MONGO_URI=${MONGO_URI:-mongodb://quant-mongodb:27017/}
       - DB_NAME=${MONGO_DB}
       - MONGO_DB=${DATA_DB_NAME:-quant_data}
       - BACKTEST_DB_NAME=${MONGO_DB:-finance}
@@ -342,7 +343,7 @@ services:
       dockerfile: Dockerfile
     container_name: quant-scorer
     environment:
-      - MONGO_URI=${MONGO_URI:-mongodb://host.docker.internal:27017/}
+      - MONGO_URI=${MONGO_URI:-mongodb://quant-mongodb:27017/}
       - MONGO_DB=${MONGO_DB}
       - TUSHARE_TOKEN=${TUSHARE_TOKEN}
       - MAX_WORKERS=${SCORING_MAX_WORKERS:-6}
@@ -371,7 +372,7 @@ services:
     ports:
       - "5001:5000"
     environment:
-      - MONGO_URI=${MONGO_URI:-mongodb://host.docker.internal:27017/}
+      - MONGO_URI=${MONGO_URI:-mongodb://quant-mongodb:27017/}
       - MONGO_DB=${MONGO_DB}
       - API_PORT=5000
       - USE_NGINX_WEBSOCKET=${USE_NGINX_WEBSOCKET:-true}
