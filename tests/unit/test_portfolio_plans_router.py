@@ -2832,3 +2832,260 @@ def test_paper_rebalance_no_change_returns_400(monkeypatch):
         )
 
     assert excinfo.value.status_code == 400
+
+
+def test_weighted_growth_cycle_score_partial_weights():
+    assert portfolio_plans._weighted_growth_cycle_score(80.0, None, 0.3, 0.7) == pytest.approx(80.0)
+    assert portfolio_plans._weighted_growth_cycle_score(None, 60.0, 0.3, 0.7) == pytest.approx(60.0)
+    assert portfolio_plans._weighted_growth_cycle_score(80.0, 60.0, 0.3, 0.7) == pytest.approx(66.0)
+
+
+def test_get_portfolio_plan_bench_splits_starters_and_bench(monkeypatch):
+    cols = _collections()
+    data = _data_collections()
+    stock_scores = _Collection(
+        [
+            {"symbol": "000001.SZ", "name": "A", "industry": "Bank", "score_date": "20250110", "index_codes": "csi1000", "growth_score": 90, "cycle_score": 80},
+            {"symbol": "000002.SZ", "name": "B", "industry": "Bank", "score_date": "20250110", "index_codes": "csi1000", "growth_score": 85, "cycle_score": 75},
+            {"symbol": "000003.SZ", "name": "C", "industry": "Tech", "score_date": "20250110", "index_codes": "csi1000", "growth_score": 80, "cycle_score": 70},
+            {"symbol": "000004.SZ", "name": "D", "industry": "Tech", "score_date": "20250110", "index_codes": "csi1000", "growth_score": 70, "cycle_score": 60},
+            {"symbol": "000005.SZ", "name": "E", "industry": "Tech", "score_date": "20250110", "index_codes": "csi1000", "growth_score": 60, "cycle_score": 50},
+        ]
+    )
+    data["volume_price"].docs = [
+        {"symbol": "000003.SZ", "trade_date": "20250110", "close": 15.5},
+        {"symbol": "000004.SZ", "trade_date": "20250110", "close": 12.0},
+    ]
+    cols["portfolio_trade_plans"] = _Collection(
+        [
+            {
+                "plan_id": "bench-plan",
+                "strategy_template_id": "s1",
+                "user_id": "user-1",
+                "base_date": "20250110",
+                "score_date": "20250110",
+                "params_hash": "hx",
+                "params_snapshot": {
+                    "universe_index": "csi1000",
+                    "growth_weight": 0.3,
+                    "cycle_weight": 0.7,
+                    "top_n": 2,
+                    "rebalance_days": 10,
+                },
+            }
+        ]
+    )
+    monkeypatch.setattr(portfolio_plans, "get_trading_db_collections", lambda: cols)
+    monkeypatch.setattr(portfolio_plans, "get_db_collections", lambda: cols)
+    monkeypatch.setattr(portfolio_plans, "get_data_db", lambda: data)
+    monkeypatch.setattr(portfolio_plans, "finance_db", {"stock_scores": stock_scores})
+    # Starters mirror real holdings; 000001 carries the larger market value so it
+    # sorts first.
+    monkeypatch.setattr(
+        portfolio_plans,
+        "_current_lineage_holdings",
+        lambda *args, **kwargs: [
+            {"symbol": "000001.SZ", "name": "A", "shares": 1000, "last_price": 10.0, "market_value": 10000.0},
+            {"symbol": "000002.SZ", "name": "B", "shares": 800, "last_price": 11.0, "market_value": 8800.0},
+        ],
+    )
+
+    resp = asyncio.run(
+        portfolio_plans.get_portfolio_plan_bench(
+            "bench-plan",
+            bench_multiplier=1.5,
+            current_user={"id": "user-1"},
+        )
+    )
+
+    payload = resp["data"]
+    assert payload["pool_size"] == 3
+    assert [row["symbol"] for row in payload["starters"]] == ["000001.SZ", "000002.SZ"]
+    assert payload["starters"][0]["current_shares"] == 1000
+    assert payload["starters"][0]["estimated_price"] == 10.0
+    assert [row["symbol"] for row in payload["bench"]] == ["000003.SZ"]
+    assert payload["bench"][0]["rank"] == 3
+    assert payload["bench"][0]["latest_close"] == 15.5
+
+
+def test_get_portfolio_plan_bench_excludes_live_holdings(monkeypatch):
+    cols = _collections()
+    data = _data_collections()
+    stock_scores = _Collection(
+        [
+            {"symbol": "000001.SZ", "name": "A", "industry": "Bank", "score_date": "20250110", "index_codes": "csi1000", "growth_score": 90, "cycle_score": 80},
+            {"symbol": "000002.SZ", "name": "B", "industry": "Bank", "score_date": "20250110", "index_codes": "csi1000", "growth_score": 85, "cycle_score": 75},
+            {"symbol": "000003.SZ", "name": "C", "industry": "Tech", "score_date": "20250110", "index_codes": "csi1000", "growth_score": 80, "cycle_score": 70},
+            {"symbol": "000004.SZ", "name": "D", "industry": "Tech", "score_date": "20250110", "index_codes": "csi1000", "growth_score": 70, "cycle_score": 60},
+        ]
+    )
+    data["volume_price"].docs = [
+        {"symbol": "000003.SZ", "trade_date": "20250110", "close": 15.5},
+    ]
+    cols["portfolio_trade_plans"] = _Collection(
+        [
+            {
+                "plan_id": "bench-plan",
+                "strategy_template_id": "s1",
+                "user_id": "user-1",
+                "base_date": "20250110",
+                "score_date": "20250110",
+                "params_hash": "hx",
+                "params_snapshot": {
+                    "universe_index": "csi1000",
+                    "growth_weight": 0.3,
+                    "cycle_weight": 0.7,
+                    "top_n": 2,
+                    "rebalance_days": 10,
+                },
+            }
+        ]
+    )
+    monkeypatch.setattr(portfolio_plans, "get_trading_db_collections", lambda: cols)
+    monkeypatch.setattr(portfolio_plans, "get_db_collections", lambda: cols)
+    monkeypatch.setattr(portfolio_plans, "get_data_db", lambda: data)
+    monkeypatch.setattr(portfolio_plans, "finance_db", {"stock_scores": stock_scores})
+    # Hold 000001/000002 as starters plus 000003 with the *unsuffixed* code to
+    # prove suffix-insensitive matching keeps a held name off the bench even when
+    # formats differ.
+    monkeypatch.setattr(
+        portfolio_plans,
+        "_current_lineage_holdings",
+        lambda *args, **kwargs: [
+            {"symbol": "000001.SZ", "shares": 1000, "last_price": 10.0, "market_value": 10000.0},
+            {"symbol": "000002.SZ", "shares": 800, "last_price": 11.0, "market_value": 8800.0},
+            {"symbol": "000003", "shares": 500, "last_price": 15.5, "market_value": 7750.0},
+        ],
+    )
+
+    resp = asyncio.run(
+        portfolio_plans.get_portfolio_plan_bench(
+            "bench-plan",
+            bench_multiplier=1.5,
+            current_user={"id": "user-1"},
+        )
+    )
+
+    payload = resp["data"]
+    starter_symbols = {row["symbol"] for row in payload["starters"]}
+    assert {"000001.SZ", "000002.SZ", "000003"} <= starter_symbols
+    # 000003 is held -> must not appear on the bench despite the suffix mismatch.
+    assert all(row["symbol"] != "000003.SZ" for row in payload["bench"])
+
+
+def test_reconcile_portfolio_holdings_flags_mismatch(monkeypatch):
+    cols = _collections()
+    cols["portfolio_trade_plans"] = _Collection(
+        [
+            {
+                "plan_id": "rec-plan",
+                "strategy_template_id": "s1",
+                "user_id": "user-1",
+                "base_date": "20250110",
+                "params_hash": "hx",
+            }
+        ]
+    )
+    fin = {
+        "trader_positions": _Collection(
+            [
+                {"user_id": "user-1", "securities_account_id": "acct-1", "symbol": "600000", "volume": 0, "synced_at": 1700.0},
+                {"user_id": "user-1", "securities_account_id": "acct-1", "symbol": "000002.SZ", "volume": 500, "synced_at": 1700.0},
+            ]
+        )
+    }
+    monkeypatch.setattr(portfolio_plans, "get_trading_db_collections", lambda: cols)
+    monkeypatch.setattr(portfolio_plans, "get_db_collections", lambda: fin)
+    monkeypatch.setattr(portfolio_plans, "get_data_db", lambda: _data_collections())
+    # Ledger still thinks we hold 600000; broker shows it sold (0) -> mismatch.
+    monkeypatch.setattr(
+        portfolio_plans,
+        "_lineage_live_account_and_holdings",
+        lambda *a, **k: ("acct-1", [{"symbol": "600000.SH", "name": "PAB", "shares": 1000}]),
+    )
+
+    resp = asyncio.run(
+        portfolio_plans.reconcile_portfolio_holdings("rec-plan", current_user={"id": "user-1"})
+    )
+
+    data = resp["data"]
+    assert data["applicable"] is True
+    assert data["in_sync"] is False
+    diff_by_symbol = {row["symbol"]: row for row in data["diffs"]}
+    assert diff_by_symbol["600000.SH"]["ledger_shares"] == 1000
+    assert diff_by_symbol["600000.SH"]["account_shares"] == 0
+    assert diff_by_symbol["600000.SH"]["diff"] == -1000
+    # 000002 only on the broker side -> also a divergence to flag.
+    assert diff_by_symbol["000002.SZ"]["account_shares"] == 500
+
+
+def test_reconcile_portfolio_holdings_in_sync(monkeypatch):
+    cols = _collections()
+    cols["portfolio_trade_plans"] = _Collection(
+        [{"plan_id": "rec-plan", "strategy_template_id": "s1", "user_id": "user-1", "base_date": "20250110", "params_hash": "hx"}]
+    )
+    fin = {
+        "trader_positions": _Collection(
+            [{"user_id": "user-1", "securities_account_id": "acct-1", "symbol": "600000", "volume": 1000, "synced_at": 1700.0}]
+        )
+    }
+    monkeypatch.setattr(portfolio_plans, "get_trading_db_collections", lambda: cols)
+    monkeypatch.setattr(portfolio_plans, "get_db_collections", lambda: fin)
+    monkeypatch.setattr(portfolio_plans, "get_data_db", lambda: _data_collections())
+    monkeypatch.setattr(
+        portfolio_plans,
+        "_lineage_live_account_and_holdings",
+        lambda *a, **k: ("acct-1", [{"symbol": "600000.SH", "name": "PAB", "shares": 1000}]),
+    )
+
+    resp = asyncio.run(
+        portfolio_plans.reconcile_portfolio_holdings("rec-plan", current_user={"id": "user-1"})
+    )
+
+    data = resp["data"]
+    assert data["applicable"] is True
+    assert data["in_sync"] is True
+    assert data["diffs"] == []
+
+
+def test_force_rebalance_enqueues_rebalance_task_with_lineage_params(monkeypatch):
+    cols = _collections()
+    cols["portfolio_trade_plans"] = _Collection(
+        [
+            {
+                "plan_id": "anchor-plan",
+                "strategy_template_id": "s1",
+                "user_id": "user-1",
+                "base_date": "20250102",
+                "params_hash": "hash-abc",
+                "preset_id": "preset-1",
+                "params_snapshot": {
+                    "universe_index": "csi1000",
+                    "growth_weight": 0.3,
+                    "cycle_weight": 0.7,
+                    "top_n": 10,
+                    "rebalance_days": 10,
+                    "lot_size": 100,
+                    "monitor_can_trade": True,
+                },
+            }
+        ]
+    )
+    monkeypatch.setattr(portfolio_plans, "get_trading_db_collections", lambda: cols)
+
+    resp = asyncio.run(
+        portfolio_plans.force_rebalance_portfolio_plan(
+            "anchor-plan",
+            portfolio_plans.ForceRebalanceRequest(base_date="20250110"),
+            current_user={"id": "user-1"},
+        )
+    )
+
+    task = resp["data"]
+    assert task["task_type"] == "generate_portfolio_plan"
+    assert task["mode"] == "rebalance"
+    assert task["force"] is True
+    assert task["base_date"] == "20250110"
+    assert task["params_override"]["top_n"] == 10
+    assert "monitor_can_trade" not in task["params_override"]
+    assert len(cols["portfolio_plan_generation_tasks"].docs) == 1

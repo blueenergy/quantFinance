@@ -6,6 +6,7 @@ from collections import defaultdict
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 import logging
+import math
 import os
 import time
 import uuid
@@ -83,6 +84,33 @@ GROWTH_CYCLE_PARAMETER_SCHEMA = {
     # real account equity, paper -> paper snapshot). Not part of params_hash.
     "capital_basis": {"type": "enum", "options": ["account_equity", "rolling_paper", "fixed_notional"], "nullable": True},
 }
+# Mirrors stock-scoring-system/tools/portfolio_trading.py PLAN_PARAM_KEYS — keep in sync
+# when filtering params_override for force-rebalance so lineage params_hash is preserved.
+PLAN_PARAM_KEYS = {
+    "universe_index",
+    "index_benchmark_symbol",
+    "score_type",
+    "score_column",
+    "growth_weight",
+    "cycle_weight",
+    "top_n",
+    "rebalance_days",
+    "construction_mode",
+    "max_industry_weight",
+    "lot_size",
+    "transaction_cost",
+    "buy_commission_rate",
+    "sell_commission_rate",
+    "min_commission",
+    "stamp_tax_rate",
+    "transfer_fee_rate",
+    "execution_price",
+    "cash_buffer",
+    "initial_capital",
+    "candidate_pool_enabled",
+    "candidate_pool_multiplier",
+    "min_buy_lots",
+}
 DEFAULT_STRATEGY_TEMPLATES = (
     {
         "strategy_template_id": "growth_cycle_index_enhanced",
@@ -136,6 +164,12 @@ class ManualRebalanceRequest(BaseModel):
     base_date: Optional[str] = None
     targets: Dict[str, int] = Field(default_factory=dict)
     exclude_after: bool = Field(default=False)
+
+
+class ForceRebalanceRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    base_date: Optional[str] = None
 
 
 class LiveRebalanceRequest(BaseModel):
@@ -588,6 +622,247 @@ def _latest_available_score_watermark(stock_scores, universe_index: str) -> Dict
         "latest_available_score_count": count,
         "latest_available_score_source": "stock_scores",
         "latest_available_score_scope": source_scope,
+    }
+
+
+def _optional_float(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if number != number:  # NaN
+        return None
+    return number
+
+
+def _weighted_growth_cycle_score(
+    growth: Optional[float],
+    cycle: Optional[float],
+    growth_weight: Any,
+    cycle_weight: Any,
+) -> Optional[float]:
+    """Mirror stock-scoring-system compute_score_series (growth_cycle_weighted)."""
+    gw = float(growth_weight if growth_weight is not None else 0.3)
+    cw = float(cycle_weight if cycle_weight is not None else 0.7)
+    has_growth = growth is not None
+    has_cycle = cycle is not None
+    available_weight = (gw if has_growth else 0.0) + (cw if has_cycle else 0.0)
+    if available_weight <= 0:
+        return None
+    weighted_sum = (float(growth or 0) * gw) + (float(cycle or 0) * cw)
+    return weighted_sum / available_weight
+
+
+def _score_value_from_stock_row(row: Dict[str, Any], config: Dict[str, Any]) -> Optional[float]:
+    score_type = str(config.get("score_type") or "growth_cycle_weighted")
+    if score_type == "growth_cycle_weighted":
+        return _weighted_growth_cycle_score(
+            _optional_float(row.get("growth_score")),
+            _optional_float(row.get("cycle_score")),
+            config.get("growth_weight", 0.3),
+            config.get("cycle_weight", 0.7),
+        )
+    score_column = str(config.get("score_column") or "")
+    if score_column.startswith("composite_score."):
+        key = score_column.split(".", 1)[1]
+        composite = row.get("composite_score") or {}
+        if isinstance(composite, dict):
+            return _optional_float(composite.get(key))
+    return None
+
+
+def _resolve_plan_score_date(plan: Dict[str, Any], universe_index: str) -> Optional[str]:
+    score_date = _normalize_yyyymmdd(plan.get("score_date"))
+    if score_date:
+        return score_date
+    base_date = _normalize_yyyymmdd(plan.get("base_date"))
+    if not base_date:
+        return None
+    row = finance_db["stock_scores"].find_one(
+        {"score_date": {"$lte": base_date}, "index_codes": universe_index},
+        sort=[("score_date", -1)],
+        projection={"_id": 0, "score_date": 1},
+    )
+    if row and row.get("score_date"):
+        return str(row["score_date"])
+    row = finance_db["stock_scores"].find_one(
+        {"score_date": {"$lte": base_date}},
+        sort=[("score_date", -1)],
+        projection={"_id": 0, "score_date": 1},
+    )
+    return str(row["score_date"]) if row and row.get("score_date") else None
+
+
+def _normalized_plan_params_from_snapshot(params_snapshot: Dict[str, Any]) -> Dict[str, Any]:
+    return {key: params_snapshot[key] for key in sorted(PLAN_PARAM_KEYS) if key in params_snapshot}
+
+
+def _load_latest_close_prices_loose(volume_price, symbols: List[str]) -> Dict[str, float]:
+    """Latest close keyed by the *requested* symbol, tolerating suffix mismatch.
+
+    stock_scores and volume_price may store a symbol with or without the
+    exchange suffix (600000 vs 600000.SH); match on all known variants so the
+    bench reference price is not silently blank.
+    """
+    prices: Dict[str, float] = {}
+    for symbol in symbols:
+        row = volume_price.find_one(
+            {"symbol": {"$in": _symbol_query_values(symbol)}},
+            sort=[("trade_date", -1)],
+            projection={"_id": 0, "close": 1},
+        )
+        if not row:
+            continue
+        try:
+            price = float(row.get("close"))
+        except (TypeError, ValueError):
+            continue
+        if price > 0:
+            prices[symbol] = price
+    return prices
+
+
+def _build_ranked_score_universe(
+    stock_scores,
+    score_date: str,
+    universe_index: str,
+    config: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    rows = list(
+        stock_scores.find(
+            {"score_date": score_date, "index_codes": universe_index},
+            {
+                "_id": 0,
+                "symbol": 1,
+                "name": 1,
+                "industry": 1,
+                "growth_score": 1,
+                "cycle_score": 1,
+                "composite_score": 1,
+            },
+        )
+    )
+    ranked: List[Dict[str, Any]] = []
+    for row in rows:
+        symbol = row.get("symbol")
+        if not symbol:
+            continue
+        score_value = _score_value_from_stock_row(row, config)
+        if score_value is None:
+            continue
+        ranked.append(
+            {
+                "symbol": str(symbol),
+                "name": row.get("name") or "",
+                "industry": row.get("industry") or "",
+                "score_value": score_value,
+            }
+        )
+    ranked.sort(key=lambda item: (-item["score_value"], item["symbol"]))
+    for idx, row in enumerate(ranked, start=1):
+        row["rank"] = idx
+    return ranked
+
+
+def _build_plan_bench_payload(
+    plan: Dict[str, Any],
+    holdings: List[Dict[str, Any]],
+    *,
+    bench_multiplier: float,
+    data_collections: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Football-style lineup for a lineage.
+
+    Starters are the *actual current holdings* (live or paper), not the plan
+    items frozen at generation time: after a 10-day cadence with manual swaps the
+    real lineup drifts from the original recommendation, so "今日阵容" must always
+    mirror "最新持仓". The bench is the freshly-scored candidate pool minus anyone
+    already on the field (held), matched on a suffix-insensitive key.
+    """
+    params = dict(plan.get("params_snapshot") or {})
+    universe_index = str(params.get("universe_index") or "csi1000")
+    top_n = max(1, _int_value(params.get("top_n"), 10))
+    multiplier = max(1.0, float(bench_multiplier or 1.5))
+    pool_size = max(top_n, math.ceil(top_n * multiplier))
+    score_date = _resolve_plan_score_date(plan, universe_index)
+    if not score_date:
+        raise HTTPException(status_code=404, detail="score snapshot not found for plan bench")
+
+    ranked = _build_ranked_score_universe(finance_db["stock_scores"], score_date, universe_index, params)
+    ranked_pool = ranked[:pool_size]
+    rank_by_key = {_symbol_key(row["symbol"]): row for row in ranked}
+
+    starters: List[Dict[str, Any]] = []
+    on_field_keys: set = set()
+    for pos in sorted(
+        holdings, key=lambda row: _optional_float(row.get("market_value")) or 0.0, reverse=True
+    ):
+        shares = _int_value(pos.get("shares"))
+        if shares <= 0:
+            continue
+        symbol = str(pos.get("symbol") or "")
+        if not symbol:
+            continue
+        key = _symbol_key(symbol)
+        on_field_keys.add(key)
+        score_row = rank_by_key.get(key) or {}
+        price = _optional_float(pos.get("last_price")) or _optional_float(pos.get("price"))
+        starters.append(
+            {
+                "symbol": symbol,
+                "name": pos.get("name") or score_row.get("name") or "",
+                "industry": score_row.get("industry") or "",
+                "rank": score_row.get("rank"),
+                "score_value": score_row.get("score_value"),
+                "target_shares": shares,
+                "current_shares": shares,
+                "estimated_price": price,
+                "market_value": _optional_float(pos.get("market_value")),
+                "in_universe": bool(score_row),
+            }
+        )
+
+    bench_symbols = [
+        row["symbol"]
+        for row in ranked_pool
+        if _symbol_key(row["symbol"]) not in on_field_keys
+    ]
+    starters_missing_price = [s["symbol"] for s in starters if s.get("estimated_price") is None]
+    latest_close = _load_latest_close_prices_loose(
+        data_collections["volume_price"], list({*bench_symbols, *starters_missing_price})
+    )
+
+    bench: List[Dict[str, Any]] = []
+    for symbol in bench_symbols:
+        score_row = rank_by_key.get(_symbol_key(symbol)) or {}
+        bench.append(
+            {
+                "symbol": symbol,
+                "name": score_row.get("name") or "",
+                "industry": score_row.get("industry") or "",
+                "rank": score_row.get("rank"),
+                "score_value": score_row.get("score_value"),
+                "latest_close": latest_close.get(symbol),
+            }
+        )
+
+    for starter in starters:
+        if starter.get("estimated_price") is None:
+            starter["estimated_price"] = latest_close.get(starter["symbol"])
+
+    return {
+        "plan_id": plan.get("plan_id"),
+        "base_date": plan.get("base_date"),
+        "score_date": score_date,
+        "universe_index": universe_index,
+        "top_n": top_n,
+        "lot_size": max(1, _int_value(params.get("lot_size"), 100)),
+        "bench_multiplier": multiplier,
+        "pool_size": pool_size,
+        "starters": starters,
+        "bench": bench,
     }
 
 
@@ -1252,6 +1527,62 @@ async def create_manual_rebalance_plan(request: ManualRebalanceRequest, current_
     return {"success": True, "data": _jsonable(task)}
 
 
+@router.post("/plans/{plan_id}/force-rebalance")
+async def force_rebalance_portfolio_plan(
+    plan_id: str,
+    request: ForceRebalanceRequest = ForceRebalanceRequest(),
+    current_user: dict = Depends(get_current_user),
+):
+    """Enqueue an off-cycle strategy rebalance plan (slow path: worker generates lineup)."""
+    user_id = _current_user_id(current_user)
+    collections = get_trading_db_collections()
+    anchor = _require_plan(collections, plan_id, current_user)
+    strategy_template_id = str(anchor.get("strategy_template_id") or "")
+    if not strategy_template_id:
+        raise HTTPException(status_code=400, detail="plan is missing strategy_template_id")
+    strategy = _require_strategy(collections, strategy_template_id)
+    if strategy.get("status") == "disabled":
+        raise HTTPException(status_code=400, detail="strategy is disabled")
+
+    params_override = _normalized_plan_params_from_snapshot(anchor.get("params_snapshot") or {})
+    if anchor.get("params_override"):
+        params_override = {**params_override, **dict(anchor.get("params_override") or {})}
+        params_override = _normalized_plan_params_from_snapshot(params_override)
+    _validate_params_override(params_override)
+
+    base_date = _normalize_yyyymmdd(request.base_date) or datetime.now().strftime("%Y%m%d")
+    now = datetime.utcnow()
+    task = {
+        "task_id": str(uuid.uuid4()),
+        "task_type": "generate_portfolio_plan",
+        "user_id": user_id,
+        "strategy_template_id": strategy_template_id,
+        "base_date": base_date,
+        "mode": "rebalance",
+        "force": True,
+        "preset_id": anchor.get("preset_id"),
+        "params_override": params_override,
+        "status": "pending",
+        "attempts": 0,
+        "plan_id": None,
+        "error_message": None,
+        "anchor_plan_id": plan_id,
+        "operation_type": "force_rebalance",
+        "created_at": now,
+        "updated_at": now,
+    }
+    collections["portfolio_plan_generation_tasks"].insert_one(task)
+    return {
+        "success": True,
+        "data": _jsonable(
+            {
+                **task,
+                "params_hash": anchor.get("params_hash"),
+            }
+        ),
+    }
+
+
 # Config-integrity blockers that still abort a discretionary live action: there is
 # no point publishing orders the broker can never accept. For SELLS, only these
 # hard blockers abort — market/position blockers (limit-down, position mismatch,
@@ -1290,6 +1621,59 @@ def _normalize_live_target_shares(current_shares: int, requested_target: int, lo
     return current - sell_qty, blockers
 
 
+def _account_id_from_filled_signals(
+    signals: List[Dict[str, Any]], executions: List[Dict[str, Any]]
+) -> str:
+    """Securities account tied to the signals that actually received fills."""
+    filled_order_ids = {
+        str(row.get("order_id"))
+        for row in executions
+        if row.get("order_id") and _execution_fill_quantity(row) > 0
+    }
+    for signal in reversed(signals):
+        order_id = str(signal.get("order_id") or "")
+        if order_id not in filled_order_ids:
+            continue
+        account_id = str(signal.get("securities_account_id") or "")
+        if account_id:
+            return account_id
+    return ""
+
+
+def _holdings_from_executions(
+    executions: List[Dict[str, Any]], data_collections: Dict[str, Any]
+) -> List[Dict[str, Any]]:
+    """Net live positions (shares > 0) rebuilt from raw executions."""
+    grouped = group_executions_by_order(executions)
+    symbols = sorted({str(row.get("symbol")) for row in grouped if row.get("symbol")})
+    if not symbols:
+        return []
+    prices, realtime_docs = _load_fresh_market_prices(data_collections, symbols)
+    payload = build_lineage_live_positions(grouped, prices, realtime_docs=realtime_docs)
+    return [row for row in (payload.get("positions") or []) if _int_value(row.get("shares")) > 0]
+
+
+def _lineage_live_account_and_holdings(
+    trading_collections: Dict[str, Any],
+    finance_collections: Dict[str, Any],
+    data_collections: Dict[str, Any],
+    plan: Dict[str, Any],
+    user_id: str,
+) -> Tuple[str, List[Dict[str, Any]]]:
+    """One pass over the lineage's live signals/executions: account id + holdings.
+
+    Both the broker account id and the ledger holdings derive from the same
+    signal/execution bundle, so callers that need both (e.g. reconciliation) get
+    them in a single fetch instead of scanning the lineage twice.
+    """
+    _ids, signals, executions = _lineage_live_signal_execution_bundle(
+        trading_collections, finance_collections, plan, user_id
+    )
+    account_id = _account_id_from_filled_signals(signals, executions)
+    holdings = _holdings_from_executions(executions, data_collections)
+    return account_id, holdings
+
+
 def _lineage_live_holdings(
     trading_collections: Dict[str, Any],
     finance_collections: Dict[str, Any],
@@ -1298,16 +1682,117 @@ def _lineage_live_holdings(
     user_id: str,
 ) -> List[Dict[str, Any]]:
     """Current live holdings (shares > 0) for the plan's params_hash lineage."""
-    _ids, _signals, executions = _lineage_live_signal_execution_bundle(
-        trading_collections, finance_collections, plan, user_id
+    return _lineage_live_account_and_holdings(
+        trading_collections, finance_collections, data_collections, plan, user_id
+    )[1]
+
+
+def _account_position_qty(pos: Dict[str, Any]) -> int:
+    for field in ("qty", "quantity", "volume", "shares", "current_volume", "total_volume"):
+        if pos.get(field) is not None:
+            return _int_value(pos.get(field))
+    return 0
+
+
+def _reconcile_live_holdings(
+    trading_collections: Dict[str, Any],
+    finance_collections: Dict[str, Any],
+    data_collections: Dict[str, Any],
+    plan: Dict[str, Any],
+    user_id: str,
+) -> Dict[str, Any]:
+    """Diff the system ledger holdings against the broker's synced positions.
+
+    The ledger (rebuilt from ``trade_executions``) and the broker account
+    (``trader_positions``, synced from miniQMT) should agree; any divergence
+    usually means a manual broker-side trade was not recorded, so we surface it
+    so the user can re-sync the book immediately.
+    """
+    account_id, ledger = _lineage_live_account_and_holdings(
+        trading_collections, finance_collections, data_collections, plan, user_id
     )
-    grouped = group_executions_by_order(executions)
-    symbols = sorted({str(row.get("symbol")) for row in grouped if row.get("symbol")})
-    if not symbols:
+    if not account_id:
+        return {"applicable": False, "in_sync": True, "diffs": [], "securities_account_id": ""}
+
+    ledger_by_key: Dict[str, Dict[str, Any]] = {
+        _symbol_key(row.get("symbol")): row for row in ledger if row.get("symbol")
+    }
+
+    account_rows = list(
+        finance_collections["trader_positions"].find(
+            {"user_id": user_id, "securities_account_id": account_id},
+            {"_id": 0},
+        )
+    )
+    account_by_key: Dict[str, Dict[str, Any]] = {}
+    synced_at: Optional[float] = None
+    for row in account_rows:
+        key = _symbol_key(row.get("symbol"))
+        if not key:
+            continue
+        account_by_key[key] = row
+        ts = row.get("synced_at")
+        if isinstance(ts, (int, float)):
+            synced_at = ts if synced_at is None else max(synced_at, ts)
+
+    diffs: List[Dict[str, Any]] = []
+    for key in sorted({*ledger_by_key, *account_by_key}):
+        ledger_row = ledger_by_key.get(key) or {}
+        account_row = account_by_key.get(key)
+        ledger_shares = _int_value(ledger_row.get("shares"))
+        # Missing from the broker sync entirely -> treat as unknown, not zero, so
+        # we don't raise a false mismatch before the account has ever synced.
+        if account_row is None and not account_rows:
+            continue
+        account_shares = _account_position_qty(account_row) if account_row is not None else 0
+        if ledger_shares == account_shares:
+            continue
+        symbol = ledger_row.get("symbol") or (account_row or {}).get("symbol") or key
+        diffs.append(
+            {
+                "symbol": symbol,
+                "name": ledger_row.get("name") or (account_row or {}).get("name") or "",
+                "ledger_shares": ledger_shares,
+                "account_shares": account_shares,
+                "diff": account_shares - ledger_shares,
+            }
+        )
+
+    return {
+        "applicable": True,
+        "in_sync": not diffs,
+        "securities_account_id": account_id,
+        "account_synced_at": synced_at,
+        "diffs": diffs,
+    }
+
+
+def _current_lineage_holdings(
+    trading_collections: Dict[str, Any],
+    finance_collections: Dict[str, Any],
+    data_collections: Dict[str, Any],
+    plan: Dict[str, Any],
+    user_id: str,
+) -> List[Dict[str, Any]]:
+    """Current real holdings (shares > 0) for the lineage.
+
+    Uses live positions when the lineage has any live fills, otherwise falls back
+    to the latest paper snapshot. Failures degrade to an empty lineup rather than
+    breaking the overview.
+    """
+    try:
+        if _lineage_has_live_fills(trading_collections, finance_collections, plan, user_id):
+            return _lineage_live_holdings(
+                trading_collections, finance_collections, data_collections, plan, user_id
+            )
+        snapshot = _latest_lineage_paper_snapshot(trading_collections, plan, user_id)
+        return [
+            row
+            for row in (snapshot.get("positions") or [])
+            if _int_value(row.get("shares")) > 0
+        ]
+    except Exception:
         return []
-    prices, realtime_docs = _load_fresh_market_prices(data_collections, symbols)
-    payload = build_lineage_live_positions(grouped, prices, realtime_docs=realtime_docs)
-    return [row for row in (payload.get("positions") or []) if _int_value(row.get("shares")) > 0]
 
 
 def _live_signal_is_blocked(item: Dict[str, Any]) -> bool:
@@ -2652,6 +3137,56 @@ async def get_portfolio_plan_items(plan_id: str, current_user: dict = Depends(ge
     return {"success": True, "data": _jsonable(items)}
 
 
+@router.get("/plans/{plan_id}/bench")
+async def get_portfolio_plan_bench(
+    plan_id: str,
+    bench_multiplier: float = Query(default=1.5, ge=1.0, le=3.0),
+    current_user: dict = Depends(get_current_user),
+):
+    collections = get_trading_db_collections()
+    finance_collections = get_db_collections()
+    data_collections = get_data_db()
+    plan = _require_plan(collections, plan_id, current_user)
+    user_id = _current_user_id(current_user)
+    # Starters mirror the actual current holdings (live if the lineage has any
+    # live fills, otherwise the latest paper snapshot) so the lineup stays in
+    # sync with 最新持仓 across the whole rebalance cadence.
+    holdings = _current_lineage_holdings(
+        collections, finance_collections, data_collections, plan, user_id
+    )
+    payload = _build_plan_bench_payload(
+        plan,
+        holdings,
+        bench_multiplier=bench_multiplier,
+        data_collections=data_collections,
+    )
+    return {"success": True, "data": _jsonable(payload)}
+
+
+@router.get("/plans/{plan_id}/holdings-reconcile")
+async def reconcile_portfolio_holdings(
+    plan_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """Compare the system ledger holdings with the broker's synced positions.
+
+    Live-only: returns per-symbol diffs so the overview can warn the moment the
+    book drifts from the real miniQMT account.
+    """
+    collections = get_trading_db_collections()
+    finance_collections = get_db_collections()
+    data_collections = get_data_db()
+    plan = _require_plan(collections, plan_id, current_user)
+    user_id = _current_user_id(current_user)
+    try:
+        payload = _reconcile_live_holdings(
+            collections, finance_collections, data_collections, plan, user_id
+        )
+    except Exception:
+        payload = {"applicable": False, "in_sync": True, "diffs": [], "securities_account_id": ""}
+    return {"success": True, "data": _jsonable(payload)}
+
+
 @router.post("/plans/{plan_id}/approve")
 async def approve_portfolio_plan(plan_id: str, request: ReviewRequest, current_user: dict = Depends(get_current_user)):
     return _review_plan(plan_id, "approved", request.comment, current_user)
@@ -3041,19 +3576,7 @@ def _lineage_live_account_id_from_fills(
     _lineage_ids, signals, executions = _lineage_live_signal_execution_bundle(
         trading_collections, finance_collections, plan, user_id
     )
-    filled_order_ids = {
-        str(row.get("order_id"))
-        for row in executions
-        if row.get("order_id") and _execution_fill_quantity(row) > 0
-    }
-    for signal in reversed(signals):
-        order_id = str(signal.get("order_id") or "")
-        if order_id not in filled_order_ids:
-            continue
-        account_id = str(signal.get("securities_account_id") or "")
-        if account_id:
-            return account_id
-    return ""
+    return _account_id_from_filled_signals(signals, executions)
 
 
 def _portfolio_plan_groups(
