@@ -285,6 +285,40 @@ def test_quote_section_prefers_daily_when_realtime_trade_date_is_stale(monkeypat
     assert section["daily_quotes"][0]["trade_date"] == "20260618"
 
 
+def test_quote_section_uses_realtime_trade_time_when_trade_date_lags(monkeypatch):
+    """Realtime trade time is the fresher market date when trade_date was not rolled."""
+    data = {
+        "volume_price_realtime_latest": _Collection(
+            [
+                {
+                    "symbol": "000001.SZ",
+                    "trade_date": "20260615",
+                    "realtime_trade_time": "2026-06-25 14:59:00",
+                    "close": 12.0,
+                }
+            ]
+        ),
+        "volume_price": _Collection(
+            [
+                {"symbol": "000001.SZ", "trade_date": "20260618", "close": 11.0},
+                {"symbol": "000001.SZ", "trade_date": "20260617", "close": 10.5},
+            ]
+        ),
+        "stock_weekly": _Collection([]),
+        "stock_monthly": _Collection([]),
+        "financial_daily_basic": _Collection([]),
+        "money_flow": _Collection([]),
+    }
+    monkeypatch.setattr("routers.stock_workbench.get_data_db", lambda: data)
+
+    section = _quote_section("000001.SZ")
+
+    assert section["quote"]["source"] == "realtime"
+    assert section["quote"]["display_trade_date"] == "20260625"
+    assert section["quote"]["display_pre_close"] == pytest.approx(11.0)
+    assert section["data_status"]["as_of"] == "20260625"
+
+
 def test_kline_section_loads_weekly_and_monthly_on_demand(monkeypatch):
     data = {
         "volume_price": _Collection([]),

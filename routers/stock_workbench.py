@@ -207,9 +207,28 @@ def _latest_daily_quote(data: Any, candidates: List[str], trade_date: Any = None
 def _trade_date_key(value: Any) -> str:
     """YYYYMMDD prefix for comparing calendar trade dates (string compare safe)."""
     s = str(value or "").strip()
-    if len(s) >= 8 and s[:8].isdigit():
-        return s[:8]
+    digits = re.sub(r"\D", "", s)
+    if len(digits) >= 8:
+        return digits[:8]
     return ""
+
+
+def _quote_date_key(quote: Optional[Dict[str, Any]]) -> str:
+    """Best available market date for comparing quote freshness."""
+    if not quote:
+        return ""
+    keys = [
+        _trade_date_key(quote.get("trade_date")),
+        _trade_date_key(quote.get("datetime")),
+        _trade_date_key(quote.get("trade_time")),
+        _trade_date_key(quote.get("realtime_trade_time")),
+    ]
+    return max((key for key in keys if key), default="")
+
+
+def _quote_as_of(quote: Optional[Dict[str, Any]]) -> Any:
+    key = _quote_date_key(quote)
+    return key or (quote or {}).get("trade_date") or (quote or {}).get("datetime") or (quote or {}).get("trade_time") or (quote or {}).get("realtime_trade_time")
 
 
 def _recent_docs_for_symbol(
@@ -708,7 +727,7 @@ def _attach_display_pct_change(data: Any, quote: Optional[Dict[str, Any]], candi
         return quote
 
     close = _first_float(quote.get("close"), quote.get("price"), quote.get("latest_price"))
-    quote_trade_date = quote.get("trade_date")
+    quote_trade_date = _quote_date_key(quote) or quote.get("trade_date")
     previous_close = _first_float(
         quote.get("pre_close"),
         quote.get("prev_close"),
@@ -722,7 +741,7 @@ def _attach_display_pct_change(data: Any, quote: Optional[Dict[str, Any]], candi
         try:
             daily_quote = _latest_daily_quote(data, candidates, quote_trade_date)
             if daily_quote:
-                if quote_trade_date and daily_quote.get("trade_date") == quote_trade_date:
+                if quote_trade_date and _trade_date_key(daily_quote.get("trade_date")) == quote_trade_date:
                     previous_close = _first_float(
                         daily_quote.get("pre_close"),
                         daily_quote.get("prev_close"),
@@ -760,13 +779,15 @@ def _latest_quote(symbol: str) -> Optional[Dict[str, Any]]:
     for field in ("symbol", "ts_code"):
         doc = data["volume_price_realtime_latest"].find_one(
             {field: {"$in": candidates}},
-            sort=[("trade_time", -1), ("trade_date", -1), ("_id", -1)],
+            sort=[("trade_time", -1), ("realtime_trade_time", -1), ("trade_date", -1), ("_id", -1)],
         )
         if doc:
             rt = doc
             break
     dy_key = _trade_date_key((daily_latest or {}).get("trade_date"))
-    rt_key = _trade_date_key((rt or {}).get("trade_date"))
+    if rt:
+        rt["source"] = "realtime"
+    rt_key = _quote_date_key(rt)
 
     # Realtime snapshot is often ETL-delayed; if quant_data.volume_price already has a newer
     # completed session, prefer that bar so refresh matches the K-line tail.
@@ -780,7 +801,9 @@ def _latest_quote(symbol: str) -> Optional[Dict[str, Any]]:
 
     if rt:
         quote = rt
-        quote["source"] = "realtime"
+        as_of = _quote_date_key(quote)
+        if as_of and _trade_date_key(quote.get("trade_date")) != as_of:
+            quote["display_trade_date"] = as_of
         return _attach_display_pct_change(data, quote, candidates)
 
     if daily_latest:
@@ -1070,7 +1093,7 @@ def _section_status(
 def _quote_status(quote: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     return _section_status(
         found=bool(quote),
-        as_of=(quote or {}).get("trade_date") or (quote or {}).get("datetime") or (quote or {}).get("trade_time"),
+        as_of=_quote_as_of(quote),
         expected_freshness="盘中实时快照优先，缺失时使用最近交易日 T+1 日线",
         source=(quote or {}).get("source") or "quant_data.volume_price",
     )
@@ -1510,7 +1533,7 @@ def get_stock_workbench(
         "quote_found": bool(quote),
         "score_found": bool(score),
         "deep_analysis_found": False,
-        "quote_date": (quote or {}).get("trade_date") or (quote or {}).get("datetime") or (quote or {}).get("trade_time"),
+        "quote_date": _quote_as_of(quote),
         "score_date": (score or {}).get("score_date"),
         "analysis_created_at": None,
         "sections": {
