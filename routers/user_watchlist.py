@@ -12,13 +12,14 @@ from models.all_models import (
 )
 from auth import get_current_active_user
 from db import get_db_collections, get_data_db
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 router = APIRouter()
 
 # 与 quant-data-engine 东财自选轮询一致：按上海日历日匹配 ``trade_date``，避免 API 容器为 UTC 时错位。
 _CN_TZ = ZoneInfo("Asia/Shanghai")
+_WATCHLIST_REALTIME_INDEXES_READY = False
 
 
 def _cn_calendar_today_yyyymmdd() -> str:
@@ -34,6 +35,23 @@ def _trade_date_match_today(today_yyyymmdd: str) -> Any:
         pass
     if len(today_yyyymmdd) == 8 and today_yyyymmdd.isdigit():
         vals.append(f"{today_yyyymmdd[:4]}-{today_yyyymmdd[4:6]}-{today_yyyymmdd[6:8]}")
+    return {"$in": vals}
+
+
+def _trade_date_match_recent(today_yyyymmdd: str, max_days: int = 15) -> Any:
+    """返回最近若干自然日的常见 ``trade_date`` 写法，用于约束快照 fallback 扫描范围。"""
+    vals: List[Any] = []
+    try:
+        today = datetime.strptime(today_yyyymmdd, "%Y%m%d").date()
+    except ValueError:
+        return _trade_date_match_today(today_yyyymmdd)
+
+    for i in range(max_days + 1):
+        d = today - timedelta(days=i)
+        compact = d.strftime("%Y%m%d")
+        vals.append(compact)
+        vals.append(int(compact))
+        vals.append(d.strftime("%Y-%m-%d"))
     return {"$in": vals}
 
 
@@ -71,6 +89,87 @@ def _eastmoney_trade_date_within_lookback(doc_td: str, today: str, max_days: int
 def _volume_price_symbol_filter(variants: List[str]) -> Dict[str, Any]:
     """``volume_price`` 有的历史数据用 ``ts_code``、有的用 ``symbol``。"""
     return {"$or": [{"symbol": {"$in": variants}}, {"ts_code": {"$in": variants}}]}
+
+
+def _unique_variants_for_symbols(symbols: List[str]) -> List[str]:
+    seen: set[str] = set()
+    out: List[str] = []
+    for symbol in symbols:
+        for variant in _symbol_variants(symbol):
+            if variant and variant not in seen:
+                seen.add(variant)
+                out.append(variant)
+    return out
+
+
+def _etf_symbol_variants(symbol: str) -> List[str]:
+    """ETF 代码常有裸代码输入，批量查 etf_basic 时同时尝试 SH/SZ 写法。"""
+    variants = list(_symbol_variants(symbol))
+    raw = remove_exchange_suffix(symbol or "")
+    if len(raw) == 6 and raw.isdigit():
+        for suffix in (".SH", ".SZ", ".BJ"):
+            candidate = f"{raw}{suffix}"
+            if candidate not in variants:
+                variants.append(candidate)
+    return variants
+
+
+def _unique_etf_variants_for_symbols(symbols: List[str]) -> List[str]:
+    seen: set[str] = set()
+    out: List[str] = []
+    for symbol in symbols:
+        for variant in _etf_symbol_variants(symbol):
+            if variant and variant not in seen:
+                seen.add(variant)
+                out.append(variant)
+    return out
+
+
+def _ensure_watchlist_realtime_indexes(data_collections: Dict[str, Any]) -> None:
+    """为自选股实时接口的热路径创建幂等索引。"""
+    global _WATCHLIST_REALTIME_INDEXES_READY
+    if _WATCHLIST_REALTIME_INDEXES_READY:
+        return
+
+    try:
+        volume_price_col = data_collections.get("volume_price")
+        if volume_price_col is not None:
+            volume_price_col.create_index(
+                [("source", 1), ("symbol", 1), ("trade_date", -1)],
+                name="vp_source_symbol_trade_date_idx",
+                background=True,
+            )
+            volume_price_col.create_index(
+                [("source", 1), ("ts_code", 1), ("trade_date", -1)],
+                name="vp_source_ts_code_trade_date_idx",
+                background=True,
+            )
+            volume_price_col.create_index(
+                [("ts_code", 1), ("trade_date", -1)],
+                name="vp_ts_code_trade_date_idx",
+                background=True,
+            )
+
+        stock_info_col = data_collections.get("stock_info")
+        if stock_info_col is not None:
+            stock_info_col.create_index([("symbol", 1)], name="stock_info_symbol_idx", background=True)
+
+        etf_basic_col = data_collections.get("etf_basic")
+        if etf_basic_col is not None:
+            etf_basic_col.create_index([("ts_code", 1)], name="etf_basic_ts_code_idx", background=True)
+
+        etf_daily_col = data_collections.get("etf_daily")
+        if etf_daily_col is not None:
+            etf_daily_col.create_index(
+                [("ts_code", 1), ("trade_date", -1)],
+                name="etf_daily_ts_code_trade_date_idx",
+                background=True,
+            )
+    except Exception:
+        # 索引创建失败不应阻断页面刷新；查询仍会按原逻辑运行。
+        pass
+    finally:
+        _WATCHLIST_REALTIME_INDEXES_READY = True
 
 
 def _safe_round_price(val: Any, ndigits: int = 2) -> Optional[float]:
@@ -499,6 +598,181 @@ def _merge_variants(*groups: List[str]) -> List[str]:
     return out
 
 
+def _pick_latest_vp_doc(docs: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """按规范化 trade_date 取最新 ``volume_price`` 文档。"""
+    if not docs:
+        return None
+
+    def _td_sort_key(d: Dict[str, Any]) -> str:
+        t = _norm_trade_date_to_yyyymmdd(d.get("trade_date"))
+        return t or ""
+
+    return sorted(docs, key=_td_sort_key, reverse=True)[0]
+
+
+def _batch_etf_ts_code_map(etf_basic_col, symbols: List[str]) -> Dict[str, Optional[str]]:
+    """批量识别 ETF 规范 ``ts_code``，key 为用户自选原始 symbol。"""
+    out: Dict[str, Optional[str]] = {symbol: None for symbol in symbols}
+    if etf_basic_col is None or not symbols:
+        return out
+
+    variants = _unique_etf_variants_for_symbols(symbols)
+    if not variants:
+        return out
+
+    by_norm: Dict[str, str] = {}
+    try:
+        for doc in etf_basic_col.find(
+            {"ts_code": {"$in": variants}},
+            {"_id": 0, "ts_code": 1},
+        ):
+            ts_code = str(doc.get("ts_code") or "").strip()
+            norm = remove_exchange_suffix(ts_code)
+            if ts_code and norm and norm not in by_norm:
+                by_norm[norm] = ts_code
+    except Exception:
+        return out
+
+    for symbol in symbols:
+        out[symbol] = by_norm.get(remove_exchange_suffix(symbol))
+    return out
+
+
+def _batch_stock_info_map(stock_info_col, all_variants: List[str]) -> Dict[str, Dict[str, Any]]:
+    """批量读取股票基础信息，key 为去后缀代码。"""
+    if stock_info_col is None or not all_variants:
+        return {}
+
+    out: Dict[str, Dict[str, Any]] = {}
+    try:
+        for doc in stock_info_col.find({"symbol": {"$in": all_variants}}):
+            symbol = str(doc.get("symbol") or "").strip()
+            norm = remove_exchange_suffix(symbol)
+            if norm and norm not in out:
+                out[norm] = doc
+    except Exception:
+        return {}
+    return out
+
+
+def _batch_etf_info_map(etf_basic_col, symbols: List[str]) -> Dict[str, Dict[str, Any]]:
+    """批量读取 ETF 基础信息，key 为去后缀代码。"""
+    if etf_basic_col is None or not symbols:
+        return {}
+
+    variants = _unique_etf_variants_for_symbols(symbols)
+    if not variants:
+        return {}
+
+    out: Dict[str, Dict[str, Any]] = {}
+    try:
+        for doc in etf_basic_col.find({"ts_code": {"$in": variants}}):
+            ts_code = str(doc.get("ts_code") or "").strip()
+            norm = remove_exchange_suffix(ts_code)
+            if norm and norm not in out:
+                out[norm] = doc
+    except Exception:
+        return {}
+    return out
+
+
+def _batch_latest_volume_price_map(
+    volume_price_col,
+    symbols: List[str],
+    sym_ctx: Dict[str, Dict[str, Any]],
+    today: str,
+) -> Dict[str, Optional[Dict[str, Any]]]:
+    """批量读取每只自选股近期最新 ``volume_price`` 文档，用于昨收/兜底。"""
+    all_variants = list(
+        dict.fromkeys(v for symbol in symbols for v in sym_ctx[symbol]["variants"])
+    )
+    out: Dict[str, Optional[Dict[str, Any]]] = {symbol: None for symbol in symbols}
+    if volume_price_col is None or not all_variants:
+        return out
+
+    docs: List[Dict[str, Any]] = []
+    recent_td_key = _trade_date_match_recent(today)
+    projection = {
+        "symbol": 1,
+        "ts_code": 1,
+        "trade_date": 1,
+        "close": 1,
+        "pre_close": 1,
+        "source": 1,
+    }
+    try:
+        docs.extend(
+            volume_price_col.find(
+                {
+                    "symbol": {"$in": all_variants},
+                    "trade_date": recent_td_key,
+                },
+                projection,
+            ).sort([("symbol", 1), ("trade_date", -1)])
+        )
+        docs.extend(
+            volume_price_col.find(
+                {
+                    "ts_code": {"$in": all_variants},
+                    "trade_date": recent_td_key,
+                },
+                projection,
+            ).sort([("ts_code", 1), ("trade_date", -1)])
+        )
+    except Exception:
+        return out
+
+    by_norm = _vp_docs_index_by_norm(docs)
+    for symbol in symbols:
+        cands = by_norm.get(remove_exchange_suffix(symbol), [])
+        out[symbol] = _pick_latest_vp_doc(cands)
+    return out
+
+
+def _batch_latest_etf_daily_close_map(
+    etf_daily_col,
+    symbols: List[str],
+    sym_ctx: Dict[str, Dict[str, Any]],
+) -> Dict[str, Any]:
+    """批量读取 ETF 最新收盘价，补足 volume_price 无昨收的情况。"""
+    out: Dict[str, Any] = {}
+    if etf_daily_col is None:
+        return out
+
+    ts_codes = list(
+        dict.fromkeys(
+            sym_ctx[symbol].get("etf_ts")
+            for symbol in symbols
+            if sym_ctx[symbol].get("etf_ts")
+        )
+    )
+    if not ts_codes:
+        return out
+
+    try:
+        docs = list(
+            etf_daily_col.find(
+                {"ts_code": {"$in": ts_codes}},
+                {"ts_code": 1, "trade_date": 1, "close": 1},
+            ).sort([("ts_code", 1), ("trade_date", -1)])
+        )
+    except Exception:
+        return out
+
+    latest_by_ts: Dict[str, Dict[str, Any]] = {}
+    for doc in docs:
+        ts_code = str(doc.get("ts_code") or "").strip()
+        if ts_code and ts_code not in latest_by_ts:
+            latest_by_ts[ts_code] = doc
+
+    for symbol in symbols:
+        etf_ts = sym_ctx[symbol].get("etf_ts")
+        doc = latest_by_ts.get(etf_ts)
+        if doc and doc.get("close") is not None:
+            out[symbol] = doc.get("close")
+    return out
+
+
 def _etf_daily_intraday_pack(
     etf_daily_col, ts_code: str, today: str
 ) -> Optional[Dict[str, Any]]:
@@ -629,11 +903,46 @@ def _batch_intraday_volume_price_map(
 
     need_fb = [sym for sym in symbols if out.get(sym) is None]
     if need_fb:
-        limit = min(3000, 200 + 50 * len(all_variants))
-        fb_docs = list(
+        fb_variants = list(
+            dict.fromkeys(v for sym in need_fb for v in sym_ctx[sym]["variants"])
+        )
+        recent_td_key = _trade_date_match_recent(today)
+        fb_docs: List[Dict[str, Any]] = []
+        projection = {
+            "symbol": 1,
+            "ts_code": 1,
+            "trade_date": 1,
+            "source": 1,
+            "open": 1,
+            "high": 1,
+            "low": 1,
+            "close": 1,
+            "pre_close": 1,
+            "change": 1,
+            "pct_chg": 1,
+            "volume": 1,
+            "update_time": 1,
+            "synced_at": 1,
+        }
+        fb_docs.extend(
             volume_price_col.find(
-                {**sym_f, "source": "eastmoney_snapshot"},
-            ).sort([("trade_date", -1)]).limit(limit)
+                {
+                    "source": "eastmoney_snapshot",
+                    "symbol": {"$in": fb_variants},
+                    "trade_date": recent_td_key,
+                },
+                projection,
+            ).sort([("symbol", 1), ("trade_date", -1)])
+        )
+        fb_docs.extend(
+            volume_price_col.find(
+                {
+                    "source": "eastmoney_snapshot",
+                    "ts_code": {"$in": fb_variants},
+                    "trade_date": recent_td_key,
+                },
+                projection,
+            ).sort([("ts_code", 1), ("trade_date", -1)])
         )
         by_norm_fb = _vp_docs_index_by_norm(fb_docs)
         for sym in need_fb:
@@ -663,6 +972,7 @@ def get_user_watchlist_realtime(current_user: dict = Depends(get_current_active_
         # 1. 获取用户自选股列表
         collections = get_db_collections()
         data_collections = get_data_db()
+        _ensure_watchlist_realtime_indexes(data_collections)
         user_watchlists_collection = collections["user_watchlists"]
         watchlist_doc = user_watchlists_collection.find_one({"user_id": user_id})
         
@@ -678,9 +988,10 @@ def get_user_watchlist_realtime(current_user: dict = Depends(get_current_active_
         etf_basic_col = data_collections.get("etf_basic")
         etf_daily_col = data_collections.get("etf_daily")
 
+        etf_ts_map = _batch_etf_ts_code_map(etf_basic_col, symbols)
         sym_ctx: Dict[str, Dict[str, Any]] = {}
         for symbol in symbols:
-            etf_ts = _resolve_etf_ts_code(etf_basic_col, symbol)
+            etf_ts = etf_ts_map.get(symbol)
             eff_variants = _merge_variants(_symbol_variants(symbol), [etf_ts] if etf_ts else [])
             sym_ctx[symbol] = {"variants": eff_variants, "etf_ts": etf_ts}
         sw_industry_map = _load_sw_industry_map(
@@ -692,25 +1003,16 @@ def get_user_watchlist_realtime(current_user: dict = Depends(get_current_active_
         volume_price_col = data_collections["volume_price"]
 
         # Key 与下方主循环的 symbol 一致（user_watchlists 原文）；命中文档靠 variants，避免后缀不一致丢 close。
-        for symbol in symbols:
-            variants = sym_ctx[symbol]["variants"]
-            latest_record = volume_price_col.find_one(
-                _volume_price_symbol_filter(variants),
-                sort=[("trade_date", -1)],
-            )
-            if latest_record:
+        today = _cn_calendar_today_yyyymmdd()
+        latest_vp_map = _batch_latest_volume_price_map(volume_price_col, symbols, sym_ctx, today)
+        etf_close_map = _batch_latest_etf_daily_close_map(etf_daily_col, symbols, sym_ctx)
+        for symbol, latest_record in latest_vp_map.items():
+            if latest_record and latest_record.get("close") is not None:
                 yesterday_close_map[symbol] = latest_record.get("close")
-            elif etf_daily_col is not None:
-                etf_ts = sym_ctx[symbol]["etf_ts"]
-                q = {"ts_code": {"$in": variants}}
-                if etf_ts:
-                    q = {"ts_code": etf_ts}
-                etf_record = etf_daily_col.find_one(q, sort=[("trade_date", -1)])
-                if etf_record:
-                    yesterday_close_map[symbol] = etf_record.get("close")
+            elif symbol in etf_close_map:
+                yesterday_close_map[symbol] = etf_close_map[symbol]
 
         minute_bars_col = data_collections["minute_bars"]
-        today = _cn_calendar_today_yyyymmdd()
 
         minute_match_symbols = list(
             dict.fromkeys(v for symbol in symbols for v in sym_ctx[symbol]["variants"])
@@ -750,23 +1052,24 @@ def get_user_watchlist_realtime(current_user: dict = Depends(get_current_active_
 
         result = []
         stock_info_col = data_collections["stock_info"]
+        all_variants = list(
+            dict.fromkeys(v for symbol in symbols for v in sym_ctx[symbol]["variants"])
+        )
+        stock_info_map = _batch_stock_info_map(stock_info_col, all_variants)
+        etf_info_map = _batch_etf_info_map(etf_basic_col, symbols)
 
         for symbol in symbols:
-            variants = sym_ctx[symbol]["variants"]
             etf_ts = sym_ctx[symbol]["etf_ts"]
             industry = ""
             sw_industry = sw_industry_map.get(remove_exchange_suffix(symbol))
-            stock_info = stock_info_col.find_one({"symbol": {"$in": variants}})
+            norm = remove_exchange_suffix(symbol)
+            stock_info = stock_info_map.get(norm)
             if stock_info:
                 name = stock_info["name"] if "name" in stock_info else symbol
                 industry = stock_info.get("industry", "")
                 asset_type = "stock"
             else:
-                etf_info = (
-                    etf_basic_col.find_one({"ts_code": {"$in": variants}})
-                    if etf_basic_col is not None
-                    else None
-                )
+                etf_info = etf_info_map.get(norm)
                 if etf_info:
                     name = etf_info["name"] if "name" in etf_info else symbol
                     asset_type = "etf"
@@ -774,7 +1077,6 @@ def get_user_watchlist_realtime(current_user: dict = Depends(get_current_active_
                     name = symbol
                     asset_type = "unknown"
             
-            norm = remove_exchange_suffix(symbol)
             item = realtime_by_norm.get(norm)
             
             if item is not None:
