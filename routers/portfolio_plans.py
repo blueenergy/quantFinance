@@ -3163,6 +3163,67 @@ async def get_portfolio_plan_bench(
     return {"success": True, "data": _jsonable(payload)}
 
 
+@router.post("/plans/{plan_id}/bench-risk")
+async def enqueue_portfolio_bench_risk(
+    plan_id: str,
+    bench_multiplier: float = Query(default=1.5, ge=1.0, le=3.0),
+    current_user: dict = Depends(get_current_user),
+):
+    """Enqueue an AI risk review for the lineage's *bench* candidates.
+
+    Mirror of holdings-risk but targeting the scored-but-unheld pool, so the
+    coach can vet a substitute before swapping it onto the field. The cheap
+    rule engine (ai_risk_review.review_symbol) runs in the plan worker, which
+    writes its result onto the task for the client to poll. Advisory only — it
+    never changes selection or status.
+    """
+    collections = get_trading_db_collections()
+    finance_collections = get_db_collections()
+    data_collections = get_data_db()
+    user_id = _current_user_id(current_user)
+    plan = _require_plan(collections, plan_id, current_user)
+    holdings = _current_lineage_holdings(
+        collections, finance_collections, data_collections, plan, user_id
+    )
+    payload = _build_plan_bench_payload(
+        plan, holdings, bench_multiplier=bench_multiplier, data_collections=data_collections
+    )
+    symbols = [str(row.get("symbol")) for row in (payload.get("bench") or []) if row.get("symbol")]
+    base_date = (
+        _normalize_yyyymmdd(payload.get("score_date"))
+        or _normalize_yyyymmdd(plan.get("base_date"))
+        or datetime.now().strftime("%Y%m%d")
+    )
+    now = datetime.utcnow()
+    task = {
+        "task_id": str(uuid.uuid4()),
+        "task_type": "bench_risk_review",
+        "user_id": user_id,
+        "plan_id": plan_id,
+        "strategy_template_id": plan.get("strategy_template_id"),
+        "params_hash": plan.get("params_hash"),
+        "base_date": base_date,
+        "symbols": symbols,
+        "status": "pending",
+        "attempts": 0,
+        "error_message": None,
+        "created_at": now,
+        "updated_at": now,
+    }
+    collections["portfolio_plan_generation_tasks"].insert_one(task)
+    return {
+        "success": True,
+        "data": _jsonable(
+            {
+                "task_id": task["task_id"],
+                "anchor_plan_id": plan_id,
+                "base_date": base_date,
+                "symbol_count": len(symbols),
+            }
+        ),
+    }
+
+
 @router.get("/plans/{plan_id}/holdings-reconcile")
 async def reconcile_portfolio_holdings(
     plan_id: str,

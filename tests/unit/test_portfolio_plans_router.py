@@ -2908,6 +2908,75 @@ def test_get_portfolio_plan_bench_splits_starters_and_bench(monkeypatch):
     assert payload["bench"][0]["latest_close"] == 15.5
 
 
+def test_enqueue_portfolio_bench_risk_enqueues_bench_symbols(monkeypatch):
+    cols = _collections()
+    data = _data_collections()
+    stock_scores = _Collection(
+        [
+            {"symbol": "000001.SZ", "name": "A", "industry": "Bank", "score_date": "20250110", "index_codes": "csi1000", "growth_score": 90, "cycle_score": 80},
+            {"symbol": "000002.SZ", "name": "B", "industry": "Bank", "score_date": "20250110", "index_codes": "csi1000", "growth_score": 85, "cycle_score": 75},
+            {"symbol": "000003.SZ", "name": "C", "industry": "Tech", "score_date": "20250110", "index_codes": "csi1000", "growth_score": 80, "cycle_score": 70},
+            {"symbol": "000004.SZ", "name": "D", "industry": "Tech", "score_date": "20250110", "index_codes": "csi1000", "growth_score": 70, "cycle_score": 60},
+        ]
+    )
+    data["volume_price"].docs = [
+        {"symbol": "000003.SZ", "trade_date": "20250110", "close": 15.5},
+    ]
+    cols["portfolio_trade_plans"] = _Collection(
+        [
+            {
+                "plan_id": "bench-plan",
+                "strategy_template_id": "s1",
+                "user_id": "user-1",
+                "base_date": "20250110",
+                "score_date": "20250110",
+                "params_hash": "hx",
+                "params_snapshot": {
+                    "universe_index": "csi1000",
+                    "growth_weight": 0.3,
+                    "cycle_weight": 0.7,
+                    "top_n": 2,
+                    "rebalance_days": 10,
+                },
+            }
+        ]
+    )
+    monkeypatch.setattr(portfolio_plans, "get_trading_db_collections", lambda: cols)
+    monkeypatch.setattr(portfolio_plans, "get_db_collections", lambda: cols)
+    monkeypatch.setattr(portfolio_plans, "get_data_db", lambda: data)
+    monkeypatch.setattr(portfolio_plans, "finance_db", {"stock_scores": stock_scores})
+    monkeypatch.setattr(
+        portfolio_plans,
+        "_current_lineage_holdings",
+        lambda *args, **kwargs: [
+            {"symbol": "000001.SZ", "name": "A", "shares": 1000, "last_price": 10.0, "market_value": 10000.0},
+            {"symbol": "000002.SZ", "name": "B", "shares": 800, "last_price": 11.0, "market_value": 8800.0},
+        ],
+    )
+
+    resp = asyncio.run(
+        portfolio_plans.enqueue_portfolio_bench_risk(
+            "bench-plan",
+            bench_multiplier=1.5,
+            current_user={"id": "user-1"},
+        )
+    )
+
+    data_payload = resp["data"]
+    assert data_payload["symbol_count"] == 1
+    assert data_payload["base_date"] == "20250110"
+    tasks = cols["portfolio_plan_generation_tasks"].docs
+    assert len(tasks) == 1
+    task = tasks[0]
+    assert task["task_type"] == "bench_risk_review"
+    assert task["status"] == "pending"
+    # Held starters (000001/000002) stay off the bench review; only the
+    # scored-but-unheld candidate is queued.
+    assert task["symbols"] == ["000003.SZ"]
+    assert task["base_date"] == "20250110"
+    assert task["task_id"] == data_payload["task_id"]
+
+
 def test_get_portfolio_plan_bench_excludes_live_holdings(monkeypatch):
     cols = _collections()
     data = _data_collections()
