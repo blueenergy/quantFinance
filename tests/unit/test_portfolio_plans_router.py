@@ -2947,6 +2947,50 @@ def test_get_portfolio_plan_bench_splits_starters_and_bench(monkeypatch):
     assert payload["bench"][0]["latest_close"] == 15.5
 
 
+def test_current_lineage_holdings_live_empty_does_not_fallback_to_paper():
+    cols = _collections()
+    fin = _finance_collections()
+    data = _data_collections()
+    plan = {
+        "plan_id": "live-plan",
+        "strategy_template_id": "s1",
+        "user_id": "user-1",
+        "base_date": "20250110",
+        "params_hash": "hx-live",
+    }
+    cols["portfolio_trade_plans"] = _Collection([plan])
+    cols["portfolio_paper_positions"] = _Collection(
+        [
+            {
+                "plan_id": "paper-plan",
+                "strategy_template_id": "s1",
+                "user_id": "user-1",
+                "params_hash": "hx-live",
+                "as_of_date": "20250109",
+                "positions": [
+                    {"symbol": "000001.SZ", "shares": 100, "market_value": 1000.0},
+                ],
+            }
+        ]
+    )
+    fin["trade_signals"] = _Collection(
+        [
+            {
+                "plan_id": "live-plan",
+                "user_id": "user-1",
+                "mode": "live",
+                "order_id": "order-1",
+                "symbol": "000001.SZ",
+                "action": "buy",
+            }
+        ]
+    )
+    fin["trade_executions"] = _Collection()
+
+    assert portfolio_plans._portfolio_execution_venue(cols, fin, plan, "user-1") == "live"
+    assert portfolio_plans._current_lineage_holdings(cols, fin, data, plan, "user-1") == []
+
+
 def test_enqueue_portfolio_bench_risk_enqueues_bench_symbols(monkeypatch):
     cols = _collections()
     data = _data_collections()

@@ -1776,12 +1776,12 @@ def _current_lineage_holdings(
 ) -> List[Dict[str, Any]]:
     """Current real holdings (shares > 0) for the lineage.
 
-    Uses live positions when the lineage has any live fills, otherwise falls back
-    to the latest paper snapshot. Failures degrade to an empty lineup rather than
-    breaking the overview.
+    Uses the lineage's execution venue as the source of truth. A live lineage
+    with no current broker-ledger holdings should show an empty lineup; it must
+    not fall back to historical paper snapshots.
     """
     try:
-        if _lineage_has_live_fills(trading_collections, finance_collections, plan, user_id):
+        if _portfolio_execution_venue(trading_collections, finance_collections, plan, user_id) == "live":
             return _lineage_live_holdings(
                 trading_collections, finance_collections, data_collections, plan, user_id
             )
