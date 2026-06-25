@@ -5082,11 +5082,12 @@ def _apply_paper_execution(collections: Dict[str, Any], data_collections: Dict[s
 
     strategy_template_id = plan.get("strategy_template_id")
     user_id = plan.get("user_id")
-    execute_date = (
-        str(plan.get("execute_date") or "").replace("-", "")
-        or str(plan.get("base_date") or "").replace("-", "")
-        or datetime.now().strftime("%Y%m%d")
-    )
+    execute_date = str(plan.get("execute_date") or "").replace("-", "")
+    if not execute_date:
+        raise HTTPException(
+            status_code=400,
+            detail="缺少 execute_date，请等待自动执行或先补齐下一交易日 execute_date",
+        )
     if not strategy_template_id:
         raise HTTPException(status_code=400, detail="plan is missing strategy_template_id")
 
@@ -5245,11 +5246,12 @@ def _paper_execution_status(collections: Dict[str, Any], data_collections: Dict[
     if plan.get("user_id"):
         execution_query["user_id"] = plan.get("user_id")
     execute_date = plan.get("execute_date")
-    effective_execute_date = execute_date or datetime.now().strftime("%Y%m%d")
+    effective_execute_date = execute_date or None
     plan_status = str(plan.get("status") or "")
 
     missing_symbols: List[str] = []
-    if plan_status == "approved":
+    missing_execute_date = plan_status == "approved" and not bool(execute_date)
+    if plan_status == "approved" and execute_date:
         execution_symbols = sorted(
             {
                 item.get("symbol")
@@ -5270,7 +5272,9 @@ def _paper_execution_status(collections: Dict[str, Any], data_collections: Dict[
         )
         execution_count = collections["portfolio_paper_executions"].count_documents(execution_query)
 
-    if plan_status == "approved":
+    if missing_execute_date:
+        backend_status = "missing_execute_date"
+    elif plan_status == "approved":
         backend_status = "waiting_for_open_prices" if missing_symbols else "ready_for_background_execution"
     elif plan_status in {"executed_paper", "partially_executed"}:
         backend_status = plan_status
@@ -5280,8 +5284,9 @@ def _paper_execution_status(collections: Dict[str, Any], data_collections: Dict[
     return {
         "execute_date": execute_date,
         "effective_execute_date": effective_execute_date,
-        "uses_runtime_execute_date": not bool(execute_date),
-        "open_price_ready": not missing_symbols,
+        "uses_runtime_execute_date": False,
+        "open_price_ready": bool(execute_date) and not missing_symbols,
+        "missing_execute_date": missing_execute_date,
         "missing_open_price_count": len(missing_symbols),
         "missing_open_price_examples": missing_symbols[:10],
         "backend_execution_status": backend_status,

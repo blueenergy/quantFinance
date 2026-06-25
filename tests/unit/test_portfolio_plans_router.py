@@ -809,6 +809,45 @@ def test_execute_paper_force_still_blocks_after_live_signal_publish(monkeypatch)
     assert "live signals" in exc.value.detail
 
 
+def test_execute_paper_requires_execute_date(monkeypatch):
+    collections = _collections()
+    collections["portfolio_trade_plans"].docs[0].update(
+        {
+            "status": "approved",
+            "params_snapshot": {"initial_capital": 1_000_000, "lot_size": 100},
+        }
+    )
+    monkeypatch.setattr(portfolio_plans, "get_db_collections", lambda: _finance_collections())
+
+    with pytest.raises(portfolio_plans.HTTPException) as exc:
+        portfolio_plans._apply_paper_execution(
+            collections,
+            data_collections=_data_collections(),
+            plan_id="plan-user-1",
+            user_id="user-1",
+        )
+
+    assert exc.value.status_code == 400
+    assert "缺少 execute_date" in exc.value.detail
+
+
+def test_paper_execution_status_missing_execute_date_is_not_ready():
+    collections = _collections()
+    plan = {
+        "plan_id": "plan-user-1",
+        "user_id": "user-1",
+        "status": "approved",
+    }
+    items = [{"symbol": "000001", "delta_shares": 100}]
+
+    status = portfolio_plans._paper_execution_status(collections, _data_collections(), plan, items)
+
+    assert status["backend_execution_status"] == "missing_execute_date"
+    assert status["missing_execute_date"] is True
+    assert status["open_price_ready"] is False
+    assert status["effective_execute_date"] is None
+
+
 def test_attach_live_context_preserves_plan_current_without_live_signals():
     finance = _finance_collections()
     items = [
