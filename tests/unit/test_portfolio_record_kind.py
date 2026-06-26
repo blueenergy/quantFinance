@@ -73,6 +73,18 @@ def test_require_record_kind_passes_through_valid():
     )
 
 
+def test_require_record_kind_lets_extman_override_bad_stamp():
+    assert (
+        require_record_kind(
+            {
+                "plan_id": "growth_cycle_index_enhanced_user_extman_20260624",
+                "record_kind": RECORD_KIND_TRADE_PLAN,
+            }
+        )
+        == RECORD_KIND_LEDGER_EVENT
+    )
+
+
 def test_require_record_kind_fails_loud_when_missing():
     with pytest.raises(ValueError):
         require_record_kind({"plan_id": "x"})

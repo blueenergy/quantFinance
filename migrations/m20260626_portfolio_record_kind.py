@@ -60,14 +60,19 @@ def _compute_changes(docs):
         set_fields = {}
         if doc.get("record_kind") != kind:
             set_fields["record_kind"] = kind
-        if not doc.get("origin"):
+        if kind == "ledger_event":
+            if doc.get("origin") != "manual":
+                set_fields["origin"] = "manual"
+            if "_extman_" in str(doc.get("plan_id") or "") and not doc.get("manual_action"):
+                set_fields["manual_action"] = "external_manual"
+            if doc.get("status") != "filled":
+                set_fields["status"] = "filled"
+        elif not doc.get("origin"):
             set_fields["origin"] = "strategy"
+
         # Legacy ledger rows carried plan_type="rebalance"; current code writes
         # "manual". Normalize so the data is internally consistent.
-        if (
-            doc.get("manual_action") in LEDGER_MANUAL_ACTIONS
-            and doc.get("plan_type") == "rebalance"
-        ):
+        if kind == "ledger_event" and doc.get("plan_type") == "rebalance":
             set_fields["plan_type"] = "manual"
 
         if set_fields:

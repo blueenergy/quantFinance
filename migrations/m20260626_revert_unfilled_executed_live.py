@@ -32,6 +32,8 @@ from datetime import datetime
 from dotenv import load_dotenv
 from pymongo import MongoClient
 
+from services.portfolio_record_kind import RECORD_KIND_LEDGER_EVENT, classify_record
+
 COLLECTION = "portfolio_trade_plans"
 
 
@@ -61,6 +63,7 @@ def main() -> int:
     print(f"[Migration] {trading_db_name}.{COLLECTION}: {len(candidates)} executed_live plans")
 
     to_revert = []
+    ledger_to_fill = []
     for plan in candidates:
         plan_id = plan.get("plan_id")
         user_id = plan.get("user_id")
@@ -72,14 +75,26 @@ def main() -> int:
         )
         total_filled = sum(_filled_qty(row) for row in live_signals)
         if total_filled <= 0:
-            to_revert.append(plan)
-            print(
-                f"    REVERT plan_id={plan_id!r} user_id={user_id!r} "
-                f"signals={len(live_signals)} filled_qty=0 -> approved"
-            )
+            try:
+                kind = classify_record(plan)
+            except ValueError:
+                kind = None
+            if kind == RECORD_KIND_LEDGER_EVENT:
+                ledger_to_fill.append(plan)
+                print(
+                    f"    FIX_LEDGER plan_id={plan_id!r} user_id={user_id!r} "
+                    f"signals={len(live_signals)} filled_qty=0 -> filled"
+                )
+            else:
+                to_revert.append(plan)
+                print(
+                    f"    REVERT plan_id={plan_id!r} user_id={user_id!r} "
+                    f"signals={len(live_signals)} filled_qty=0 -> approved"
+                )
 
     print(
-        f"[Migration] {len(to_revert)} plan(s) to revert "
+        f"[Migration] {len(to_revert)} plan(s) to revert and "
+        f"{len(ledger_to_fill)} ledger event(s) to mark filled "
         f"(of {len(candidates)} executed_live); the rest had real fills."
     )
 
@@ -87,21 +102,39 @@ def main() -> int:
         print("[Migration] DRY-RUN — no writes. Re-run with --apply to commit.")
         return 0
 
-    if not to_revert:
+    affected = to_revert + ledger_to_fill
+    if not affected:
         print("[Migration] Nothing to revert.")
         return 0
 
     stamp = datetime.utcnow().strftime("%Y%m%d%H%M%S")
     backup_name = f"{COLLECTION}_backup_executed_live_{stamp}"
-    client[trading_db_name][backup_name].insert_many([dict(p) for p in to_revert])
-    print(f"[Migration] Backed up {len(to_revert)} docs to {trading_db_name}.{backup_name}")
+    client[trading_db_name][backup_name].insert_many([dict(p) for p in affected])
+    print(f"[Migration] Backed up {len(affected)} docs to {trading_db_name}.{backup_name}")
 
     for plan in to_revert:
         plans.update_one(
             {"_id": plan["_id"]},
             {"$set": {"status": "approved"}, "$unset": {"live_executed_at": ""}},
         )
-    print(f"[Migration] Reverted {len(to_revert)} plan(s) to approved.")
+    for plan in ledger_to_fill:
+        plans.update_one(
+            {"_id": plan["_id"]},
+            {
+                "$set": {
+                    "status": "filled",
+                    "record_kind": RECORD_KIND_LEDGER_EVENT,
+                    "plan_type": "manual",
+                    "origin": "manual",
+                    "manual_action": plan.get("manual_action") or "external_manual",
+                },
+                "$unset": {"live_executed_at": ""},
+            },
+        )
+    print(
+        f"[Migration] Reverted {len(to_revert)} plan(s) to approved and "
+        f"fixed {len(ledger_to_fill)} ledger event(s) to filled."
+    )
     return 0
 
 

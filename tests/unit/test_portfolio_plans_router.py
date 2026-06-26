@@ -894,6 +894,31 @@ def test_plan_execution_context_reverts_executed_live_without_signals():
     assert "live_executed_at" not in plan_doc
 
 
+def test_plan_execution_context_fixes_extman_executed_live_to_filled():
+    finance = _finance_collections()
+    finance["trade_signals"] = _Collection()
+    plan = {
+        "plan_id": "growth_cycle_index_enhanced_hash_user_extman_20260624192646767ef3",
+        "user_id": "user-1",
+        "record_kind": "trade_plan",
+        "plan_type": "rebalance",
+        "status": "executed_live",
+        "live_executed_at": "2026-06-26T00:00:00",
+    }
+    ctx, trading = _run_execution_context(finance, plan)
+
+    assert ctx["execution_mode"] == "not_executed"
+    assert plan["status"] == "filled"
+    assert plan["record_kind"] == "ledger_event"
+    assert plan["plan_type"] == "manual"
+    assert plan["origin"] == "manual"
+    assert plan["manual_action"] == "external_manual"
+    plan_doc = trading["portfolio_trade_plans"].find_one({"plan_id": plan["plan_id"]})
+    assert plan_doc["status"] == "filled"
+    assert plan_doc["record_kind"] == "ledger_event"
+    assert plan_doc["plan_type"] == "manual"
+
+
 def test_plan_execution_context_does_not_stamp_executed_live_for_observation():
     finance = _finance_collections()
     finance["trade_signals"] = _Collection(
@@ -1841,6 +1866,18 @@ def _patch_lineage_live_env(monkeypatch, cols, fin, data):
 def test_resilient_record_kind_prefers_stamp_then_derives_then_none():
     # Stamped value wins.
     assert portfolio_plans._resilient_record_kind({"record_kind": "observation", "plan_type": "rebalance"}) == "observation"
+    # External manual ids are ledger events even if legacy data was wrongly
+    # stamped as a trade_plan.
+    assert (
+        portfolio_plans._resilient_record_kind(
+            {
+                "plan_id": "growth_cycle_index_enhanced_hash_user_extman_20260624192646767ef3",
+                "record_kind": "trade_plan",
+                "plan_type": "rebalance",
+            }
+        )
+        == "ledger_event"
+    )
     # Missing stamp (e.g. a worker still on pre-stamp code) -> derive from shape.
     assert portfolio_plans._resilient_record_kind({"plan_type": "rebalance"}) == "trade_plan"
     assert portfolio_plans._resilient_record_kind({"plan_type": "monitor"}) == "observation"
@@ -2947,7 +2984,7 @@ def _live_rebalance_env():
     ]
     # Broker can sell the full 500 shares -> no insufficient_available_position.
     fin["trader_positions"].docs = [
-        {"user_id": "user-1", "securities_account_id": "acct-1", "symbol": "600000.SH", "can_use_volume": 500}
+        {"user_id": "user-1", "securities_account_id": "acct-1", "symbol": "600000.SH", "qty": 500, "can_use_volume": 500}
     ]
     return cols, fin, data
 
@@ -2980,6 +3017,57 @@ def test_live_rebalance_dry_run_builds_sell_signals(monkeypatch):
     assert len(fin["trade_signals"].docs) == 1
     assert fin["trade_signals"].docs[0]["order_id"] == "o-buy-1"
     assert not [p for p in cols["portfolio_trade_plans"].docs if p.get("origin") == "manual"]
+
+
+def test_live_rebalance_skips_sell_when_account_position_zero(monkeypatch):
+    cols, fin, data = _live_rebalance_env()
+    fin["trader_positions"].docs = [
+        {"user_id": "user-1", "securities_account_id": "acct-1", "symbol": "600000.SH", "qty": 0, "can_use_volume": 0}
+    ]
+    _patch_lineage_live_env(monkeypatch, cols, fin, data)
+
+    with pytest.raises(portfolio_plans.HTTPException) as exc:
+        asyncio.run(
+            portfolio_plans.live_rebalance_portfolio(
+                "pla",
+                portfolio_plans.LiveRebalanceRequest(
+                    securities_account_id="acct-1", targets={"600000.SH": 0}, dry_run=True
+                ),
+                current_user={"id": "user-1"},
+            )
+        )
+
+    assert exc.value.status_code == 400
+    assert "no executable changes" in exc.value.detail
+
+
+def test_live_rebalance_caps_sell_to_account_available(monkeypatch):
+    cols, fin, data = _live_rebalance_env()
+    fin["trader_positions"].docs = [
+        {"user_id": "user-1", "securities_account_id": "acct-1", "symbol": "600000.SH", "qty": 200, "can_use_volume": 200}
+    ]
+    _patch_lineage_live_env(monkeypatch, cols, fin, data)
+
+    resp = asyncio.run(
+        portfolio_plans.live_rebalance_portfolio(
+            "pla",
+            portfolio_plans.LiveRebalanceRequest(
+                securities_account_id="acct-1", targets={"600000.SH": 0}, dry_run=True
+            ),
+            current_user={"id": "user-1"},
+        )
+    )
+
+    data_out = resp["data"]
+    signal = data_out["signals"][0]
+    assert signal["action"] == "sell"
+    assert signal["size"] == 200
+    item = data_out["items"][0]
+    assert item["delta_shares"] == -200
+    assert item["target_shares"] == 300
+    assert item["account_current_shares"] == 200
+    assert item["account_available_shares"] == 200
+    assert "account_position_capped" in item["blockers"]
 
 
 def test_live_rebalance_liquidation_publishes_and_creates_manual_plan(monkeypatch):

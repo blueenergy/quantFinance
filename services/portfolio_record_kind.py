@@ -27,9 +27,10 @@ Classification priority (validated against real data in two environments,
 rows carry ``plan_type == "rebalance"``::
 
     1. manual_action in {external_manual, external_liquidation} -> ledger_event
-    2. plan_type == "monitor"                                   -> observation
-    3. plan_type == "rebalance"                                 -> trade_plan
-    4. otherwise                                                -> ValueError
+    2. plan_id contains "_extman_"                               -> ledger_event
+    3. plan_type == "monitor"                                    -> observation
+    4. plan_type == "rebalance"                                  -> trade_plan
+    5. otherwise                                                 -> ValueError
 """
 
 from __future__ import annotations
@@ -63,6 +64,13 @@ def classify_record(doc: Mapping[str, Any]) -> str:
     if manual_action in LEDGER_MANUAL_ACTIONS:
         return RECORD_KIND_LEDGER_EVENT
 
+    # External manual records are ledger facts, not trade plans. Some legacy /
+    # partially migrated rows have lost manual_action or were wrongly stamped as
+    # trade_plan; the id marker is still authoritative enough to prevent the
+    # lifecycle state machine from treating them as executable rebalance plans.
+    if "_extman_" in str(doc.get("plan_id") or ""):
+        return RECORD_KIND_LEDGER_EVENT
+
     plan_type = doc.get("plan_type")
     if plan_type == "monitor":
         return RECORD_KIND_OBSERVATION
@@ -89,6 +97,13 @@ def require_record_kind(doc: Mapping[str, Any]) -> str:
     path that forgot to stamp it (a bug) rather than something to paper
     over with a fallback.
     """
+    try:
+        classified = classify_record(doc)
+    except ValueError:
+        classified = None
+    if classified == RECORD_KIND_LEDGER_EVENT:
+        return RECORD_KIND_LEDGER_EVENT
+
     kind = doc.get("record_kind")
     if kind not in VALID_RECORD_KINDS:
         raise ValueError(

@@ -1225,6 +1225,31 @@ def _maybe_revert_unfilled_executed_live(
     if has_live_fills:
         return False
     plan_id = str(plan.get("plan_id") or "")
+    try:
+        record_kind = classify_record(plan)
+    except ValueError:
+        record_kind = None
+    if record_kind == RECORD_KIND_LEDGER_EVENT:
+        trading_collections["portfolio_trade_plans"].update_one(
+            {"plan_id": plan_id, "user_id": user_id, "status": "executed_live"},
+            {
+                "$set": {
+                    "status": "filled",
+                    "record_kind": RECORD_KIND_LEDGER_EVENT,
+                    "plan_type": "manual",
+                    "origin": "manual",
+                    "manual_action": plan.get("manual_action") or "external_manual",
+                },
+                "$unset": {"live_executed_at": ""},
+            },
+        )
+        plan["status"] = "filled"
+        plan["record_kind"] = RECORD_KIND_LEDGER_EVENT
+        plan["plan_type"] = "manual"
+        plan["origin"] = "manual"
+        plan["manual_action"] = plan.get("manual_action") or "external_manual"
+        plan.pop("live_executed_at", None)
+        return True
     trading_collections["portfolio_trade_plans"].update_one(
         {"plan_id": plan_id, "user_id": user_id, "status": "executed_live"},
         {"$set": {"status": "approved"}, "$unset": {"live_executed_at": ""}},
@@ -1819,6 +1844,56 @@ def _account_position_qty(pos: Dict[str, Any]) -> int:
     return 0
 
 
+def _account_available_qty(pos: Dict[str, Any]) -> int:
+    for field in ("can_use_volume", "available_qty", "available_shares", "available_volume"):
+        if pos.get(field) is not None:
+            return _int_value(pos.get(field))
+    return _account_position_qty(pos)
+
+
+def _account_positions_by_symbol(
+    finance_collections: Dict[str, Any],
+    *,
+    user_id: str,
+    securities_account_id: str,
+) -> Tuple[Dict[str, Dict[str, int]], bool]:
+    """Return broker-synced current/available shares by normalized symbol key.
+
+    The boolean says whether the account has any synced position rows at all.
+    When true, a missing symbol should be treated as zero for sell protection.
+    When false, the account has not synced yet, so callers should avoid forcing
+    zero and fall back to the system ledger.
+    """
+    rows = list(
+        finance_collections["trader_positions"].find(
+            {"user_id": user_id, "securities_account_id": securities_account_id},
+            {
+                "_id": 0,
+                "symbol": 1,
+                "qty": 1,
+                "quantity": 1,
+                "volume": 1,
+                "shares": 1,
+                "current_volume": 1,
+                "total_volume": 1,
+                "can_use_volume": 1,
+                "available_qty": 1,
+                "available_shares": 1,
+                "available_volume": 1,
+            },
+        )
+    )
+    positions: Dict[str, Dict[str, int]] = {}
+    for row in rows:
+        key = _symbol_key(row.get("symbol"))
+        if not key:
+            continue
+        bucket = positions.setdefault(key, {"current": 0, "available": 0})
+        bucket["current"] += max(0, _account_position_qty(row))
+        bucket["available"] += max(0, _account_available_qty(row))
+    return positions, bool(rows)
+
+
 def _reconcile_live_holdings(
     trading_collections: Dict[str, Any],
     finance_collections: Dict[str, Any],
@@ -1970,6 +2045,12 @@ async def live_rebalance_portfolio(
     current_by_key: Dict[str, Dict[str, Any]] = {}
     for row in holdings:
         current_by_key[_symbol_key(row.get("symbol"))] = row
+    securities_account_id = str(account.get("_id") or request.securities_account_id)
+    account_positions_by_key, account_positions_synced = _account_positions_by_symbol(
+        finance_collections,
+        user_id=user_id,
+        securities_account_id=securities_account_id,
+    )
 
     # Resolve a price for every symbol we may trade (held + newly-added targets).
     target_symbols = {str(s) for s in request.targets.keys() if s}
@@ -1990,10 +2071,29 @@ async def live_rebalance_portfolio(
     estimated_sell = 0.0
     rank = 0
     for symbol in sorted(target_symbols):
-        held = current_by_key.get(_symbol_key(symbol)) or {}
+        symbol_key = _symbol_key(symbol)
+        held = current_by_key.get(symbol_key) or {}
         current_shares = _int_value(held.get("shares"))
         target_shares, blockers = _normalize_live_target_shares(current_shares, request.targets[symbol], lot_size)
         delta = target_shares - current_shares
+        account_pos = account_positions_by_key.get(symbol_key) or {"current": 0, "available": 0}
+        account_current_shares = account_pos["current"] if account_positions_synced else None
+        account_available_shares = account_pos["available"] if account_positions_synced else None
+        if delta < 0 and account_positions_synced:
+            if account_current_shares <= 0 or account_available_shares <= 0:
+                # The broker account has synced and says this symbol is not
+                # sellable. The lineage ledger may be stale after external
+                # clean-up, so never generate a sell for shares the account
+                # does not currently hold.
+                continue
+            sell_qty = abs(delta)
+            capped_sell_qty = min(sell_qty, account_available_shares)
+            if capped_sell_qty <= 0:
+                continue
+            if capped_sell_qty < sell_qty:
+                delta = -capped_sell_qty
+                target_shares = current_shares + delta
+                blockers.append("account_position_capped")
         if delta == 0:
             continue
         rank += 1
@@ -2030,6 +2130,8 @@ async def live_rebalance_portfolio(
                 "target_shares": target_shares,
                 "delta_shares": delta,
                 "drift_delta_shares": delta,
+                "account_current_shares": account_current_shares,
+                "account_available_shares": account_available_shares,
                 "estimated_price": price,
                 "estimated_amount": abs(delta) * float(price or 0) if price else None,
                 "blockers": item_blockers,
@@ -4183,13 +4285,16 @@ def _resilient_record_kind(row: Dict[str, Any]) -> Optional[str]:
     unstamped plan can't 500 the whole portfolios list — strict per-plan reads
     (detail / timeline) still fail loud to surface the missing stamp.
     """
+    try:
+        classified = classify_record(row)
+    except ValueError:
+        classified = None
+    if classified == RECORD_KIND_LEDGER_EVENT:
+        return RECORD_KIND_LEDGER_EVENT
     kind = row.get("record_kind")
     if kind in VALID_RECORD_KINDS:
         return kind
-    try:
-        return classify_record(row)
-    except ValueError:
-        return None
+    return classified
 
 
 def _build_portfolio_entry(
