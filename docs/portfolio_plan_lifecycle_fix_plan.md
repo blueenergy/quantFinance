@@ -110,10 +110,14 @@
     用 `require_record_kind` 缺失即报错。
   - 行为修正：手动 rebalance（trade_plan）不再被当成 ledger 记录——时间轴节点
     从 `manual` 变为 `rebalance`，且可作为 cadence/drift 基准。
-- [~] **5B API 契约收敛 + 前端去重判断**
-  - [x] 谱系接口每个 timeline 节点与 `operation_plan` 显式带 `record_kind`。
-  - [ ] 前端删除基于 `_extman_` / `origin` / `plan_type` 的自行推断，
-    UI 明确区分「调仓计划 / 监控快照 / 账本记录」。
+- [x] **5B API 契约收敛 + 前端去重判断**
+  - [x] 谱系接口每个 timeline 节点与 `operation_plan` 显式带 `record_kind`；
+    plan 列表 / 详情接口经 `PLAN_LIST_PROJECTION` / 全文档返回 `record_kind`。
+  - [x] `PortfolioPlans.vue` 的 `planCadenceBadge` / monitor 过滤 / 上期 rebalance
+    定位 / 详情观察日文案改读 `record_kind`，删除基于 `origin` / `plan_type` 的种类推断；
+    `origin` 仅保留作 trade_plan 内「手动 vs 周期」的来源细分。
+  - 总览页时间轴沿用后端 `node_type`（已由 `record_kind` 派生），标签区分
+    调仓 / 补录 / 观察。
 - [ ] **5D 物理拆表（长期）**
   - 语义稳定后按 `observation` → `ledger_event` 顺序拆出独立 collection；
     `trade_plan` 留主表。物理迁移只迁近 N 个月活跃谱系，冷数据归档。
