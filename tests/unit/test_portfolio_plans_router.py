@@ -37,6 +37,11 @@ class _Cursor(list):
         return _Cursor(list(self)[:n])
 
 
+class _UpdateResult:
+    def __init__(self, modified_count=0):
+        self.modified_count = modified_count
+
+
 class _Collection:
     def __init__(self, docs=None):
         self.docs = list(docs or [])
@@ -62,12 +67,14 @@ class _Collection:
                 doc.update(update.get("$set", {}))
                 for key in update.get("$unset", {}):
                     doc.pop(key, None)
-                return
+                return _UpdateResult(1)
         if upsert:
             new_doc = dict(query)
             new_doc.update(update.get("$setOnInsert", {}))
             new_doc.update(update.get("$set", {}))
             self.docs.append(new_doc)
+            return _UpdateResult(1)
+        return _UpdateResult(0)
 
     def replace_one(self, query, new_doc, upsert=False):
         for idx, doc in enumerate(self.docs):
@@ -343,6 +350,62 @@ def test_review_plan_writes_user_id(monkeypatch):
     assert response["success"] is True
     assert collections["portfolio_plan_reviews"].docs[0]["user_id"] == "user-1"
     assert collections["portfolio_trade_plans"].find_one({"plan_id": "plan-user-1"})["status"] == "approved"
+
+
+def test_reject_approved_plan_cancels_unfilled_live_signals(monkeypatch):
+    collections = _collections()
+    finance_collections = _finance_collections()
+    collections["portfolio_trade_plans"].docs[0]["status"] = "approved"
+    finance_collections["trade_signals"].insert_one(
+        {
+            "order_id": "order-1",
+            "plan_id": "plan-user-1",
+            "user_id": "user-1",
+            "mode": "live",
+            "status": "submitted",
+        }
+    )
+    monkeypatch.setattr(portfolio_plans, "get_trading_db_collections", lambda: collections)
+    monkeypatch.setattr(portfolio_plans, "get_db_collections", lambda: finance_collections)
+
+    response = portfolio_plans._review_plan("plan-user-1", "rejected", "bad idea", {"id": "user-1", "username": "alice"})
+
+    assert response["success"] is True
+    assert collections["portfolio_trade_plans"].find_one({"plan_id": "plan-user-1"})["status"] == "rejected"
+    assert collections["portfolio_plan_reviews"].docs[0]["decision"] == "rejected"
+    signal = finance_collections["trade_signals"].find_one({"order_id": "order-1"})
+    assert signal["status"] == "cancelled"
+    assert signal["cancel_reason"] == "bad idea"
+    log = collections["portfolio_plan_operation_logs"].docs[0]
+    assert log["operation_type"] == "reject_plan"
+    assert log["payload"]["previous_status"] == "approved"
+    assert log["payload"]["cancelled_signal_count"] == 1
+
+
+def test_reject_approved_plan_rejects_live_fills(monkeypatch):
+    collections = _collections()
+    finance_collections = _finance_collections()
+    collections["portfolio_trade_plans"].docs[0]["status"] = "approved"
+    finance_collections["trade_signals"].insert_one(
+        {
+            "order_id": "order-1",
+            "plan_id": "plan-user-1",
+            "user_id": "user-1",
+            "mode": "live",
+            "status": "partial_filled",
+            "filled_qty": 100,
+        }
+    )
+    monkeypatch.setattr(portfolio_plans, "get_trading_db_collections", lambda: collections)
+    monkeypatch.setattr(portfolio_plans, "get_db_collections", lambda: finance_collections)
+
+    with pytest.raises(portfolio_plans.HTTPException) as exc:
+        portfolio_plans._review_plan("plan-user-1", "rejected", "too late", {"id": "user-1", "username": "alice"})
+
+    assert exc.value.status_code == 409
+    assert "live fills" in exc.value.detail
+    assert collections["portfolio_trade_plans"].find_one({"plan_id": "plan-user-1"})["status"] == "approved"
+    assert not collections["portfolio_plan_reviews"].docs
 
 
 def test_cancel_plan_cancels_unfilled_live_signals(monkeypatch):

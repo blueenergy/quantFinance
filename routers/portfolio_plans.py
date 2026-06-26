@@ -3264,41 +3264,16 @@ async def cancel_portfolio_plan(plan_id: str, request: ReviewRequest, current_us
     return _cancel_plan(plan_id, request.comment, current_user)
 
 
-def _review_plan(plan_id: str, decision: str, comment: str, current_user: Dict[str, Any]):
-    collections = get_trading_db_collections()
-    plan = _require_plan(collections, plan_id, current_user)
-    if plan.get("status") not in {"needs_review", "approved", "rejected"}:
-        raise HTTPException(status_code=400, detail=f"plan is not reviewable in status {plan.get('status')}")
-    now = datetime.utcnow()
-    user_id = _current_user_id(current_user)
-    review = {
-        "plan_id": plan_id,
-        "strategy_template_id": plan.get("strategy_template_id"),
-        "user_id": user_id,
-        "decision": decision,
-        "reviewer": _reviewer(current_user),
-        "comment": comment,
-        "created_at": now,
-    }
-    collections["portfolio_plan_reviews"].insert_one(review)
-    collections["portfolio_trade_plans"].update_one(
-        {"plan_id": plan_id, "user_id": user_id},
-        {"$set": {"status": decision, "reviewer": review["reviewer"], "reviewed_at": now}},
-    )
-    return {"success": True, "data": _jsonable(review)}
-
-
-def _cancel_plan(plan_id: str, comment: str, current_user: Dict[str, Any]):
-    trading_collections = get_trading_db_collections()
-    finance_collections = get_db_collections()
-    plan = _require_plan(trading_collections, plan_id, current_user)
-    user_id = _current_user_id(current_user)
-    status = str(plan.get("status") or "")
-    if status not in ACTIVE_PLAN_STATUSES:
-        raise HTTPException(status_code=400, detail=f"plan is not cancellable in status {status}")
-    if plan.get("paper_executed_at") or trading_collections["portfolio_paper_executions"].find_one({"plan_id": plan_id, "user_id": user_id}):
-        raise HTTPException(status_code=409, detail="plan already has paper executions; cannot cancel")
-
+def _cancel_open_live_signals_or_block(
+    finance_collections: Dict[str, Any],
+    *,
+    plan_id: str,
+    user_id: str,
+    reviewer: str,
+    reason: str,
+    now: datetime,
+    conflict_action: str,
+) -> int:
     signal_query = {"plan_id": plan_id, "user_id": user_id, "mode": "live"}
     signals = list(finance_collections["trade_signals"].find(signal_query))
     order_ids = [row.get("order_id") for row in signals if row.get("order_id")]
@@ -3308,11 +3283,8 @@ def _cancel_plan(plan_id: str, comment: str, current_user: Dict[str, Any]):
         else []
     )
     if any(_signal_filled_qty(row) > 0 for row in signals) or any(_execution_fill_quantity(row) > 0 for row in executions):
-        raise HTTPException(status_code=409, detail="plan already has live fills; cannot cancel")
+        raise HTTPException(status_code=409, detail=f"plan already has live fills; cannot {conflict_action}")
 
-    now = datetime.utcnow()
-    reviewer = _reviewer(current_user)
-    reason = comment or "plan cancelled by user"
     cancelled_signal_count = 0
     terminal_signal_statuses = TERMINAL_SIGNAL_STATUSES | {"cancelled", "canceled"}
     for signal in signals:
@@ -3332,6 +3304,83 @@ def _cancel_plan(plan_id: str, comment: str, current_user: Dict[str, Any]):
             },
         )
         cancelled_signal_count += int(getattr(result, "modified_count", 0) or 0)
+    return cancelled_signal_count
+
+
+def _review_plan(plan_id: str, decision: str, comment: str, current_user: Dict[str, Any]):
+    collections = get_trading_db_collections()
+    plan = _require_plan(collections, plan_id, current_user)
+    status = str(plan.get("status") or "")
+    if status not in {"needs_review", "approved", "rejected"}:
+        raise HTTPException(status_code=400, detail=f"plan is not reviewable in status {status}")
+    now = datetime.utcnow()
+    user_id = _current_user_id(current_user)
+    reviewer = _reviewer(current_user)
+    cancelled_signal_count = 0
+    if decision == "rejected" and status == "approved":
+        if plan.get("paper_executed_at") or collections["portfolio_paper_executions"].find_one({"plan_id": plan_id, "user_id": user_id}):
+            raise HTTPException(status_code=409, detail="plan already has paper executions; cannot reject")
+        cancelled_signal_count = _cancel_open_live_signals_or_block(
+            get_db_collections(),
+            plan_id=plan_id,
+            user_id=user_id,
+            reviewer=reviewer,
+            reason=comment or "plan rejected by reviewer",
+            now=now,
+            conflict_action="reject",
+        )
+    review = {
+        "plan_id": plan_id,
+        "strategy_template_id": plan.get("strategy_template_id"),
+        "user_id": user_id,
+        "decision": decision,
+        "reviewer": reviewer,
+        "comment": comment,
+        "created_at": now,
+    }
+    if cancelled_signal_count:
+        review["cancelled_signal_count"] = cancelled_signal_count
+    collections["portfolio_plan_reviews"].insert_one(review)
+    collections["portfolio_trade_plans"].update_one(
+        {"plan_id": plan_id, "user_id": user_id},
+        {"$set": {"status": decision, "reviewer": review["reviewer"], "reviewed_at": now}},
+    )
+    if decision == "rejected":
+        _append_plan_operation_log(
+            collections,
+            plan_id=plan_id,
+            user_id=user_id,
+            operation_type="reject_plan",
+            status="success",
+            message=comment or "plan rejected by reviewer",
+            payload={"previous_status": status, "cancelled_signal_count": cancelled_signal_count},
+        )
+    return {"success": True, "data": _jsonable(review)}
+
+
+def _cancel_plan(plan_id: str, comment: str, current_user: Dict[str, Any]):
+    trading_collections = get_trading_db_collections()
+    finance_collections = get_db_collections()
+    plan = _require_plan(trading_collections, plan_id, current_user)
+    user_id = _current_user_id(current_user)
+    status = str(plan.get("status") or "")
+    if status not in ACTIVE_PLAN_STATUSES:
+        raise HTTPException(status_code=400, detail=f"plan is not cancellable in status {status}")
+    if plan.get("paper_executed_at") or trading_collections["portfolio_paper_executions"].find_one({"plan_id": plan_id, "user_id": user_id}):
+        raise HTTPException(status_code=409, detail="plan already has paper executions; cannot cancel")
+
+    now = datetime.utcnow()
+    reviewer = _reviewer(current_user)
+    reason = comment or "plan cancelled by user"
+    cancelled_signal_count = _cancel_open_live_signals_or_block(
+        finance_collections,
+        plan_id=plan_id,
+        user_id=user_id,
+        reviewer=reviewer,
+        reason=reason,
+        now=now,
+        conflict_action="cancel",
+    )
 
     review = {
         "plan_id": plan_id,

@@ -21,10 +21,10 @@
 目标：任何让计划「退出活跃状态」的路径，都必须妥善处理已发布的实盘订单，
 不得让券商挂单与系统状态脱节，也不得让 paper / live 双轨执行同一计划。
 
-- [ ] **1.1 抽取共享清理逻辑**
+- [x] **1.1 抽取共享清理逻辑**
   - 把 `_cancel_plan`（router L3291+）中「取消未成交 live 信号 / 拦截已成交 fills」
     的逻辑抽成共享辅助函数，例如 `_settle_open_live_signals_or_block(plan)`。
-- [ ] **1.2 reject 复用清理逻辑**
+- [x] **1.2 reject 复用清理逻辑**
   - `_review_plan`（router L3284）`approved → rejected` 前：
     有未成交信号则取消；已有成交（live fills）则拒绝转换并返回 409。
   - 注意：此时**不要**提示「改用 cancel」——`_cancel_plan` 在有 fills 时同样
