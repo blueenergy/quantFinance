@@ -726,8 +726,38 @@ def test_plan_execution_context_derives_phase_and_stamps_sell_settled():
 
     assert ctx["execution_mode"] == "live"
     assert ctx["execution_phase_state"] == "sell_settled"
+    assert ctx["signal_count"] == 2
+    assert ctx["active_signal_count"] == 1
+    assert ctx["status_summary"] == {"filled": 1, "pending": 1}
     plan_doc = trading["portfolio_trade_plans"].find_one({"plan_id": "plan-user-1"})
     assert plan_doc.get("sell_settled_at") is not None
+
+
+def test_plan_execution_context_distinguishes_terminal_live_history():
+    finance = _finance_collections()
+    finance["trade_signals"] = _Collection(
+        [
+            {"plan_id": "plan-user-1", "user_id": "user-1", "mode": "live", "execution_phase": "sell", "status": "cancelled"},
+            {"plan_id": "plan-user-1", "user_id": "user-1", "mode": "live", "execution_phase": "buy", "status": "failed"},
+        ]
+    )
+    trading = {
+        "portfolio_paper_executions": _Collection(),
+        "portfolio_trade_plans": _Collection([{"plan_id": "plan-user-1", "user_id": "user-1"}]),
+    }
+    import routers.portfolio_plans as pp
+
+    orig = pp.get_trading_db_collections
+    pp.get_trading_db_collections = lambda: trading
+    try:
+        ctx = pp._plan_execution_context(finance, {"plan_id": "plan-user-1"}, "user-1")
+    finally:
+        pp.get_trading_db_collections = orig
+
+    assert ctx["execution_mode"] == "live"
+    assert ctx["signal_count"] == 2
+    assert ctx["active_signal_count"] == 0
+    assert ctx["status_summary"] == {"cancelled": 1, "failed": 1}
 
 
 def test_plan_execution_context_selling_does_not_stamp_sell_settled():
@@ -902,6 +932,42 @@ def test_publish_live_signals_rounds_protected_prices_to_tick(monkeypatch):
     assert buy_signal["effective_limit_price"] == 10.11
     assert sell_signal["price_floor"] == 9.9
     assert sell_signal["effective_limit_price"] == 9.9
+
+
+def test_publish_live_signals_rejects_empty_signal_set(monkeypatch):
+    collections = _collections()
+    collections["portfolio_trade_plans"].docs[0]["status"] = "approved"
+    collections["portfolio_trade_plan_items"].docs.append(
+        {
+            "plan_id": "plan-user-1",
+            "user_id": "user-1",
+            "symbol": "000001",
+            "action": "hold",
+            "delta_shares": 0,
+            "target_shares": 100,
+            "estimated_price": 10.0,
+            "rank": 1,
+        }
+    )
+    finance = _finance_collections()
+    monkeypatch.setattr(portfolio_plans, "get_trading_db_collections", lambda: collections)
+    monkeypatch.setattr(portfolio_plans, "get_db_collections", lambda: finance)
+    monkeypatch.setattr(portfolio_plans, "get_data_db", _data_collections)
+
+    with pytest.raises(portfolio_plans.HTTPException) as exc:
+        asyncio.run(
+            portfolio_plans.publish_portfolio_plan_live_signals(
+                "plan-user-1",
+                portfolio_plans.PublishLiveSignalsRequest(securities_account_id="acct-1", dry_run=False),
+                current_user={"id": "user-1"},
+            )
+        )
+
+    assert exc.value.status_code == 409
+    assert exc.value.detail["message"] == "no live signals could be built"
+    assert not finance["trade_signals"].docs
+    plan = collections["portfolio_trade_plans"].find_one({"plan_id": "plan-user-1"})
+    assert not plan.get("live_signals_published_at")
 
 
 def test_publish_live_signals_blocks_after_paper_execution(monkeypatch):

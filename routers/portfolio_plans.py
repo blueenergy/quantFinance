@@ -1170,12 +1170,18 @@ def _plan_execution_context(finance_collections: Dict[str, Any], plan: Dict[str,
     )
     signal_count = len(live_signals)
     if signal_count > 0:
+        status_summary = summarize_signal_statuses(live_signals)
+        active_signal_count = sum(
+            1 for signal in live_signals if str(signal.get("status") or "").lower() in ACTIVE_SIGNAL_STATUSES
+        )
         phase_state = derive_execution_phase_state(live_signals)
         _stamp_sell_settled_at(trading_collections, plan, user_id, phase_state)
         return {
             "execution_mode": "live",
             "has_live_signals": True,
             "signal_count": signal_count,
+            "active_signal_count": active_signal_count,
+            "status_summary": status_summary,
             "has_paper_conflict": has_paper_state,
             "execution_phase_state": phase_state,
         }
@@ -1184,12 +1190,16 @@ def _plan_execution_context(finance_collections: Dict[str, Any], plan: Dict[str,
             "execution_mode": "paper",
             "has_live_signals": False,
             "signal_count": 0,
+            "active_signal_count": 0,
+            "status_summary": {},
             "has_paper_conflict": False,
         }
     return {
         "execution_mode": "not_executed",
         "has_live_signals": False,
         "signal_count": 0,
+        "active_signal_count": 0,
+        "status_summary": {},
         "has_paper_conflict": False,
     }
 
@@ -4889,6 +4899,12 @@ async def publish_portfolio_plan_live_signals(
             continue
         if signal is not None:
             signals.append(signal.to_mongo())
+
+    if not signals:
+        raise HTTPException(
+            status_code=409,
+            detail={"message": "no live signals could be built", "skipped_items": skipped_items},
+        )
 
     order_ids = [signal["order_id"] for signal in signals]
     existing_signals = list(
