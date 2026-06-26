@@ -64,6 +64,60 @@
 
 ---
 
+## 阶段 5 — 数据模型语义治理（P0，优先于阶段 2）
+
+> 根因：`portfolio_trade_plans` 混装三种语义实体，"种类"靠散落字段
+> （`origin` / `plan_type` / `is_rebalance_day` / `manual_action` / `_extman_` 后缀）
+> 在读取时现算，router / worker / 前端各算一遍。先确立权威类型字段，再谈拆分。
+
+原则：
+- `record_kind` 是唯一权威类型字段，写入盖章、读取只读不算。
+- `origin`（strategy / manual）与 `record_kind` 正交：手动 rebalance 仍是 `trade_plan`。
+- 状态机只作用于 `record_kind == trade_plan`。
+- 先把现有数据洗成标准格式，代码只认标准格式、违规即报错（不长在脏数据上）。
+
+记录分类（已对两个环境共 50 条实测验证，判定按顺序）：
+
+```
+1. manual_action in {external_manual, external_liquidation} -> ledger_event
+2. plan_type == "monitor"                                   -> observation
+3. plan_type == "rebalance"                                 -> trade_plan
+4. 其它                                                      -> 报错/人工核对（实测 0 条）
+```
+
+实测脏点：`origin` 在多数老记录缺失（env1 14/20、env2 22/30）；env1 有 3 条遗留
+`external_manual` 的 `plan_type=rebalance`（现行代码写 `manual`）；`record_kind` 全为空。
+
+- [x] **5A.1 共享分类模块**
+  - `quantFinance/services/portfolio_record_kind.py`：`RECORD_KIND_*` 常量、
+    `LEDGER_MANUAL_ACTIONS`、纯函数 `classify_record`（未知形态抛错）、
+    读路径用 `require_record_kind`（缺失/非法即报错，不 fallback）。
+- [x] **5A.2 写入端盖章**（5 处）
+  - router：`live_rebalance` / `paper_rebalance` → `trade_plan`；
+    `record_external_manual_record` → `ledger_event`。
+  - worker（`portfolio_trading.py`，独立仓，镜像常量）：`generate_trade_plan`
+    按 `plan_type` 盖 `observation` / `trade_plan`；手动 replan → `trade_plan`。
+- [x] **5A.3 一次性规范化迁移脚本**
+  - `quantFinance/migrations/m20260626_portfolio_record_kind.py`：dry-run 默认、
+    `--apply` 前自动备份到 `*_backup_record_kind_<stamp>`；盖 `record_kind`、
+    回填缺失 `origin=strategy`、修正遗留 `external_manual` 的 `plan_type→manual`；
+    幂等、打印目标分布与变更计数；不可分类记录报告并中止。
+- [ ] **5A.4 读路径切到 record_kind（fail-loud）**
+  - `_build_lineage_timeline_payload`（router L4435-4488）`node_type` / `cadence_plan`
+    / `is_strategy_rebalance` 改读 `record_kind`，删除基于 `origin` / `_extman_` 的推断；
+    缺失即报错。需在迁移 `--apply` 后执行。
+- [ ] **5B API 契约收敛 + 前端去重判断**
+  - 谱系接口每个节点显式带 `record_kind`；前端删除基于 `_extman_` / `origin` /
+    `plan_type` 的自行推断，UI 明确区分「调仓计划 / 监控快照 / 账本记录」。
+- [ ] **5D 物理拆表（长期）**
+  - 语义稳定后按 `observation` → `ledger_event` 顺序拆出独立 collection；
+    `trade_plan` 留主表。物理迁移只迁近 N 个月活跃谱系，冷数据归档。
+
+> 阶段 2 的终态定义（`executed_live` / `expired` / `filled`）应在 5A 之后进行，
+> 且只对 `record_kind == trade_plan` 应用状态机。
+
+---
+
 ## 阶段 2 — 状态机终态与死角（P1）
 
 - [ ] **2.1 定义实盘终态**
@@ -121,8 +175,9 @@
 ## 建议执行顺序
 
 1. ~~前端提交~~（已完成 `quantFinance-dashboard@60db7ae`）
-2. 阶段 1（最独立的 1.1 + 1.2 先做，必须配测试）
-3. 阶段 2 → 阶段 4 → 阶段 3
+2. ~~阶段 1~~（资金安全 / 账本一致性，已完成）
+3. 阶段 5（数据模型语义治理，当前最高优先：5A.1-5A.3 已实现，待 `--apply` 后做 5A.4 / 5B）
+4. 阶段 2 → 阶段 4 → 阶段 3
 
 ## 已完成 / 设计合理（对照参考）
 

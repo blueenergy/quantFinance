@@ -2179,6 +2179,8 @@ def test_lineage_timeline_monitor_drift_and_action_required(monkeypatch):
     monitor_data = monitor_resp["data"]
     assert monitor_data["action_required"] is True
     assert monitor_data["today_state"] == "调仓日：等待审核"
+    assert monitor_data["operation_plan"]["plan_id"] == "reb-2"
+    assert monitor_data["operation_plan"]["status"] == "needs_review"
     drift = monitor_data["latest_drift_summary"]
     assert drift["plan_id"] == "reb-2"
     assert drift["buy_count"] == 1
@@ -2201,6 +2203,7 @@ def test_lineage_timeline_monitor_drift_and_action_required(monkeypatch):
     review_data = review_resp["data"]
     assert review_data["action_required"] is True
     assert review_data["today_state"] == "调仓日：等待审核"
+    assert review_data["operation_plan"]["plan_id"] == "reb-2"
     assert len(review_data["timeline"]) == 3
     assert review_data["timeline"][0]["plan_id"] == "reb-2"
     reb2_brief = review_data["timeline"][0]["drift_brief"]
@@ -2323,6 +2326,8 @@ def test_lineage_timeline_manual_record_does_not_mask_pending_rebalance(monkeypa
     # A same-day manual ledger record must not hide a rebalance awaiting review.
     assert payload["action_required"] is True
     assert "手工" not in payload["today_state"]
+    assert payload["operation_plan"]["plan_id"] == "reb-pending"
+    assert payload["operation_plan"]["status"] == "needs_review"
 
 
 def test_lineage_timeline_monitor_can_trade_label(monkeypatch):

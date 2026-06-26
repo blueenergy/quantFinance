@@ -43,6 +43,10 @@ from services.portfolio_lineage_paper import (
     build_lineage_paper_trades,
     merge_lineage_paper_executions,
 )
+from services.portfolio_record_kind import (
+    RECORD_KIND_LEDGER_EVENT,
+    RECORD_KIND_TRADE_PLAN,
+)
 from services.trade_ledger import group_executions_by_order
 from services.portfolio_plan_remainder import (
     LIVE_SIGNAL_SOURCE_PLAN_TOPUP,
@@ -1941,6 +1945,7 @@ async def live_rebalance_portfolio(
         "base_date": base_date,
         "execute_date": base_date,
         "plan_type": "rebalance",
+        "record_kind": RECORD_KIND_TRADE_PLAN,
         "origin": "manual",
         "manual_action": manual_action,
         "is_liquidation": is_liquidation,
@@ -2258,6 +2263,7 @@ async def record_external_manual_record(
         "base_date": base_date,
         "execute_date": base_date,
         "plan_type": "manual",
+        "record_kind": RECORD_KIND_LEDGER_EVENT,
         "origin": "manual",
         # manual_action stays "external_manual" for idempotency/query keying;
         # is_liquidation flags the full-clear case for downstream display.
@@ -2540,6 +2546,7 @@ async def paper_rebalance_portfolio(
         "base_date": base_date,
         "execute_date": base_date,
         "plan_type": "rebalance",
+        "record_kind": RECORD_KIND_TRADE_PLAN,
         "origin": "manual",
         "manual_action": manual_action,
         "is_liquidation": is_liquidation,
@@ -4511,6 +4518,16 @@ def _build_lineage_timeline_payload(
             "latest_plan_id": latest_plan.get("plan_id"),
             "execution_venue": execution_venue,
             "securities_account_id": live_account_id or None,
+        },
+        "operation_plan": {
+            "plan_id": headline_plan.get("plan_id"),
+            "status": headline_plan.get("status"),
+            "base_date": headline_plan.get("base_date"),
+            "plan_type": headline_plan.get("plan_type"),
+            "origin": headline_plan.get("origin"),
+            "manual_action": headline_plan.get("manual_action"),
+            "today_state": _plan_today_state_label(headline_plan),
+            "action_required": _plan_action_required(headline_plan),
         },
         "current_cycle": _compute_current_cycle(
             cadence_plan, latest_rebalance, latest_monitor, data_collections
