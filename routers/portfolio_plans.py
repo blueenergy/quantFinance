@@ -48,6 +48,8 @@ from services.portfolio_record_kind import (
     RECORD_KIND_LEDGER_EVENT,
     RECORD_KIND_OBSERVATION,
     RECORD_KIND_TRADE_PLAN,
+    VALID_RECORD_KINDS,
+    classify_record,
     require_record_kind,
 )
 
@@ -1168,22 +1170,30 @@ def _maybe_stamp_plan_executed_live(
     *,
     active_signal_count: int,
     phase_state: str,
+    has_live_fills: bool,
 ) -> bool:
-    """Close out a live trade_plan once all its live signals reach terminal.
+    """Close out a live trade_plan once it has actually executed.
 
     Computed-then-persisted (same pattern as ``_stamp_sell_settled_at``): a
     published live plan sits at ``approved`` until its signals settle. When all
-    signals are terminal (no active in-flight) and the plan phase is ``done``,
-    flip ``approved -> executed_live`` so it no longer looks like it is awaiting
-    execution. Only applies to ``record_kind == trade_plan``; mixed terminal
-    outcomes (some filled, some cancelled) still count as executed_live — the
-    per-signal breakdown lives in ``live_signal_status_summary``.
+    signals are terminal (no active in-flight), the plan phase is ``done`` and at
+    least one signal actually filled, flip ``approved -> executed_live`` so it no
+    longer looks like it is awaiting execution. Only applies to
+    ``record_kind == trade_plan``; mixed terminal outcomes (some filled, some
+    cancelled) still count as executed_live — the per-signal breakdown lives in
+    ``live_signal_status_summary``.
+
+    The fill requirement is essential: a plan whose live signals were *all*
+    cancelled/rejected/failed (zero fills) never executed, so it must NOT be
+    marked executed_live just because every signal reached a terminal status.
     """
     if plan.get("record_kind") != RECORD_KIND_TRADE_PLAN:
         return False
     if str(plan.get("status") or "") != "approved":
         return False
     if active_signal_count > 0 or phase_state != PLAN_PHASE_DONE:
+        return False
+    if not has_live_fills:
         return False
     now = datetime.utcnow()
     plan_id = str(plan.get("plan_id") or "")
@@ -1193,6 +1203,34 @@ def _maybe_stamp_plan_executed_live(
     )
     plan["status"] = "executed_live"
     plan["live_executed_at"] = now
+    return True
+
+
+def _maybe_revert_unfilled_executed_live(
+    trading_collections: Dict[str, Any],
+    plan: Dict[str, Any],
+    user_id: str,
+    *,
+    has_live_fills: bool,
+) -> bool:
+    """Undo an invalid executed_live stamp when no live fill exists.
+
+    ``executed_live`` must mean "at least one live signal filled". If a legacy
+    bad stamp, manual edit, or transient bug left a plan at executed_live while
+    there are no live signals / no fills, normalize it back to approved on read
+    so the UI never presents an unexecuted plan as completed.
+    """
+    if str(plan.get("status") or "") != "executed_live":
+        return False
+    if has_live_fills:
+        return False
+    plan_id = str(plan.get("plan_id") or "")
+    trading_collections["portfolio_trade_plans"].update_one(
+        {"plan_id": plan_id, "user_id": user_id, "status": "executed_live"},
+        {"$set": {"status": "approved"}, "$unset": {"live_executed_at": ""}},
+    )
+    plan["status"] = "approved"
+    plan.pop("live_executed_at", None)
     return True
 
 
@@ -1214,13 +1252,29 @@ def _plan_execution_context(finance_collections: Dict[str, Any], plan: Dict[str,
         list(
             finance_collections["trade_signals"].find(
                 {"user_id": user_id, "plan_id": plan_id, "mode": "live"},
-                {"_id": 0, "execution_phase": 1, "action": 1, "status": 1, "mode": 1},
+                {
+                    "_id": 0,
+                    "execution_phase": 1,
+                    "action": 1,
+                    "status": 1,
+                    "mode": 1,
+                    "filled_qty": 1,
+                    "filled_size": 1,
+                    "size": 1,
+                },
             )
         )
         if plan_id
         else []
     )
     signal_count = len(live_signals)
+    has_live_fills = any(_signal_filled_qty(signal) > 0 for signal in live_signals)
+    _maybe_revert_unfilled_executed_live(
+        trading_collections,
+        plan,
+        user_id,
+        has_live_fills=has_live_fills,
+    )
     if signal_count > 0:
         status_summary = summarize_signal_statuses(live_signals)
         active_signal_count = sum(
@@ -1234,6 +1288,7 @@ def _plan_execution_context(finance_collections: Dict[str, Any], plan: Dict[str,
             user_id,
             active_signal_count=active_signal_count,
             phase_state=phase_state,
+            has_live_fills=has_live_fills,
         )
         return {
             "execution_mode": "live",
@@ -4118,6 +4173,25 @@ def _latest_lineage_paper_snapshot(
     )
 
 
+def _resilient_record_kind(row: Dict[str, Any]) -> Optional[str]:
+    """Best-effort record_kind for aggregate/list views.
+
+    Prefers the stamped ``record_kind``; if a write path (e.g. a worker still
+    running pre-stamp code) left it unset, derive it from the document shape via
+    ``classify_record``. Returns ``None`` only when the row is genuinely
+    unclassifiable. Unlike ``require_record_kind`` this never raises, so one
+    unstamped plan can't 500 the whole portfolios list — strict per-plan reads
+    (detail / timeline) still fail loud to surface the missing stamp.
+    """
+    kind = row.get("record_kind")
+    if kind in VALID_RECORD_KINDS:
+        return kind
+    try:
+        return classify_record(row)
+    except ValueError:
+        return None
+
+
 def _build_portfolio_entry(
     trading_collections: Dict[str, Any],
     finance_collections: Dict[str, Any],
@@ -4139,6 +4213,8 @@ def _build_portfolio_entry(
                 "strategy_name": 1,
                 "status": 1,
                 "plan_type": 1,
+                "manual_action": 1,
+                "record_kind": 1,
                 "params_snapshot": 1,
             },
         )
@@ -4190,7 +4266,12 @@ def _build_portfolio_entry(
         "rebalance_days": params.get("rebalance_days"),
         "construction_mode": params.get("construction_mode"),
         "initial_capital": params.get("initial_capital"),
-        "plan_count": len(all_lineage),
+        # "期" = executable rebalance cycles only. Observations (daily monitor
+        # snapshots) and ledger events share this collection but are not cycles,
+        # so counting len(all_lineage) wildly inflates the number.
+        "plan_count": sum(
+            1 for row in all_lineage if _resilient_record_kind(row) == RECORD_KIND_TRADE_PLAN
+        ),
         "first_base_date": earliest.get("base_date"),
         "last_base_date": latest.get("base_date"),
         "strategy_name": latest.get("strategy_name") or earliest.get("strategy_name") or "",

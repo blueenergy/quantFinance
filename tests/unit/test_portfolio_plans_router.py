@@ -825,8 +825,8 @@ def test_plan_execution_context_stamps_executed_live_when_done():
     finance = _finance_collections()
     finance["trade_signals"] = _Collection(
         [
-            {"plan_id": "plan-user-1", "user_id": "user-1", "mode": "live", "execution_phase": "sell", "status": "filled"},
-            {"plan_id": "plan-user-1", "user_id": "user-1", "mode": "live", "execution_phase": "buy", "status": "filled"},
+            {"plan_id": "plan-user-1", "user_id": "user-1", "mode": "live", "execution_phase": "sell", "status": "filled", "filled_qty": 100},
+            {"plan_id": "plan-user-1", "user_id": "user-1", "mode": "live", "execution_phase": "buy", "status": "filled", "filled_qty": 200},
         ]
     )
     plan = {"plan_id": "plan-user-1", "user_id": "user-1", "record_kind": "trade_plan", "status": "approved"}
@@ -855,12 +855,51 @@ def test_plan_execution_context_keeps_approved_while_signals_active():
     assert trading["portfolio_trade_plans"].find_one({"plan_id": "plan-user-1"})["status"] == "approved"
 
 
+def test_plan_execution_context_does_not_stamp_executed_live_without_fills():
+    # All live signals terminal but zero fills (cancelled/rejected) -> the plan
+    # never executed, so it must stay approved, not flip to executed_live.
+    finance = _finance_collections()
+    finance["trade_signals"] = _Collection(
+        [
+            {"plan_id": "plan-user-1", "user_id": "user-1", "mode": "live", "execution_phase": "sell", "status": "cancelled"},
+            {"plan_id": "plan-user-1", "user_id": "user-1", "mode": "live", "execution_phase": "buy", "status": "rejected"},
+        ]
+    )
+    plan = {"plan_id": "plan-user-1", "user_id": "user-1", "record_kind": "trade_plan", "status": "approved"}
+    ctx, trading = _run_execution_context(finance, plan)
+
+    assert ctx["execution_phase_state"] == "done"
+    assert ctx["active_signal_count"] == 0
+    assert plan["status"] == "approved"
+    assert trading["portfolio_trade_plans"].find_one({"plan_id": "plan-user-1"})["status"] == "approved"
+
+
+def test_plan_execution_context_reverts_executed_live_without_signals():
+    finance = _finance_collections()
+    finance["trade_signals"] = _Collection()
+    plan = {
+        "plan_id": "plan-user-1",
+        "user_id": "user-1",
+        "record_kind": "trade_plan",
+        "status": "executed_live",
+        "live_executed_at": "2026-06-26T00:00:00",
+    }
+    ctx, trading = _run_execution_context(finance, plan)
+
+    assert ctx["execution_mode"] == "not_executed"
+    assert plan["status"] == "approved"
+    assert "live_executed_at" not in plan
+    plan_doc = trading["portfolio_trade_plans"].find_one({"plan_id": "plan-user-1"})
+    assert plan_doc["status"] == "approved"
+    assert "live_executed_at" not in plan_doc
+
+
 def test_plan_execution_context_does_not_stamp_executed_live_for_observation():
     finance = _finance_collections()
     finance["trade_signals"] = _Collection(
         [
-            {"plan_id": "plan-user-1", "user_id": "user-1", "mode": "live", "execution_phase": "sell", "status": "filled"},
-            {"plan_id": "plan-user-1", "user_id": "user-1", "mode": "live", "execution_phase": "buy", "status": "filled"},
+            {"plan_id": "plan-user-1", "user_id": "user-1", "mode": "live", "execution_phase": "sell", "status": "filled", "filled_qty": 100},
+            {"plan_id": "plan-user-1", "user_id": "user-1", "mode": "live", "execution_phase": "buy", "status": "filled", "filled_qty": 200},
         ]
     )
     plan = {"plan_id": "plan-user-1", "user_id": "user-1", "record_kind": "observation", "status": "approved"}
@@ -1799,15 +1838,45 @@ def _patch_lineage_live_env(monkeypatch, cols, fin, data):
     monkeypatch.setattr(portfolio_plans, "_attach_signal_names", lambda _dc, sigs: sigs)
 
 
+def test_resilient_record_kind_prefers_stamp_then_derives_then_none():
+    # Stamped value wins.
+    assert portfolio_plans._resilient_record_kind({"record_kind": "observation", "plan_type": "rebalance"}) == "observation"
+    # Missing stamp (e.g. a worker still on pre-stamp code) -> derive from shape.
+    assert portfolio_plans._resilient_record_kind({"plan_type": "rebalance"}) == "trade_plan"
+    assert portfolio_plans._resilient_record_kind({"plan_type": "monitor"}) == "observation"
+    assert portfolio_plans._resilient_record_kind({"manual_action": "external_manual", "plan_type": "rebalance"}) == "ledger_event"
+    # Genuinely unclassifiable -> None (never raises, so the list view survives).
+    assert portfolio_plans._resilient_record_kind({"plan_id": "x"}) is None
+
+
+def test_list_portfolios_survives_unstamped_plan(monkeypatch):
+    # A freshly generated plan that missed record_kind stamping must NOT 500 the
+    # whole portfolios list; it is counted via derivation instead.
+    cols = _collections()
+    fin = _finance_collections()
+    data = _data_collections()
+    cols["portfolio_trade_plans"] = _Collection(
+        [
+            {"plan_id": "stamped", "strategy_template_id": "stx", "user_id": "user-1", "base_date": "20250101", "status": "executed_paper", "params_hash": "hx", "plan_type": "rebalance", "record_kind": "trade_plan"},
+            {"plan_id": "unstamped", "strategy_template_id": "stx", "user_id": "user-1", "base_date": "20250125", "status": "executed_paper", "params_hash": "hx", "plan_type": "rebalance"},
+        ]
+    )
+    _patch_lineage_live_env(monkeypatch, cols, fin, data)
+    resp = asyncio.run(portfolio_plans.list_portfolios(current_user={"id": "user-1"}))
+    ports = resp["data"]["portfolios"]
+    assert len(ports) == 1
+    assert ports[0]["plan_count"] == 2
+
+
 def test_list_live_portfolios_finds_lineage_with_live_signals(monkeypatch):
     cols = _collections()
     fin = _finance_collections()
     data = _data_collections()
     cols["portfolio_trade_plans"] = _Collection(
         [
-            {"plan_id": "pla", "strategy_template_id": "stx", "user_id": "user-1", "base_date": "20250101", "status": "approved", "params_hash": "hx", "strategy_name": "L1"},
-            {"plan_id": "plb", "strategy_template_id": "stx", "user_id": "user-1", "base_date": "20250125", "status": "approved", "params_hash": "hx", "strategy_name": "L1"},
-            {"plan_id": "plz", "strategy_template_id": "sty", "user_id": "user-1", "base_date": "20250110", "status": "approved", "params_hash": "hy", "strategy_name": "NoLive"},
+            {"plan_id": "pla", "strategy_template_id": "stx", "user_id": "user-1", "base_date": "20250101", "status": "approved", "params_hash": "hx", "strategy_name": "L1", "record_kind": "trade_plan"},
+            {"plan_id": "plb", "strategy_template_id": "stx", "user_id": "user-1", "base_date": "20250125", "status": "approved", "params_hash": "hx", "strategy_name": "L1", "record_kind": "trade_plan"},
+            {"plan_id": "plz", "strategy_template_id": "sty", "user_id": "user-1", "base_date": "20250110", "status": "approved", "params_hash": "hy", "strategy_name": "NoLive", "record_kind": "trade_plan"},
         ]
     )
     fin["trade_signals"].docs = [
@@ -1999,6 +2068,7 @@ def test_list_portfolios_includes_live_and_paper_lineages(monkeypatch):
         [
             {
                 "plan_id": "live-a",
+                "record_kind": "trade_plan",
                 "strategy_template_id": "st-live",
                 "user_id": "user-1",
                 "base_date": "20250120",
@@ -2009,6 +2079,7 @@ def test_list_portfolios_includes_live_and_paper_lineages(monkeypatch):
             },
             {
                 "plan_id": "live-b",
+                "record_kind": "trade_plan",
                 "strategy_template_id": "st-live",
                 "user_id": "user-1",
                 "base_date": "20250125",
@@ -2019,6 +2090,7 @@ def test_list_portfolios_includes_live_and_paper_lineages(monkeypatch):
             },
             {
                 "plan_id": "paper-a",
+                "record_kind": "trade_plan",
                 "strategy_template_id": "st-paper",
                 "user_id": "user-1",
                 "base_date": "20250118",
@@ -2029,6 +2101,7 @@ def test_list_portfolios_includes_live_and_paper_lineages(monkeypatch):
             },
             {
                 "plan_id": "paper-b",
+                "record_kind": "trade_plan",
                 "strategy_template_id": "st-paper",
                 "user_id": "user-1",
                 "base_date": "20250122",
@@ -2039,6 +2112,7 @@ def test_list_portfolios_includes_live_and_paper_lineages(monkeypatch):
             },
             {
                 "plan_id": "inactive",
+                "record_kind": "trade_plan",
                 "strategy_template_id": "st-inactive",
                 "user_id": "user-1",
                 "base_date": "20250110",
@@ -2090,6 +2164,7 @@ def test_list_portfolios_treats_unfilled_live_signals_as_live(monkeypatch):
         [
             {
                 "plan_id": "signal-only",
+                "record_kind": "trade_plan",
                 "strategy_template_id": "st-live",
                 "user_id": "user-1",
                 "base_date": "20250120",
@@ -2661,6 +2736,7 @@ def test_list_portfolios_includes_param_summary_and_paper_holdings(monkeypatch):
                 "params_hash": "hx-a",
                 "strategy_name": "ComboA",
                 "plan_type": "rebalance",
+                "record_kind": "trade_plan",
                 "params_snapshot": {
                     "universe_index": "csi1000",
                     "top_n": 20,
@@ -2677,6 +2753,7 @@ def test_list_portfolios_includes_param_summary_and_paper_holdings(monkeypatch):
                 "params_hash": "hx-b",
                 "strategy_name": "ComboB",
                 "plan_type": "monitor",
+                "record_kind": "observation",
                 "params_snapshot": {
                     "universe_index": "csi500",
                     "top_n": 30,

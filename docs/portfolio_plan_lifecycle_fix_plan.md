@@ -102,6 +102,8 @@
     `--apply` 前自动备份到 `*_backup_record_kind_<stamp>`；盖 `record_kind`、
     回填缺失 `origin=strategy`、修正遗留 `external_manual` 的 `plan_type→manual`；
     幂等、打印目标分布与变更计数；不可分类记录报告并中止。
+  - 执行记录：2026-06-26 已在两套环境实际 `--apply` 跑完（迁移前自动备份），
+    `record_kind` 全部落库、无不可分类记录；读路径的 fail-loud 依赖已满足。
 - [x] **5A.4 读路径切到 record_kind（fail-loud）**
   - `_build_lineage_timeline_payload` 的 `cadence_plan`（改为「跳过 ledger_event」）、
     `is_strategy_rebalance`（`record_kind==trade_plan` 且 `origin!=manual`）、
