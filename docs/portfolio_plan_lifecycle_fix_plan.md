@@ -36,11 +36,14 @@
     - `approved → rejected`：按 1.2 处理 live 信号/成交。
     - 已有 paper execution 或 live fills 的计划：禁止 re-review 翻转。
     - `rejected → approved` 是否允许？若允许，需限定「无执行态、无已发布信号」前提。
-- [ ] **1.3 supersede 加保护**
+- [x] **1.3 supersede 加保护**
   - `supersede_stale_active_strategy_plans`（worker L104-146）仅改 status，
     不处理 live 信号（已核验）。被 supersede 的旧计划若已发布实盘信号：
     取消其未成交信号，或跳过该计划并告警。
   - 需确认 worker 侧能否访问 `trade_signals` 集合。
+  - 已实现：`generate_trade_plan` 将 `app_db` 传入 supersede 逻辑；未成交 live signal
+    会被标记 `cancelled` 后再 supersede；已有 live fills 的旧 plan 不会被 supersede，
+    并写入 blocked operation log。
 - [ ] **1.4 cron 纸面执行加 live 检查**
   - `apply_paper_trade_plan` / `apply_approved_paper_plans`（worker）缺少
     `_plan_has_live_signals` 门禁，可能与实盘双轨执行。对齐 API 侧 `_apply_paper_execution`。
