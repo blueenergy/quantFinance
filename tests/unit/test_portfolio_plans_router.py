@@ -1258,6 +1258,71 @@ def test_execute_paper_inherits_lineage_positions(monkeypatch):
     assert collections["portfolio_paper_equity"].find_one({"plan_id": "child-plan"})["inherited_from_plan_id"] == "parent-plan"
 
 
+def test_execute_paper_sells_before_buys_avoids_spurious_partial(monkeypatch):
+    # A rank-1 buy whose only funding is a rank-2 sell must fully fill: processing
+    # sells first credits the cash before the buy is attempted. A naive rank-order
+    # pass would starve the buy and report a spurious partially_executed.
+    collections = _collections()
+    parent = {
+        "plan_id": "parent-plan",
+        "strategy_template_id": "s1",
+        "user_id": "user-1",
+        "params_hash": "hash-1",
+        "base_date": "20250101",
+        "execute_date": "20250102",
+        "status": "executed_paper",
+    }
+    child = {
+        "plan_id": "child-plan",
+        "strategy_template_id": "s1",
+        "user_id": "user-1",
+        "params_hash": "hash-1",
+        "base_date": "20250103",
+        "execute_date": "20250103",
+        "status": "approved",
+        "params_snapshot": {"initial_capital": 1_000_000, "lot_size": 100},
+    }
+    collections["portfolio_trade_plans"].docs.extend([parent, child])
+    collections["portfolio_paper_positions"].docs.append(
+        {
+            "strategy_template_id": "s1",
+            "user_id": "user-1",
+            "params_hash": "hash-1",
+            "as_of_date": "20250102",
+            "plan_id": "parent-plan",
+            "cash": 1_000,  # not enough for the buy on its own
+            "equity": 11_000,
+            "positions": [{"symbol": "000002", "name": "卖出标的", "shares": 1000, "cost_basis": 10.0}],
+        }
+    )
+    collections["portfolio_trade_plan_items"].docs.extend(
+        [
+            {"plan_id": "child-plan", "user_id": "user-1", "symbol": "000001", "name": "买入标的", "rank": 1, "delta_shares": 500},
+            {"plan_id": "child-plan", "user_id": "user-1", "symbol": "000002", "name": "卖出标的", "rank": 2, "delta_shares": -1000},
+        ]
+    )
+    data = _data_collections()
+    data["volume_price"].docs.extend(
+        [
+            {"symbol": "000001", "trade_date": "20250103", "open": 20.0, "close": 20.0},
+            {"symbol": "000002", "trade_date": "20250103", "open": 10.0, "close": 10.0},
+        ]
+    )
+    monkeypatch.setattr(portfolio_plans, "get_db_collections", lambda: _finance_collections())
+
+    result = portfolio_plans._apply_paper_execution(
+        collections,
+        data_collections=data,
+        plan_id="child-plan",
+        user_id="user-1",
+    )
+
+    assert result["status"] == "executed_paper"
+    buy_exec = next(e for e in result["executions"] if e["symbol"] == "000001")
+    assert buy_exec["action"] == "buy"
+    assert buy_exec["quantity"] == 500
+
+
 def test_get_portfolio_plan_lineage_equity_returns_combo_rows(monkeypatch):
     collections = _collections()
     collections["portfolio_trade_plans"].docs.extend(

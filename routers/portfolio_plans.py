@@ -2622,7 +2622,11 @@ async def paper_rebalance_portfolio(
     work_cash = cash
     executions: List[Dict[str, Any]] = []
     partial = False
-    for item in items:
+    # Sell first, then buy: credit same-day sell proceeds before buys so a
+    # rank-leading buy is not starved of cash its funding sells would provide
+    # (avoids spurious partial). sorted() is stable, preserving rank order
+    # within each side.
+    for item in sorted(items, key=lambda it: 0 if int(it.get("delta_shares", 0) or 0) < 0 else 1):
         symbol = item["symbol"]
         delta = int(item["delta_shares"])
         price = item.get("estimated_price")
@@ -5409,7 +5413,12 @@ def _apply_paper_execution(collections: Dict[str, Any], data_collections: Dict[s
     if force:
         collections["portfolio_paper_executions"].delete_many(execution_query)
 
-    for item in items:
+    # Sell first, then buy: A-share sell proceeds are usable for same-day buys,
+    # so process all sells before any buy to credit cash up front. A single rank
+    # ordered pass would otherwise starve a buy that precedes its funding sells
+    # and report a spurious partial. sorted() is stable, preserving rank order
+    # within each side.
+    for item in sorted(items, key=lambda it: 0 if int(it.get("delta_shares", 0) or 0) < 0 else 1):
         symbol = item.get("symbol")
         delta = int(item.get("delta_shares", 0) or 0)
         if not symbol or delta == 0:
