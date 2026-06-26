@@ -44,11 +44,14 @@
   - 已实现：`generate_trade_plan` 将 `app_db` 传入 supersede 逻辑；未成交 live signal
     会被标记 `cancelled` 后再 supersede；已有 live fills 的旧 plan 不会被 supersede，
     并写入 blocked operation log。
-- [ ] **1.4 cron 纸面执行加 live 检查**
+- [x] **1.4 cron 纸面执行加 live 检查**
   - `apply_paper_trade_plan` / `apply_approved_paper_plans`（worker）缺少
     `_plan_has_live_signals` 门禁，可能与实盘双轨执行。对齐 API 侧 `_apply_paper_execution`。
-  - 阻断范围：仅在存在**非终态（active）live 信号**时阻断；若该 plan 的 live 信号
-    都已 `cancelled` / terminal，则不应阻断 paper（避免实现过严）。与 API 侧口径保持一致。
+  - 阻断范围：只要该 plan 存在任意 live signal 即阻断（包括 `cancelled` /
+    terminal），避免同一计划在 live / paper 双账本之间混用。
+  - 已实现：`apply_paper_trade_plan` 在执行前阻断任意 live signals（`force=True`
+    也不能绕过）；`apply_approved_paper_plans` 遇到 live signals 时跳过并记录
+    `live_signals`。
 - [ ] **1.5 测试**
   - reject-with-open-signals、supersede-with-published-live、
     cron-paper-skips-live-plan 各至少一例单测。
