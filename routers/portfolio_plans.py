@@ -45,8 +45,19 @@ from services.portfolio_lineage_paper import (
 )
 from services.portfolio_record_kind import (
     RECORD_KIND_LEDGER_EVENT,
+    RECORD_KIND_OBSERVATION,
     RECORD_KIND_TRADE_PLAN,
+    require_record_kind,
 )
+
+# Timeline node_type is a display label derived from the authoritative
+# record_kind (trade_plans render as "rebalance" nodes, monitor snapshots as
+# "monitor", external ledger facts as "manual").
+_NODE_TYPE_BY_RECORD_KIND = {
+    RECORD_KIND_TRADE_PLAN: "rebalance",
+    RECORD_KIND_OBSERVATION: "monitor",
+    RECORD_KIND_LEDGER_EVENT: "manual",
+}
 from services.trade_ledger import group_executions_by_order
 from services.portfolio_plan_remainder import (
     LIVE_SIGNAL_SOURCE_PLAN_TOPUP,
@@ -490,6 +501,7 @@ PLAN_LIST_PROJECTION = {
     "score_date": 1,
     "execute_date": 1,
     "plan_type": 1,
+    "record_kind": 1,
     "origin": 1,
     "manual_action": 1,
     "is_liquidation": 1,
@@ -4435,23 +4447,34 @@ def _build_lineage_timeline_payload(
         raise HTTPException(status_code=404, detail="lineage plans not found")
 
     latest_plan = plans[0]
-    # Manual broker-side records (origin=manual) are ledger facts, not strategy
-    # decisions, so cadence / drift / headline must look past them to the latest
-    # real strategy plan. headline prefers whatever still needs human action so a
-    # same-day manual record never hides a rebalance awaiting approval.
-    cadence_plan = next((row for row in plans if row.get("origin") != "manual"), latest_plan)
+    # record_kind is the authoritative type (stamped at write time). External
+    # ledger facts (record_kind == ledger_event) are not strategy decisions, so
+    # cadence / drift / headline look past them to the latest real plan. headline
+    # prefers whatever still needs human action so a same-day ledger record never
+    # hides a rebalance awaiting approval. require_record_kind fails loud if any
+    # document is missing its kind (a write-path bug, not something to paper over).
+    cadence_plan = next(
+        (row for row in plans if require_record_kind(row) != RECORD_KIND_LEDGER_EVENT),
+        latest_plan,
+    )
     headline_plan = next((row for row in plans if _plan_action_required(row)), latest_plan)
 
     def is_strategy_rebalance(row: Dict[str, Any]) -> bool:
-        if row.get("origin") == "manual":
-            return False
-        return row.get("plan_type") == "rebalance" or row.get("is_rebalance_day")
+        # A scheduled (non-manual) trade plan. Manual off-cycle rebalances are
+        # trade_plans too, but excluded here by origin (provenance dimension).
+        return (
+            require_record_kind(row) == RECORD_KIND_TRADE_PLAN
+            and row.get("origin") != "manual"
+        )
 
     latest_rebalance = next(
         (row for row in plans if is_strategy_rebalance(row)),
         None,
     )
-    latest_monitor = next((row for row in plans if row.get("plan_type") == "monitor"), None)
+    latest_monitor = next(
+        (row for row in plans if require_record_kind(row) == RECORD_KIND_OBSERVATION),
+        None,
+    )
     execution_venue = _portfolio_execution_venue(
         trading_collections, finance_collections, latest_plan, user_id
     )
@@ -4487,17 +4510,14 @@ def _build_lineage_timeline_payload(
     page_plans = plans[offset : offset + limit]
     timeline: List[Dict[str, Any]] = []
     for row in page_plans:
-        if row.get("origin") == "manual":
-            node_type = "manual"
-        elif row.get("plan_type") == "rebalance" or row.get("is_rebalance_day"):
-            node_type = "rebalance"
-        else:
-            node_type = "monitor"
+        record_kind = require_record_kind(row)
+        node_type = _NODE_TYPE_BY_RECORD_KIND[record_kind]
         drift_brief = _timeline_node_drift_brief(trading_collections, row, user_id)
         timeline.append(
             {
                 "date": row.get("base_date"),
                 "plan_id": row.get("plan_id"),
+                "record_kind": record_kind,
                 "node_type": node_type,
                 "status": row.get("status"),
                 "executable": bool(row.get("executable")),
@@ -4523,6 +4543,7 @@ def _build_lineage_timeline_payload(
             "plan_id": headline_plan.get("plan_id"),
             "status": headline_plan.get("status"),
             "base_date": headline_plan.get("base_date"),
+            "record_kind": require_record_kind(headline_plan),
             "plan_type": headline_plan.get("plan_type"),
             "origin": headline_plan.get("origin"),
             "manual_action": headline_plan.get("manual_action"),

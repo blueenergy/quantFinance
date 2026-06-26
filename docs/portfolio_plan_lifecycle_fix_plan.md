@@ -102,13 +102,18 @@
     `--apply` 前自动备份到 `*_backup_record_kind_<stamp>`；盖 `record_kind`、
     回填缺失 `origin=strategy`、修正遗留 `external_manual` 的 `plan_type→manual`；
     幂等、打印目标分布与变更计数；不可分类记录报告并中止。
-- [ ] **5A.4 读路径切到 record_kind（fail-loud）**
-  - `_build_lineage_timeline_payload`（router L4435-4488）`node_type` / `cadence_plan`
-    / `is_strategy_rebalance` 改读 `record_kind`，删除基于 `origin` / `_extman_` 的推断；
-    缺失即报错。需在迁移 `--apply` 后执行。
-- [ ] **5B API 契约收敛 + 前端去重判断**
-  - 谱系接口每个节点显式带 `record_kind`；前端删除基于 `_extman_` / `origin` /
-    `plan_type` 的自行推断，UI 明确区分「调仓计划 / 监控快照 / 账本记录」。
+- [x] **5A.4 读路径切到 record_kind（fail-loud）**
+  - `_build_lineage_timeline_payload` 的 `cadence_plan`（改为「跳过 ledger_event」）、
+    `is_strategy_rebalance`（`record_kind==trade_plan` 且 `origin!=manual`）、
+    `latest_monitor`（`record_kind==observation`）、`node_type`（按 record_kind 映射）
+    全部改读 `record_kind`，删除基于 `origin` / `plan_type` / `is_rebalance_day` 的推断；
+    用 `require_record_kind` 缺失即报错。
+  - 行为修正：手动 rebalance（trade_plan）不再被当成 ledger 记录——时间轴节点
+    从 `manual` 变为 `rebalance`，且可作为 cadence/drift 基准。
+- [~] **5B API 契约收敛 + 前端去重判断**
+  - [x] 谱系接口每个 timeline 节点与 `operation_plan` 显式带 `record_kind`。
+  - [ ] 前端删除基于 `_extman_` / `origin` / `plan_type` 的自行推断，
+    UI 明确区分「调仓计划 / 监控快照 / 账本记录」。
 - [ ] **5D 物理拆表（长期）**
   - 语义稳定后按 `observation` → `ledger_event` 顺序拆出独立 collection；
     `trade_plan` 留主表。物理迁移只迁近 N 个月活跃谱系，冷数据归档。

@@ -2089,6 +2089,7 @@ def test_lineage_timeline_monitor_drift_and_action_required(monkeypatch):
                 "params_hash": "hx",
                 "strategy_name": "Combo",
                 "plan_type": "rebalance",
+                "record_kind": "trade_plan",
                 "is_rebalance_day": True,
                 "previous_rebalance_date": None,
                 "params_snapshot": {"rebalance_days": 20},
@@ -2104,6 +2105,7 @@ def test_lineage_timeline_monitor_drift_and_action_required(monkeypatch):
                 "params_hash": "hx",
                 "strategy_name": "Combo",
                 "plan_type": "monitor",
+                "record_kind": "observation",
                 "is_rebalance_day": False,
                 "previous_rebalance_date": "20250102",
                 "previous_rebalance_plan_id": "reb-1",
@@ -2127,6 +2129,7 @@ def test_lineage_timeline_monitor_drift_and_action_required(monkeypatch):
                 "params_hash": "hx",
                 "strategy_name": "Combo",
                 "plan_type": "rebalance",
+                "record_kind": "trade_plan",
                 "is_rebalance_day": True,
                 "previous_rebalance_date": "20250102",
                 "previous_rebalance_plan_id": "reb-1",
@@ -2232,6 +2235,7 @@ def test_lineage_timeline_ignores_manual_records_for_rebalance_cadence(monkeypat
                 "strategy_name": "Combo",
                 "origin": "strategy",
                 "plan_type": "rebalance",
+                "record_kind": "trade_plan",
                 "is_rebalance_day": True,
                 "params_snapshot": {"rebalance_days": 10},
                 "summary": {"equity": 1_000_000},
@@ -2248,6 +2252,7 @@ def test_lineage_timeline_ignores_manual_records_for_rebalance_cadence(monkeypat
                 "origin": "manual",
                 "manual_action": "external_manual",
                 "plan_type": "rebalance",
+                "record_kind": "ledger_event",
                 "is_rebalance_day": True,
                 "is_liquidation": True,
                 "params_snapshot": {"rebalance_days": 10},
@@ -2290,6 +2295,7 @@ def test_lineage_timeline_manual_record_does_not_mask_pending_rebalance(monkeypa
                 "strategy_name": "Combo",
                 "origin": "strategy",
                 "plan_type": "rebalance",
+                "record_kind": "trade_plan",
                 "is_rebalance_day": True,
                 "params_snapshot": {"rebalance_days": 10},
                 "summary": {"equity": 1_000_000},
@@ -2306,6 +2312,7 @@ def test_lineage_timeline_manual_record_does_not_mask_pending_rebalance(monkeypa
                 "origin": "manual",
                 "manual_action": "external_manual",
                 "plan_type": "manual",
+                "record_kind": "ledger_event",
                 "is_rebalance_day": False,
                 "is_liquidation": False,
                 "params_snapshot": {"rebalance_days": 10},
@@ -2345,6 +2352,7 @@ def test_lineage_timeline_monitor_can_trade_label(monkeypatch):
                 "params_hash": "hx",
                 "strategy_name": "Combo",
                 "plan_type": "monitor",
+                "record_kind": "observation",
                 "is_rebalance_day": False,
                 "monitor_can_trade": True,
                 "params_snapshot": {"rebalance_days": 20, "monitor_can_trade": True},
@@ -2378,6 +2386,7 @@ def test_lineage_timeline_drift_summary_uses_items_when_monitor_summary_zero(mon
                 "params_hash": "hx",
                 "strategy_name": "Combo",
                 "plan_type": "monitor",
+                "record_kind": "observation",
                 "is_rebalance_day": False,
                 "params_snapshot": {"rebalance_days": 20},
                 "summary": {
@@ -2413,6 +2422,78 @@ def test_lineage_timeline_drift_summary_uses_items_when_monitor_summary_zero(mon
     assert drift["buy_count"] == 1
     assert drift["estimated_buy_amount"] == 1000.0
     assert drift["estimated_turnover"] == pytest.approx(0.001)
+
+
+def test_lineage_timeline_exposes_record_kind_and_treats_manual_rebalance_as_plan(monkeypatch):
+    cols = _collections()
+    fin = _finance_collections()
+    data = _data_collections()
+    data["volume_price"].docs = [{"trade_date": f"202501{d:02d}"} for d in range(1, 32)]
+    cols["portfolio_trade_plans"] = _Collection(
+        [
+            {
+                "plan_id": "manual-reb",
+                "strategy_template_id": "stx",
+                "user_id": "user-1",
+                "base_date": "20250115",
+                "status": "needs_review",
+                "params_hash": "hx",
+                "strategy_name": "Combo",
+                "origin": "manual",
+                "manual_action": "rebalance",
+                "plan_type": "rebalance",
+                "record_kind": "trade_plan",
+                "is_rebalance_day": True,
+                "params_snapshot": {"rebalance_days": 20},
+                "summary": {"equity": 1_000_000},
+                "executable": True,
+            },
+        ]
+    )
+    _patch_lineage_live_env(monkeypatch, cols, fin, data)
+    resp = asyncio.run(
+        portfolio_plans.get_portfolio_plan_lineage_timeline(
+            "manual-reb", limit=60, offset=0, current_user={"id": "user-1"}
+        )
+    )
+    payload = resp["data"]
+    # A manual rebalance is a trade_plan, so it renders as a "rebalance" node
+    # (not a "manual" ledger node) and carries its record_kind explicitly.
+    node = payload["timeline"][0]
+    assert node["record_kind"] == "trade_plan"
+    assert node["node_type"] == "rebalance"
+    assert payload["operation_plan"]["record_kind"] == "trade_plan"
+
+
+def test_lineage_timeline_fails_loud_when_record_kind_missing(monkeypatch):
+    cols = _collections()
+    fin = _finance_collections()
+    data = _data_collections()
+    cols["portfolio_trade_plans"] = _Collection(
+        [
+            {
+                "plan_id": "no-kind",
+                "strategy_template_id": "stx",
+                "user_id": "user-1",
+                "base_date": "20250115",
+                "status": "needs_review",
+                "params_hash": "hx",
+                "strategy_name": "Combo",
+                "plan_type": "rebalance",
+                "is_rebalance_day": True,
+                "params_snapshot": {"rebalance_days": 20},
+                "summary": {"equity": 1_000_000},
+                "executable": True,
+            },
+        ]
+    )
+    _patch_lineage_live_env(monkeypatch, cols, fin, data)
+    with pytest.raises(ValueError):
+        asyncio.run(
+            portfolio_plans.get_portfolio_plan_lineage_timeline(
+                "no-kind", limit=60, offset=0, current_user={"id": "user-1"}
+            )
+        )
 
 
 def test_list_portfolios_includes_param_summary_and_paper_holdings(monkeypatch):
