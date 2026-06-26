@@ -30,12 +30,15 @@
   - 注意：此时**不要**提示「改用 cancel」——`_cancel_plan` 在有 fills 时同样
     返回 409（已核验，router L3310-3311）。应提示走成交后处理 / 补单 / 人工对账流程。
   - 现状：reject 仅 `$set status`，完全不碰 `trade_signals`（已核验）。
-- [ ] **1.6 收紧 review 状态转换**
+- [x] **1.6 收紧 review 状态转换**
   - `_review_plan`（router L3270）当前允许 `needs_review / approved / rejected`
     三者任意互转，且不检查执行态（已核验）。需明确并实现：
     - `approved → rejected`：按 1.2 处理 live 信号/成交。
     - 已有 paper execution 或 live fills 的计划：禁止 re-review 翻转。
     - `rejected → approved` 是否允许？若允许，需限定「无执行态、无已发布信号」前提。
+  - 已实现：review 状态真正变化时先检查执行痕迹；已有 paper execution 或 live fills
+    的计划禁止翻转；`rejected → approved` 仅允许在没有 paper execution 且没有任何
+    live signal 的情况下执行。
 - [x] **1.3 supersede 加保护**
   - `supersede_stale_active_strategy_plans`（worker L104-146）仅改 status，
     不处理 live 信号（已核验）。被 supersede 的旧计划若已发布实盘信号：
@@ -52,7 +55,7 @@
   - 已实现：`apply_paper_trade_plan` 在执行前阻断任意 live signals（`force=True`
     也不能绕过）；`apply_approved_paper_plans` 遇到 live signals 时跳过并记录
     `live_signals`。
-- [ ] **1.5 测试**
+- [x] **1.5 测试**
   - reject-with-open-signals、supersede-with-published-live、
     cron-paper-skips-live-plan 各至少一例单测。
 

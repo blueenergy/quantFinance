@@ -3307,21 +3307,49 @@ def _cancel_open_live_signals_or_block(
     return cancelled_signal_count
 
 
+def _plan_has_paper_executions(collections: Dict[str, Any], plan: Dict[str, Any], plan_id: str, user_id: str) -> bool:
+    return bool(
+        plan.get("paper_executed_at")
+        or collections["portfolio_paper_executions"].find_one({"plan_id": plan_id, "user_id": user_id})
+    )
+
+
+def _plan_has_live_fills(finance_collections: Dict[str, Any], plan_id: str, user_id: str) -> bool:
+    signal_query = {"plan_id": plan_id, "user_id": user_id, "mode": "live"}
+    signals = list(finance_collections["trade_signals"].find(signal_query))
+    order_ids = [row.get("order_id") for row in signals if row.get("order_id")]
+    executions = (
+        list(finance_collections["trade_executions"].find({"user_id": user_id, "order_id": {"$in": order_ids}}))
+        if order_ids
+        else []
+    )
+    return any(_signal_filled_qty(row) > 0 for row in signals) or any(_execution_fill_quantity(row) > 0 for row in executions)
+
+
 def _review_plan(plan_id: str, decision: str, comment: str, current_user: Dict[str, Any]):
     collections = get_trading_db_collections()
     plan = _require_plan(collections, plan_id, current_user)
     status = str(plan.get("status") or "")
+    if decision not in {"approved", "rejected"}:
+        raise HTTPException(status_code=400, detail=f"unsupported review decision {decision}")
     if status not in {"needs_review", "approved", "rejected"}:
         raise HTTPException(status_code=400, detail=f"plan is not reviewable in status {status}")
     now = datetime.utcnow()
     user_id = _current_user_id(current_user)
     reviewer = _reviewer(current_user)
+    finance_collections = get_db_collections()
+    status_flipped = decision != status
+    review_action = "approve" if decision == "approved" else "reject"
     cancelled_signal_count = 0
+    if status_flipped and _plan_has_paper_executions(collections, plan, plan_id, user_id):
+        raise HTTPException(status_code=409, detail=f"plan already has paper executions; cannot {review_action}")
+    if status_flipped and decision == "approved" and _plan_has_live_signals(finance_collections, plan_id, user_id):
+        raise HTTPException(status_code=409, detail="plan already has live signals; cannot approve")
+    if status_flipped and not (decision == "rejected" and status == "approved") and _plan_has_live_fills(finance_collections, plan_id, user_id):
+        raise HTTPException(status_code=409, detail=f"plan already has live fills; cannot {review_action}")
     if decision == "rejected" and status == "approved":
-        if plan.get("paper_executed_at") or collections["portfolio_paper_executions"].find_one({"plan_id": plan_id, "user_id": user_id}):
-            raise HTTPException(status_code=409, detail="plan already has paper executions; cannot reject")
         cancelled_signal_count = _cancel_open_live_signals_or_block(
-            get_db_collections(),
+            finance_collections,
             plan_id=plan_id,
             user_id=user_id,
             reviewer=reviewer,

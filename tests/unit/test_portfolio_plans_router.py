@@ -343,13 +343,73 @@ def test_review_plan_rejects_cross_user_access(monkeypatch):
 
 def test_review_plan_writes_user_id(monkeypatch):
     collections = _collections()
+    finance_collections = _finance_collections()
     monkeypatch.setattr(portfolio_plans, "get_trading_db_collections", lambda: collections)
+    monkeypatch.setattr(portfolio_plans, "get_db_collections", lambda: finance_collections)
 
     response = portfolio_plans._review_plan("plan-user-1", "approved", "ok", {"id": "user-1", "username": "alice"})
 
     assert response["success"] is True
     assert collections["portfolio_plan_reviews"].docs[0]["user_id"] == "user-1"
     assert collections["portfolio_trade_plans"].find_one({"plan_id": "plan-user-1"})["status"] == "approved"
+
+
+def test_rejected_plan_can_be_approved_without_execution_trace(monkeypatch):
+    collections = _collections()
+    finance_collections = _finance_collections()
+    collections["portfolio_trade_plans"].docs[0]["status"] = "rejected"
+    monkeypatch.setattr(portfolio_plans, "get_trading_db_collections", lambda: collections)
+    monkeypatch.setattr(portfolio_plans, "get_db_collections", lambda: finance_collections)
+
+    response = portfolio_plans._review_plan("plan-user-1", "approved", "looks ok", {"id": "user-1", "username": "alice"})
+
+    assert response["success"] is True
+    assert collections["portfolio_trade_plans"].find_one({"plan_id": "plan-user-1"})["status"] == "approved"
+    assert collections["portfolio_plan_reviews"].docs[0]["decision"] == "approved"
+
+
+def test_rejected_plan_approval_rejects_live_signals(monkeypatch):
+    collections = _collections()
+    finance_collections = _finance_collections()
+    collections["portfolio_trade_plans"].docs[0]["status"] = "rejected"
+    finance_collections["trade_signals"].insert_one(
+        {
+            "order_id": "order-1",
+            "plan_id": "plan-user-1",
+            "user_id": "user-1",
+            "mode": "live",
+            "status": "cancelled",
+        }
+    )
+    monkeypatch.setattr(portfolio_plans, "get_trading_db_collections", lambda: collections)
+    monkeypatch.setattr(portfolio_plans, "get_db_collections", lambda: finance_collections)
+
+    with pytest.raises(portfolio_plans.HTTPException) as exc:
+        portfolio_plans._review_plan("plan-user-1", "approved", "retry", {"id": "user-1", "username": "alice"})
+
+    assert exc.value.status_code == 409
+    assert "live signals" in exc.value.detail
+    assert collections["portfolio_trade_plans"].find_one({"plan_id": "plan-user-1"})["status"] == "rejected"
+    assert not collections["portfolio_plan_reviews"].docs
+
+
+def test_review_plan_rejects_paper_executed_status_flip(monkeypatch):
+    collections = _collections()
+    finance_collections = _finance_collections()
+    collections["portfolio_trade_plans"].docs[0]["status"] = "approved"
+    collections["portfolio_paper_executions"].insert_one(
+        {"plan_id": "plan-user-1", "user_id": "user-1", "symbol": "000001"}
+    )
+    monkeypatch.setattr(portfolio_plans, "get_trading_db_collections", lambda: collections)
+    monkeypatch.setattr(portfolio_plans, "get_db_collections", lambda: finance_collections)
+
+    with pytest.raises(portfolio_plans.HTTPException) as exc:
+        portfolio_plans._review_plan("plan-user-1", "rejected", "too late", {"id": "user-1", "username": "alice"})
+
+    assert exc.value.status_code == 409
+    assert "paper executions" in exc.value.detail
+    assert collections["portfolio_trade_plans"].find_one({"plan_id": "plan-user-1"})["status"] == "approved"
+    assert not collections["portfolio_plan_reviews"].docs
 
 
 def test_reject_approved_plan_cancels_unfilled_live_signals(monkeypatch):
