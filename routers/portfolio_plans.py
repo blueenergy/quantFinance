@@ -22,6 +22,7 @@ from utils.time_display import add_display_time_fields
 from services.live_trade_signals import (
     ACTIVE_SIGNAL_STATUSES,
     PLAN_PHASE_APPROVED_PUBLISHED,
+    PLAN_PHASE_DONE,
     PLAN_PHASE_SELLING,
     TERMINAL_SIGNAL_STATUSES,
     active_signal_query_for_order_ids,
@@ -1160,6 +1161,41 @@ def _stamp_sell_settled_at(
         log.debug("Failed to stamp sell_settled_at for plan %s: %s", plan_id, exc)
 
 
+def _maybe_stamp_plan_executed_live(
+    trading_collections: Dict[str, Any],
+    plan: Dict[str, Any],
+    user_id: str,
+    *,
+    active_signal_count: int,
+    phase_state: str,
+) -> bool:
+    """Close out a live trade_plan once all its live signals reach terminal.
+
+    Computed-then-persisted (same pattern as ``_stamp_sell_settled_at``): a
+    published live plan sits at ``approved`` until its signals settle. When all
+    signals are terminal (no active in-flight) and the plan phase is ``done``,
+    flip ``approved -> executed_live`` so it no longer looks like it is awaiting
+    execution. Only applies to ``record_kind == trade_plan``; mixed terminal
+    outcomes (some filled, some cancelled) still count as executed_live — the
+    per-signal breakdown lives in ``live_signal_status_summary``.
+    """
+    if plan.get("record_kind") != RECORD_KIND_TRADE_PLAN:
+        return False
+    if str(plan.get("status") or "") != "approved":
+        return False
+    if active_signal_count > 0 or phase_state != PLAN_PHASE_DONE:
+        return False
+    now = datetime.utcnow()
+    plan_id = str(plan.get("plan_id") or "")
+    trading_collections["portfolio_trade_plans"].update_one(
+        {"plan_id": plan_id, "user_id": user_id, "status": "approved"},
+        {"$set": {"status": "executed_live", "live_executed_at": now}},
+    )
+    plan["status"] = "executed_live"
+    plan["live_executed_at"] = now
+    return True
+
+
 def _plan_execution_context(finance_collections: Dict[str, Any], plan: Dict[str, Any], user_id: str) -> Dict[str, Any]:
     """Single source of truth for how a plan is being executed.
 
@@ -1192,6 +1228,13 @@ def _plan_execution_context(finance_collections: Dict[str, Any], plan: Dict[str,
         )
         phase_state = derive_execution_phase_state(live_signals)
         _stamp_sell_settled_at(trading_collections, plan, user_id, phase_state)
+        _maybe_stamp_plan_executed_live(
+            trading_collections,
+            plan,
+            user_id,
+            active_signal_count=active_signal_count,
+            phase_state=phase_state,
+        )
         return {
             "execution_mode": "live",
             "has_live_signals": True,
@@ -3421,9 +3464,16 @@ def _cancel_plan(plan_id: str, comment: str, current_user: Dict[str, Any]):
     plan = _require_plan(trading_collections, plan_id, current_user)
     user_id = _current_user_id(current_user)
     status = str(plan.get("status") or "")
-    if status not in ACTIVE_PLAN_STATUSES:
+    # partially_executed is a paper shortfall outcome: it always carries paper
+    # executions, so allow cancelling it to escape the dead-end. Live fills are
+    # still blocked below via _cancel_open_live_signals_or_block.
+    cancellable = ACTIVE_PLAN_STATUSES | {"partially_executed"}
+    if status not in cancellable:
         raise HTTPException(status_code=400, detail=f"plan is not cancellable in status {status}")
-    if plan.get("paper_executed_at") or trading_collections["portfolio_paper_executions"].find_one({"plan_id": plan_id, "user_id": user_id}):
+    if status != "partially_executed" and (
+        plan.get("paper_executed_at")
+        or trading_collections["portfolio_paper_executions"].find_one({"plan_id": plan_id, "user_id": user_id})
+    ):
         raise HTTPException(status_code=409, detail="plan already has paper executions; cannot cancel")
 
     now = datetime.utcnow()
@@ -4281,8 +4331,12 @@ def _plan_today_state_label(plan: Dict[str, Any]) -> str:
         return "已批准，等待执行/发布"
     if status == "executed_paper":
         return "纸面已执行"
+    if status == "executed_live":
+        return "实盘已执行"
     if status == "partially_executed":
         return "部分执行"
+    if status == "filled":
+        return "已成交"
     if status == "cancelled":
         return "计划已作废"
     if status == "superseded":

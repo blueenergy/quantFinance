@@ -518,6 +518,26 @@ def test_cancel_plan_rejects_live_fills(monkeypatch):
     assert collections["portfolio_trade_plans"].find_one({"plan_id": "plan-user-1"})["status"] == "approved"
 
 
+def test_cancel_plan_allows_partially_executed_paper(monkeypatch):
+    # A partially_executed (paper shortfall) plan always carries paper executions
+    # but no live fills, so cancelling it must be allowed to escape the dead-end.
+    collections = _collections()
+    finance_collections = _finance_collections()
+    plan_doc = collections["portfolio_trade_plans"].docs[0]
+    plan_doc["status"] = "partially_executed"
+    plan_doc["record_kind"] = "trade_plan"
+    collections["portfolio_paper_executions"].insert_one(
+        {"plan_id": "plan-user-1", "user_id": "user-1", "action": "buy", "quantity": 100}
+    )
+    monkeypatch.setattr(portfolio_plans, "get_trading_db_collections", lambda: collections)
+    monkeypatch.setattr(portfolio_plans, "get_db_collections", lambda: finance_collections)
+
+    response = portfolio_plans._cancel_plan("plan-user-1", "abandon partial", {"id": "user-1", "username": "alice"})
+
+    assert response["success"] is True
+    assert collections["portfolio_trade_plans"].find_one({"plan_id": "plan-user-1"})["status"] == "cancelled"
+
+
 def test_generate_portfolio_plan_uses_current_user(monkeypatch):
     collections = _collections()
     monkeypatch.setattr(portfolio_plans, "get_trading_db_collections", lambda: collections)
@@ -783,6 +803,71 @@ def test_plan_execution_context_selling_does_not_stamp_sell_settled():
     assert ctx["execution_phase_state"] == "selling"
     plan_doc = trading["portfolio_trade_plans"].find_one({"plan_id": "plan-user-1"})
     assert plan_doc.get("sell_settled_at") is None
+
+
+def _run_execution_context(finance, plan):
+    import routers.portfolio_plans as pp
+
+    trading = {
+        "portfolio_paper_executions": _Collection(),
+        "portfolio_trade_plans": _Collection([dict(plan)]),
+    }
+    orig = pp.get_trading_db_collections
+    pp.get_trading_db_collections = lambda: trading
+    try:
+        ctx = pp._plan_execution_context(finance, plan, "user-1")
+    finally:
+        pp.get_trading_db_collections = orig
+    return ctx, trading
+
+
+def test_plan_execution_context_stamps_executed_live_when_done():
+    finance = _finance_collections()
+    finance["trade_signals"] = _Collection(
+        [
+            {"plan_id": "plan-user-1", "user_id": "user-1", "mode": "live", "execution_phase": "sell", "status": "filled"},
+            {"plan_id": "plan-user-1", "user_id": "user-1", "mode": "live", "execution_phase": "buy", "status": "filled"},
+        ]
+    )
+    plan = {"plan_id": "plan-user-1", "user_id": "user-1", "record_kind": "trade_plan", "status": "approved"}
+    ctx, trading = _run_execution_context(finance, plan)
+
+    assert ctx["execution_phase_state"] == "done"
+    assert ctx["active_signal_count"] == 0
+    # approved -> executed_live persisted and reflected on the in-memory plan.
+    assert plan["status"] == "executed_live"
+    assert plan.get("live_executed_at") is not None
+    assert trading["portfolio_trade_plans"].find_one({"plan_id": "plan-user-1"})["status"] == "executed_live"
+
+
+def test_plan_execution_context_keeps_approved_while_signals_active():
+    finance = _finance_collections()
+    finance["trade_signals"] = _Collection(
+        [
+            {"plan_id": "plan-user-1", "user_id": "user-1", "mode": "live", "execution_phase": "sell", "status": "filled"},
+            {"plan_id": "plan-user-1", "user_id": "user-1", "mode": "live", "execution_phase": "buy", "status": "pending"},
+        ]
+    )
+    plan = {"plan_id": "plan-user-1", "user_id": "user-1", "record_kind": "trade_plan", "status": "approved"}
+    _ctx, trading = _run_execution_context(finance, plan)
+
+    assert plan["status"] == "approved"
+    assert trading["portfolio_trade_plans"].find_one({"plan_id": "plan-user-1"})["status"] == "approved"
+
+
+def test_plan_execution_context_does_not_stamp_executed_live_for_observation():
+    finance = _finance_collections()
+    finance["trade_signals"] = _Collection(
+        [
+            {"plan_id": "plan-user-1", "user_id": "user-1", "mode": "live", "execution_phase": "sell", "status": "filled"},
+            {"plan_id": "plan-user-1", "user_id": "user-1", "mode": "live", "execution_phase": "buy", "status": "filled"},
+        ]
+    )
+    plan = {"plan_id": "plan-user-1", "user_id": "user-1", "record_kind": "observation", "status": "approved"}
+    _ctx, _trading = _run_execution_context(finance, plan)
+
+    # Only trade_plans run the lifecycle state machine.
+    assert plan["status"] == "approved"
 
 
 def test_publish_live_signals_dry_run_builds_contract(monkeypatch):

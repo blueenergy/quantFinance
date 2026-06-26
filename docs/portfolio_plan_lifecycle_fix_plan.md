@@ -129,26 +129,34 @@
 
 ## 阶段 2 — 状态机终态与死角（P1）
 
-- [ ] **2.1 定义实盘终态**
-  - `executed_live` 被列入 `TERMINAL_PLAN_STATUSES`（worker L92-100）但全仓库从不写入。
-    实盘成交收口后应写 `executed_live`（在 reconcile / trader 回填处判断），
-    否则计划永远停在 `approved`，无法区分「待发布」与「实盘已完成」。
-  - 需先明确「收口」判定（验收标准）：
-    - 何为「全部成交」：所有 live 信号都进入终态（filled / cancelled / rejected / expired），
-      且没有 active 信号在途？还是要求全部 `filled`？
-    - 部分成交 + 部分取消的混合终态如何归类（`executed_live` 还是新增
-      `partially_executed_live` / 保持 `approved + live_closed` 标记）？
-  - 实现前先定义清楚上述判定，避免把「信号都终态」误判为「实盘完成」。
-- [ ] **2.2 `partially_executed` 给出路**
-  - 它被 `_plan_action_required`（L4203）标为「需处理」，但 cancel / review /
-    publish-live / replan-remainder 都不接受它 → 用户被困。
-  - 方案：无实盘成交时允许 cancel；或加补单入口；或从 action_required 移除。
-- [ ] **2.3 `filled` 纳入状态常量**
-  - `record_external_manual_record`（L2264）写 `filled`，但它不在任何状态机常量里，
-    `_plan_today_state_label` 无对应分支，会落入「未知状态」。补常量 + 标签分支。
-- [ ] **2.4 `expired` 决断**
-  - `_plan_today_state_label`（L4184-4185）有文案但代码从不写入。
-    要么实现过期逻辑，要么删除 UI 文案。
+- [x] **2.1 定义实盘终态（已完成）**
+  - 收口判定（已定）：仅 `record_kind == trade_plan`、当前状态 `approved`、所有 live
+    信号都进入终态（无 active 在途）且执行阶段 `PLAN_PHASE_DONE` 时收口。
+    混合终态（部分 filled + 部分 cancelled）统一归为 `executed_live`，逐信号明细仍由
+    `live_signal_status_summary` 承载。
+  - 实现：`_maybe_stamp_plan_executed_live` 在 `_plan_execution_context`（详情页单计划
+    读路径）里「读时落库」，与 `_stamp_sell_settled_at` 同模式，把 `approved`→
+    `executed_live` 并写 `live_executed_at`；`_plan_today_state_label` 增 `实盘已执行` 分支。
+- [x] **2.2 `partially_executed` 给出路（已完成）**
+  - 它被 `_plan_action_required`（L4203）标为「需处理」，但 cancel / replan-remainder
+    都不接受它 → 用户被困。
+  - 关键事实：`partially_executed` 只在纸面执行（paper shortfall）路径写入，从不出现在
+    实盘计划上；而 `replan-remainder` 是**实盘专用**（基于实盘账户、要求 live 信号、发布
+    `plan_topup` 实盘信号），并不适用于纸面残单。
+  - 落地：
+    1. **允许 cancel**：`_cancel_plan` 放开 `partially_executed`，并对该状态跳过「已有纸面
+       执行即拒绝」的门禁（它天生带纸面执行）；实盘成交仍由
+       `_cancel_open_live_signals_or_block` 把守。
+    2. **补单**：纸面残单的补单即「强制重执行」——`_apply_paper_execution(force=True)`
+       已支持非 approved 计划重跑（卖出 T+1 释放现金后即可补齐买入），机制已具备，无需
+       把纸面残单错误地接入实盘 remainder。
+- [x] **2.3 `filled` 纳入状态常量（已完成）**
+  - `_plan_today_state_label` 增 `filled → 已成交` 分支（external_manual 仍走更早的
+    台账分支）。`filled` 不进 `_plan_action_required`，被当作终态、不再落入「未知状态」。
+- [ ] **2.4 `expired` 决断（暂缓 / 决定保留文案）**
+  - `_plan_today_state_label` 的 `计划已过期` 文案保留（前向兼容），但**暂不实现自动过期**：
+    过期需要独立策略（按 `execute_date + N` 判定、与 cadence/补单交互），属另一专项，
+    与本阶段终态收口解耦。当前没有写入方，文案为惰性分支，无副作用。
 
 ---
 
