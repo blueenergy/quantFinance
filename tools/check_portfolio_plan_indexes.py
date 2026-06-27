@@ -21,6 +21,14 @@ from pymongo.collection import Collection
 
 
 IndexKey = List[Tuple[str, int]]
+UNIQUE_STRATEGY_PLAN_STATUSES = [
+    "generated",
+    "needs_review",
+    "approved",
+    "executed_paper",
+    "partially_executed",
+    "executed_live",
+]
 
 
 @dataclass(frozen=True)
@@ -32,8 +40,8 @@ class ExpectedIndex:
     reason: str
     unique: bool = False
     # When set, the unique constraint applies only to documents matching this
-    # filter (MongoDB partial index). Used so manual (origin=manual) plans can
-    # coexist with the day's strategy plan on the same lineage tuple.
+    # filter (MongoDB partial index). Used so terminal historical rows can remain
+    # in the timeline without blocking same-day regeneration.
     partial_filter: Optional[Dict[str, Any]] = None
 
 
@@ -74,10 +82,13 @@ def _expected_indexes() -> List[ExpectedIndex]:
                 ("params_hash", ASCENDING),
                 ("base_date", ASCENDING),
             ],
-            "user_strategy_params_base_date_strategy_origin",
-            "same-day plan dedupe (strategy plans only; manual plans exempt)",
+            "user_strategy_params_base_date_active_strategy",
+            "same-day active strategy-plan dedupe; terminal rows are historical",
             unique=True,
-            partial_filter={"origin": "strategy"},
+            partial_filter={
+                "origin": "strategy",
+                "status": {"$in": UNIQUE_STRATEGY_PLAN_STATUSES},
+            },
         ),
         ExpectedIndex(
             "trading",

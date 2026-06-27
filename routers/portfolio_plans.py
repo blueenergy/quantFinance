@@ -379,6 +379,34 @@ def _lineage_query_for_plan(collections: Dict[str, Any], plan: Dict[str, Any], u
     return query
 
 
+def _lineage_open_trade_plan(
+    collections: Dict[str, Any], plan: Dict[str, Any], user_id: str
+) -> Optional[Dict[str, Any]]:
+    query = _lineage_query_for_plan(collections, plan, user_id)
+    query["status"] = {"$in": ["needs_review", "approved"]}
+    rows = (
+        collections["portfolio_trade_plans"]
+        .find(
+            query,
+            {
+                "_id": 0,
+                "plan_id": 1,
+                "base_date": 1,
+                "created_at": 1,
+                "status": 1,
+                "plan_type": 1,
+                "record_kind": 1,
+                "manual_action": 1,
+            },
+        )
+        .sort([("base_date", -1), ("created_at", -1)])
+    )
+    for row in rows:
+        if _resilient_record_kind(row) == RECORD_KIND_TRADE_PLAN:
+            return row
+    return None
+
+
 def _lineage_live_signal_execution_bundle(
     trading_collections: Dict[str, Any],
     finance_collections: Dict[str, Any],
@@ -1693,6 +1721,17 @@ async def force_rebalance_portfolio_plan(
     strategy = _require_strategy(collections, strategy_template_id)
     if strategy.get("status") == "disabled":
         raise HTTPException(status_code=400, detail="strategy is disabled")
+    open_plan = _lineage_open_trade_plan(collections, anchor, user_id)
+    if open_plan:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "lineage already has a pending or approved trade plan",
+                "plan_id": open_plan.get("plan_id"),
+                "status": open_plan.get("status"),
+                "base_date": open_plan.get("base_date"),
+            },
+        )
 
     params_override = _normalized_plan_params_from_snapshot(anchor.get("params_snapshot") or {})
     if anchor.get("params_override"):
@@ -4519,6 +4558,8 @@ def _plan_today_state_label(plan: Dict[str, Any]) -> str:
         return "调仓日：等待审核"
     if status == "approved":
         return "已批准，等待执行/发布"
+    if status == "rejected":
+        return "已拒绝，保留记录"
     if status == "executed_paper":
         return "纸面已执行"
     if status == "executed_live":

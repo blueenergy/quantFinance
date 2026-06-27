@@ -3881,3 +3881,49 @@ def test_force_rebalance_enqueues_rebalance_task_with_lineage_params(monkeypatch
     assert task["params_override"]["top_n"] == 10
     assert "monitor_can_trade" not in task["params_override"]
     assert len(cols["portfolio_plan_generation_tasks"].docs) == 1
+
+
+@pytest.mark.parametrize("open_status", ["needs_review", "approved"])
+def test_force_rebalance_blocks_when_lineage_has_open_trade_plan(monkeypatch, open_status):
+    cols = _collections()
+    cols["portfolio_trade_plans"] = _Collection(
+        [
+            {
+                "plan_id": "anchor-plan",
+                "strategy_template_id": "s1",
+                "user_id": "user-1",
+                "base_date": "20250102",
+                "params_hash": "hash-abc",
+                "params_snapshot": {"top_n": 10},
+                "status": "executed_live",
+                "plan_type": "rebalance",
+                "record_kind": portfolio_plans.RECORD_KIND_TRADE_PLAN,
+            },
+            {
+                "plan_id": "open-plan",
+                "strategy_template_id": "s1",
+                "user_id": "user-1",
+                "base_date": "20250103",
+                "params_hash": "hash-abc",
+                "params_snapshot": {"top_n": 10},
+                "status": open_status,
+                "plan_type": "rebalance",
+                "record_kind": portfolio_plans.RECORD_KIND_TRADE_PLAN,
+            },
+        ]
+    )
+    monkeypatch.setattr(portfolio_plans, "get_trading_db_collections", lambda: cols)
+
+    with pytest.raises(portfolio_plans.HTTPException) as exc:
+        asyncio.run(
+            portfolio_plans.force_rebalance_portfolio_plan(
+                "anchor-plan",
+                portfolio_plans.ForceRebalanceRequest(base_date="20250110"),
+                current_user={"id": "user-1"},
+            )
+        )
+
+    assert exc.value.status_code == 409
+    assert exc.value.detail["plan_id"] == "open-plan"
+    assert exc.value.detail["status"] == open_status
+    assert not cols["portfolio_plan_generation_tasks"].docs
