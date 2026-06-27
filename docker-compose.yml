@@ -336,6 +336,39 @@ services:
         max-size: "50m"
         max-file: "3"
 
+  # 模拟 quantTrader：Linux/dev 环境中用 fake xtquant 走真实 miniQMT broker 路径。
+  # 显式启动：docker compose up -d --build quant-trader
+  quant-trader:
+    build:
+      context: ../quantTrader
+      dockerfile: Dockerfile
+    container_name: quant-trader
+    environment:
+      - QUANT_TRADER_ENV=dev
+      - QUANT_TRADER_SEED_SIM_ACCOUNT=${QUANT_TRADER_SEED_SIM_ACCOUNT:-1}
+      - QUANT_TRADER_SIM_BROKER_NAME=${QUANT_TRADER_SIM_BROKER_NAME:-SIMULATED_MINIQMT}
+      - TRADER_BACKEND_MODE=db
+      - TRADER_MONGO_URI=${DOCKER_MONGO_URI:-mongodb://quant-mongodb:27017/}
+      - TRADER_MONGO_DB=${MONGO_DB}
+      - TRADER_USER_ID=${QUANT_TRADER_SIM_USER_ID:-sim-e2e-user}
+      - TRADER_SECURITIES_ACCOUNT_ID=${QUANT_TRADER_SIM_SECURITIES_ACCOUNT_ID:-00000000000000000000e2e1}
+      - TRADER_BROKER=miniQMT
+      - TRADER_MINIQMT_XT_PATH=/tmp/fake-userdata-mini
+      - TRADER_MINIQMT_ACCOUNT_ID=${QUANT_TRADER_SIM_ACCOUNT_ID:-SIM-ACC-0001}
+      - TRADER_POLL_INTERVAL=${QUANT_TRADER_POLL_INTERVAL:-1.0}
+      - TRADER_LOG_LEVEL=${QUANT_TRADER_LOG_LEVEL:-INFO}
+      - QUANT_TRADER_TRADING_SESSIONS=${QUANT_TRADER_TRADING_SESSIONS:-}
+      - QUANT_TRADER_USE_ACTIVATE_AFTER=${QUANT_TRADER_USE_ACTIVATE_AFTER:-false}
+      - TZ=Asia/Shanghai
+    restart: unless-stopped
+    networks:
+      - quant-network
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
+
   # 股票评分系统 (每日19:00定时评分)
   quant-scorer:
     build:
