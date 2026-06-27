@@ -3917,8 +3917,13 @@ def test_reconcile_portfolio_holdings_flags_mismatch(monkeypatch):
     # Ledger still thinks we hold 600000; broker shows it sold (0) -> mismatch.
     monkeypatch.setattr(
         portfolio_plans,
-        "_lineage_live_account_and_holdings",
-        lambda *a, **k: ("acct-1", [{"symbol": "600000.SH", "name": "PAB", "shares": 1000}]),
+        "_lineage_live_account_id_from_fills",
+        lambda *a, **k: "acct-1",
+    )
+    monkeypatch.setattr(
+        portfolio_plans,
+        "_account_level_live_holdings",
+        lambda *a, **k: [{"symbol": "600000.SH", "name": "PAB", "shares": 1000}],
     )
 
     resp = asyncio.run(
@@ -3951,8 +3956,13 @@ def test_reconcile_portfolio_holdings_in_sync(monkeypatch):
     monkeypatch.setattr(portfolio_plans, "get_data_db", lambda: _data_collections())
     monkeypatch.setattr(
         portfolio_plans,
-        "_lineage_live_account_and_holdings",
-        lambda *a, **k: ("acct-1", [{"symbol": "600000.SH", "name": "PAB", "shares": 1000}]),
+        "_lineage_live_account_id_from_fills",
+        lambda *a, **k: "acct-1",
+    )
+    monkeypatch.setattr(
+        portfolio_plans,
+        "_account_level_live_holdings",
+        lambda *a, **k: [{"symbol": "600000.SH", "name": "PAB", "shares": 1000}],
     )
 
     resp = asyncio.run(
@@ -3963,6 +3973,220 @@ def test_reconcile_portfolio_holdings_in_sync(monkeypatch):
     assert data["applicable"] is True
     assert data["in_sync"] is True
     assert data["diffs"] == []
+
+
+def _reconcile_shared_account_fixtures():
+    cols = _collections()
+    fin = _finance_collections()
+    data = _data_collections()
+    cols["portfolio_trade_plans"] = _Collection(
+        [
+            {
+                "plan_id": "plan-a",
+                "strategy_template_id": "stx",
+                "user_id": "user-1",
+                "base_date": "20250101",
+                "status": "approved",
+                "params_hash": "hash-a",
+            },
+            {
+                "plan_id": "plan-b",
+                "strategy_template_id": "sty",
+                "user_id": "user-1",
+                "base_date": "20250110",
+                "status": "approved",
+                "params_hash": "hash-b",
+            },
+        ]
+    )
+    return cols, fin, data
+
+
+def test_reconcile_live_holdings_shared_account_in_sync(monkeypatch):
+    cols, fin, data = _reconcile_shared_account_fixtures()
+    fin["trade_signals"].docs = [
+        {
+            "order_id": "oa",
+            "user_id": "user-1",
+            "mode": "live",
+            "plan_id": "plan-a",
+            "securities_account_id": "acct-1",
+            "created_at": 1,
+        },
+        {
+            "order_id": "ob",
+            "user_id": "user-1",
+            "mode": "live",
+            "plan_id": "plan-b",
+            "securities_account_id": "acct-1",
+            "created_at": 2,
+        },
+    ]
+    fin["trade_executions"].docs = [
+        {
+            "order_id": "oa",
+            "user_id": "user-1",
+            "symbol": "000001.SZ",
+            "side": "BUY",
+            "filled_size": 100,
+            "filled_price": 10.0,
+            "timestamp": 1.0,
+        },
+        {
+            "order_id": "ob",
+            "user_id": "user-1",
+            "symbol": "600000.SH",
+            "side": "BUY",
+            "filled_size": 200,
+            "filled_price": 12.0,
+            "timestamp": 2.0,
+        },
+    ]
+    fin["trader_positions"].docs = [
+        {
+            "user_id": "user-1",
+            "securities_account_id": "acct-1",
+            "symbol": "000001.SZ",
+            "volume": 100,
+            "synced_at": 1700.0,
+        },
+        {
+            "user_id": "user-1",
+            "securities_account_id": "acct-1",
+            "symbol": "600000.SH",
+            "volume": 200,
+            "synced_at": 1700.0,
+        },
+    ]
+    _patch_lineage_live_env(monkeypatch, cols, fin, data)
+    plan = cols["portfolio_trade_plans"].find_one({"plan_id": "plan-a"})
+
+    result = portfolio_plans._reconcile_live_holdings(cols, fin, data, plan, "user-1")
+
+    assert result["applicable"] is True
+    assert result["in_sync"] is True
+    assert result["diffs"] == []
+
+
+def test_reconcile_live_holdings_same_symbol_aggregated_across_plans(monkeypatch):
+    cols, fin, data = _reconcile_shared_account_fixtures()
+    fin["trade_signals"].docs = [
+        {
+            "order_id": "oa",
+            "user_id": "user-1",
+            "mode": "live",
+            "plan_id": "plan-a",
+            "securities_account_id": "acct-1",
+            "created_at": 1,
+        },
+        {
+            "order_id": "ob",
+            "user_id": "user-1",
+            "mode": "live",
+            "plan_id": "plan-b",
+            "securities_account_id": "acct-1",
+            "created_at": 2,
+        },
+    ]
+    fin["trade_executions"].docs = [
+        {
+            "order_id": "oa",
+            "user_id": "user-1",
+            "symbol": "000001.SZ",
+            "side": "BUY",
+            "filled_size": 100,
+            "filled_price": 10.0,
+            "timestamp": 1.0,
+        },
+        {
+            "order_id": "ob",
+            "user_id": "user-1",
+            "symbol": "000001.SZ",
+            "side": "BUY",
+            "filled_size": 100,
+            "filled_price": 12.0,
+            "timestamp": 2.0,
+        },
+    ]
+    fin["trader_positions"].docs = [
+        {
+            "user_id": "user-1",
+            "securities_account_id": "acct-1",
+            "symbol": "000001.SZ",
+            "volume": 200,
+            "synced_at": 1700.0,
+        },
+    ]
+    _patch_lineage_live_env(monkeypatch, cols, fin, data)
+    plan = cols["portfolio_trade_plans"].find_one({"plan_id": "plan-b"})
+
+    result = portfolio_plans._reconcile_live_holdings(cols, fin, data, plan, "user-1")
+
+    assert result["applicable"] is True
+    assert result["in_sync"] is True
+    assert result["diffs"] == []
+
+
+def test_reconcile_live_holdings_flags_real_account_drift(monkeypatch):
+    cols, fin, data = _reconcile_shared_account_fixtures()
+    fin["trade_signals"].docs = [
+        {
+            "order_id": "oa",
+            "user_id": "user-1",
+            "mode": "live",
+            "plan_id": "plan-a",
+            "securities_account_id": "acct-1",
+            "created_at": 1,
+        },
+        {
+            "order_id": "ob",
+            "user_id": "user-1",
+            "mode": "live",
+            "plan_id": "plan-b",
+            "securities_account_id": "acct-1",
+            "created_at": 2,
+        },
+    ]
+    fin["trade_executions"].docs = [
+        {
+            "order_id": "oa",
+            "user_id": "user-1",
+            "symbol": "000001.SZ",
+            "side": "BUY",
+            "filled_size": 100,
+            "filled_price": 10.0,
+            "timestamp": 1.0,
+        },
+        {
+            "order_id": "ob",
+            "user_id": "user-1",
+            "symbol": "000001.SZ",
+            "side": "BUY",
+            "filled_size": 100,
+            "filled_price": 12.0,
+            "timestamp": 2.0,
+        },
+    ]
+    fin["trader_positions"].docs = [
+        {
+            "user_id": "user-1",
+            "securities_account_id": "acct-1",
+            "symbol": "000001.SZ",
+            "volume": 150,
+            "synced_at": 1700.0,
+        },
+    ]
+    _patch_lineage_live_env(monkeypatch, cols, fin, data)
+    plan = cols["portfolio_trade_plans"].find_one({"plan_id": "plan-a"})
+
+    result = portfolio_plans._reconcile_live_holdings(cols, fin, data, plan, "user-1")
+
+    assert result["applicable"] is True
+    assert result["in_sync"] is False
+    diff_by_symbol = {row["symbol"]: row for row in result["diffs"]}
+    assert diff_by_symbol["000001.SZ"]["ledger_shares"] == 200
+    assert diff_by_symbol["000001.SZ"]["account_shares"] == 150
+    assert diff_by_symbol["000001.SZ"]["diff"] == -50
 
 
 def test_force_rebalance_enqueues_rebalance_task_with_lineage_params(monkeypatch):

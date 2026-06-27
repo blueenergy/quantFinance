@@ -1861,6 +1861,34 @@ def _holdings_from_executions(
     return [row for row in (payload.get("positions") or []) if _int_value(row.get("shares")) > 0]
 
 
+def _account_level_live_holdings(
+    finance_collections: Dict[str, Any],
+    data_collections: Dict[str, Any],
+    *,
+    user_id: str,
+    securities_account_id: str,
+) -> List[Dict[str, Any]]:
+    """Net live positions for the whole securities account (all live plans)."""
+    signals = list(
+        finance_collections["trade_signals"].find(
+            {
+                "user_id": user_id,
+                "mode": "live",
+                "securities_account_id": securities_account_id,
+            }
+        )
+    )
+    order_ids = [row.get("order_id") for row in signals if row.get("order_id")]
+    if not order_ids:
+        return []
+    executions = list(
+        finance_collections["trade_executions"]
+        .find({"user_id": user_id, "order_id": {"$in": order_ids}})
+        .sort("timestamp", 1)
+    )
+    return _holdings_from_executions(executions, data_collections)
+
+
 def _lineage_live_account_and_holdings(
     trading_collections: Dict[str, Any],
     finance_collections: Dict[str, Any],
@@ -1959,18 +1987,25 @@ def _reconcile_live_holdings(
     plan: Dict[str, Any],
     user_id: str,
 ) -> Dict[str, Any]:
-    """Diff the system ledger holdings against the broker's synced positions.
+    """Diff the account-level system ledger against broker-synced positions.
 
-    The ledger (rebuilt from ``trade_executions``) and the broker account
-    (``trader_positions``, synced from miniQMT) should agree; any divergence
-    usually means a manual broker-side trade was not recorded, so we surface it
-    so the user can re-sync the book immediately.
+    The ledger aggregates every live fill under the plan's ``securities_account_id``
+    (not just this plan's lineage) so shared accounts with multiple strategies do
+    not produce false mismatches. Divergence usually means a manual broker-side
+    trade was not recorded, so we surface it for immediate re-sync.
     """
-    account_id, ledger = _lineage_live_account_and_holdings(
-        trading_collections, finance_collections, data_collections, plan, user_id
+    account_id = _lineage_live_account_id_from_fills(
+        trading_collections, finance_collections, plan, user_id
     )
     if not account_id:
         return {"applicable": False, "in_sync": True, "diffs": [], "securities_account_id": ""}
+
+    ledger = _account_level_live_holdings(
+        finance_collections,
+        data_collections,
+        user_id=user_id,
+        securities_account_id=account_id,
+    )
 
     ledger_by_key: Dict[str, Dict[str, Any]] = {
         _symbol_key(row.get("symbol")): row for row in ledger if row.get("symbol")
