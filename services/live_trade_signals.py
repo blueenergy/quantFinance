@@ -364,6 +364,7 @@ def build_portfolio_plan_live_signal(
         execution_priority=execution_priority,
         plan_item_rank=plan_item_rank,
         reference_price=reference_price,
+        reference_price_source=str(item.get("price_source") or "estimated_price"),
         max_slippage_bps=max_slippage_bps,
         fee_model=account.get("fee_model") or {},
         price_floor=price_floor,

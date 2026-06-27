@@ -68,6 +68,14 @@ from services.portfolio_plan_remainder import (
     build_topup_signal_doc,
 )
 from services.trader_signal_reprice import resolve_market_reference_price
+from services.portfolio_plan_market import (
+    PRICE_SOURCE_DAILY_CLOSE,
+    PRICE_SOURCE_NONE,
+    attach_plan_item_overlay,
+    market_price_quotes,
+    quotes_to_prices_and_realtime_docs,
+    reprice_plan_items_for_publish,
+)
 
 
 router = APIRouter(prefix="/portfolio-plans", tags=["portfolio-plans"])
@@ -1515,6 +1523,7 @@ def _build_live_publish_risk_report(
                 "execution_priority": signal.get("execution_priority"),
                 "plan_item_rank": signal.get("plan_item_rank"),
                 "reference_price": signal.get("reference_price"),
+                "reference_price_source": signal.get("reference_price_source"),
                 "max_slippage_bps": signal.get("max_slippage_bps"),
                 "price_floor": signal.get("price_floor"),
                 "price_ceiling": signal.get("price_ceiling"),
@@ -1522,6 +1531,16 @@ def _build_live_publish_risk_report(
                 "valid_until": signal.get("valid_until"),
                 "estimated_amount": amount,
                 "blockers": sorted(set(blockers)),
+                "warnings": sorted(
+                    {
+                        warning
+                        for warning in (
+                            ["priced_from_stale_close"]
+                            if str(signal.get("reference_price_source") or "") == PRICE_SOURCE_DAILY_CLOSE
+                            else []
+                        )
+                    }
+                ),
             }
         )
 
@@ -3343,6 +3362,12 @@ async def get_portfolio_plan(plan_id: str, current_user: dict = Depends(get_curr
         user_id=user_id,
     )
     mark("live_context")
+    items, live_overlay = _enrich_plan_items_with_overlay(
+        data_collections=data_collections,
+        plan=plan,
+        items=items,
+    )
+    mark("live_overlay")
     reviews = list(collections["portfolio_plan_reviews"].find(owner_query).sort("created_at", -1))
     mark("reviews")
     execution_status = _paper_execution_status(collections, data_collections, plan, items)
@@ -3368,6 +3393,7 @@ async def get_portfolio_plan(plan_id: str, current_user: dict = Depends(get_curr
         "data": {
             "plan": _jsonable(plan),
             "items": _jsonable(items),
+            "live_overlay": _jsonable(live_overlay),
             "reviews": _jsonable(reviews),
             "execution_status": _jsonable(execution_status),
             "execution_mode": execution_context["execution_mode"],
@@ -3398,6 +3424,7 @@ async def get_portfolio_plan_operation_logs(
 async def get_portfolio_plan_items(plan_id: str, current_user: dict = Depends(get_current_user)):
     collections = get_trading_db_collections()
     finance_collections = get_db_collections()
+    data_collections = get_data_db()
     plan = _require_plan(collections, plan_id, current_user)
     user_id = _current_user_id(current_user)
     items = list(collections["portfolio_trade_plan_items"].find({"plan_id": plan_id, "user_id": user_id}).sort("rank", 1))
@@ -3407,7 +3434,12 @@ async def get_portfolio_plan_items(plan_id: str, current_user: dict = Depends(ge
         items=items,
         user_id=user_id,
     )
-    return {"success": True, "data": _jsonable(items)}
+    items, live_overlay = _enrich_plan_items_with_overlay(
+        data_collections=data_collections,
+        plan=plan,
+        items=items,
+    )
+    return {"success": True, "data": _jsonable({"items": items, "live_overlay": live_overlay})}
 
 
 @router.get("/plans/{plan_id}/bench")
@@ -5212,6 +5244,42 @@ async def publish_portfolio_plan_live_signals(
         .sort("rank", 1)
     )
     now = datetime.utcnow()
+    account_snapshot = _latest_account_snapshot(finance_collections, account, user_id)
+    equity = _numeric(account_snapshot.get("total_assets") or account_snapshot.get("total_asset"))
+    available_cash = _numeric(account_snapshot.get("available_cash") or account_snapshot.get("cash"))
+    securities_account_id = str(account.get("_id") or request.securities_account_id)
+    account_positions_by_key, account_positions_synced = _account_positions_by_symbol(
+        finance_collections,
+        user_id=user_id,
+        securities_account_id=securities_account_id,
+    )
+    params_snapshot = plan.get("params_snapshot") or {}
+    lot_size = _int_value(params_snapshot.get("lot_size"), 100) or 100
+    symbols = sorted({str(item.get("symbol")) for item in items if item.get("symbol")})
+    quotes = _market_price_quotes(data_collections, symbols)
+    repriced_items, reprice_summary = reprice_plan_items_for_publish(
+        plan=plan,
+        items=items,
+        quotes=quotes,
+        equity=equity,
+        lot_size=lot_size,
+        account_positions_by_key=account_positions_by_key,
+        account_positions_synced=account_positions_synced,
+        normalize_live_target_shares=_normalize_live_target_shares,
+        int_value=_int_value,
+        numeric=_numeric,
+        symbol_key=_symbol_key,
+        available_cash=available_cash if account_snapshot else None,
+    )
+    if reprice_summary.get("blockers") and not request.dry_run:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "publish repricing blocked: missing usable prices",
+                "reprice_summary": reprice_summary,
+            },
+        )
+    items = repriced_items
     signals = []
     skipped_items = []
     for item in items:
@@ -5224,6 +5292,25 @@ async def publish_portfolio_plan_live_signals(
             signals.append(signal.to_mongo())
 
     if not signals:
+        if request.dry_run:
+            return {
+                "success": True,
+                "data": _jsonable(
+                    {
+                        "plan_id": plan_id,
+                        "dry_run": True,
+                        "signals": [],
+                        "new_signals": [],
+                        "existing_signals": [],
+                        "skipped_items": skipped_items,
+                        "risk_report": {"items": [], "blocked_count": len(reprice_summary.get("blockers") or [])},
+                        "reprice_summary": reprice_summary,
+                        "inserted_count": 0,
+                        "existing_count": 0,
+                        "blocked": bool(reprice_summary.get("blockers")),
+                    }
+                ),
+            }
         raise HTTPException(
             status_code=409,
             detail={"message": "no live signals could be built", "skipped_items": skipped_items},
@@ -5248,6 +5335,27 @@ async def publish_portfolio_plan_live_signals(
 
     inserted_count = 0
     if not request.dry_run and new_signals:
+        _persist_repriced_plan_items(
+            trading_collections,
+            plan_id=plan_id,
+            user_id=user_id,
+            items=repriced_items,
+            reprice_summary=reprice_summary,
+            now=now,
+        )
+        _append_plan_operation_log(
+            trading_collections,
+            plan_id=plan_id,
+            user_id=user_id,
+            operation_type="publish_reprice",
+            status="success",
+            message="plan repriced with latest market quotes before live publish",
+            payload={
+                "equity_used": reprice_summary.get("equity_used"),
+                "turnover_drift_pct": reprice_summary.get("turnover_drift_pct"),
+                "stale_price_symbols": reprice_summary.get("stale_price_symbols"),
+            },
+        )
         finance_collections["trade_signals"].insert_many(new_signals)
         inserted_count = len(new_signals)
         trading_collections["portfolio_trade_plans"].update_one(
@@ -5284,6 +5392,7 @@ async def publish_portfolio_plan_live_signals(
                 "existing_signals": existing_signals,
                 "skipped_items": skipped_items,
                 "risk_report": risk_report,
+                "reprice_summary": reprice_summary,
                 "inserted_count": inserted_count,
                 "existing_count": len(existing_signals),
                 "blocked": bool(blocked),
@@ -5896,6 +6005,11 @@ def _market_doc_yyyymmdd(doc: Optional[Dict[str, Any]]) -> str:
     return ""
 
 
+def _market_price_quotes(data_collections: Dict[str, Any], symbols: List[str]) -> Dict[str, Dict[str, Any]]:
+    """Per-symbol price quotes with source metadata for overlay and publish repricing."""
+    return market_price_quotes(data_collections, symbols, symbol_query_values=_symbol_query_values)
+
+
 def _load_fresh_market_prices(data_collections: Dict[str, Any], symbols: List[str]) -> Tuple[Dict[str, float], Dict[str, Dict[str, Any]]]:
     """Load latest usable market prices.
 
@@ -5903,52 +6017,99 @@ def _load_fresh_market_prices(data_collections: Dict[str, Any], symbols: List[st
     as the latest daily bar. Otherwise the daily close is used so stale realtime
     snapshots do not distort live holdings.
     """
+    quotes = _market_price_quotes(data_collections, symbols)
+    return quotes_to_prices_and_realtime_docs(quotes)
 
-    prices: Dict[str, float] = {}
-    realtime_docs: Dict[str, Dict[str, Any]] = {}
-    daily_coll = data_collections["volume_price"]
-    realtime_coll = data_collections["volume_price_realtime_latest"]
 
-    for symbol in symbols:
-        candidates = _symbol_query_values(symbol)
-        daily_doc = daily_coll.find_one(
-            {"symbol": {"$in": candidates}},
-            sort=[("trade_date", -1)],
-            projection={"_id": 0, "symbol": 1, "trade_date": 1, "date": 1, "close": 1},
+def _enrich_plan_items_with_overlay(
+    *,
+    data_collections: Dict[str, Any],
+    plan: Dict[str, Any],
+    items: List[Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """Attach read-only live price/score drift overlay; never writes to DB."""
+    status = str(plan.get("status") or "")
+    if status not in {"generated", "needs_review", "approved"}:
+        return items, {
+            "enabled": False,
+            "reason": "plan_status_not_active",
+            "score_snapshot_date": _normalize_yyyymmdd(plan.get("score_date")),
+            "latest_score_date": None,
+            "score_snapshot_stale": False,
+            "score_snapshot_age_days": None,
+        }
+    symbols = sorted({str(item.get("symbol")) for item in items if item.get("symbol")})
+    quotes = _market_price_quotes(data_collections, symbols)
+    params = dict(plan.get("params_snapshot") or {})
+    universe_index = str(params.get("universe_index") or "csi1000")
+    top_n = max(1, _int_value(params.get("top_n"), 10))
+    plan_score_date = _resolve_plan_score_date(plan, universe_index)
+    watermark = _latest_available_score_watermark(finance_db["stock_scores"], universe_index)
+    latest_score_date = watermark.get("latest_available_score_date")
+    latest_ranked: List[Dict[str, Any]] = []
+    if latest_score_date:
+        latest_ranked = _build_ranked_score_universe(
+            finance_db["stock_scores"],
+            str(latest_score_date),
+            universe_index,
+            params,
         )
-        realtime_doc = realtime_coll.find_one(
-            {"symbol": {"$in": candidates}},
-            sort=[("trade_date", -1)],
-            projection={
-                "_id": 0,
-                "symbol": 1,
-                "trade_date": 1,
-                "date": 1,
-                "close": 1,
-                "price": 1,
-                "latest_price": 1,
-                "realtime_trade_time": 1,
-                "snapshot_time": 1,
-                "updated_at": 1,
-                "created_at": 1,
-            },
-        )
+    return attach_plan_item_overlay(
+        plan=plan,
+        items=items,
+        quotes=quotes,
+        plan_score_date=plan_score_date,
+        latest_score_date=str(latest_score_date) if latest_score_date else None,
+        latest_ranked=latest_ranked,
+        top_n=top_n,
+        numeric=_numeric,
+        int_value=_int_value,
+        symbol_key=_symbol_key,
+    )
 
-        daily_price = _first_positive_float((daily_doc or {}).get("close"))
-        realtime_price = _first_positive_float(
-            (realtime_doc or {}).get("close"),
-            (realtime_doc or {}).get("price"),
-            (realtime_doc or {}).get("latest_price"),
-        )
-        daily_date = _market_doc_yyyymmdd(daily_doc)
-        realtime_date = _market_doc_yyyymmdd(realtime_doc)
-        if realtime_doc and realtime_price and realtime_date and (not daily_date or realtime_date >= daily_date):
-            prices[symbol] = realtime_price
-            realtime_docs[symbol] = realtime_doc
-        elif daily_price:
-            prices[symbol] = daily_price
 
-    return prices, realtime_docs
+def _persist_repriced_plan_items(
+    trading_collections: Dict[str, Any],
+    *,
+    plan_id: str,
+    user_id: str,
+    items: List[Dict[str, Any]],
+    reprice_summary: Dict[str, Any],
+    now: datetime,
+) -> None:
+    for item in items:
+        symbol = str(item.get("symbol") or "")
+        if not symbol:
+            continue
+        query = {"plan_id": plan_id, "user_id": user_id, "symbol": symbol}
+        existing = trading_collections["portfolio_trade_plan_items"].find_one(query)
+        set_fields = {
+            "current_shares": _int_value(item.get("current_shares")),
+            "target_shares": _int_value(item.get("target_shares")),
+            "delta_shares": _int_value(item.get("delta_shares")),
+            "action": item.get("action"),
+            "estimated_price": item.get("estimated_price"),
+            "estimated_amount": item.get("estimated_amount"),
+            "price_source": item.get("price_source"),
+            "price_as_of": item.get("price_as_of"),
+            "blockers": item.get("blockers") or [],
+            "warnings": item.get("warnings") or [],
+            "estimated_price_at_approval": item.get("estimated_price"),
+            "updated_at": now,
+        }
+        if existing and not existing.get("estimated_price_at_generation"):
+            set_fields["estimated_price_at_generation"] = existing.get("estimated_price")
+        trading_collections["portfolio_trade_plan_items"].update_one(query, {"$set": set_fields})
+    trading_collections["portfolio_trade_plans"].update_one(
+        {"plan_id": plan_id, "user_id": user_id},
+        {
+            "$set": {
+                "repriced_at": now,
+                "reprice_summary": reprice_summary,
+                "updated_at": now,
+            }
+        },
+    )
 
 
 def _execution_doc(plan: Dict[str, Any], item: Dict[str, Any], action: str, quantity: int, price: Optional[float], amount: float, blocker: Optional[str], now: datetime) -> Dict[str, Any]:

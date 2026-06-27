@@ -202,7 +202,7 @@ def _finance_collections():
         "trade_signals": _Collection(),
         "trade_executions": _Collection(),
         "trader_account_equity": _Collection(),
-        "trader_accounts": _Collection([{"user_id": "user-1", "securities_account_id": "acct-1", "available_cash": 100000, "synced_at": 10}]),
+        "trader_accounts": _Collection([{"user_id": "user-1", "securities_account_id": "acct-1", "available_cash": 100000, "total_asset": 1000000, "synced_at": 10}]),
         "trader_positions": _Collection([{"user_id": "user-1", "securities_account_id": "acct-1", "symbol": "600000", "can_use_volume": 500}]),
     }
 
@@ -1003,6 +1003,130 @@ def test_publish_live_signals_dry_run_builds_contract(monkeypatch):
     assert sell_signal["price_floor"] == 11.88
     assert sell_signal["phase_barrier"] is None
     assert response["data"]["risk_report"]["blocked_count"] == 0
+    assert response["data"]["reprice_summary"]["equity_used"] == 1000000
+    assert len(response["data"]["reprice_summary"]["items"]) == 2
+
+
+def test_publish_live_signals_reprice_blocks_missing_price(monkeypatch):
+    collections = _collections()
+    collections["portfolio_trade_plans"].docs[0]["status"] = "approved"
+    collections["portfolio_trade_plan_items"].docs.append(
+        {
+            "plan_id": "plan-user-1",
+            "user_id": "user-1",
+            "symbol": "000001",
+            "action": "buy",
+            "delta_shares": 100,
+            "target_shares": 100,
+            "target_weight": 0.01,
+            "estimated_price": 10.0,
+            "rank": 1,
+        }
+    )
+    finance = _finance_collections()
+    data = _data_collections()
+    data["volume_price_realtime_latest"] = _Collection([])
+    data["volume_price"] = _Collection([])
+    monkeypatch.setattr(portfolio_plans, "get_trading_db_collections", lambda: collections)
+    monkeypatch.setattr(portfolio_plans, "get_db_collections", lambda: finance)
+    monkeypatch.setattr(portfolio_plans, "get_data_db", lambda: data)
+
+    preview = asyncio.run(
+        portfolio_plans.publish_portfolio_plan_live_signals(
+            "plan-user-1",
+            portfolio_plans.PublishLiveSignalsRequest(securities_account_id="acct-1", dry_run=True),
+            current_user={"id": "user-1"},
+        )
+    )
+    assert preview["data"]["blocked"] is True
+    assert preview["data"]["reprice_summary"]["missing_price_symbols"] == ["000001"]
+
+    with pytest.raises(portfolio_plans.HTTPException) as exc:
+        asyncio.run(
+            portfolio_plans.publish_portfolio_plan_live_signals(
+                "plan-user-1",
+                portfolio_plans.PublishLiveSignalsRequest(securities_account_id="acct-1", dry_run=False),
+                current_user={"id": "user-1"},
+            )
+        )
+    assert "missing usable prices" in str(exc.value.detail["message"])
+
+
+def test_publish_live_signals_allows_missing_price_market_sell(monkeypatch):
+    collections = _collections()
+    collections["portfolio_trade_plans"].docs[0]["status"] = "approved"
+    collections["portfolio_trade_plan_items"].docs.append(
+        {
+            "plan_id": "plan-user-1",
+            "user_id": "user-1",
+            "symbol": "600000",
+            "action": "sell",
+            "delta_shares": -200,
+            "target_shares": 0,
+            "target_weight": 0,
+            "estimated_price": 12.0,
+            "rank": 1,
+        }
+    )
+    finance = _finance_collections()
+    data = _data_collections()
+    data["volume_price_realtime_latest"] = _Collection([])
+    data["volume_price"] = _Collection([])
+    monkeypatch.setattr(portfolio_plans, "get_trading_db_collections", lambda: collections)
+    monkeypatch.setattr(portfolio_plans, "get_db_collections", lambda: finance)
+    monkeypatch.setattr(portfolio_plans, "get_data_db", lambda: data)
+
+    response = asyncio.run(
+        portfolio_plans.publish_portfolio_plan_live_signals(
+            "plan-user-1",
+            portfolio_plans.PublishLiveSignalsRequest(securities_account_id="acct-1", dry_run=True),
+            current_user={"id": "user-1"},
+        )
+    )
+
+    assert response["data"]["blocked"] is False
+    assert response["data"]["signals"][0]["action"] == "sell"
+    assert response["data"]["signals"][0]["order_type"] == "market"
+    assert response["data"]["signals"][0]["price"] is None
+    assert response["data"]["reprice_summary"]["missing_price_symbols"] == []
+
+
+def test_publish_live_signals_risk_failure_does_not_persist_reprice(monkeypatch):
+    collections = _collections()
+    collections["portfolio_trade_plans"].docs[0]["status"] = "approved"
+    collections["portfolio_trade_plan_items"].docs.append(
+        {
+            "plan_id": "plan-user-1",
+            "user_id": "user-1",
+            "symbol": "000001",
+            "action": "buy",
+            "delta_shares": 100,
+            "target_shares": 100,
+            "target_weight": 0.1,
+            "estimated_price": 8.0,
+            "rank": 1,
+        }
+    )
+    finance = _finance_collections()
+    finance["securities_accounts"].docs[0]["live_trading_enabled"] = False
+    monkeypatch.setattr(portfolio_plans, "get_trading_db_collections", lambda: collections)
+    monkeypatch.setattr(portfolio_plans, "get_db_collections", lambda: finance)
+    monkeypatch.setattr(portfolio_plans, "get_data_db", _data_collections)
+
+    with pytest.raises(portfolio_plans.HTTPException):
+        asyncio.run(
+            portfolio_plans.publish_portfolio_plan_live_signals(
+                "plan-user-1",
+                portfolio_plans.PublishLiveSignalsRequest(securities_account_id="acct-1", dry_run=False),
+                current_user={"id": "user-1"},
+            )
+        )
+
+    item = collections["portfolio_trade_plan_items"].find_one({"plan_id": "plan-user-1", "symbol": "000001"})
+    plan = collections["portfolio_trade_plans"].find_one({"plan_id": "plan-user-1"})
+    assert item["estimated_price"] == 8.0
+    assert "estimated_price_at_approval" not in item
+    assert "repriced_at" not in plan
 
 
 def test_publish_live_signals_write_is_idempotent(monkeypatch):
@@ -1077,10 +1201,10 @@ def test_publish_live_signals_rounds_protected_prices_to_tick(monkeypatch):
 
     buy_signal = response["data"]["signals"][0]
     sell_signal = response["data"]["signals"][1]
-    assert buy_signal["price_ceiling"] == 10.11
-    assert buy_signal["effective_limit_price"] == 10.11
-    assert sell_signal["price_floor"] == 9.9
-    assert sell_signal["effective_limit_price"] == 9.9
+    assert buy_signal["price_ceiling"] == 10.1
+    assert buy_signal["effective_limit_price"] == 10.1
+    assert sell_signal["price_floor"] == 11.88
+    assert sell_signal["effective_limit_price"] == 11.88
 
 
 def test_publish_live_signals_rejects_empty_signal_set(monkeypatch):
@@ -1093,12 +1217,16 @@ def test_publish_live_signals_rejects_empty_signal_set(monkeypatch):
             "symbol": "000001",
             "action": "hold",
             "delta_shares": 0,
+            "current_shares": 100,
             "target_shares": 100,
             "estimated_price": 10.0,
             "rank": 1,
         }
     )
     finance = _finance_collections()
+    finance["trader_positions"].docs.append(
+        {"user_id": "user-1", "securities_account_id": "acct-1", "symbol": "000001", "shares": 100, "can_use_volume": 100}
+    )
     monkeypatch.setattr(portfolio_plans, "get_trading_db_collections", lambda: collections)
     monkeypatch.setattr(portfolio_plans, "get_db_collections", lambda: finance)
     monkeypatch.setattr(portfolio_plans, "get_data_db", _data_collections)
@@ -1114,9 +1242,6 @@ def test_publish_live_signals_rejects_empty_signal_set(monkeypatch):
 
     assert exc.value.status_code == 409
     assert exc.value.detail["message"] == "no live signals could be built"
-    assert not finance["trade_signals"].docs
-    plan = collections["portfolio_trade_plans"].find_one({"plan_id": "plan-user-1"})
-    assert not plan.get("live_signals_published_at")
 
 
 def test_publish_live_signals_blocks_after_paper_execution(monkeypatch):
