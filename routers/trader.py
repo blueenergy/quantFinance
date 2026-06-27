@@ -25,6 +25,35 @@ from services import trader_signal_reprice as signal_reprice
 
 router = APIRouter()
 
+
+def _require_securities_account_doc(
+    securities_coll,
+    *,
+    securities_account_id: Optional[str],
+    user_id: str,
+) -> Dict[str, Any]:
+    if not securities_account_id:
+        raise HTTPException(
+            status_code=400,
+            detail="securities_account_id is required to prevent account conflicts",
+        )
+
+    query_ids: List[Any] = [securities_account_id]
+    try:
+        query_ids.insert(0, ObjectId(securities_account_id))
+    except Exception:
+        pass
+
+    for query_id in query_ids:
+        account_doc = securities_coll.find_one({"_id": query_id, "user_id": user_id})
+        if account_doc:
+            return account_doc
+
+    raise HTTPException(
+        status_code=404,
+        detail=f"Securities account not found: {securities_account_id}",
+    )
+
 # Fields quantTrader may set via POST /trader/signals/{order_id}/status (allowlist).
 _TRADER_SIGNAL_STATUS_ALLOWED_FIELDS = frozenset(
     {
@@ -399,29 +428,14 @@ def sync_positions(
         user_id = current_user["id"]
         current_time = time.time()
         
-        # Validate securities_account_id if provided
-        account_doc = None
-        if securities_account_id:
-            try:
-                account_doc = securities_coll.find_one({
-                    "_id": ObjectId(securities_account_id),
-                    "user_id": user_id
-                })
-                if not account_doc:
-                    raise HTTPException(
-                        status_code=404,
-                        detail=f"Securities account not found: {securities_account_id}"
-                    )
-            except Exception as e:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Invalid securities_account_id: {str(e)}"
-                )
+        account_doc = _require_securities_account_doc(
+            securities_coll,
+            securities_account_id=securities_account_id,
+            user_id=user_id,
+        )
         
         # Clear existing positions for this user (and account if specified)
-        delete_query = {"user_id": user_id}
-        if securities_account_id:
-            delete_query["securities_account_id"] = securities_account_id
+        delete_query = {"user_id": user_id, "securities_account_id": securities_account_id}
         positions_coll.delete_many(delete_query)
         
         # Insert new positions
@@ -429,13 +443,11 @@ def sync_positions(
             for pos in positions:
                 pos["user_id"] = user_id
                 pos["synced_at"] = current_time
-                # Link to securities_account if provided
-                if securities_account_id:
-                    pos["securities_account_id"] = securities_account_id
-                    # Fill broker and account_id from securities_accounts if not present
-                    if not pos.get("broker") or not pos.get("account_id"):
-                        pos["broker"] = account_doc.get("broker")
-                        pos["account_id"] = account_doc.get("account_id")
+                pos["securities_account_id"] = securities_account_id
+                # Fill broker and account_id from securities_accounts if not present
+                if not pos.get("broker") or not pos.get("account_id"):
+                    pos["broker"] = account_doc.get("broker")
+                    pos["account_id"] = account_doc.get("account_id")
             
             positions_coll.insert_many(positions)
         
@@ -445,6 +457,8 @@ def sync_positions(
             "timestamp": current_time
         }
         
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to sync positions: {str(e)}")
 
@@ -481,41 +495,18 @@ def sync_account(
         account_data["user_id"] = user_id
         account_data["synced_at"] = current_time
         
-        # Validate and link to securities_account if provided
-        if securities_account_id:
-            try:
-                account_doc = securities_coll.find_one({
-                    "_id": ObjectId(securities_account_id),
-                    "user_id": user_id
-                })
-                if not account_doc:
-                    raise HTTPException(
-                        status_code=404,
-                        detail=f"Securities account not found: {securities_account_id}"
-                    )
-                # Add link and metadata from securities_account
-                account_data["securities_account_id"] = securities_account_id
-                # Fill broker and account_id from securities_accounts if not already present
-                if not account_data.get("broker"):
-                    account_data["broker"] = account_doc.get("broker")
-                if not account_data.get("account_id"):
-                    account_data["account_id"] = account_doc.get("account_id")
-            except HTTPException:
-                raise
-            except Exception as e:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Invalid securities_account_id: {str(e)}"
-                )
-        
-        # Build upsert query
-        # 关键：必须使用 securities_account_id 作为唯一标识
-        # 避免使用 account_id 匹配，因为真实账户和模拟账户可能有相同ID
-        if not securities_account_id:
-            raise HTTPException(
-                status_code=400,
-                detail="securities_account_id is required to prevent account conflicts"
-            )
+        account_doc = _require_securities_account_doc(
+            securities_coll,
+            securities_account_id=securities_account_id,
+            user_id=user_id,
+        )
+        # Add link and metadata from securities_account
+        account_data["securities_account_id"] = securities_account_id
+        # Fill broker and account_id from securities_accounts if not already present
+        if not account_data.get("broker"):
+            account_data["broker"] = account_doc.get("broker")
+        if not account_data.get("account_id"):
+            account_data["account_id"] = account_doc.get("account_id")
         
         query = {
             "user_id": user_id,
@@ -534,6 +525,8 @@ def sync_account(
             "timestamp": current_time
         }
         
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to sync account: {str(e)}")
 
@@ -566,22 +559,17 @@ def store_position_snapshot(
         # Add user_id
         snapshot["user_id"] = user_id
         
-        # Validate and link to securities_account if provided
-        if securities_account_id:
-            try:
-                account_doc = securities_coll.find_one({
-                    "_id": ObjectId(securities_account_id),
-                    "user_id": user_id
-                })
-                if account_doc:
-                    snapshot["securities_account_id"] = securities_account_id
-                    # Fill broker and account_id from securities_accounts if not present
-                    if not snapshot.get("broker"):
-                        snapshot["broker"] = account_doc.get("broker")
-                    if not snapshot.get("account_id"):
-                        snapshot["account_id"] = account_doc.get("account_id")
-            except Exception:
-                pass  # Optional field, don't fail if invalid
+        account_doc = _require_securities_account_doc(
+            securities_coll,
+            securities_account_id=securities_account_id,
+            user_id=user_id,
+        )
+        snapshot["securities_account_id"] = securities_account_id
+        # Fill broker and account_id from securities_accounts if not present
+        if not snapshot.get("broker"):
+            snapshot["broker"] = account_doc.get("broker")
+        if not snapshot.get("account_id"):
+            snapshot["account_id"] = account_doc.get("account_id")
         
         # Check if snapshot for this date already exists
         date_str = snapshot.get("date")
@@ -613,6 +601,8 @@ def store_position_snapshot(
             "snapshot_id": str(result.inserted_id)
         }
         
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to store snapshot: {str(e)}")
 
@@ -712,8 +702,14 @@ def cleanup_positions(
     try:
         collections = get_db_collections()
         positions_coll = collections["trader_positions"]
+        securities_coll = collections["securities_accounts"]
         
         user_id = current_user["id"]
+        _require_securities_account_doc(
+            securities_coll,
+            securities_account_id=securities_account_id,
+            user_id=user_id,
+        )
         
         # Build cleanup query - remove positions NOT in current_symbols
         cleanup_query = {
@@ -721,9 +717,7 @@ def cleanup_positions(
             "symbol": {"$nin": current_symbols}
         }
         
-        # Filter by securities_account_id if provided
-        if securities_account_id:
-            cleanup_query["securities_account_id"] = securities_account_id
+        cleanup_query["securities_account_id"] = securities_account_id
         
         # Delete stale positions
         result = positions_coll.delete_many(cleanup_query)
@@ -734,6 +728,8 @@ def cleanup_positions(
             "timestamp": time.time()
         }
         
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to cleanup positions: {str(e)}")
 

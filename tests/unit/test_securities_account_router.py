@@ -71,6 +71,72 @@ def test_create_simulated_account_forces_live_trading_off(monkeypatch):
     assert saved["risk_limits"] == {"max_order_amount": 1000.0}
 
 
+def test_create_allows_multiple_distinct_accounts_for_user(monkeypatch):
+    accounts = _Collection(
+        [
+            {
+                "_id": ObjectId(),
+                "user_id": "user-1",
+                "broker": "miniQMT",
+                "account_id": "A123",
+                "account_type": "real",
+                "created_at": securities_account.datetime.utcnow(),
+            }
+        ]
+    )
+    monkeypatch.setattr(
+        securities_account,
+        "get_db_collections",
+        lambda: {"securities_accounts": accounts},
+    )
+
+    response = securities_account.create_account(
+        SecuritiesAccountCreate(
+            account_type="real",
+            broker="miniQMT",
+            account_id="B456",
+        ),
+        current_user={"id": "user-1", "username": "alice"},
+    )
+
+    assert response.account_id == "B456"
+    assert len(accounts.docs) == 2
+
+
+def test_create_rejects_duplicate_account_for_user(monkeypatch):
+    accounts = _Collection(
+        [
+            {
+                "_id": ObjectId(),
+                "user_id": "user-1",
+                "broker": "miniQMT",
+                "account_id": "A123",
+                "account_type": "real",
+                "created_at": securities_account.datetime.utcnow(),
+            }
+        ]
+    )
+    monkeypatch.setattr(
+        securities_account,
+        "get_db_collections",
+        lambda: {"securities_accounts": accounts},
+    )
+
+    try:
+        securities_account.create_account(
+            SecuritiesAccountCreate(
+                account_type="real",
+                broker="miniQMT",
+                account_id="A123",
+            ),
+            current_user={"id": "user-1", "username": "alice"},
+        )
+    except securities_account.HTTPException as exc:
+        assert exc.status_code == 409
+    else:
+        raise AssertionError("expected duplicate account to be rejected")
+
+
 def test_update_real_account_saves_live_switch_and_risk_limits(monkeypatch):
     account_id = ObjectId()
     accounts = _Collection(

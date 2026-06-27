@@ -137,6 +137,7 @@ class TestCleanupPositionsEndpoint:
             {
                 "_id": ObjectId(),
                 "user_id": "user_123",
+                "securities_account_id": "000000000000000000000001",
                 "symbol": "600000",
                 "qty": 1000,
                 "avg_price": 10.5
@@ -144,6 +145,7 @@ class TestCleanupPositionsEndpoint:
             {
                 "_id": ObjectId(),
                 "user_id": "user_123",
+                "securities_account_id": "000000000000000000000001",
                 "symbol": "300001",
                 "qty": 500,
                 "avg_price": 25.0
@@ -151,6 +153,7 @@ class TestCleanupPositionsEndpoint:
             {
                 "_id": ObjectId(),
                 "user_id": "user_123",
+                "securities_account_id": "000000000000000000000001",
                 "symbol": "000001",
                 "qty": 200,
                 "avg_price": 15.5
@@ -198,7 +201,7 @@ class TestCleanupPositionsEndpoint:
             "/api/trader/positions/cleanup",
             json={
                 "current_symbols": ["600000"],
-                "securities_account_id": None
+                "securities_account_id": "000000000000000000000001"
             }
         )
         
@@ -221,7 +224,7 @@ class TestCleanupPositionsEndpoint:
             "/api/trader/positions/cleanup",
             json={
                 "current_symbols": ["600000", "300001"],
-                "securities_account_id": None
+                "securities_account_id": "000000000000000000000001"
             }
         )
         
@@ -244,7 +247,7 @@ class TestCleanupPositionsEndpoint:
             "/api/trader/positions/cleanup",
             json={
                 "current_symbols": [],
-                "securities_account_id": None
+                "securities_account_id": "000000000000000000000001"
             }
         )
         
@@ -265,7 +268,7 @@ class TestCleanupPositionsEndpoint:
             "/api/trader/positions/cleanup",
             json={
                 "current_symbols": ["600000", "300001", "000001"],
-                "securities_account_id": None
+                "securities_account_id": "000000000000000000000001"
             }
         )
         
@@ -285,7 +288,7 @@ class TestCleanupPositionsEndpoint:
             "/api/trader/positions/cleanup",
             json={
                 "current_symbols": ["600000"],
-                "securities_account_id": None
+                "securities_account_id": "000000000000000000000001"
             }
         )
         
@@ -293,6 +296,22 @@ class TestCleanupPositionsEndpoint:
         data = response.json()
         assert "timestamp" in data
         assert isinstance(data["timestamp"], (int, float))
+
+    def test_cleanup_requires_securities_account_id(self, setup):
+        """Test that cleanup cannot operate across all user accounts."""
+        client = TestClient(app)
+
+        response = client.request(
+            "DELETE",
+            "/api/trader/positions/cleanup",
+            json={
+                "current_symbols": ["600000"],
+                "securities_account_id": None,
+            }
+        )
+
+        assert response.status_code == 400
+        assert "securities_account_id is required" in response.json()["detail"]
     
     def test_cleanup_validates_input(self, setup):
         """Test that cleanup validates required parameters."""
@@ -403,6 +422,21 @@ class TestSyncPositionsEndpoint:
         assert len(self.positions_coll.docs) == 1
         assert self.positions_coll.docs[0]["symbol"] == "600000.SH"
 
+    def test_sync_positions_requires_securities_account_id(self, setup):
+        """Test that position sync cannot clear all accounts for a user."""
+        client = TestClient(app)
+
+        response = client.post(
+            "/api/trader/positions/sync",
+            json={
+                "positions": [{"symbol": "600000.SH", "qty": 1000}],
+                "securities_account_id": None,
+            },
+        )
+
+        assert response.status_code == 400
+        assert "securities_account_id is required" in response.json()["detail"]
+
 
 class TestGetPositionsEndpoint:
     """Tests for GET /trader/positions endpoint."""
@@ -481,18 +515,33 @@ def test_cleanup_positions_endpoint_integration(monkeypatch):
         {
             "_id": ObjectId(),
             "user_id": "user_123",
+            "securities_account_id": "000000000000000000000001",
             "symbol": "600000",
             "qty": 1000
         },
         {
             "_id": ObjectId(),
             "user_id": "user_123",
+            "securities_account_id": "000000000000000000000001",
             "symbol": "300001",
             "qty": 500
         }
     ])
     
-    fake_collections = {"trader_positions": positions_coll}
+    securities_coll = FakeCollection(
+        [
+            {
+                "_id": ObjectId("000000000000000000000001"),
+                "user_id": "user_123",
+                "account_id": "ACC_123",
+                "broker": "miniQMT",
+            }
+        ]
+    )
+    fake_collections = {
+        "trader_positions": positions_coll,
+        "securities_accounts": securities_coll,
+    }
     
     def mock_get_db_collections():
         return fake_collections
@@ -511,7 +560,7 @@ def test_cleanup_positions_endpoint_integration(monkeypatch):
             "/api/trader/positions/cleanup",
             json={
                 "current_symbols": ["600000"],
-                "securities_account_id": None
+                "securities_account_id": "000000000000000000000001"
             }
         )
         

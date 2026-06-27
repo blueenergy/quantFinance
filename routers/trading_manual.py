@@ -7,6 +7,8 @@ Manual trading operations API
 from fastapi import APIRouter, HTTPException, Depends, Query
 from typing import Dict, Any, Optional
 from datetime import datetime
+from bson import ObjectId
+from bson.errors import InvalidId
 from db import get_db_collections
 from auth import get_current_active_user
 from utils.stock_utils import serialize_doc
@@ -15,6 +17,29 @@ import time
 import uuid
 
 router = APIRouter()
+
+
+def _load_user_securities_account(
+    securities_accounts_coll,
+    *,
+    user_id: str,
+    securities_account_id: str,
+) -> Dict[str, Any]:
+    if not securities_account_id:
+        raise HTTPException(status_code=400, detail="请选择证券账户")
+
+    query_ids = [securities_account_id]
+    try:
+        query_ids.insert(0, ObjectId(securities_account_id))
+    except (InvalidId, TypeError):
+        pass
+
+    for query_id in query_ids:
+        account = securities_accounts_coll.find_one({"_id": query_id, "user_id": user_id})
+        if account:
+            return account
+
+    raise HTTPException(status_code=404, detail="证券账户不存在或无权访问")
 
 
 @router.post("/trade-signals/manual-retry/{order_id}", summary="手动重试失败的交易信号")
@@ -97,6 +122,7 @@ def manual_create_signal(
         size = request.get("size")
         price = request.get("price")
         strategy = request.get("strategy", "manual")
+        securities_account_id = str(request.get("securities_account_id") or "").strip()
         
         if not symbol:
             raise HTTPException(status_code=400, detail="股票代码不能为空")
@@ -117,16 +143,13 @@ def manual_create_signal(
         if size <= 0:
             raise HTTPException(status_code=400, detail="交易数量必须大于0")
         
-        # 获取用户的证券账户
+        # 手动交易必须显式选择证券账户，避免多账户场景下误下到第一个账户。
         securities_accounts_coll = collections["securities_accounts"]
-        user_account = securities_accounts_coll.find_one({"user_id": user_id})
-        
-        if not user_account:
-            raise HTTPException(
-                status_code=400, 
-                detail="请先配置证券账户。单账户模式下，每个用户需要先创建一个证券账户。"
-            )
-        
+        user_account = _load_user_securities_account(
+            securities_accounts_coll,
+            user_id=user_id,
+            securities_account_id=securities_account_id,
+        )
         securities_account_id = str(user_account["_id"])
         
         # 生成订单ID

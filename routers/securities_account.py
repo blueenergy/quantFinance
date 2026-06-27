@@ -145,14 +145,6 @@ def create_account(payload: SecuritiesAccountCreate, current_user: dict = Depend
         # 先插入 securities_accounts 获取 _id，然后再初始化 trader_accounts
         pass  # 稍后在插入后处理
     
-    # 单账户限制：检查用户是否已有账户
-    existing_count = col.count_documents({"user_id": str(current_user["id"])})
-    if existing_count > 0:
-        raise HTTPException(
-            status_code=400, 
-            detail="当前版本每个用户只支持一个账户。如需多账户，请注册多个用户。"
-        )
-    
     # enforce uniqueness per user per broker+account_id+account_type
     # 真实账户和模拟账户可以有相同的 broker+account_id
     existing = col.find_one({
