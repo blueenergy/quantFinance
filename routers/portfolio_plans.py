@@ -1980,6 +1980,78 @@ def _account_positions_by_symbol(
     return positions, bool(rows)
 
 
+# Live signal statuses that mean an order is still working at the broker and has
+# not finished settling. A divergence on such a symbol is expected (in-flight),
+# not a manual broker-side drift, so it must not raise the reconcile banner.
+_INFLIGHT_SIGNAL_STATUSES = frozenset(
+    {"pending", "retry_pending", "submitted", "partial_filled", "cancel_requested"}
+)
+
+
+def _settling_symbol_keys(
+    finance_collections: Dict[str, Any],
+    *,
+    user_id: str,
+    securities_account_id: str,
+    account_synced_at: Optional[float],
+) -> set:
+    """Symbol keys whose ledger/broker gap is explained by in-flight settlement.
+
+    A divergence is "settling" (not a real manual drift) when either:
+      * a live signal for the symbol is still working at the broker, or
+      * the symbol has a fill newer than the broker's last position sync, so the
+        broker snapshot is simply stale and will catch up on the next sync.
+
+    These should be hidden from the reconcile banner to avoid confusing users
+    right after they trigger an in-app add/reduce.
+    """
+    signals_col = finance_collections.get("trade_signals")
+    if signals_col is None:
+        return set()
+
+    signals = list(
+        signals_col.find(
+            {
+                "user_id": user_id,
+                "mode": "live",
+                "securities_account_id": securities_account_id,
+            }
+        )
+    )
+    if not signals:
+        return set()
+
+    settling: set = set()
+    order_ids: List[Any] = []
+    for sig in signals:
+        oid = sig.get("order_id")
+        if oid:
+            order_ids.append(oid)
+        status = str(sig.get("status") or "").strip().lower()
+        if status in _INFLIGHT_SIGNAL_STATUSES:
+            key = _symbol_key(sig.get("symbol"))
+            if key:
+                settling.add(key)
+
+    executions_col = finance_collections.get("trade_executions")
+    if (
+        executions_col is not None
+        and order_ids
+        and isinstance(account_synced_at, (int, float))
+    ):
+        for ex in executions_col.find(
+            {"user_id": user_id, "order_id": {"$in": order_ids}},
+            {"_id": 0, "symbol": 1, "timestamp": 1},
+        ):
+            ts = ex.get("timestamp")
+            if isinstance(ts, (int, float)) and ts > account_synced_at:
+                key = _symbol_key(ex.get("symbol"))
+                if key:
+                    settling.add(key)
+
+    return settling
+
+
 def _reconcile_live_holdings(
     trading_collections: Dict[str, Any],
     finance_collections: Dict[str, Any],
@@ -1993,6 +2065,11 @@ def _reconcile_live_holdings(
     (not just this plan's lineage) so shared accounts with multiple strategies do
     not produce false mismatches. Divergence usually means a manual broker-side
     trade was not recorded, so we surface it for immediate re-sync.
+
+    Symbols whose gap is still settling (working orders or fills newer than the
+    broker's last position sync) are reported separately and excluded from the
+    ``in_sync`` verdict, so an in-app add/reduce does not flash a false mismatch
+    during the fill -> position-sync window.
     """
     account_id = _lineage_live_account_id_from_fills(
         trading_collections, finance_collections, plan, user_id
@@ -2028,7 +2105,15 @@ def _reconcile_live_holdings(
         if isinstance(ts, (int, float)):
             synced_at = ts if synced_at is None else max(synced_at, ts)
 
+    settling_keys = _settling_symbol_keys(
+        finance_collections,
+        user_id=user_id,
+        securities_account_id=account_id,
+        account_synced_at=synced_at,
+    )
+
     diffs: List[Dict[str, Any]] = []
+    settling_diffs: List[Dict[str, Any]] = []
     for key in sorted({*ledger_by_key, *account_by_key}):
         ledger_row = ledger_by_key.get(key) or {}
         account_row = account_by_key.get(key)
@@ -2041,15 +2126,18 @@ def _reconcile_live_holdings(
         if ledger_shares == account_shares:
             continue
         symbol = ledger_row.get("symbol") or (account_row or {}).get("symbol") or key
-        diffs.append(
-            {
-                "symbol": symbol,
-                "name": ledger_row.get("name") or (account_row or {}).get("name") or "",
-                "ledger_shares": ledger_shares,
-                "account_shares": account_shares,
-                "diff": account_shares - ledger_shares,
-            }
-        )
+        entry = {
+            "symbol": symbol,
+            "name": ledger_row.get("name") or (account_row or {}).get("name") or "",
+            "ledger_shares": ledger_shares,
+            "account_shares": account_shares,
+            "diff": account_shares - ledger_shares,
+        }
+        if key in settling_keys:
+            entry["settling"] = True
+            settling_diffs.append(entry)
+        else:
+            diffs.append(entry)
 
     return {
         "applicable": True,
@@ -2057,6 +2145,7 @@ def _reconcile_live_holdings(
         "securities_account_id": account_id,
         "account_synced_at": synced_at,
         "diffs": diffs,
+        "settling_diffs": settling_diffs,
     }
 
 

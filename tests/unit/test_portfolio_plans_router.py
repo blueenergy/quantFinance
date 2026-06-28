@@ -4189,6 +4189,101 @@ def test_reconcile_live_holdings_flags_real_account_drift(monkeypatch):
     assert diff_by_symbol["000001.SZ"]["diff"] == -50
 
 
+def test_reconcile_live_holdings_suppresses_recent_fill_before_sync(monkeypatch):
+    # Simulate an in-app add: the ledger already reflects the fresh fill but the
+    # broker position snapshot is stale (synced before the fill). This must NOT
+    # raise a mismatch; it is surfaced as a settling diff instead.
+    cols, fin, data = _reconcile_shared_account_fixtures()
+    fin["trade_signals"].docs = [
+        {
+            "order_id": "oa",
+            "user_id": "user-1",
+            "mode": "live",
+            "plan_id": "plan-a",
+            "securities_account_id": "acct-1",
+            "status": "filled",
+            "created_at": 1,
+        },
+    ]
+    fin["trade_executions"].docs = [
+        {
+            "order_id": "oa",
+            "user_id": "user-1",
+            "symbol": "000001.SZ",
+            "side": "BUY",
+            "filled_size": 200,
+            "filled_price": 10.0,
+            "timestamp": 1800.0,
+        },
+    ]
+    fin["trader_positions"].docs = [
+        {
+            "user_id": "user-1",
+            "securities_account_id": "acct-1",
+            "symbol": "000001.SZ",
+            "volume": 100,
+            "synced_at": 1700.0,
+        },
+    ]
+    _patch_lineage_live_env(monkeypatch, cols, fin, data)
+    plan = cols["portfolio_trade_plans"].find_one({"plan_id": "plan-a"})
+
+    result = portfolio_plans._reconcile_live_holdings(cols, fin, data, plan, "user-1")
+
+    assert result["applicable"] is True
+    assert result["in_sync"] is True
+    assert result["diffs"] == []
+    settling_by_symbol = {row["symbol"]: row for row in result["settling_diffs"]}
+    assert settling_by_symbol["000001.SZ"]["diff"] == -100
+
+
+def test_reconcile_live_holdings_suppresses_inflight_signal(monkeypatch):
+    # A working (non-terminal) order still settling at the broker must not flag a
+    # mismatch even when the broker snapshot is fresher than the order timestamp.
+    cols, fin, data = _reconcile_shared_account_fixtures()
+    fin["trade_signals"].docs = [
+        {
+            "order_id": "oa",
+            "user_id": "user-1",
+            "mode": "live",
+            "plan_id": "plan-a",
+            "securities_account_id": "acct-1",
+            "symbol": "000001.SZ",
+            "status": "pending",
+            "created_at": 1,
+        },
+    ]
+    fin["trade_executions"].docs = [
+        {
+            "order_id": "oa",
+            "user_id": "user-1",
+            "symbol": "000001.SZ",
+            "side": "BUY",
+            "filled_size": 200,
+            "filled_price": 10.0,
+            "timestamp": 1.0,
+        },
+    ]
+    fin["trader_positions"].docs = [
+        {
+            "user_id": "user-1",
+            "securities_account_id": "acct-1",
+            "symbol": "000001.SZ",
+            "volume": 100,
+            "synced_at": 1700.0,
+        },
+    ]
+    _patch_lineage_live_env(monkeypatch, cols, fin, data)
+    plan = cols["portfolio_trade_plans"].find_one({"plan_id": "plan-a"})
+
+    result = portfolio_plans._reconcile_live_holdings(cols, fin, data, plan, "user-1")
+
+    assert result["applicable"] is True
+    assert result["in_sync"] is True
+    assert result["diffs"] == []
+    assert {row["symbol"] for row in result["settling_diffs"]} == {"000001.SZ"}
+
+
 def test_force_rebalance_enqueues_rebalance_task_with_lineage_params(monkeypatch):
     cols = _collections()
     cols["portfolio_trade_plans"] = _Collection(
