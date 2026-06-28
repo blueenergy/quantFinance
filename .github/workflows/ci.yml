@@ -44,190 +44,64 @@ jobs:
         run: |
           echo "Skipping integration tests in GitHub Actions."
 
-  deploy:
-    name: Deploy to VolcEngine (docker pull from ACR)
+  release:
+    name: Bump image tag in quant-infrastructure & trigger deploy
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     runs-on: ubuntu-latest
     needs: [test-build, docker]
-    env:
-      DEPLOY_MCP: ${{ vars.DEPLOY_MCP || 'false' }}
     steps:
-      - name: Set up SSH key
+      - name: Compute image tag
+        id: tag
+        run: echo "tag=sha-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout quant-infrastructure
+        uses: actions/checkout@v4
+        with:
+          repository: blueenergy/quant-infrastructure
+          ref: main
+          token: ${{ secrets.INFRA_REPO_TOKEN }}
+          path: infra
+
+      - name: Bump versions.env (rebase-retry on concurrent pushes)
+        working-directory: infra
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+          KEY: QUANT_API_IMAGE_TAG
         run: |
-          mkdir -p ~/.ssh
-          echo "${{ secrets.VOLC_SSH_KEY }}" > ~/.ssh/id_ed25519
-          chmod 600 ~/.ssh/id_ed25519
-          ssh-keyscan ${{ secrets.VOLC_HOST }} >> ~/.ssh/known_hosts
+          git config user.name "ci-bot"
+          git config user.email "ci-bot@users.noreply.github.com"
+          for attempt in 1 2 3 4 5; do
+            git fetch --quiet origin main
+            git reset --hard --quiet origin/main
+            sed -i "s|^${KEY}=.*|${KEY}=${TAG}|" apps/versions.env
+            if git diff --quiet apps/versions.env; then
+              echo "versions.env already at ${TAG}; nothing to commit."
+              exit 0
+            fi
+            git add apps/versions.env
+            git commit -m "deploy(quant-api): ${TAG}"
+            if git push origin main; then
+              echo "Pushed tag bump (${TAG})."
+              exit 0
+            fi
+            echo "Push raced (attempt ${attempt}); retrying..."
+            sleep $((attempt * 5))
+          done
+          echo "Failed to push tag bump after retries." >&2
+          exit 1
 
-      - name: Pull image and deploy
-        timeout-minutes: 15
+      - name: Trigger centralized deploy
+        env:
+          INFRA_REPO_TOKEN: ${{ secrets.INFRA_REPO_TOKEN }}
+          TAG: ${{ steps.tag.outputs.tag }}
         run: |
-          ssh -i ~/.ssh/id_ed25519 \
-            -o StrictHostKeyChecking=no \
-            -o ServerAliveInterval=30 \
-            -o ServerAliveCountMax=6 \
-            ${{ secrets.VOLC_USER }}@${{ secrets.VOLC_HOST }} \
-            "ALIYUN_USER='${{ secrets.ALIYUN_USER }}' ALIYUN_TOKEN='${{ secrets.ALIYUN_TOKEN }}' DEPLOY_MCP='${DEPLOY_MCP}' IMAGE_TAG='sha-${GITHUB_SHA::7}' bash -s" <<'EOF'
-          set -euo pipefail
-
-          IMAGE="crpi-gv3f6mfcrw75qane.cn-hangzhou.personal.cr.aliyuncs.com/wukongquant/quant-api:${IMAGE_TAG}"
-
-          log_step() {
-            echo "[$(date '+%Y-%m-%d %H:%M:%S %z')] $*"
-          }
-
-          log_step "Logging in to Aliyun registry"
-          timeout 60 docker login crpi-gv3f6mfcrw75qane.cn-hangzhou.personal.cr.aliyuncs.com \
-            -u "$ALIYUN_USER" \
-            -p "$ALIYUN_TOKEN"
-
-          log_step "Pulling quant-api image"
-          timeout 300 docker pull "$IMAGE"
-
-          log_step "Preparing shared directories"
-          mkdir -p /home/deployuser/quantFinance/logs /home/deployuser/shared/portfolio-research
-
-          log_step "Ensuring shared Docker network"
-          docker network inspect quant-network >/dev/null 2>&1 || docker network create quant-network
-
-          log_step "Ensuring portfolio plan MongoDB indexes"
-          # Self-migrating: drops the legacy unconditional unique lineage index
-          # and (re)creates the partial unique / query-acceleration indexes used
-          # by the quant-api plan APIs. Non-fatal so an index issue never blocks
-          # the API rollout.
-          timeout 120 docker run --rm \
-            --network quant-network \
-            --add-host=host.docker.internal:host-gateway \
-            --env-file /home/deployuser/quantFinance/.env \
-            -e TZ=Asia/Shanghai \
-            -v /home/deployuser/quantFinance/.env:/app/.env:ro \
-            "$IMAGE" \
-            python tools/check_portfolio_plan_indexes.py --apply \
-            || log_step "WARN: portfolio index maintenance failed (continuing deploy)"
-
-          log_step "Ensuring general performance MongoDB indexes"
-          # Broad finance / quant_analyzer / quant_data query-acceleration indexes.
-          # Idempotent (skips existing) and per-index fault tolerant. Non-fatal so
-          # an index issue never blocks the API rollout.
-          timeout 600 docker run --rm \
-            --network quant-network \
-            --add-host=host.docker.internal:host-gateway \
-            --env-file /home/deployuser/quantFinance/.env \
-            -e TZ=Asia/Shanghai \
-            -v /home/deployuser/quantFinance/.env:/app/.env:ro \
-            "$IMAGE" \
-            python tools/check_and_fix_indexes.py --apply \
-            || log_step "WARN: general index maintenance failed (continuing deploy)"
-
-          log_step "Stopping existing containers"
-          timeout 30 docker stop -t 20 quant-mcp-actions 2>/dev/null || true
-          timeout 30 docker rm quant-mcp-actions 2>/dev/null || true
-          timeout 30 docker stop -t 20 quant-mcp-read 2>/dev/null || true
-          timeout 30 docker rm quant-mcp-read 2>/dev/null || true
-          timeout 30 docker stop -t 20 quant-mcp 2>/dev/null || true
-          timeout 30 docker rm quant-mcp 2>/dev/null || true
-          timeout 30 docker stop -t 20 quant-scheduler 2>/dev/null || true
-          timeout 30 docker rm quant-scheduler 2>/dev/null || true
-          timeout 30 docker stop -t 20 quant-api 2>/dev/null || true
-          timeout 30 docker rm quant-api 2>/dev/null || true
-
-          log_step "Starting quant-api"
-          timeout 60 docker run -d \
-            --name quant-api \
-            --restart unless-stopped \
-            --network quant-network \
-            --add-host=host.docker.internal:host-gateway \
-            -p 3001:3001 \
-            -e TZ=Asia/Shanghai \
-            -e ENABLE_EMBEDDED_SCHEDULER=false \
-            -e ENABLE_MCP_SERVER=false \
-            -e API_WORKERS=2 \
-            -e PORTFOLIO_RESEARCH_REPORT_DIR=/app/reports/portfolio-research \
-            --log-driver json-file \
-            --log-opt max-size=50m \
-            --log-opt max-file=3 \
-            -v /home/deployuser/quantFinance/.env:/app/.env:ro \
-            -v /home/deployuser/quantFinance/logs:/app/logs \
-            -v /home/deployuser/shared/portfolio-research:/app/reports/portfolio-research \
-            "$IMAGE"
-
-          if [ "${DEPLOY_MCP:-false}" = "true" ]; then
-            log_step "Starting quant-mcp-read"
-            timeout 60 docker run -d \
-              --name quant-mcp-read \
-              --restart unless-stopped \
-              --network quant-network \
-              --add-host=host.docker.internal:host-gateway \
-              -p 3002:3002 \
-              -e TZ=Asia/Shanghai \
-              -e ENABLE_EMBEDDED_SCHEDULER=false \
-              -e ENABLE_MCP_SERVER=true \
-              -e MCP_SERVER_MODE=read \
-              --health-cmd "curl -f http://localhost:3002/health || exit 1" \
-              --health-interval 30s \
-              --health-timeout 10s \
-              --health-retries 3 \
-              --log-driver json-file \
-              --log-opt max-size=50m \
-              --log-opt max-file=3 \
-              -v /home/deployuser/quantFinance/.env:/app/.env:ro \
-              -v /home/deployuser/quantFinance/logs:/app/logs \
-              "$IMAGE" \
-              uvicorn main:app --host 0.0.0.0 --port 3002 --workers 1 --log-level info
-
-            log_step "Starting quant-mcp-actions"
-            timeout 60 docker run -d \
-              --name quant-mcp-actions \
-              --restart unless-stopped \
-              --network quant-network \
-              --add-host=host.docker.internal:host-gateway \
-              -p 3003:3003 \
-              -e TZ=Asia/Shanghai \
-              -e ENABLE_EMBEDDED_SCHEDULER=false \
-              -e ENABLE_MCP_SERVER=true \
-              -e MCP_SERVER_MODE=actions \
-              --health-cmd "curl -f http://localhost:3003/health || exit 1" \
-              --health-interval 30s \
-              --health-timeout 10s \
-              --health-retries 3 \
-              --log-driver json-file \
-              --log-opt max-size=50m \
-              --log-opt max-file=3 \
-              -v /home/deployuser/quantFinance/.env:/app/.env:ro \
-              -v /home/deployuser/quantFinance/logs:/app/logs \
-              "$IMAGE" \
-              uvicorn main:app --host 0.0.0.0 --port 3003 --workers 1 --log-level info
-          else
-            log_step "Skipping MCP containers because DEPLOY_MCP=${DEPLOY_MCP:-false}"
-          fi
-
-          log_step "Starting quant-scheduler"
-          timeout 60 docker run -d \
-            --name quant-scheduler \
-            --restart unless-stopped \
-            --network quant-network \
-            --add-host=host.docker.internal:host-gateway \
-            -e TZ=Asia/Shanghai \
-            --health-cmd "python tools/check_scheduler_health.py" \
-            --health-interval 30s \
-            --health-timeout 10s \
-            --health-retries 3 \
-            --log-driver json-file \
-            --log-opt max-size=50m \
-            --log-opt max-file=3 \
-            -v /home/deployuser/quantFinance/.env:/app/.env:ro \
-            -v /home/deployuser/quantFinance/logs:/app/logs \
-            "$IMAGE" \
-            python scheduler_runner.py
-
-          log_step "Listing deployed containers"
-          docker ps --filter "name=quant-api" --filter "name=quant-mcp-read" --filter "name=quant-mcp-actions" --filter "name=quant-scheduler"
-
-          log_step "Pruning old images"
-          timeout 120 docker image prune -f || true
-
-          log_step "Deploy finished"
-          EOF
+          # MCP containers are defined in quant-infrastructure behind the "mcp"
+          # profile and are intentionally not deployed by the default CI path.
+          curl -fsSL -X POST \
+            -H "Authorization: Bearer ${INFRA_REPO_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/blueenergy/quant-infrastructure/dispatches \
+            -d "{\"event_type\":\"deploy\",\"client_payload\":{\"services\":\"quant-api quant-scheduler\",\"tag\":\"${TAG}\"}}"
 
   docker:
     name: Build & Push Docker image (ghcr.io + ACR)
