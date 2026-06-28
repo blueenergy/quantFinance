@@ -190,6 +190,42 @@ class TestFetchMarketAnalysisResult:
 
 
 @pytest.mark.unit
+class TestMarketAnalysisPreviousSnapshot:
+    def test_previous_snapshot_requires_nearby_slot(self, monkeypatch):
+        from market_analysis_cache import MarketAnalysisCache
+
+        monkeypatch.setenv("USE_IN_MEMORY_DB", "true")
+        cache = MarketAnalysisCache()
+        monkeypatch.setattr(cache, "is_trading_day", lambda d: True)
+        cache.collection._docs = [
+            {
+                "analysis_date": "2025-12-19",
+                "time_slot": "1130",
+                "snapshot": {"total_market_amount_yi": 6000},
+            },
+            {
+                "analysis_date": "2025-12-19",
+                "time_slot": "1630",
+                "snapshot": {"total_market_amount_yi": 10000},
+            },
+        ]
+
+        prev = cache.get_nearest_previous_snapshot("2025-12-22", "1630")
+        assert prev["time_slot"] == "1630"
+        assert prev["lag_minutes"] == 0
+        assert prev["snapshot"]["total_market_amount_yi"] == 10000
+
+        cache.collection._docs = [
+            {
+                "analysis_date": "2025-12-19",
+                "time_slot": "1130",
+                "snapshot": {"total_market_amount_yi": 6000},
+            },
+        ]
+        assert cache.get_nearest_previous_snapshot("2025-12-22", "1630") is None
+
+
+@pytest.mark.unit
 class TestHomeSummaryBuilders:
     def test_market_home_summary_falls_back_to_result_fields(self):
         from routers import market

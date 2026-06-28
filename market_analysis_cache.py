@@ -194,14 +194,19 @@ class MarketAnalysisCache:
         analysis_date: str,
         target_slot: str,
         max_lookback_days: int = 7,
+        max_lag_minutes: int = 30,
     ) -> Optional[Dict[str, Any]]:
         """
-        查找上一交易日中"时间最接近 target_slot"的 snapshot 字段。
+        查找上一交易日中与 target_slot 足够接近的 snapshot 字段。
+
+        成交额等快照字段是日内累计值，不能把收盘快照与午盘快照混比。
+        因此默认只允许 30 分钟以内的邻近时段；缺少同阶段快照时返回 None。
 
         Args:
             analysis_date: 当前分析日期 YYYY-MM-DD
             target_slot: 当前分析时段 HHMM
             max_lookback_days: 最大回溯日历天数（默认 7，含周末/假期）
+            max_lag_minutes: 允许的最大时段差。None 表示不限制（仅用于兼容/排查）。
 
         Returns:
             {
@@ -247,6 +252,8 @@ class MarketAnalysisCache:
                 except (ValueError, IndexError):
                     continue
                 lag = abs(slot_minutes - target_minutes)
+                if max_lag_minutes is not None and lag > max_lag_minutes:
+                    continue
                 candidates.append((lag, slot, snapshot, candidate_str))
 
             if not candidates:
