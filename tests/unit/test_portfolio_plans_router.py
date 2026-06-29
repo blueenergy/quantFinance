@@ -90,13 +90,21 @@ class _Collection:
     def count_documents(self, query=None):
         return len(self.find(query or {}))
 
+    def _get_value(self, doc, key):
+        value = doc
+        for part in str(key).split("."):
+            if not isinstance(value, dict) or part not in value:
+                return None
+            value = value.get(part)
+        return value
+
     def _matches(self, doc, query):
         for key, expected in query.items():
             if key == "$or":
                 if not any(self._matches(doc, branch) for branch in expected):
                     return False
                 continue
-            value = doc.get(key)
+            value = self._get_value(doc, key)
             if isinstance(expected, dict):
                 if "$in" in expected and value not in expected["$in"]:
                     return False
@@ -215,6 +223,12 @@ def _data_collections():
     }
 
 
+def _analyzer_collections():
+    return {
+        "portfolio_risk_llm": _Collection(),
+    }
+
+
 def test_bulk_reject_plan_items_enqueues_single_regeneration(monkeypatch):
     collections = _collections()
     plan = collections["portfolio_trade_plans"].docs[0]
@@ -238,7 +252,6 @@ def test_bulk_reject_plan_items_enqueues_single_regeneration(monkeypatch):
     assert task["operation_type"] == "bulk_reject_symbols"
     assert task["operation_symbol"] is None
     assert task["excluded_symbols"] == ["000001", "000003", "600000"]
-
     updated_plan = collections["portfolio_trade_plans"].find_one({"plan_id": "plan-user-1", "user_id": "user-1"})
     assert updated_plan["excluded_symbols"] == ["000001", "000003", "600000"]
     assert len(collections["portfolio_plan_operation_logs"].docs) == 1
@@ -247,6 +260,177 @@ def test_bulk_reject_plan_items_enqueues_single_regeneration(monkeypatch):
     assert log["operation_symbol"] is None
     assert log["payload"]["operation_symbols"] == ["000001", "600000"]
 
+
+def test_enqueue_portfolio_llm_risk_fans_out_by_industry_and_reuses_running_run(monkeypatch):
+    collections = _collections()
+    plan = collections["portfolio_trade_plans"].docs[0]
+    collections["portfolio_trade_plan_items"].insert_many(
+        [
+            {
+                "plan_id": plan["plan_id"],
+                "user_id": "user-1",
+                "symbol": "000001",
+                "name": "平安银行",
+                "industry": "银行",
+                "action": "buy",
+                "rank": 1,
+                "target_weight": 0.06,
+                "score_value": 88.0,
+                "ai_risk": {"severity": "medium", "reasons": ["近期涨幅过大"]},
+            },
+            {
+                "plan_id": plan["plan_id"],
+                "user_id": "user-1",
+                "symbol": "600000",
+                "name": "浦发银行",
+                "industry": "银行",
+                "action": "hold",
+                "rank": 2,
+                "target_weight": 0.04,
+                "score_value": 80.0,
+                "ai_risk": {"severity": "none"},
+            },
+            {
+                "plan_id": plan["plan_id"],
+                "user_id": "user-1",
+                "symbol": "300001",
+                "name": "测试科技",
+                "industry": "电子/半导体",
+                "action": "buy",
+                "rank": 3,
+                "target_weight": 0.03,
+                "score_value": 77.0,
+                "ai_risk": {"severity": "low"},
+            },
+        ]
+    )
+    analysis_tasks = _Collection()
+    monkeypatch.setattr(portfolio_plans, "get_trading_db_collections", lambda: collections)
+    monkeypatch.setattr(portfolio_plans, "get_data_db", _data_collections)
+    monkeypatch.setattr(portfolio_plans, "finance_db", {"analysis_tasks": analysis_tasks})
+
+    response = asyncio.run(
+        portfolio_plans.enqueue_portfolio_plan_llm_risk(
+            plan["plan_id"],
+            portfolio_plans.PortfolioLlmRiskReviewRequest(max_symbols_per_call=2),
+            current_user={"id": "user-1"},
+        )
+    )
+
+    data = response["data"]
+    assert data["reused"] is False
+    assert data["summary"]["total"] == 2
+    assert {task["params"]["industry"] for task in analysis_tasks.docs} == {"银行", "电子"}
+    assert all(task["priority"] == portfolio_plans.PORTFOLIO_RISK_LLM_PRIORITY for task in analysis_tasks.docs)
+    assert all(task["type"] == portfolio_plans.PORTFOLIO_RISK_LLM_TASK_TYPE for task in analysis_tasks.docs)
+
+    reused = asyncio.run(
+        portfolio_plans.enqueue_portfolio_plan_llm_risk(
+            plan["plan_id"],
+            portfolio_plans.PortfolioLlmRiskReviewRequest(max_symbols_per_call=2),
+            current_user={"id": "user-1"},
+        )
+    )
+    assert reused["data"]["reused"] is True
+    assert reused["data"]["run_id"] == data["run_id"]
+    assert len(analysis_tasks.docs) == 2
+
+
+def test_plan_detail_enriches_latest_completed_llm_risk(monkeypatch):
+    collections = _collections()
+    plan = collections["portfolio_trade_plans"].docs[0]
+    collections["portfolio_trade_plan_items"].insert_one(
+        {
+            "plan_id": plan["plan_id"],
+            "user_id": "user-1",
+            "symbol": "000001",
+            "name": "平安银行",
+            "industry": "银行",
+            "action": "buy",
+            "rank": 1,
+            "ai_risk": {"severity": "medium", "reasons": ["近期涨幅过大"]},
+        }
+    )
+    finance_collections = _finance_collections()
+    data_collections = _data_collections()
+    analyzer_collections = _analyzer_collections()
+    analyzer_collections["portfolio_risk_llm"].insert_many(
+        [
+            {
+                "plan_id": plan["plan_id"],
+                "run_id": "run-old",
+                "scope": "symbol",
+                "symbol": "000001",
+                "industry": "银行",
+                "severity": "low",
+                "summary": "旧结果",
+                "findings": [],
+                "engine_version": "llm-v1",
+                "model": "old",
+                "analyzed_at": "2026-06-28T10:00:00",
+            },
+            {
+                "plan_id": plan["plan_id"],
+                "run_id": "run-new",
+                "scope": "symbol",
+                "symbol": "000001",
+                "industry": "银行",
+                "severity": "high",
+                "summary": "监管问询风险",
+                "findings": [{"title": "收到问询", "severity": "high"}],
+                "engine_version": "llm-v1",
+                "model": "new",
+                "analyzed_at": "2026-06-29T10:00:00",
+            },
+            {
+                "plan_id": plan["plan_id"],
+                "run_id": "run-new",
+                "scope": "industry",
+                "industry": "银行",
+                "severity": "medium",
+                "summary": "行业风险偏中性",
+                "findings": [],
+                "engine_version": "llm-v1",
+                "model": "new",
+                "analyzed_at": "2026-06-29T10:00:00",
+            },
+        ]
+    )
+    analysis_tasks = _Collection(
+        [
+            {
+                "type": portfolio_plans.PORTFOLIO_RISK_LLM_TASK_TYPE,
+                "user_id": "user-1",
+                "status": "completed",
+                "created_at": datetime(2026, 6, 28),
+                "params": {"plan_id": plan["plan_id"], "run_id": "run-old"},
+            },
+            {
+                "type": portfolio_plans.PORTFOLIO_RISK_LLM_TASK_TYPE,
+                "user_id": "user-1",
+                "status": "completed",
+                "created_at": datetime(2026, 6, 29),
+                "params": {"plan_id": plan["plan_id"], "run_id": "run-new"},
+            },
+        ]
+    )
+    monkeypatch.setattr(portfolio_plans, "get_trading_db_collections", lambda: collections)
+    monkeypatch.setattr(portfolio_plans, "get_db_collections", lambda: finance_collections)
+    monkeypatch.setattr(portfolio_plans, "get_data_db", lambda: data_collections)
+    monkeypatch.setattr(portfolio_plans, "get_analyzer_db", lambda: analyzer_collections)
+    monkeypatch.setattr(portfolio_plans, "finance_db", {"analysis_tasks": analysis_tasks})
+
+    response = asyncio.run(
+        portfolio_plans.get_portfolio_plan(plan["plan_id"], current_user={"id": "user-1"})
+    )
+
+    item = response["data"]["items"][0]
+    assert item["ai_risk"]["llm"]["run_id"] == "run-new"
+    assert item["ai_risk"]["llm"]["severity"] == "high"
+    assert item["ai_risk"]["llm"]["summary"] == "监管问询风险"
+    summary = response["data"]["plan"]["summary"]["ai_risk_llm_summary"]
+    assert summary["run_id"] == "run-new"
+    assert summary["industries"][0]["industry"] == "银行"
 
 def test_bulk_reject_plan_items_rejects_empty_symbols(monkeypatch):
     collections = _collections()

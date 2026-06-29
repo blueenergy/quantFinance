@@ -147,6 +147,7 @@ def get_analyzer_db():
         "hot_stock_analysis": analyzer_db["hot_stock_analysis"],
         "sector_concept_analysis": analyzer_db["sector_concept_analysis"],
         "portfolio_analysis": analyzer_db["portfolio_analysis"],
+        "portfolio_risk_llm": analyzer_db["portfolio_risk_llm"],
         "market_analysis_cache": analyzer_db["market_analysis_cache"],
         # LLM interpretations of risk scan reports (written by quantAnalyzer)
         "risk_report_analysis": analyzer_db["risk_report_analysis"],
