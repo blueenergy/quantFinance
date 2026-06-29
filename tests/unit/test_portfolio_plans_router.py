@@ -1185,7 +1185,16 @@ def test_plan_execution_context_does_not_stamp_executed_live_for_observation():
 
 def test_publish_live_signals_dry_run_builds_contract(monkeypatch):
     collections = _collections()
-    collections["portfolio_trade_plans"].docs[0]["status"] = "approved"
+    collections["portfolio_trade_plans"].docs[0].update(
+        {
+            "status": "approved",
+            "summary": {
+                "baseline_equity": 1_200_000,
+                "baseline_cash": 320_000,
+                "capital_basis": "account_equity",
+            },
+        }
+    )
     collections["portfolio_trade_plan_items"].docs.extend(
         [
             {
@@ -1252,13 +1261,198 @@ def test_publish_live_signals_dry_run_builds_contract(monkeypatch):
     assert sell_signal["price_floor"] == 11.88
     assert sell_signal["phase_barrier"] is None
     assert response["data"]["risk_report"]["blocked_count"] == 0
-    assert response["data"]["reprice_summary"]["equity_used"] == 1000000
+    assert response["data"]["reprice_summary"]["equity_used"] == 1_200_000
+    assert response["data"]["reprice_summary"]["plan_equity_used"] == 1_200_000
+    assert response["data"]["reprice_summary"]["plan_cash_used"] == 320_000
+    assert response["data"]["reprice_summary"]["account_available_cash"] == 100_000
+    assert response["data"]["reprice_summary"]["plan_equity_source"] == "summary.baseline_equity"
+    assert response["data"]["reprice_summary"]["plan_cash_source"] == "summary.baseline_cash"
+    assert response["data"]["reprice_summary"]["capital_basis"] == "account_equity"
     assert len(response["data"]["reprice_summary"]["items"]) == 2
+
+
+def test_publish_live_signals_uses_plan_equity_not_account_total_asset(monkeypatch):
+    collections = _collections()
+    collections["portfolio_trade_plans"].docs[0].update(
+        {
+            "status": "approved",
+            "summary": {"baseline_equity": 1_200_000, "baseline_cash": 500_000},
+        }
+    )
+    collections["portfolio_trade_plan_items"].docs.append(
+        {
+            "plan_id": "plan-user-1",
+            "user_id": "user-1",
+            "symbol": "000001",
+            "action": "buy",
+            "delta_shares": 100,
+            "target_shares": 100,
+            "target_weight": 0.1,
+            "estimated_price": 10.0,
+            "rank": 1,
+        }
+    )
+    finance = _finance_collections()
+    finance["trader_accounts"].docs[0]["total_asset"] = 5_000_000
+    finance["securities_accounts"].docs[0]["risk_limits"]["max_order_amount"] = 500_000
+    monkeypatch.setattr(portfolio_plans, "get_trading_db_collections", lambda: collections)
+    monkeypatch.setattr(portfolio_plans, "get_db_collections", lambda: finance)
+    monkeypatch.setattr(portfolio_plans, "get_data_db", _data_collections)
+
+    response = asyncio.run(
+        portfolio_plans.publish_portfolio_plan_live_signals(
+            "plan-user-1",
+            portfolio_plans.PublishLiveSignalsRequest(securities_account_id="acct-1", dry_run=True),
+            current_user={"id": "user-1"},
+        )
+    )
+
+    assert response["data"]["reprice_summary"]["equity_used"] == 1_200_000
+    assert response["data"]["reprice_summary"]["account_equity"] == 5_000_000
+    row = response["data"]["reprice_summary"]["items"][0]
+    assert row["new_target_shares"] == 12_000
+    assert row["new_delta_shares"] == 12_000
+
+
+def test_publish_live_signals_falls_back_to_initial_capital_when_plan_baseline_missing(monkeypatch):
+    collections = _collections()
+    collections["portfolio_trade_plans"].docs[0].update(
+        {
+            "status": "approved",
+            "params_snapshot": {"initial_capital": 300_000, "lot_size": 100},
+            "summary": {},
+        }
+    )
+    collections["portfolio_trade_plan_items"].docs.append(
+        {
+            "plan_id": "plan-user-1",
+            "user_id": "user-1",
+            "symbol": "000001",
+            "action": "buy",
+            "delta_shares": 100,
+            "target_shares": 100,
+            "target_weight": 0.1,
+            "estimated_price": 10.0,
+            "rank": 1,
+        }
+    )
+    finance = _finance_collections()
+    finance["trader_accounts"].docs[0]["total_asset"] = 5_000_000
+    finance["securities_accounts"].docs[0]["risk_limits"]["max_order_amount"] = 500_000
+    monkeypatch.setattr(portfolio_plans, "get_trading_db_collections", lambda: collections)
+    monkeypatch.setattr(portfolio_plans, "get_db_collections", lambda: finance)
+    monkeypatch.setattr(portfolio_plans, "get_data_db", _data_collections)
+
+    response = asyncio.run(
+        portfolio_plans.publish_portfolio_plan_live_signals(
+            "plan-user-1",
+            portfolio_plans.PublishLiveSignalsRequest(securities_account_id="acct-1", dry_run=True),
+            current_user={"id": "user-1"},
+        )
+    )
+
+    assert response["data"]["reprice_summary"]["equity_used"] == 300_000
+    assert response["data"]["reprice_summary"]["plan_equity_source"] == "params_snapshot.initial_capital"
+    assert response["data"]["reprice_summary"]["plan_cash_source"] == "params_snapshot.initial_capital"
+    row = response["data"]["reprice_summary"]["items"][0]
+    assert row["new_target_shares"] == 3_000
+    assert row["new_delta_shares"] == 3_000
+
+
+def test_publish_live_signals_blocks_confirm_when_plan_capital_missing(monkeypatch):
+    collections = _collections()
+    collections["portfolio_trade_plans"].docs[0].update(
+        {
+            "status": "approved",
+            "params_snapshot": {"lot_size": 100},
+            "summary": {},
+            "initial_capital": None,
+        }
+    )
+    collections["portfolio_trade_plan_items"].docs.append(
+        {
+            "plan_id": "plan-user-1",
+            "user_id": "user-1",
+            "symbol": "000001",
+            "action": "buy",
+            "delta_shares": 100,
+            "target_shares": 100,
+            "target_weight": 0.1,
+            "estimated_price": 10.0,
+            "rank": 1,
+        }
+    )
+    finance = _finance_collections()
+    monkeypatch.setattr(portfolio_plans, "get_trading_db_collections", lambda: collections)
+    monkeypatch.setattr(portfolio_plans, "get_db_collections", lambda: finance)
+    monkeypatch.setattr(portfolio_plans, "get_data_db", _data_collections)
+
+    preview = asyncio.run(
+        portfolio_plans.publish_portfolio_plan_live_signals(
+            "plan-user-1",
+            portfolio_plans.PublishLiveSignalsRequest(securities_account_id="acct-1", dry_run=True),
+            current_user={"id": "user-1"},
+        )
+    )
+    assert "missing_plan_equity" in preview["data"]["reprice_summary"]["blockers"]
+    assert "missing_plan_cash" in preview["data"]["reprice_summary"]["blockers"]
+
+    with pytest.raises(portfolio_plans.HTTPException) as exc:
+        asyncio.run(
+            portfolio_plans.publish_portfolio_plan_live_signals(
+                "plan-user-1",
+                portfolio_plans.PublishLiveSignalsRequest(securities_account_id="acct-1", dry_run=False),
+                current_user={"id": "user-1"},
+            )
+        )
+    assert exc.value.status_code == 409
+    assert "missing plan capital baseline" in exc.value.detail["message"]
+
+
+def test_publish_live_signals_dry_run_blocked_flag_reflects_capital_blocker(monkeypatch):
+    # A sell-to-zero builds a signal even without a capital baseline, but the
+    # dry-run response must still report blocked=True so the preview matches the
+    # confirm-time 409.
+    collections = _collections()
+    collections["portfolio_trade_plans"].docs[0].update(
+        {"status": "approved", "params_snapshot": {"lot_size": 100}, "summary": {}}
+    )
+    collections["portfolio_trade_plan_items"].docs.append(
+        {
+            "plan_id": "plan-user-1",
+            "user_id": "user-1",
+            "symbol": "600000",
+            "action": "sell",
+            "delta_shares": -200,
+            "target_shares": 0,
+            "target_weight": 0,
+            "estimated_price": 12.0,
+            "rank": 1,
+        }
+    )
+    finance = _finance_collections()
+    monkeypatch.setattr(portfolio_plans, "get_trading_db_collections", lambda: collections)
+    monkeypatch.setattr(portfolio_plans, "get_db_collections", lambda: finance)
+    monkeypatch.setattr(portfolio_plans, "get_data_db", _data_collections)
+
+    response = asyncio.run(
+        portfolio_plans.publish_portfolio_plan_live_signals(
+            "plan-user-1",
+            portfolio_plans.PublishLiveSignalsRequest(securities_account_id="acct-1", dry_run=True),
+            current_user={"id": "user-1"},
+        )
+    )
+
+    assert len(response["data"]["signals"]) == 1
+    assert response["data"]["blocked"] is True
+    assert "missing_plan_equity" in response["data"]["reprice_summary"]["blockers"]
 
 
 def test_publish_live_signals_reprice_blocks_missing_price(monkeypatch):
     collections = _collections()
-    collections["portfolio_trade_plans"].docs[0]["status"] = "approved"
+    collections["portfolio_trade_plans"].docs[0].update(
+        {"status": "approved", "params_snapshot": {"initial_capital": 1_000_000, "lot_size": 100}}
+    )
     collections["portfolio_trade_plan_items"].docs.append(
         {
             "plan_id": "plan-user-1",
@@ -1303,7 +1497,9 @@ def test_publish_live_signals_reprice_blocks_missing_price(monkeypatch):
 
 def test_publish_live_signals_allows_missing_price_market_sell(monkeypatch):
     collections = _collections()
-    collections["portfolio_trade_plans"].docs[0]["status"] = "approved"
+    collections["portfolio_trade_plans"].docs[0].update(
+        {"status": "approved", "params_snapshot": {"initial_capital": 1_000_000, "lot_size": 100}}
+    )
     collections["portfolio_trade_plan_items"].docs.append(
         {
             "plan_id": "plan-user-1",
@@ -1380,7 +1576,9 @@ def test_publish_live_signals_risk_failure_does_not_persist_reprice(monkeypatch)
 
 def test_publish_live_signals_write_is_idempotent(monkeypatch):
     collections = _collections()
-    collections["portfolio_trade_plans"].docs[0]["status"] = "approved"
+    collections["portfolio_trade_plans"].docs[0].update(
+        {"status": "approved", "params_snapshot": {"initial_capital": 1_000_000, "lot_size": 100}}
+    )
     collections["portfolio_trade_plan_items"].docs.append(
         {
             "plan_id": "plan-user-1",
@@ -1458,7 +1656,9 @@ def test_publish_live_signals_rounds_protected_prices_to_tick(monkeypatch):
 
 def test_publish_live_signals_rejects_empty_signal_set(monkeypatch):
     collections = _collections()
-    collections["portfolio_trade_plans"].docs[0]["status"] = "approved"
+    collections["portfolio_trade_plans"].docs[0].update(
+        {"status": "approved", "params_snapshot": {"initial_capital": 1_000_000, "lot_size": 100}}
+    )
     collections["portfolio_trade_plan_items"].docs.append(
         {
             "plan_id": "plan-user-1",
@@ -2159,7 +2359,9 @@ def test_publish_live_signals_blocks_when_live_switch_is_off(monkeypatch):
 
 def test_publish_live_signals_blocks_when_position_pct_exceeded(monkeypatch):
     collections = _collections()
-    collections["portfolio_trade_plans"].docs[0]["status"] = "approved"
+    collections["portfolio_trade_plans"].docs[0].update(
+        {"status": "approved", "params_snapshot": {"initial_capital": 1_000_000, "lot_size": 100}}
+    )
     collections["portfolio_trade_plan_items"].docs.append(
         {
             "plan_id": "plan-user-1",
@@ -4114,6 +4316,100 @@ def test_get_portfolio_plan_bench_enriches_latest_bench_llm_risk(monkeypatch):
     assert payload["bench"][0]["ai_risk"]["llm"]["run_id"] == "bench-run"
     assert payload["bench"][0]["ai_risk"]["llm"]["severity"] == "high"
     assert payload["ai_risk_llm_summary"]["run_id"] == "bench-run"
+
+
+def test_get_portfolio_plan_bench_enriches_running_bench_llm_risk(monkeypatch):
+    cols = _collections()
+    data = _data_collections()
+    stock_scores = _Collection(
+        [
+            {"symbol": "000001.SZ", "name": "A", "industry": "Bank", "score_date": "20250110", "index_codes": "csi1000", "growth_score": 90, "cycle_score": 80},
+            {"symbol": "000002.SZ", "name": "B", "industry": "Bank", "score_date": "20250110", "index_codes": "csi1000", "growth_score": 85, "cycle_score": 75},
+            {"symbol": "000003.SZ", "name": "C", "industry": "Tech", "score_date": "20250110", "index_codes": "csi1000", "growth_score": 80, "cycle_score": 70},
+        ]
+    )
+    cols["portfolio_trade_plans"] = _Collection(
+        [
+            {
+                "plan_id": "bench-running-plan",
+                "strategy_template_id": "s1",
+                "user_id": "user-1",
+                "base_date": "20250110",
+                "score_date": "20250110",
+                "params_hash": "hx",
+                "params_snapshot": {
+                    "universe_index": "csi1000",
+                    "growth_weight": 0.3,
+                    "cycle_weight": 0.7,
+                    "top_n": 2,
+                },
+            }
+        ]
+    )
+    analyzer = _analyzer_collections()
+    analyzer["portfolio_risk_llm"].insert_one(
+        {
+            "plan_id": "bench-running-plan",
+            "run_id": "bench-running-run",
+            "scope": "symbol",
+            "symbol": "000003.SZ",
+            "industry": "Tech",
+            "severity": "low",
+            "summary": "替补候选已有部分 LLM 结果",
+            "findings": [],
+            "engine_version": "llm-v1",
+            "model": "test-model",
+            "analyzed_at": "2026-06-29T10:00:00",
+        }
+    )
+    analysis_tasks = _Collection(
+        [
+            {
+                "type": portfolio_plans.PORTFOLIO_RISK_LLM_TASK_TYPE,
+                "user_id": "user-1",
+                "status": "completed",
+                "created_at": datetime(2026, 6, 29),
+                "params": {"plan_id": "bench-running-plan", "run_id": "bench-running-run", "target_scope": "bench"},
+            },
+            {
+                "type": portfolio_plans.PORTFOLIO_RISK_LLM_TASK_TYPE,
+                "user_id": "user-1",
+                "status": "pending",
+                "created_at": datetime(2026, 6, 29),
+                "params": {"plan_id": "bench-running-plan", "run_id": "bench-running-run", "target_scope": "bench"},
+            },
+        ]
+    )
+    monkeypatch.setattr(portfolio_plans, "get_trading_db_collections", lambda: cols)
+    monkeypatch.setattr(portfolio_plans, "get_db_collections", lambda: cols)
+    monkeypatch.setattr(portfolio_plans, "get_data_db", lambda: data)
+    monkeypatch.setattr(portfolio_plans, "get_analyzer_db", lambda: analyzer)
+    monkeypatch.setattr(
+        portfolio_plans,
+        "finance_db",
+        {"stock_scores": stock_scores, "analysis_tasks": analysis_tasks},
+    )
+    monkeypatch.setattr(
+        portfolio_plans,
+        "_current_lineage_holdings",
+        lambda *args, **kwargs: [
+            {"symbol": "000001.SZ", "name": "A", "shares": 1000, "last_price": 10.0, "market_value": 10000.0},
+            {"symbol": "000002.SZ", "name": "B", "shares": 800, "last_price": 11.0, "market_value": 8800.0},
+        ],
+    )
+
+    resp = asyncio.run(
+        portfolio_plans.get_portfolio_plan_bench(
+            "bench-running-plan",
+            bench_multiplier=1.5,
+            current_user={"id": "user-1"},
+        )
+    )
+
+    payload = resp["data"]
+    assert payload["bench"][0]["ai_risk"]["llm"]["run_id"] == "bench-running-run"
+    assert payload["bench"][0]["ai_risk"]["llm"]["summary"] == "替补候选已有部分 LLM 结果"
+    assert payload["ai_risk_llm_summary"]["status"] == "running"
 
 
 def test_current_lineage_holdings_live_empty_does_not_fallback_to_paper():

@@ -474,6 +474,59 @@ def _lineage_initial_capital(plan: Dict[str, Any]) -> float:
     )
 
 
+def _first_valid_numeric(candidates: List[Tuple[str, Any]]) -> Tuple[Optional[float], Optional[str]]:
+    """Return the first parseable finite float and its source label."""
+    for source, raw in candidates:
+        value = _optional_float(raw)
+        if value is not None:
+            return value, source
+    return None, None
+
+
+def _resolve_publish_plan_capital(plan: Dict[str, Any]) -> Dict[str, Any]:
+    """Resolve plan-scoped equity/cash baseline for live publish repricing.
+
+    Sizing at publish must use the plan's *own* book equity/cash (so unrelated
+    funds parked in the same brokerage account never inflate this plan), not the
+    broker account total asset. The fallback chain is fixed and deliberately
+    never falls back to the account snapshot:
+
+        equity: summary.baseline_equity -> summary.equity
+                -> params_snapshot.initial_capital -> plan.initial_capital
+        cash:   summary.baseline_cash   -> summary.cash
+                -> params_snapshot.initial_capital -> plan.initial_capital
+
+    Unlike ``_lineage_initial_capital`` (which silently defaults to 1,000,000),
+    a fully missing baseline returns ``None`` so the caller can block the publish
+    instead of guessing a budget.
+    """
+    params = plan.get("params_snapshot") or {}
+    summary = plan.get("summary") or {}
+    equity, equity_source = _first_valid_numeric(
+        [
+            ("summary.baseline_equity", summary.get("baseline_equity")),
+            ("summary.equity", summary.get("equity")),
+            ("params_snapshot.initial_capital", params.get("initial_capital")),
+            ("plan.initial_capital", plan.get("initial_capital")),
+        ]
+    )
+    cash, cash_source = _first_valid_numeric(
+        [
+            ("summary.baseline_cash", summary.get("baseline_cash")),
+            ("summary.cash", summary.get("cash")),
+            ("params_snapshot.initial_capital", params.get("initial_capital")),
+            ("plan.initial_capital", plan.get("initial_capital")),
+        ]
+    )
+    return {
+        "equity": equity,
+        "cash": cash,
+        "equity_source": equity_source,
+        "cash_source": cash_source,
+        "capital_basis": summary.get("capital_basis"),
+    }
+
+
 def _compute_lineage_book_equity(
     *,
     trading_collections: Dict[str, Any],
@@ -1165,7 +1218,9 @@ def _latest_completed_portfolio_llm_run_id(
     user_id: str,
     plan_id: str,
     target_scope: str = "plan",
+    eligible_statuses: Optional[set] = None,
 ) -> Optional[str]:
+    statuses = eligible_statuses or {"completed", "completed_with_failures"}
     tasks_col = _analysis_tasks_collection()
     if tasks_col is None:
         return None
@@ -1189,7 +1244,7 @@ def _latest_completed_portfolio_llm_run_id(
     candidates: List[Tuple[datetime, str]] = []
     for run_id, run_tasks in grouped.items():
         summary = _portfolio_llm_run_status(run_tasks)
-        if summary["status"] not in {"completed", "completed_with_failures"}:
+        if summary["status"] not in statuses:
             continue
         latest_created = max(
             (task.get("created_at") for task in run_tasks if isinstance(task.get("created_at"), datetime)),
@@ -1410,6 +1465,7 @@ def _enrich_bench_payload_with_llm_risk(
         user_id=user_id,
         plan_id=plan_id,
         target_scope="bench",
+        eligible_statuses={"completed", "completed_with_failures", "running", "partial"},
     )
     if not run_id:
         return payload
@@ -6123,9 +6179,26 @@ async def publish_portfolio_plan_live_signals(
     )
     now = datetime.utcnow()
     account_snapshot = _latest_account_snapshot(finance_collections, account, user_id)
-    equity = _numeric(account_snapshot.get("total_assets") or account_snapshot.get("total_asset"))
-    available_cash = _numeric(account_snapshot.get("available_cash") or account_snapshot.get("cash"))
+    account_equity = _numeric(account_snapshot.get("total_assets") or account_snapshot.get("total_asset"))
+    account_available_cash = _numeric(account_snapshot.get("available_cash") or account_snapshot.get("cash"))
+    # Sizing budget comes from the plan's own book (see _resolve_publish_plan_capital);
+    # the account snapshot above is kept only for broker-side execution risk checks.
+    plan_capital = _resolve_publish_plan_capital(plan)
+    plan_equity = plan_capital.get("equity")
+    plan_cash = plan_capital.get("cash")
+    capital_blockers: List[str] = []
+    if plan_equity is None:
+        capital_blockers.append("missing_plan_equity")
+        plan_equity = 0.0
+    if plan_cash is None:
+        capital_blockers.append("missing_plan_cash")
+        plan_cash = 0.0
     securities_account_id = str(account.get("_id") or request.securities_account_id)
+    # NOTE (phase-1 basis seam): equity/cash are plan-book scoped, but current_shares
+    # below still come from broker account positions. They coincide when one account
+    # serves a single lineage; if the account also holds the same symbol for other
+    # plans, delta/sell-proceeds may diverge from the plan book. Switching
+    # current_shares to lineage-book positions is deferred to phase 2.
     account_positions_by_key, account_positions_synced = _account_positions_by_symbol(
         finance_collections,
         user_id=user_id,
@@ -6139,7 +6212,7 @@ async def publish_portfolio_plan_live_signals(
         plan=plan,
         items=items,
         quotes=quotes,
-        equity=equity,
+        equity=plan_equity,
         lot_size=lot_size,
         account_positions_by_key=account_positions_by_key,
         account_positions_synced=account_positions_synced,
@@ -6147,13 +6220,37 @@ async def publish_portfolio_plan_live_signals(
         int_value=_int_value,
         numeric=_numeric,
         symbol_key=_symbol_key,
-        available_cash=available_cash if account_snapshot else None,
+        # plan_cash is always a number (fallback to initial_capital), so the buy
+        # cash cap is always active here -- even when the broker account is not
+        # synced. This soft-caps buys to the plan budget and tags them with an
+        # item-level ``insufficient_cash`` blocker. The broker account's real cash
+        # is enforced separately (hard 409) in _build_live_publish_risk_report;
+        # the two share the ``insufficient_cash`` label today (TODO: split into
+        # plan_budget_capped vs account_cash_insufficient).
+        available_cash=plan_cash,
     )
+    blockers = set(reprice_summary.get("blockers") or [])
+    blockers.update(capital_blockers)
+    reprice_summary["blockers"] = sorted(blockers)
+    reprice_summary["equity_used"] = float(plan_equity)
+    reprice_summary["plan_equity_used"] = float(plan_equity)
+    reprice_summary["plan_cash_used"] = float(plan_cash)
+    reprice_summary["plan_equity_source"] = plan_capital.get("equity_source")
+    reprice_summary["plan_cash_source"] = plan_capital.get("cash_source")
+    reprice_summary["account_equity"] = account_equity
+    reprice_summary["account_available_cash"] = account_available_cash
+    reprice_summary["capital_basis"] = plan_capital.get("capital_basis")
     if reprice_summary.get("blockers") and not request.dry_run:
+        message = "publish repricing blocked"
+        blocker_set = set(reprice_summary.get("blockers") or [])
+        if blocker_set == {"missing_price"}:
+            message = "publish repricing blocked: missing usable prices"
+        elif blocker_set.intersection({"missing_plan_equity", "missing_plan_cash"}):
+            message = "publish repricing blocked: missing plan capital baseline"
         raise HTTPException(
             status_code=409,
             detail={
-                "message": "publish repricing blocked: missing usable prices",
+                "message": message,
                 "reprice_summary": reprice_summary,
             },
         )
@@ -6207,9 +6304,13 @@ async def publish_portfolio_plan_live_signals(
         signals=new_signals,
         user_id=user_id,
     )
-    blocked = [item for item in risk_report["items"] if item["blockers"]]
-    if blocked and not request.dry_run:
+    risk_blocked = [item for item in risk_report["items"] if item["blockers"]]
+    if risk_blocked and not request.dry_run:
         raise HTTPException(status_code=409, detail={"message": "live signal risk check failed", "risk_report": risk_report})
+    # The response-level ``blocked`` flag must reflect every reason a confirm
+    # would 409 (risk items AND reprice/capital blockers), so a dry-run preview
+    # never shows "ok" for a publish that would actually fail.
+    response_blocked = bool(risk_blocked) or bool(reprice_summary.get("blockers"))
 
     inserted_count = 0
     if not request.dry_run and new_signals:
@@ -6230,6 +6331,9 @@ async def publish_portfolio_plan_live_signals(
             message="plan repriced with latest market quotes before live publish",
             payload={
                 "equity_used": reprice_summary.get("equity_used"),
+                "plan_equity_used": reprice_summary.get("plan_equity_used"),
+                "plan_cash_used": reprice_summary.get("plan_cash_used"),
+                "account_available_cash": reprice_summary.get("account_available_cash"),
                 "turnover_drift_pct": reprice_summary.get("turnover_drift_pct"),
                 "stale_price_symbols": reprice_summary.get("stale_price_symbols"),
             },
@@ -6273,7 +6377,7 @@ async def publish_portfolio_plan_live_signals(
                 "reprice_summary": reprice_summary,
                 "inserted_count": inserted_count,
                 "existing_count": len(existing_signals),
-                "blocked": bool(blocked),
+                "blocked": response_blocked,
             }
         ),
     }
@@ -6307,6 +6411,10 @@ async def replan_portfolio_plan_remainder(
     account = _require_securities_account(finance_collections, request.securities_account_id, user_id)
     account_snapshot = _latest_account_snapshot(finance_collections, account, user_id)
     account_synced = bool(account_snapshot)
+    # NOTE (basis divergence): remainder/top-up still budgets against the broker
+    # account's available_cash, whereas publish-live-signals now budgets against
+    # the plan book. Unifying top-up onto the plan-book budget is deferred (phase 2)
+    # together with the lineage-position basis change.
     available_cash = _numeric(
         account_snapshot.get("available_cash") or account_snapshot.get("cash")
     ) if account_snapshot else None
