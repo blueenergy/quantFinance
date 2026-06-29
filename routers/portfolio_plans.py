@@ -1189,7 +1189,7 @@ def _latest_completed_portfolio_llm_run_id(
     candidates: List[Tuple[datetime, str]] = []
     for run_id, run_tasks in grouped.items():
         summary = _portfolio_llm_run_status(run_tasks)
-        if summary["status"] != "completed":
+        if summary["status"] not in {"completed", "completed_with_failures"}:
             continue
         latest_created = max(
             (task.get("created_at") for task in run_tasks if isinstance(task.get("created_at"), datetime)),
@@ -1257,10 +1257,13 @@ def _enrich_plan_items_with_llm_risk(
 
     industry_docs = [doc for doc in docs if doc.get("scope") == "industry"]
     enriched, attached_symbol_count = _attach_llm_risk_to_items(items=items, docs=docs, run_id=run_id)
+    run_summary = _portfolio_llm_run_status(
+        _portfolio_llm_run_tasks(user_id=user_id, plan_id=plan_id, run_id=run_id)
+    )
 
     summary = {
         "run_id": run_id,
-        "status": "completed",
+        "status": run_summary.get("status") or "completed",
         "symbol_count": attached_symbol_count,
         "industry_count": len(industry_docs),
         "industries": [
@@ -1422,12 +1425,20 @@ def _enrich_bench_payload_with_llm_risk(
         run_id=run_id,
     )
     industry_docs = [doc for doc in docs if doc.get("scope") == "industry"]
+    run_summary = _portfolio_llm_run_status(
+        _portfolio_llm_run_tasks(
+            user_id=user_id,
+            plan_id=plan_id,
+            run_id=run_id,
+            target_scope="bench",
+        )
+    )
     return {
         **payload,
         "bench": enriched_bench,
         "ai_risk_llm_summary": {
             "run_id": run_id,
-            "status": "completed",
+            "status": run_summary.get("status") or "completed",
             "symbol_count": attached_symbol_count,
             "industry_count": len(industry_docs),
             "industries": [

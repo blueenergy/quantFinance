@@ -469,6 +469,13 @@ def test_plan_detail_enriches_latest_completed_llm_risk(monkeypatch):
                 "created_at": datetime(2026, 6, 29),
                 "params": {"plan_id": plan["plan_id"], "run_id": "run-new"},
             },
+            {
+                "type": portfolio_plans.PORTFOLIO_RISK_LLM_TASK_TYPE,
+                "user_id": "user-1",
+                "status": "failed",
+                "created_at": datetime(2026, 6, 29),
+                "params": {"plan_id": plan["plan_id"], "run_id": "run-new"},
+            },
         ]
     )
     monkeypatch.setattr(portfolio_plans, "get_trading_db_collections", lambda: collections)
@@ -487,6 +494,7 @@ def test_plan_detail_enriches_latest_completed_llm_risk(monkeypatch):
     assert item["ai_risk"]["llm"]["summary"] == "监管问询风险"
     summary = response["data"]["plan"]["summary"]["ai_risk_llm_summary"]
     assert summary["run_id"] == "run-new"
+    assert summary["status"] == "completed_with_failures"
     assert summary["industries"][0]["industry"] == "银行"
 
 def test_bulk_reject_plan_items_rejects_empty_symbols(monkeypatch):
