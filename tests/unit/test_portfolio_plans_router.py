@@ -1729,6 +1729,64 @@ def test_plan_detail_without_live_signals_marks_live_context_false(monkeypatch):
     assert response["data"]["live_execution_context"]["signal_count"] == 0
 
 
+def test_plan_detail_fills_missing_item_metadata_from_score_snapshot(monkeypatch):
+    collections = _collections()
+    collections["portfolio_trade_plans"].docs[0].update(
+        {
+            "score_date": "20250102",
+            "params_snapshot": {
+                "universe_index": "csi1000",
+                "score_type": "growth_cycle_weighted",
+                "growth_weight": 0.3,
+                "cycle_weight": 0.7,
+            },
+        }
+    )
+    collections["portfolio_trade_plan_items"].docs.append(
+        {
+            "plan_id": "plan-user-1",
+            "user_id": "user-1",
+            "strategy_template_id": "s1",
+            "symbol": "002897.SZ",
+            "name": "",
+            "industry": "",
+            "score_value": None,
+            "action": "sell",
+            "current_shares": 100,
+            "target_shares": 0,
+            "delta_shares": -100,
+            "rank": None,
+        }
+    )
+    finance = _finance_collections()
+    data = _data_collections()
+    score_rows = _Collection(
+        [
+            {
+                "score_date": "20250102",
+                "symbol": "002897.SZ",
+                "index_codes": ["csi1000"],
+                "name": "意华股份",
+                "industry": "元器件",
+                "growth_score": 79.5,
+                "cycle_score": 85.95,
+            }
+        ]
+    )
+    monkeypatch.setattr(portfolio_plans, "get_trading_db_collections", lambda: collections)
+    monkeypatch.setattr(portfolio_plans, "get_db_collections", lambda: finance)
+    monkeypatch.setattr(portfolio_plans, "get_data_db", lambda: data)
+    monkeypatch.setattr(portfolio_plans, "finance_db", {"stock_scores": score_rows})
+
+    response = asyncio.run(portfolio_plans.get_portfolio_plan("plan-user-1", current_user={"id": "user-1"}))
+
+    item = response["data"]["items"][0]
+    assert item["name"] == "意华股份"
+    assert item["industry"] == "元器件"
+    assert item["score_value"] == pytest.approx(84.015)
+    assert item["rank"] is None
+
+
 def test_paper_executed_plan_with_live_signals_prefers_live_context(monkeypatch):
     collections = _collections()
     collections["portfolio_trade_plans"].docs[0]["status"] = "executed_paper"

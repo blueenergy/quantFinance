@@ -822,6 +822,85 @@ def _build_ranked_score_universe(
     return ranked
 
 
+def _enrich_plan_items_with_score_snapshot(
+    *,
+    data_collections: Dict[str, Any],
+    plan: Dict[str, Any],
+    items: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Fill display metadata from the plan score snapshot without mutating DB."""
+    if not items:
+        return items
+    if not plan.get("score_date") and not plan.get("params_snapshot"):
+        return items
+    params = dict(plan.get("params_snapshot") or {})
+    universe_index = str(params.get("universe_index") or "csi1000")
+    score_date = _resolve_plan_score_date(plan, universe_index)
+    symbols = sorted({str(item.get("symbol")) for item in items if item.get("symbol")})
+    if not score_date or not symbols:
+        return items
+
+    stock_scores = finance_db["stock_scores"]
+    score_rows: Dict[str, Dict[str, Any]] = {}
+    for symbol in symbols:
+        row = stock_scores.find_one(
+            {
+                "score_date": score_date,
+                "symbol": {"$in": _symbol_query_values(symbol)},
+                "index_codes": universe_index,
+            },
+            {
+                "_id": 0,
+                "symbol": 1,
+                "name": 1,
+                "industry": 1,
+                "growth_score": 1,
+                "cycle_score": 1,
+                "composite_score": 1,
+            },
+        ) or stock_scores.find_one(
+            {"score_date": score_date, "symbol": {"$in": _symbol_query_values(symbol)}},
+            {
+                "_id": 0,
+                "symbol": 1,
+                "name": 1,
+                "industry": 1,
+                "growth_score": 1,
+                "cycle_score": 1,
+                "composite_score": 1,
+            },
+        )
+        if row:
+            score_rows[_symbol_key(symbol)] = row
+
+    stock_info_rows: Dict[str, Dict[str, Any]] = {}
+    stock_info = data_collections.get("stock_info") if data_collections else None
+    if stock_info is not None:
+        for symbol in symbols:
+            row = stock_info.find_one(
+                {"symbol": {"$in": _symbol_query_values(symbol)}},
+                {"_id": 0, "symbol": 1, "name": 1, "industry": 1},
+            )
+            if row:
+                stock_info_rows[_symbol_key(symbol)] = row
+
+    enriched: List[Dict[str, Any]] = []
+    for item in items:
+        symbol = item.get("symbol")
+        key = _symbol_key(symbol)
+        score_row = score_rows.get(key) or {}
+        info_row = stock_info_rows.get(key) or {}
+        patch: Dict[str, Any] = {}
+        if not item.get("name"):
+            patch["name"] = score_row.get("name") or info_row.get("name") or ""
+        if not item.get("industry"):
+            patch["industry"] = score_row.get("industry") or info_row.get("industry") or ""
+        if item.get("score_value") is None and score_row:
+            patch["score_value"] = _score_value_from_stock_row(score_row, params)
+        enriched.append({**item, **patch} if patch else item)
+    return enriched
+
+
 def _build_plan_bench_payload(
     plan: Dict[str, Any],
     holdings: List[Dict[str, Any]],
@@ -3486,6 +3565,12 @@ async def get_portfolio_plan(plan_id: str, current_user: dict = Depends(get_curr
         user_id=user_id,
     )
     mark("live_context")
+    items = _enrich_plan_items_with_score_snapshot(
+        data_collections=data_collections,
+        plan=plan,
+        items=items,
+    )
+    mark("score_snapshot")
     items, live_overlay = _enrich_plan_items_with_overlay(
         data_collections=data_collections,
         plan=plan,
@@ -3557,6 +3642,11 @@ async def get_portfolio_plan_items(plan_id: str, current_user: dict = Depends(ge
         plan=plan,
         items=items,
         user_id=user_id,
+    )
+    items = _enrich_plan_items_with_score_snapshot(
+        data_collections=data_collections,
+        plan=plan,
+        items=items,
     )
     items, live_overlay = _enrich_plan_items_with_overlay(
         data_collections=data_collections,
@@ -6158,6 +6248,15 @@ def _enrich_plan_items_with_overlay(
             "enabled": False,
             "reason": "plan_status_not_active",
             "score_snapshot_date": _normalize_yyyymmdd(plan.get("score_date")),
+            "latest_score_date": None,
+            "score_snapshot_stale": False,
+            "score_snapshot_age_days": None,
+        }
+    if not plan.get("score_date") and not plan.get("params_snapshot"):
+        return items, {
+            "enabled": False,
+            "reason": "score_context_missing",
+            "score_snapshot_date": None,
             "latest_score_date": None,
             "score_snapshot_stale": False,
             "score_snapshot_age_days": None,
