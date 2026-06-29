@@ -216,12 +216,13 @@ def reprice_plan_items_for_publish(
         target_weight = numeric(item.get("target_weight"))
         planned_delta = int_value(item.get("delta_shares"))
         account_pos = account_positions_by_key.get(symbol_key(symbol)) or {"current": 0, "available": 0}
-        if account_positions_synced:
-            account_current = int_value(account_pos.get("current"))
-            account_available = int_value(account_pos.get("available"))
-            current_shares = account_current if account_current > 0 else account_available
-        else:
-            current_shares = int_value(item.get("current_shares"))
+        # current_shares is the plan/lineage book holding (carried on the item by
+        # the caller), never the broker account aggregate. The securities account
+        # can be shared by several plans / manual positions, so using the account
+        # total would distort this plan's delta -- and could make it sell shares it
+        # does not own. account positions are consulted only to cap sells to the
+        # broker-available quantity (see ``account_positions_synced`` blocks below).
+        current_shares = int_value(item.get("current_shares"))
         if live_price is None or float(live_price) <= 0:
             # A pure sell-to-zero can still be published as a market order when
             # the latest price is unavailable. Buys / target-weight positions need

@@ -137,6 +137,60 @@ def test_sell_residual_odd_lot_when_available_below_gap():
     assert rem.REASON_AVAILABLE_BELOW_GAP in spec.reasons
 
 
+def test_sell_uses_lineage_book_not_shared_account_aggregate():
+    # Shared account: this plan's lineage book holds 200, but the broker account
+    # aggregate (incl. another plan) shows 500. A full exit (target 0) must only
+    # sell THIS plan's 200, never the other plan's shares.
+    specs = rem.build_remainder_specs(
+        plan=_plan(),
+        enriched_items=[
+            _item(
+                target_shares=0,
+                delta_shares=-1000,
+                strategy_current_shares=200,
+                current_shares=200,
+                account_current_shares=500,
+                account_available_shares=500,
+            )
+        ],
+        available_cash=0,
+        account_synced=True,
+        price_resolver=_price(10.0),
+    )
+    spec = _spec_for(specs)
+    assert spec.action == "sell"
+    assert spec.baseline_current_shares == 200
+    assert spec.gap_shares == 200
+    assert spec.topup_shares == 200
+
+
+def test_buy_gap_uses_lineage_book_not_shared_account_aggregate():
+    # Shared account holds 2000 of the symbol for OTHER plans; this plan's lineage
+    # book holds 0. Topping up to target 500 must buy 500, not treat the position
+    # as already-at-target because of the contaminated account aggregate.
+    specs = rem.build_remainder_specs(
+        plan=_plan(),
+        enriched_items=[
+            _item(
+                target_shares=500,
+                delta_shares=500,
+                strategy_current_shares=0,
+                current_shares=0,
+                account_current_shares=2000,
+                account_available_shares=2000,
+            )
+        ],
+        available_cash=1_000_000,
+        account_synced=True,
+        price_resolver=_price(10.0),
+    )
+    spec = _spec_for(specs)
+    assert spec.action == "buy"
+    assert spec.baseline_current_shares == 0
+    assert spec.gap_shares == 500
+    assert spec.topup_shares == 500
+
+
 def test_account_not_synced_blocks():
     specs = rem.build_remainder_specs(
         plan=_plan(),

@@ -116,6 +116,113 @@ def test_reprice_uses_target_weight_and_equity():
     assert summary["blockers"] == []
 
 
+def test_reprice_uses_plan_book_not_shared_account_positions():
+    # Shared account already holds 2000 of the symbol for OTHER plans, but this
+    # plan's book holds 0. Sizing a buy to target must size off the plan book
+    # (current=0 -> buy), never off the account aggregate (which would compute a
+    # negative delta and SELL shares this plan does not own).
+    items = [
+        {
+            "symbol": "600000",
+            "target_weight": 0,
+            "target_shares": 500,
+            "delta_shares": 500,
+            "current_shares": 0,
+            "estimated_price": 10.0,
+        }
+    ]
+    quotes = {
+        "600000": {
+            "price": 10.0,
+            "price_source": PRICE_SOURCE_REALTIME,
+            "price_as_of": "2026-06-27T14:58:00",
+            "is_stale": False,
+        }
+    }
+
+    def normalize(current, requested, lot):
+        lot = max(1, lot)
+        if requested == 0:
+            return 0, []
+        delta = requested - current
+        rounded = (abs(delta) // lot) * lot
+        if rounded <= 0:
+            return current, ["below_lot_size"]
+        return current + (rounded if delta > 0 else -rounded), []
+
+    repriced, summary = reprice_plan_items_for_publish(
+        plan={},
+        items=items,
+        quotes=quotes,
+        equity=1_000_000,
+        lot_size=100,
+        account_positions_by_key={"600000": {"current": 2000, "available": 2000}},
+        account_positions_synced=True,
+        normalize_live_target_shares=normalize,
+        int_value=lambda value, default=0: int(value or default),
+        numeric=lambda value: float(value or 0),
+        symbol_key=lambda value: str(value),
+        available_cash=1_000_000,
+    )
+    assert repriced[0]["current_shares"] == 0
+    assert repriced[0]["target_shares"] == 500
+    assert repriced[0]["delta_shares"] == 500
+    assert summary["blockers"] == []
+
+
+def test_reprice_plan_cash_cap_applies_even_without_account_sync():
+    # The plan cash budget is always passed at publish (fallback to initial
+    # capital), so the buy cash cap must bind even when the broker account has
+    # not synced any positions -- it soft-caps to the plan budget, not silently
+    # letting an unsynced account allow an unbounded buy.
+    items = [
+        {
+            "symbol": "600000",
+            "target_weight": 0,
+            "target_shares": 1000,
+            "delta_shares": 1000,
+            "current_shares": 0,
+            "estimated_price": 10.0,
+        }
+    ]
+    quotes = {
+        "600000": {
+            "price": 10.0,
+            "price_source": PRICE_SOURCE_REALTIME,
+            "price_as_of": "2026-06-27T14:58:00",
+            "is_stale": False,
+        }
+    }
+
+    def normalize(current, requested, lot):
+        lot = max(1, lot)
+        if requested == 0:
+            return 0, []
+        delta = requested - current
+        rounded = (abs(delta) // lot) * lot
+        if rounded <= 0:
+            return current, ["below_lot_size"]
+        return current + (rounded if delta > 0 else -rounded), []
+
+    repriced, _summary = reprice_plan_items_for_publish(
+        plan={},
+        items=items,
+        quotes=quotes,
+        equity=1_000_000,
+        lot_size=100,
+        account_positions_by_key={},
+        account_positions_synced=False,
+        normalize_live_target_shares=normalize,
+        int_value=lambda value, default=0: int(value or default),
+        numeric=lambda value: float(value or 0),
+        symbol_key=lambda value: str(value),
+        available_cash=3000,
+    )
+    assert repriced[0]["delta_shares"] == 300
+    assert repriced[0]["target_shares"] == 300
+    assert "insufficient_cash" in (repriced[0]["blockers"] or [])
+
+
 def test_reprice_blocks_missing_price():
     items = [{"symbol": "600000", "target_weight": 0.1, "target_shares": 100, "delta_shares": 100, "current_shares": 0}]
     quotes = {"600000": {"price": None, "price_source": PRICE_SOURCE_NONE, "price_as_of": None, "is_stale": True}}

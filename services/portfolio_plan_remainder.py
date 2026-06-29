@@ -2,14 +2,19 @@
 
 After a plan is published live, some signals get cancelled or only partially
 filled, so the deployed capital never reaches the planned target. This module
-computes, **against the live broker account as the baseline**, the remaining
-shares needed to finish what the plan originally intended to trade, capped by
-the planned per-position budget and by available cash.
+computes, **against this plan's own lineage book as the baseline**, the
+remaining shares needed to finish what the plan originally intended to trade,
+capped by the planned per-position budget and by available cash.
 
 Design invariants:
 
-- Baseline is the **live account** (`account_current_shares` from
-  ``trader_positions``), not the paper lineage used at plan generation.
+- Baseline is the **plan's lineage book** holding (``strategy_current_shares``
+  = generation snapshot + this lineage's own live fills), not the broker
+  account aggregate. The securities account can be shared by several plans /
+  manual positions, so measuring the gap off the account total would let the
+  top-up trade shares this plan never owned. The broker
+  ``account_available_shares`` is consulted only to cap sells to what the
+  account can actually sell.
 - Only items the plan **meant to trade** (original ``delta_shares != 0``) are
   topped up, and only in the **same direction**. This avoids inventing brand-new
   sells of pre-existing holdings the plan never intended to touch.
@@ -91,6 +96,7 @@ class RemainderSpec:
     target_shares: int
     account_current_shares: Optional[int]
     account_available_shares: Optional[int]
+    baseline_current_shares: int
     gap_shares: int
     topup_shares: int
     reference_price: Optional[float]
@@ -110,6 +116,7 @@ class RemainderSpec:
             "target_shares": self.target_shares,
             "account_current_shares": self.account_current_shares,
             "account_available_shares": self.account_available_shares,
+            "baseline_current_shares": self.baseline_current_shares,
             "gap_shares": self.gap_shares,
             "topup_shares": self.topup_shares,
             "reference_price": self.reference_price,
@@ -214,6 +221,7 @@ def _evaluate_item(
         target_shares=target_shares,
         account_current_shares=account_current,
         account_available_shares=account_available,
+        baseline_current_shares=0,
         gap_shares=0,
         topup_shares=0,
         reference_price=None,
@@ -233,8 +241,18 @@ def _evaluate_item(
         spec.reasons.append(REASON_ACCOUNT_NOT_SYNCED)
         return spec
 
-    # Absent position row on a synced account = 0 holdings (trustworthy).
-    current = _to_int(account_current, 0)
+    # Baseline is THIS plan's lineage book holding, not the broker account
+    # aggregate: a shared account may also hold the symbol for other plans /
+    # manual positions, and gauging the gap off the aggregate could top-up
+    # (or sell) shares this plan never owned. ``strategy_current_shares`` is the
+    # generation snapshot plus this lineage's own live fills.
+    lineage_current = item.get("strategy_current_shares")
+    if lineage_current is None:
+        lineage_current = item.get("current_shares")
+    current = _to_int(lineage_current, _to_int(account_current, 0))
+    spec.baseline_current_shares = current
+    # account availability still caps sells to what the broker can actually sell;
+    # never let it exceed the lineage holding implied by ``current``.
     available = _to_int(account_available, current)
 
     if original_delta > 0:

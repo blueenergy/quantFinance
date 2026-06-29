@@ -6177,6 +6177,15 @@ async def publish_portfolio_plan_live_signals(
         .find({"plan_id": plan_id, "user_id": user_id})
         .sort("rank", 1)
     )
+    # Carry the plan/lineage book holdings onto each item (generation snapshot plus
+    # this lineage's own live fills) so repricing sizes deltas against what THIS
+    # plan owns, not the shared broker account aggregate.
+    items = _attach_live_plan_item_context(
+        finance_collections=finance_collections,
+        plan=plan,
+        items=items,
+        user_id=user_id,
+    )
     now = datetime.utcnow()
     account_snapshot = _latest_account_snapshot(finance_collections, account, user_id)
     account_equity = _numeric(account_snapshot.get("total_assets") or account_snapshot.get("total_asset"))
@@ -6411,10 +6420,13 @@ async def replan_portfolio_plan_remainder(
     account = _require_securities_account(finance_collections, request.securities_account_id, user_id)
     account_snapshot = _latest_account_snapshot(finance_collections, account, user_id)
     account_synced = bool(account_snapshot)
-    # NOTE (basis divergence): remainder/top-up still budgets against the broker
-    # account's available_cash, whereas publish-live-signals now budgets against
-    # the plan book. Unifying top-up onto the plan-book budget is deferred (phase 2)
-    # together with the lineage-position basis change.
+    # Position basis is now lineage-scoped (build_remainder_specs measures the gap
+    # off this plan's own book, not the shared account aggregate). The *cash*
+    # budget below is still the broker account's available_cash: unifying it onto
+    # the plan book requires reconstructing the plan's *current* book cash
+    # (baseline_cash minus what this lineage already deployed), not the generation
+    # baseline. Until then the per-item budget cap plus the account-cash hard
+    # check in the risk report bound overspend; the cash-basis switch is deferred.
     available_cash = _numeric(
         account_snapshot.get("available_cash") or account_snapshot.get("cash")
     ) if account_snapshot else None
