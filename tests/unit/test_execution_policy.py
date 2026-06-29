@@ -4,6 +4,8 @@ from services.execution_policy import (
     STYLE_BALANCED,
     STYLE_OPEN_AUCTION,
     build_price_guard,
+    buy_order_freeze_price,
+    estimate_buy_order_cash_exposure,
     protected_limit_price,
     resolve_execution_policy,
 )
@@ -57,3 +59,34 @@ def test_build_price_guard_open_auction_buy_example():
     assert guard.max_slippage_bps == 100
     assert guard.price_ceiling == 67.38
     assert protected_limit_price(66.71, 100, action="buy") == 67.38
+
+
+def test_buy_order_freeze_price_prefers_effective_limit():
+    signal = {
+        "action": "buy",
+        "effective_limit_price": 10.03,
+        "price_ceiling": 10.02,
+        "price": 10.0,
+    }
+    assert buy_order_freeze_price(signal) == 10.03
+
+
+def test_estimate_buy_order_cash_exposure_partial_fill():
+    signal = {
+        "action": "buy",
+        "size": 1000,
+        "filled_qty": 400,
+        "status": "partial_filled",
+        "effective_limit_price": 10.0,
+    }
+    assert estimate_buy_order_cash_exposure(signal) == 6000.0
+
+
+def test_estimate_buy_order_cash_exposure_ignores_sell():
+    signal = {"action": "sell", "size": 500, "effective_limit_price": 10.0}
+    assert estimate_buy_order_cash_exposure(signal) == 0.0
+
+
+def test_estimate_buy_order_cash_exposure_missing_price_returns_none():
+    signal = {"action": "buy", "size": 100, "filled_qty": 0, "status": "submitted"}
+    assert estimate_buy_order_cash_exposure(signal) is None

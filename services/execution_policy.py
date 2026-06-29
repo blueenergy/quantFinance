@@ -159,3 +159,64 @@ def build_price_guard(
         effective_limit_price=price_ceiling,
         order_type=policy.order_type,
     )
+
+
+def _positive_float(value: Any) -> Optional[float]:
+    if value in (None, ""):
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    if parsed != parsed or parsed <= 0:  # NaN or non-positive
+        return None
+    return parsed
+
+
+def buy_order_freeze_price(signal: Dict[str, Any]) -> Optional[float]:
+    """Return the per-share price used to estimate active buy-order cash freeze.
+
+    Priority matches persisted signal fields produced by ``build_price_guard``:
+    ``effective_limit_price`` -> ``price_ceiling`` -> ``price``.
+    """
+
+    for key in ("effective_limit_price", "price_ceiling", "price"):
+        price = _positive_float(signal.get(key))
+        if price is not None:
+            return price
+    return None
+
+
+def _signal_remaining_buy_qty(signal: Dict[str, Any]) -> int:
+    action = str(signal.get("action") or signal.get("side") or "").lower()
+    if action not in {"buy", "b"}:
+        return 0
+    try:
+        size = int(signal.get("size") or 0)
+    except (TypeError, ValueError):
+        size = 0
+    filled_raw = signal.get("filled_qty", signal.get("filled_size"))
+    try:
+        filled = int(filled_raw or 0)
+    except (TypeError, ValueError):
+        filled = 0
+    if filled == 0 and str(signal.get("status") or "").lower() == "filled":
+        filled = abs(size)
+    return max(0, abs(size) - abs(filled))
+
+
+def estimate_buy_order_cash_exposure(signal: Dict[str, Any]) -> Optional[float]:
+    """Estimate cash reserved by one active buy signal's unfilled quantity.
+
+    Returns ``None`` when the signal still has unfilled buy quantity but no
+    usable freeze price is available. Callers aggregate across lineage signals;
+    this module does not query Mongo or lineage state.
+    """
+
+    remaining = _signal_remaining_buy_qty(signal)
+    if remaining <= 0:
+        return 0.0
+    price = buy_order_freeze_price(signal)
+    if price is None:
+        return None
+    return remaining * price

@@ -62,6 +62,7 @@ _NODE_TYPE_BY_RECORD_KIND = {
     RECORD_KIND_OBSERVATION: "monitor",
     RECORD_KIND_LEDGER_EVENT: "manual",
 }
+from services.execution_policy import estimate_buy_order_cash_exposure
 from services.trade_ledger import group_executions_by_order
 from services.portfolio_plan_remainder import (
     LIVE_SIGNAL_SOURCE_PLAN_TOPUP,
@@ -576,6 +577,90 @@ def _compute_lineage_book_equity(
         "lineage_plan_ids": lineage_ids,
         "execution_count": len(grouped),
         "latest_price_update": payload.get("latest_price_update"),
+    }
+
+
+def _resolve_lineage_available_cash_for_remainder(
+    *,
+    trading_collections: Dict[str, Any],
+    finance_collections: Dict[str, Any],
+    data_collections: Dict[str, Any],
+    plan: Dict[str, Any],
+    user_id: str,
+) -> Dict[str, Any]:
+    """Plan-book available cash for remainder top-up budgeting.
+
+    ``plan_available_cash = lineage_book_cash - active_buy_order_frozen_cash``
+
+    ``lineage_book_cash`` is rebuilt from executed fills at trade prices via
+    ``_compute_lineage_book_equity``. Active buy signals in this lineage reserve
+    cash at their persisted protected limit prices (see
+    ``execution_policy.estimate_buy_order_cash_exposure``). Broker account cash
+    is *not* used here; callers keep it for execution risk hard checks.
+    """
+    book = _compute_lineage_book_equity(
+        trading_collections=trading_collections,
+        finance_collections=finance_collections,
+        data_collections=data_collections,
+        plan=plan,
+        user_id=user_id,
+    )
+    lineage_book_cash = _numeric(book.get("cash"))
+    lineage_ids = list(book.get("lineage_plan_ids") or [])
+    if not lineage_ids and plan.get("plan_id"):
+        lineage_ids = [str(plan.get("plan_id"))]
+
+    active_signals: List[Dict[str, Any]] = []
+    if lineage_ids:
+        active_signals = list(
+            finance_collections["trade_signals"].find(
+                {
+                    "user_id": user_id,
+                    "plan_id": {"$in": lineage_ids},
+                    "mode": "live",
+                    "status": {"$in": sorted(ACTIVE_SIGNAL_STATUSES)},
+                },
+                {
+                    "_id": 0,
+                    "symbol": 1,
+                    "action": 1,
+                    "side": 1,
+                    "status": 1,
+                    "size": 1,
+                    "filled_qty": 1,
+                    "filled_size": 1,
+                    "effective_limit_price": 1,
+                    "price_ceiling": 1,
+                    "price": 1,
+                },
+            )
+        )
+
+    frozen_buy_cash = 0.0
+    missing_frozen_price_symbols: List[str] = []
+    for signal in active_signals:
+        exposure = estimate_buy_order_cash_exposure(signal)
+        if exposure is None:
+            symbol = str(signal.get("symbol") or "")
+            if symbol:
+                missing_frozen_price_symbols.append(symbol)
+            continue
+        frozen_buy_cash += exposure
+
+    plan_available_cash = max(0.0, lineage_book_cash - frozen_buy_cash)
+    blockers: List[str] = []
+    if missing_frozen_price_symbols:
+        blockers.append("missing_frozen_price")
+
+    return {
+        "cash_basis": "lineage_book",
+        "lineage_book_cash": lineage_book_cash,
+        "frozen_buy_cash": frozen_buy_cash,
+        "plan_available_cash": plan_available_cash,
+        "broker_available_cash": None,
+        "missing_frozen_price_symbols": sorted(set(missing_frozen_price_symbols)),
+        "blockers": blockers,
+        "lineage_plan_ids": lineage_ids,
     }
 
 
@@ -6400,11 +6485,11 @@ async def replan_portfolio_plan_remainder(
 ):
     """Gap-fill a live plan whose execution fell short (cancelled / partial).
 
-    Computes, against the **live account** baseline, the remaining shares needed
-    to finish what the plan intended to trade — capped by the planned per-position
-    budget and available cash — and (after dry-run confirmation) publishes
-    ``plan_topup`` signals. It never re-selects stocks; it only finishes the
-    original selection.
+    Computes, against this plan's **lineage book** baseline, the remaining shares
+    needed to finish what the plan intended to trade — capped by the planned
+    per-position budget and plan-book available cash — and (after dry-run
+    confirmation) publishes ``plan_topup`` signals. It never re-selects stocks;
+    it only finishes the original selection.
     """
     trading_collections = get_trading_db_collections()
     finance_collections = get_db_collections()
@@ -6420,16 +6505,20 @@ async def replan_portfolio_plan_remainder(
     account = _require_securities_account(finance_collections, request.securities_account_id, user_id)
     account_snapshot = _latest_account_snapshot(finance_collections, account, user_id)
     account_synced = bool(account_snapshot)
-    # Position basis is now lineage-scoped (build_remainder_specs measures the gap
-    # off this plan's own book, not the shared account aggregate). The *cash*
-    # budget below is still the broker account's available_cash: unifying it onto
-    # the plan book requires reconstructing the plan's *current* book cash
-    # (baseline_cash minus what this lineage already deployed), not the generation
-    # baseline. Until then the per-item budget cap plus the account-cash hard
-    # check in the risk report bound overspend; the cash-basis switch is deferred.
-    available_cash = _numeric(
+    broker_available_cash = _numeric(
         account_snapshot.get("available_cash") or account_snapshot.get("cash")
     ) if account_snapshot else None
+
+    cash_snapshot = _resolve_lineage_available_cash_for_remainder(
+        trading_collections=trading_collections,
+        finance_collections=finance_collections,
+        data_collections=data_collections,
+        plan=plan,
+        user_id=user_id,
+    )
+    cash_snapshot["broker_available_cash"] = broker_available_cash
+    plan_available_cash = cash_snapshot.get("plan_available_cash")
+    cash_blockers = list(cash_snapshot.get("blockers") or [])
 
     items = list(
         trading_collections["portfolio_trade_plan_items"]
@@ -6475,7 +6564,7 @@ async def replan_portfolio_plan_remainder(
     specs = build_remainder_specs(
         plan=plan,
         enriched_items=enriched_items,
-        available_cash=available_cash,
+        available_cash=plan_available_cash,
         account_synced=account_synced,
         active_symbols=active_symbols,
         price_resolver=resolve_market_reference_price,
@@ -6509,10 +6598,20 @@ async def replan_portfolio_plan_remainder(
         user_id=user_id,
     )
     blocked = [item for item in risk_report["items"] if item["blockers"]]
-    if blocked and not request.dry_run:
+    response_blocked = bool(blocked) or bool(cash_blockers)
+    if response_blocked and not request.dry_run:
+        # cash_blockers (e.g. missing_frozen_price) mean plan_available_cash may be
+        # overestimated, so confirming could over-budget the top-up. Block confirm
+        # consistently with the dry-run preview rather than relying on the shared
+        # broker-account cash check, which cannot bound this plan's own budget.
+        message = "remainder risk check failed" if blocked else "remainder cash check failed"
         raise HTTPException(
             status_code=409,
-            detail={"message": "remainder risk check failed", "risk_report": risk_report},
+            detail={
+                "message": message,
+                "risk_report": risk_report,
+                "cash_blockers": cash_blockers,
+            },
         )
 
     inserted_count = 0
@@ -6535,13 +6634,20 @@ async def replan_portfolio_plan_remainder(
                 "plan_id": plan_id,
                 "dry_run": request.dry_run,
                 "account_synced": account_synced,
-                "available_cash": available_cash,
+                "available_cash": plan_available_cash,
+                "plan_available_cash": plan_available_cash,
+                "lineage_book_cash": cash_snapshot.get("lineage_book_cash"),
+                "frozen_buy_cash": cash_snapshot.get("frozen_buy_cash"),
+                "broker_available_cash": broker_available_cash,
+                "cash_basis": cash_snapshot.get("cash_basis"),
+                "missing_frozen_price_symbols": cash_snapshot.get("missing_frozen_price_symbols") or [],
+                "cash_blockers": cash_blockers,
                 "remainder": [spec.to_public() for spec in specs],
                 "actionable_count": sum(1 for spec in specs if spec.actionable),
                 "signals": signals,
                 "risk_report": risk_report,
                 "inserted_count": inserted_count,
-                "blocked": bool(blocked),
+                "blocked": response_blocked,
             }
         ),
     }

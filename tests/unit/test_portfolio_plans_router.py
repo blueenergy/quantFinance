@@ -2497,6 +2497,351 @@ def test_replan_remainder_confirm_inserts_and_is_idempotent(monkeypatch):
     assert "live_signal_active" in remainder["reasons"]
 
 
+def _lineage_cash_remainder_setup(monkeypatch, *, broker_available_cash=100_000, active_buy=None):
+    collections, finance = _remainder_setup(monkeypatch)
+    plan = collections["portfolio_trade_plans"].docs[0]
+    plan["params_snapshot"] = {"initial_capital": 100_000, "lot_size": 100}
+    plan["params_hash"] = "hash-1"
+    plan["strategy_template_id"] = "s1"
+
+    finance["trader_accounts"].docs[0]["available_cash"] = broker_available_cash
+    finance["trade_executions"].docs.append(
+        {
+            "user_id": "user-1",
+            "order_id": "live-plan-orig",
+            "symbol": "000001",
+            "side": "BUY",
+            "filled_size": 400,
+            "filled_qty": 400,
+            "avg_price": 10.0,
+            "price": 10.0,
+            "timestamp": 1,
+        }
+    )
+    if active_buy is not None:
+        finance["trade_signals"].docs.append(active_buy)
+    return collections, finance, plan
+
+
+def test_resolve_lineage_available_cash_without_executions(monkeypatch):
+    collections = _collections()
+    plan = collections["portfolio_trade_plans"].docs[0]
+    plan.update({"params_snapshot": {"initial_capital": 250_000}})
+    finance = _finance_collections()
+    data = _data_collections()
+    monkeypatch.setattr(portfolio_plans, "get_trading_db_collections", lambda: collections)
+    monkeypatch.setattr(portfolio_plans, "get_db_collections", lambda: finance)
+
+    snapshot = portfolio_plans._resolve_lineage_available_cash_for_remainder(
+        trading_collections=collections,
+        finance_collections=finance,
+        data_collections=data,
+        plan=plan,
+        user_id="user-1",
+    )
+
+    assert snapshot["lineage_book_cash"] == 250_000
+    assert snapshot["frozen_buy_cash"] == 0
+    assert snapshot["plan_available_cash"] == 250_000
+    assert snapshot["cash_basis"] == "lineage_book"
+
+
+def test_resolve_lineage_available_cash_deducts_executed_buy_and_freezes_active_buy(monkeypatch):
+    collections = _collections()
+    plan = collections["portfolio_trade_plans"].docs[0]
+    plan.update(
+        {
+            "params_snapshot": {"initial_capital": 100_000},
+            "params_hash": "hash-1",
+            "strategy_template_id": "s1",
+            "live_signal_count": 1,
+            "live_signals_published_at": 1,
+        }
+    )
+    finance = _finance_collections()
+    finance["trade_signals"].docs.extend(
+        [
+            {
+                "order_id": "live-plan-orig",
+                "user_id": "user-1",
+                "plan_id": "plan-user-1",
+                "mode": "live",
+                "action": "buy",
+                "status": "filled",
+                "size": 400,
+                "filled_qty": 400,
+                "symbol": "000001",
+            },
+            {
+                "order_id": "live-plan-active",
+                "user_id": "user-1",
+                "plan_id": "plan-user-1",
+                "mode": "live",
+                "action": "buy",
+                "status": "submitted",
+                "size": 600,
+                "filled_qty": 0,
+                "symbol": "000001",
+                "effective_limit_price": 10.0,
+            },
+        ]
+    )
+    finance["trade_executions"].docs.append(
+        {
+            "user_id": "user-1",
+            "order_id": "live-plan-orig",
+            "symbol": "000001",
+            "side": "BUY",
+            "filled_size": 400,
+            "avg_price": 10.0,
+            "timestamp": 1,
+        }
+    )
+    data = _data_collections()
+    data["volume_price_realtime_latest"].docs.append({"symbol": "000001", "close": 10.0})
+    monkeypatch.setattr(portfolio_plans, "get_trading_db_collections", lambda: collections)
+    monkeypatch.setattr(portfolio_plans, "get_db_collections", lambda: finance)
+    monkeypatch.setattr(portfolio_plans, "get_data_db", lambda: data)
+
+    snapshot = portfolio_plans._resolve_lineage_available_cash_for_remainder(
+        trading_collections=collections,
+        finance_collections=finance,
+        data_collections=data,
+        plan=plan,
+        user_id="user-1",
+    )
+
+    assert snapshot["lineage_book_cash"] == 96_000
+    assert snapshot["frozen_buy_cash"] == 6_000
+    assert snapshot["plan_available_cash"] == 90_000
+
+
+def test_resolve_lineage_available_cash_partial_filled_active_buy_only_freezes_remainder(monkeypatch):
+    collections = _collections()
+    plan = collections["portfolio_trade_plans"].docs[0]
+    plan.update({"params_snapshot": {"initial_capital": 100_000}})
+    finance = _finance_collections()
+    finance["trade_signals"].docs.append(
+        {
+            "order_id": "live-plan-active",
+            "user_id": "user-1",
+            "plan_id": "plan-user-1",
+            "mode": "live",
+            "action": "buy",
+            "status": "partial_filled",
+            "size": 1000,
+            "filled_qty": 400,
+            "symbol": "000001",
+            "price_ceiling": 10.0,
+        }
+    )
+    data = _data_collections()
+    monkeypatch.setattr(portfolio_plans, "get_trading_db_collections", lambda: collections)
+    monkeypatch.setattr(portfolio_plans, "get_db_collections", lambda: finance)
+    monkeypatch.setattr(portfolio_plans, "get_data_db", lambda: data)
+
+    snapshot = portfolio_plans._resolve_lineage_available_cash_for_remainder(
+        trading_collections=collections,
+        finance_collections=finance,
+        data_collections=data,
+        plan=plan,
+        user_id="user-1",
+    )
+
+    assert snapshot["frozen_buy_cash"] == 6_000
+    assert snapshot["plan_available_cash"] == 94_000
+
+
+def test_resolve_lineage_available_cash_missing_frozen_price_blocks(monkeypatch):
+    collections = _collections()
+    plan = collections["portfolio_trade_plans"].docs[0]
+    plan.update({"params_snapshot": {"initial_capital": 100_000}})
+    finance = _finance_collections()
+    finance["trade_signals"].docs.append(
+        {
+            "order_id": "live-plan-active",
+            "user_id": "user-1",
+            "plan_id": "plan-user-1",
+            "mode": "live",
+            "action": "buy",
+            "status": "submitted",
+            "size": 100,
+            "filled_qty": 0,
+            "symbol": "000001",
+        }
+    )
+    data = _data_collections()
+    monkeypatch.setattr(portfolio_plans, "get_trading_db_collections", lambda: collections)
+    monkeypatch.setattr(portfolio_plans, "get_db_collections", lambda: finance)
+    monkeypatch.setattr(portfolio_plans, "get_data_db", lambda: data)
+
+    snapshot = portfolio_plans._resolve_lineage_available_cash_for_remainder(
+        trading_collections=collections,
+        finance_collections=finance,
+        data_collections=data,
+        plan=plan,
+        user_id="user-1",
+    )
+
+    assert snapshot["missing_frozen_price_symbols"] == ["000001"]
+    assert "missing_frozen_price" in snapshot["blockers"]
+
+
+def test_replan_remainder_uses_plan_cash_not_broker_aggregate(monkeypatch):
+    collections, finance, _plan = _lineage_cash_remainder_setup(monkeypatch, broker_available_cash=5_000_000)
+
+    response = asyncio.run(
+        portfolio_plans.replan_portfolio_plan_remainder(
+            "plan-user-1",
+            portfolio_plans.ReplanRemainderRequest(securities_account_id="acct-1", dry_run=True),
+            current_user={"id": "user-1"},
+        )
+    )
+
+    data = response["data"]
+    assert data["cash_basis"] == "lineage_book"
+    assert data["lineage_book_cash"] == 96_000
+    assert data["broker_available_cash"] == 5_000_000
+    assert data["plan_available_cash"] == 96_000
+    assert data["available_cash"] == 96_000
+    assert data["signals"][0]["size"] == 600
+
+
+def test_replan_remainder_cash_capped_by_plan_available(monkeypatch):
+    collections, finance, plan = _lineage_cash_remainder_setup(monkeypatch)
+    plan["params_snapshot"] = {"initial_capital": 5_000, "lot_size": 100}
+    finance["trade_executions"].docs[0]["filled_size"] = 400
+    finance["trade_executions"].docs[0]["filled_qty"] = 400
+    finance["trade_signals"].docs[0]["filled_qty"] = 400
+    finance["trader_positions"].docs[0]["qty"] = 400
+    finance["trader_positions"].docs[0]["can_use_volume"] = 400
+
+    response = asyncio.run(
+        portfolio_plans.replan_portfolio_plan_remainder(
+            "plan-user-1",
+            portfolio_plans.ReplanRemainderRequest(securities_account_id="acct-1", dry_run=True),
+            current_user={"id": "user-1"},
+        )
+    )
+
+    data = response["data"]
+    remainder = data["remainder"][0]
+    assert remainder["gap_shares"] == 600
+    assert remainder["topup_shares"] == 100
+    assert data["plan_available_cash"] == 1_000
+    assert "cash_capped" in remainder["reasons"]
+
+
+def test_replan_remainder_blocked_when_broker_cash_insufficient(monkeypatch):
+    collections, finance, _plan = _lineage_cash_remainder_setup(monkeypatch, broker_available_cash=1_000)
+
+    response = asyncio.run(
+        portfolio_plans.replan_portfolio_plan_remainder(
+            "plan-user-1",
+            portfolio_plans.ReplanRemainderRequest(securities_account_id="acct-1", dry_run=True),
+            current_user={"id": "user-1"},
+        )
+    )
+
+    data = response["data"]
+    assert data["plan_available_cash"] == 96_000
+    assert data["broker_available_cash"] == 1_000
+    assert data["blocked"] is True
+    assert "insufficient_cash" in data["risk_report"]["items"][0]["blockers"]
+
+
+def test_replan_remainder_dry_run_blocked_when_active_buy_missing_frozen_price(monkeypatch):
+    collections, finance, _plan = _lineage_cash_remainder_setup(
+        monkeypatch,
+        active_buy={
+            "order_id": "live-plan-active",
+            "user_id": "user-1",
+            "plan_id": "plan-user-1",
+            "mode": "live",
+            "action": "buy",
+            "status": "submitted",
+            "size": 100,
+            "filled_qty": 0,
+            "symbol": "000001",
+        },
+    )
+
+    response = asyncio.run(
+        portfolio_plans.replan_portfolio_plan_remainder(
+            "plan-user-1",
+            portfolio_plans.ReplanRemainderRequest(securities_account_id="acct-1", dry_run=True),
+            current_user={"id": "user-1"},
+        )
+    )
+
+    data = response["data"]
+    assert data["blocked"] is True
+    assert "missing_frozen_price" in data["cash_blockers"]
+
+
+def test_replan_remainder_confirm_blocked_when_active_buy_missing_frozen_price(monkeypatch):
+    collections, finance, _plan = _lineage_cash_remainder_setup(
+        monkeypatch,
+        active_buy={
+            "order_id": "live-plan-active",
+            "user_id": "user-1",
+            "plan_id": "plan-user-1",
+            "mode": "live",
+            "action": "buy",
+            "status": "submitted",
+            "size": 100,
+            "filled_qty": 0,
+            "symbol": "000002",
+        },
+    )
+
+    with pytest.raises(portfolio_plans.HTTPException) as exc:
+        asyncio.run(
+            portfolio_plans.replan_portfolio_plan_remainder(
+                "plan-user-1",
+                portfolio_plans.ReplanRemainderRequest(securities_account_id="acct-1", dry_run=False),
+                current_user={"id": "user-1"},
+            )
+        )
+
+    assert exc.value.status_code == 409
+    assert "missing_frozen_price" in exc.value.detail["cash_blockers"]
+    # Nothing inserted: only the seed original + active buy remain.
+    assert all(doc.get("source") != "plan_topup" for doc in finance["trade_signals"].docs)
+
+
+def test_replan_remainder_reports_frozen_cash_when_active_buy_blocks_symbol(monkeypatch):
+    collections, finance, _plan = _lineage_cash_remainder_setup(
+        monkeypatch,
+        active_buy={
+            "order_id": "live-plan-active",
+            "user_id": "user-1",
+            "plan_id": "plan-user-1",
+            "mode": "live",
+            "action": "buy",
+            "status": "submitted",
+            "size": 600,
+            "filled_qty": 0,
+            "symbol": "000001",
+            "effective_limit_price": 10.0,
+        },
+    )
+
+    response = asyncio.run(
+        portfolio_plans.replan_portfolio_plan_remainder(
+            "plan-user-1",
+            portfolio_plans.ReplanRemainderRequest(securities_account_id="acct-1", dry_run=True),
+            current_user={"id": "user-1"},
+        )
+    )
+
+    data = response["data"]
+    assert data["frozen_buy_cash"] == 6_000
+    assert data["plan_available_cash"] == 90_000
+    assert data["actionable_count"] == 0
+    assert "live_signal_active" in data["remainder"][0]["reasons"]
+
+
 def _patch_lineage_live_env(monkeypatch, cols, fin, data):
     monkeypatch.setattr(portfolio_plans, "get_trading_db_collections", lambda: cols)
     monkeypatch.setattr(portfolio_plans, "get_db_collections", lambda: fin)
