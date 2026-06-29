@@ -780,6 +780,36 @@ def _load_latest_close_prices_loose(volume_price, symbols: List[str]) -> Dict[st
     return prices
 
 
+def _load_latest_daily_bars_loose(volume_price, symbols: List[str]) -> Dict[str, Dict[str, Any]]:
+    """Latest daily bar keyed by the requested symbol, tolerating suffix mismatch."""
+    bars: Dict[str, Dict[str, Any]] = {}
+    projection = {
+        "_id": 0,
+        "trade_date": 1,
+        "symbol": 1,
+        "open": 1,
+        "high": 1,
+        "low": 1,
+        "close": 1,
+        "pre_close": 1,
+        "change": 1,
+        "pct_chg": 1,
+        "volume": 1,
+        "amount": 1,
+        "update_time": 1,
+        "source": 1,
+    }
+    for symbol in symbols:
+        row = volume_price.find_one(
+            {"symbol": {"$in": _symbol_query_values(symbol)}},
+            sort=[("trade_date", -1)],
+            projection=projection,
+        )
+        if row:
+            bars[symbol] = row
+    return bars
+
+
 def _build_ranked_score_universe(
     stock_scores,
     score_date: str,
@@ -965,13 +995,14 @@ def _build_plan_bench_payload(
         if _symbol_key(row["symbol"]) not in on_field_keys
     ]
     starters_missing_price = [s["symbol"] for s in starters if s.get("estimated_price") is None]
-    latest_close = _load_latest_close_prices_loose(
+    latest_bars = _load_latest_daily_bars_loose(
         data_collections["volume_price"], list({*bench_symbols, *starters_missing_price})
     )
 
     bench: List[Dict[str, Any]] = []
     for symbol in bench_symbols:
         score_row = rank_by_key.get(_symbol_key(symbol)) or {}
+        latest_bar = latest_bars.get(symbol) or {}
         bench.append(
             {
                 "symbol": symbol,
@@ -979,13 +1010,25 @@ def _build_plan_bench_payload(
                 "industry": score_row.get("industry") or "",
                 "rank": score_row.get("rank"),
                 "score_value": score_row.get("score_value"),
-                "latest_close": latest_close.get(symbol),
+                "latest_close": _optional_float(latest_bar.get("close")),
+                "latest_trade_date": latest_bar.get("trade_date"),
+                "latest_open": _optional_float(latest_bar.get("open")),
+                "latest_high": _optional_float(latest_bar.get("high")),
+                "latest_low": _optional_float(latest_bar.get("low")),
+                "latest_pre_close": _optional_float(latest_bar.get("pre_close")),
+                "latest_change": _optional_float(latest_bar.get("change")),
+                "latest_pct_chg": _optional_float(latest_bar.get("pct_chg")),
+                "latest_volume": _optional_float(latest_bar.get("volume")),
+                "latest_amount": _optional_float(latest_bar.get("amount")),
+                "latest_update_time": latest_bar.get("update_time"),
+                "latest_price_source": latest_bar.get("source"),
             }
         )
 
     for starter in starters:
         if starter.get("estimated_price") is None:
-            starter["estimated_price"] = latest_close.get(starter["symbol"])
+            latest_bar = latest_bars.get(starter["symbol"]) or {}
+            starter["estimated_price"] = _optional_float(latest_bar.get("close"))
 
     return {
         "plan_id": plan.get("plan_id"),
