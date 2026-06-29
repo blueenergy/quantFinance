@@ -181,11 +181,13 @@ class BulkRejectPlanItemsRequest(BaseModel):
 class PortfolioLlmRiskReviewRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    target_scope: str = Field(default="plan", pattern="^(plan|bench)$")
     min_rules_severity: str = Field(default="none", pattern="^(none|low|medium|high)$")
     taxonomy_level: str = Field(default="sw1", pattern="^sw1$")
     include_actions: List[str] = Field(default_factory=lambda: ["buy", "hold"])
     max_symbols_per_call: int = Field(default=8, ge=1, le=20)
     prompt_version: str = Field(default="v1")
+    bench_multiplier: float = Field(default=1.5, ge=1.0, le=3.0)
     force: bool = Field(default=False)
 
 
@@ -1002,7 +1004,9 @@ def _portfolio_llm_actionable_items(
     for item in items:
         symbol = item.get("symbol")
         action = str(item.get("action") or "").lower()
-        if not symbol or action not in include_actions:
+        if not symbol:
+            continue
+        if request.target_scope != "bench" and action not in include_actions:
             continue
         rules_risk = item.get("ai_risk") if isinstance(item.get("ai_risk"), dict) else {}
         if not _risk_severity_at_least(rules_risk.get("severity"), request.min_rules_severity):
@@ -1060,6 +1064,7 @@ def _portfolio_llm_task_query(
     user_id: str,
     plan_id: str,
     run_id: Optional[str] = None,
+    target_scope: str = "plan",
     statuses: Optional[set] = None,
 ) -> Dict[str, Any]:
     query: Dict[str, Any] = {
@@ -1067,6 +1072,13 @@ def _portfolio_llm_task_query(
         "user_id": user_id,
         "params.plan_id": plan_id,
     }
+    if target_scope == "bench":
+        query["params.target_scope"] = "bench"
+    else:
+        query["$or"] = [
+            {"params.target_scope": {"$in": [None, "plan"]}},
+            {"params.target_scope": {"$exists": False}},
+        ]
     if run_id:
         query["params.run_id"] = run_id
     if statuses:
@@ -1123,18 +1135,52 @@ def _portfolio_llm_run_status(tasks: List[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
-def _portfolio_llm_run_tasks(*, user_id: str, plan_id: str, run_id: str) -> List[Dict[str, Any]]:
+def _portfolio_llm_run_tasks(
+    *,
+    user_id: str,
+    plan_id: str,
+    run_id: str,
+    target_scope: str = "plan",
+) -> List[Dict[str, Any]]:
     tasks_col = _analysis_tasks_collection()
     if tasks_col is None:
         return []
-    return list(tasks_col.find(_portfolio_llm_task_query(user_id=user_id, plan_id=plan_id, run_id=run_id)))
+    try:
+        return list(
+            tasks_col.find(
+                _portfolio_llm_task_query(
+                    user_id=user_id,
+                    plan_id=plan_id,
+                    run_id=run_id,
+                    target_scope=target_scope,
+                )
+            )
+        )
+    except Exception:
+        return []
 
 
-def _latest_completed_portfolio_llm_run_id(*, user_id: str, plan_id: str) -> Optional[str]:
+def _latest_completed_portfolio_llm_run_id(
+    *,
+    user_id: str,
+    plan_id: str,
+    target_scope: str = "plan",
+) -> Optional[str]:
     tasks_col = _analysis_tasks_collection()
     if tasks_col is None:
         return None
-    tasks = list(tasks_col.find(_portfolio_llm_task_query(user_id=user_id, plan_id=plan_id)))
+    try:
+        tasks = list(
+            tasks_col.find(
+                _portfolio_llm_task_query(
+                    user_id=user_id,
+                    plan_id=plan_id,
+                    target_scope=target_scope,
+                )
+            )
+        )
+    except Exception:
+        return None
     grouped: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
     for task in tasks:
         run_id = ((task.get("params") or {}).get("run_id"))
@@ -1156,30 +1202,17 @@ def _latest_completed_portfolio_llm_run_id(*, user_id: str, plan_id: str) -> Opt
     return candidates[0][1]
 
 
-def _enrich_plan_items_with_llm_risk(
+def _attach_llm_risk_to_items(
     *,
-    plan: Dict[str, Any],
     items: List[Dict[str, Any]],
-    user_id: str,
-) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
-    if not items:
-        return plan, items
-    plan_id = str(plan.get("plan_id") or "")
-    run_id = _latest_completed_portfolio_llm_run_id(user_id=user_id, plan_id=plan_id)
-    if not run_id:
-        return plan, items
-
-    risk_coll = get_analyzer_db()["portfolio_risk_llm"]
-    docs = list(risk_coll.find({"plan_id": plan_id, "run_id": run_id}, {"_id": 0}))
-    if not docs:
-        return plan, items
-
+    docs: List[Dict[str, Any]],
+    run_id: str,
+) -> Tuple[List[Dict[str, Any]], int]:
     symbol_docs = {
         _symbol_key(doc.get("symbol")): doc
         for doc in docs
         if doc.get("scope") == "symbol" and doc.get("symbol")
     }
-    industry_docs = [doc for doc in docs if doc.get("scope") == "industry"]
     enriched: List[Dict[str, Any]] = []
     attached_symbol_count = 0
     for item in items:
@@ -1201,6 +1234,29 @@ def _enrich_plan_items_with_llm_risk(
         }
         enriched.append({**item, "ai_risk": risk})
         attached_symbol_count += 1
+    return enriched, attached_symbol_count
+
+
+def _enrich_plan_items_with_llm_risk(
+    *,
+    plan: Dict[str, Any],
+    items: List[Dict[str, Any]],
+    user_id: str,
+) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+    if not items:
+        return plan, items
+    plan_id = str(plan.get("plan_id") or "")
+    run_id = _latest_completed_portfolio_llm_run_id(user_id=user_id, plan_id=plan_id)
+    if not run_id:
+        return plan, items
+
+    risk_coll = get_analyzer_db()["portfolio_risk_llm"]
+    docs = list(risk_coll.find({"plan_id": plan_id, "run_id": run_id}, {"_id": 0}))
+    if not docs:
+        return plan, items
+
+    industry_docs = [doc for doc in docs if doc.get("scope") == "industry"]
+    enriched, attached_symbol_count = _attach_llm_risk_to_items(items=items, docs=docs, run_id=run_id)
 
     summary = {
         "run_id": run_id,
@@ -1334,6 +1390,58 @@ def _build_plan_bench_payload(
         "pool_size": pool_size,
         "starters": starters,
         "bench": bench,
+    }
+
+
+def _enrich_bench_payload_with_llm_risk(
+    *,
+    plan: Dict[str, Any],
+    payload: Dict[str, Any],
+    user_id: str,
+) -> Dict[str, Any]:
+    bench_items = list(payload.get("bench") or [])
+    if not bench_items:
+        return payload
+    plan_id = str(plan.get("plan_id") or payload.get("plan_id") or "")
+    run_id = _latest_completed_portfolio_llm_run_id(
+        user_id=user_id,
+        plan_id=plan_id,
+        target_scope="bench",
+    )
+    if not run_id:
+        return payload
+
+    risk_coll = get_analyzer_db()["portfolio_risk_llm"]
+    docs = list(risk_coll.find({"plan_id": plan_id, "run_id": run_id}, {"_id": 0}))
+    if not docs:
+        return payload
+
+    enriched_bench, attached_symbol_count = _attach_llm_risk_to_items(
+        items=bench_items,
+        docs=docs,
+        run_id=run_id,
+    )
+    industry_docs = [doc for doc in docs if doc.get("scope") == "industry"]
+    return {
+        **payload,
+        "bench": enriched_bench,
+        "ai_risk_llm_summary": {
+            "run_id": run_id,
+            "status": "completed",
+            "symbol_count": attached_symbol_count,
+            "industry_count": len(industry_docs),
+            "industries": [
+                {
+                    "industry": doc.get("industry"),
+                    "severity": doc.get("severity"),
+                    "summary": doc.get("summary"),
+                    "findings": doc.get("findings") or [],
+                    "analyzed_at": doc.get("analyzed_at"),
+                    "model": doc.get("model"),
+                }
+                for doc in sorted(industry_docs, key=lambda row: str(row.get("industry") or ""))
+            ],
+        },
     }
 
 
@@ -3816,13 +3924,19 @@ async def enqueue_portfolio_plan_llm_risk(
             _portfolio_llm_task_query(
                 user_id=user_id,
                 plan_id=plan_id,
+                target_scope=request.target_scope,
                 statuses=PORTFOLIO_RISK_LLM_RUNNING_STATUSES,
             ),
             sort=[("created_at", -1)],
         )
         if existing:
             existing_run_id = str((existing.get("params") or {}).get("run_id") or "")
-            tasks = _portfolio_llm_run_tasks(user_id=user_id, plan_id=plan_id, run_id=existing_run_id)
+            tasks = _portfolio_llm_run_tasks(
+                user_id=user_id,
+                plan_id=plan_id,
+                run_id=existing_run_id,
+                target_scope=request.target_scope,
+            )
             return {
                 "success": True,
                 "data": _jsonable(
@@ -3835,16 +3949,41 @@ async def enqueue_portfolio_plan_llm_risk(
                 ),
             }
 
-    owner_query = {"plan_id": plan_id, "user_id": user_id}
-    items = list(collections["portfolio_trade_plan_items"].find(owner_query).sort("rank", 1))
-    items = _enrich_plan_items_with_score_snapshot(
-        data_collections=data_collections,
-        plan=plan,
-        items=items,
-    )
+    if request.target_scope == "bench":
+        finance_collections = get_db_collections()
+        holdings = _current_lineage_holdings(
+            collections, finance_collections, data_collections, plan, user_id
+        )
+        bench_payload = _build_plan_bench_payload(
+            plan,
+            holdings,
+            bench_multiplier=request.bench_multiplier,
+            data_collections=data_collections,
+        )
+        items = [
+            {
+                **row,
+                "action": "bench",
+                "target_weight": None,
+            }
+            for row in bench_payload.get("bench") or []
+        ]
+    else:
+        owner_query = {"plan_id": plan_id, "user_id": user_id}
+        items = list(collections["portfolio_trade_plan_items"].find(owner_query).sort("rank", 1))
+        items = _enrich_plan_items_with_score_snapshot(
+            data_collections=data_collections,
+            plan=plan,
+            items=items,
+        )
     actionable = _portfolio_llm_actionable_items(items, request)
     if not actionable:
-        raise HTTPException(status_code=400, detail="no buy/hold plan items matched LLM risk review filters")
+        detail = (
+            "no bench candidates matched LLM risk review filters"
+            if request.target_scope == "bench"
+            else "no buy/hold plan items matched LLM risk review filters"
+        )
+        raise HTTPException(status_code=400, detail=detail)
 
     groups = _portfolio_llm_industry_groups(actionable)
     industry_context = _portfolio_llm_industry_context(groups)
@@ -3864,6 +4003,7 @@ async def enqueue_portfolio_plan_llm_risk(
             params = {
                 "plan_id": plan_id,
                 "run_id": run_id,
+                "target_scope": request.target_scope,
                 "base_date": base_date,
                 "score_date": score_date,
                 "industry": industry,
@@ -3878,6 +4018,7 @@ async def enqueue_portfolio_plan_llm_risk(
                     "include_actions": request.include_actions,
                     "max_symbols_per_call": request.max_symbols_per_call,
                     "prompt_version": request.prompt_version,
+                    "bench_multiplier": request.bench_multiplier,
                 },
             }
             task_doc = build_task_doc(
@@ -3888,8 +4029,8 @@ async def enqueue_portfolio_plan_llm_risk(
                 source="portfolio_plan_llm_risk",
                 extra_fields={
                     "plan_id": plan_id,
-                    "operation_type": "llm_risk_review",
-                    "idempotency_key": f"{plan_id}:{run_id}:{industry}:{chunk_index}",
+                    "operation_type": f"{request.target_scope}_llm_risk_review",
+                    "idempotency_key": f"{plan_id}:{request.target_scope}:{run_id}:{industry}:{chunk_index}",
                 },
             )
             result = analysis_tasks.insert_one(task_doc)
@@ -3901,21 +4042,28 @@ async def enqueue_portfolio_plan_llm_risk(
         collections,
         plan_id=plan_id,
         user_id=user_id,
-        operation_type="llm_risk_review",
+        operation_type=f"{request.target_scope}_llm_risk_review",
         status="enqueued",
-        message="portfolio llm risk review enqueued",
+        message=f"portfolio {request.target_scope} llm risk review enqueued",
         payload={
             "run_id": run_id,
+            "target_scope": request.target_scope,
             "task_count": sum(len(_chunked(rows, request.max_symbols_per_call)) for rows in groups.values()),
             "industry_context": industry_context,
         },
     )
-    tasks = _portfolio_llm_run_tasks(user_id=user_id, plan_id=plan_id, run_id=run_id)
+    tasks = _portfolio_llm_run_tasks(
+        user_id=user_id,
+        plan_id=plan_id,
+        run_id=run_id,
+        target_scope=request.target_scope,
+    )
     return {
         "success": True,
         "data": _jsonable(
             {
                 "run_id": run_id,
+                "target_scope": request.target_scope,
                 "reused": False,
                 "task_ids": task_ids,
                 "summary": _portfolio_llm_run_status(tasks),
@@ -3929,13 +4077,19 @@ async def enqueue_portfolio_plan_llm_risk(
 async def get_portfolio_plan_llm_risk_run(
     plan_id: str,
     run_id: str,
+    target_scope: str = Query(default="plan", pattern="^(plan|bench)$"),
     current_user: dict = Depends(get_current_user),
 ):
     """Aggregate quantAnalyzer analysis_tasks status for one LLM risk run."""
     collections = get_trading_db_collections()
     user_id = _current_user_id(current_user)
     _require_plan(collections, plan_id, current_user)
-    tasks = _portfolio_llm_run_tasks(user_id=user_id, plan_id=plan_id, run_id=run_id)
+    tasks = _portfolio_llm_run_tasks(
+        user_id=user_id,
+        plan_id=plan_id,
+        run_id=run_id,
+        target_scope=target_scope,
+    )
     if not tasks:
         raise HTTPException(status_code=404, detail="llm risk review run not found")
     summary = _portfolio_llm_run_status(tasks)
@@ -3944,6 +4098,7 @@ async def get_portfolio_plan_llm_risk_run(
         "data": _jsonable(
             {
                 "run_id": run_id,
+                "target_scope": target_scope,
                 **summary,
                 "tasks": tasks,
             }
@@ -4176,6 +4331,7 @@ async def get_portfolio_plan_bench(
         bench_multiplier=bench_multiplier,
         data_collections=data_collections,
     )
+    payload = _enrich_bench_payload_with_llm_risk(plan=plan, payload=payload, user_id=user_id)
     return {"success": True, "data": _jsonable(payload)}
 
 

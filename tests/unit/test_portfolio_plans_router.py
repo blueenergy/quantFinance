@@ -336,6 +336,63 @@ def test_enqueue_portfolio_llm_risk_fans_out_by_industry_and_reuses_running_run(
     assert len(analysis_tasks.docs) == 2
 
 
+def test_enqueue_portfolio_llm_risk_supports_bench_scope(monkeypatch):
+    collections = _collections()
+    data_collections = _data_collections()
+    stock_scores = _Collection(
+        [
+            {"symbol": "000001.SZ", "name": "A", "industry": "Bank", "score_date": "20250110", "index_codes": "csi1000", "growth_score": 90, "cycle_score": 80},
+            {"symbol": "000002.SZ", "name": "B", "industry": "Bank", "score_date": "20250110", "index_codes": "csi1000", "growth_score": 85, "cycle_score": 75},
+            {"symbol": "000003.SZ", "name": "C", "industry": "Tech", "score_date": "20250110", "index_codes": "csi1000", "growth_score": 80, "cycle_score": 70},
+        ]
+    )
+    plan = collections["portfolio_trade_plans"].docs[0]
+    plan.update(
+        {
+            "score_date": "20250110",
+            "params_snapshot": {
+                "universe_index": "csi1000",
+                "growth_weight": 0.3,
+                "cycle_weight": 0.7,
+                "top_n": 2,
+            },
+        }
+    )
+    analysis_tasks = _Collection()
+    monkeypatch.setattr(portfolio_plans, "get_trading_db_collections", lambda: collections)
+    monkeypatch.setattr(portfolio_plans, "get_db_collections", lambda: collections)
+    monkeypatch.setattr(portfolio_plans, "get_data_db", lambda: data_collections)
+    monkeypatch.setattr(
+        portfolio_plans,
+        "_current_lineage_holdings",
+        lambda *args, **kwargs: [
+            {"symbol": "000001.SZ", "name": "A", "shares": 1000, "last_price": 10.0, "market_value": 10000.0},
+            {"symbol": "000002.SZ", "name": "B", "shares": 800, "last_price": 11.0, "market_value": 8800.0},
+        ],
+    )
+    monkeypatch.setattr(
+        portfolio_plans,
+        "finance_db",
+        {"stock_scores": stock_scores, "analysis_tasks": analysis_tasks},
+    )
+
+    response = asyncio.run(
+        portfolio_plans.enqueue_portfolio_plan_llm_risk(
+            plan["plan_id"],
+            portfolio_plans.PortfolioLlmRiskReviewRequest(target_scope="bench"),
+            current_user={"id": "user-1"},
+        )
+    )
+
+    data = response["data"]
+    assert data["target_scope"] == "bench"
+    assert data["summary"]["total"] == 1
+    task = analysis_tasks.docs[0]
+    assert task["params"]["target_scope"] == "bench"
+    assert task["params"]["items"][0]["symbol"] == "000003.SZ"
+    assert task["params"]["items"][0]["action"] == "bench"
+
+
 def test_plan_detail_enriches_latest_completed_llm_risk(monkeypatch):
     collections = _collections()
     plan = collections["portfolio_trade_plans"].docs[0]
@@ -3955,6 +4012,100 @@ def test_get_portfolio_plan_bench_splits_starters_and_bench(monkeypatch):
     assert [row["symbol"] for row in payload["bench"]] == ["000003.SZ"]
     assert payload["bench"][0]["rank"] == 3
     assert payload["bench"][0]["latest_close"] == 15.5
+
+
+def test_get_portfolio_plan_bench_enriches_latest_bench_llm_risk(monkeypatch):
+    cols = _collections()
+    data = _data_collections()
+    stock_scores = _Collection(
+        [
+            {"symbol": "000001.SZ", "name": "A", "industry": "Bank", "score_date": "20250110", "index_codes": "csi1000", "growth_score": 90, "cycle_score": 80},
+            {"symbol": "000002.SZ", "name": "B", "industry": "Bank", "score_date": "20250110", "index_codes": "csi1000", "growth_score": 85, "cycle_score": 75},
+            {"symbol": "000003.SZ", "name": "C", "industry": "Tech", "score_date": "20250110", "index_codes": "csi1000", "growth_score": 80, "cycle_score": 70},
+        ]
+    )
+    cols["portfolio_trade_plans"] = _Collection(
+        [
+            {
+                "plan_id": "bench-plan",
+                "strategy_template_id": "s1",
+                "user_id": "user-1",
+                "base_date": "20250110",
+                "score_date": "20250110",
+                "params_hash": "hx",
+                "params_snapshot": {
+                    "universe_index": "csi1000",
+                    "growth_weight": 0.3,
+                    "cycle_weight": 0.7,
+                    "top_n": 2,
+                },
+            }
+        ]
+    )
+    analyzer = _analyzer_collections()
+    analyzer["portfolio_risk_llm"].insert_one(
+        {
+            "plan_id": "bench-plan",
+            "run_id": "bench-run",
+            "scope": "symbol",
+            "symbol": "000003.SZ",
+            "industry": "Tech",
+            "severity": "high",
+            "summary": "替补候选存在事件风险",
+            "findings": [{"title": "测试公告", "severity": "high"}],
+            "engine_version": "llm-v1",
+            "model": "test-model",
+            "analyzed_at": "2026-06-29T10:00:00",
+        }
+    )
+    analysis_tasks = _Collection(
+        [
+            {
+                "type": portfolio_plans.PORTFOLIO_RISK_LLM_TASK_TYPE,
+                "user_id": "user-1",
+                "status": "completed",
+                "created_at": datetime(2026, 6, 30),
+                "params": {"plan_id": "bench-plan", "run_id": "plan-run", "target_scope": "plan"},
+            },
+            {
+                "type": portfolio_plans.PORTFOLIO_RISK_LLM_TASK_TYPE,
+                "user_id": "user-1",
+                "status": "completed",
+                "created_at": datetime(2026, 6, 29),
+                "params": {"plan_id": "bench-plan", "run_id": "bench-run", "target_scope": "bench"},
+            },
+        ]
+    )
+    monkeypatch.setattr(portfolio_plans, "get_trading_db_collections", lambda: cols)
+    monkeypatch.setattr(portfolio_plans, "get_db_collections", lambda: cols)
+    monkeypatch.setattr(portfolio_plans, "get_data_db", lambda: data)
+    monkeypatch.setattr(portfolio_plans, "get_analyzer_db", lambda: analyzer)
+    monkeypatch.setattr(
+        portfolio_plans,
+        "finance_db",
+        {"stock_scores": stock_scores, "analysis_tasks": analysis_tasks},
+    )
+    monkeypatch.setattr(
+        portfolio_plans,
+        "_current_lineage_holdings",
+        lambda *args, **kwargs: [
+            {"symbol": "000001.SZ", "name": "A", "shares": 1000, "last_price": 10.0, "market_value": 10000.0},
+            {"symbol": "000002.SZ", "name": "B", "shares": 800, "last_price": 11.0, "market_value": 8800.0},
+        ],
+    )
+
+    resp = asyncio.run(
+        portfolio_plans.get_portfolio_plan_bench(
+            "bench-plan",
+            bench_multiplier=1.5,
+            current_user={"id": "user-1"},
+        )
+    )
+
+    payload = resp["data"]
+    assert payload["bench"][0]["ai_risk"]["llm"]["run_id"] == "bench-run"
+    assert payload["bench"][0]["ai_risk"]["llm"]["severity"] == "high"
+    assert payload["ai_risk_llm_summary"]["run_id"] == "bench-run"
 
 
 def test_current_lineage_holdings_live_empty_does_not_fallback_to_paper():
