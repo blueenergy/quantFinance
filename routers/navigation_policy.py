@@ -21,6 +21,7 @@ KNOWN_MAIN_TABS: List[tuple] = [
     ("market-analysis", False),
     ("limit-up-ladder", False),
     ("market-risk", False),
+    ("market-regime", False),
     ("china-macro", False),
     ("us-rates", False),
     ("x-influencer-voices", False),

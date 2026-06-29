@@ -23,6 +23,7 @@ def test_compute_visible_tab_ids_admin_sees_all():
     assert "data-pulse" in ids
     assert "market-analysis" in ids
     assert "limit-up-ladder" in ids
+    assert "market-regime" in ids
 
 
 @pytest.mark.unit
@@ -32,9 +33,11 @@ def test_compute_visible_tab_ids_free_inherit_excludes_req_vip_tabs():
     assert "etf" not in ids
     assert "sector-concept" not in ids
     assert ids.index("global-market-brief") < ids.index("limit-up-ladder")
+    assert ids.index("market-risk") < ids.index("market-regime") < ids.index("china-macro")
     assert "data-pulse" in ids
     assert "market-analysis" in ids
     assert "limit-up-ladder" in ids
+    assert "market-regime" in ids
 
 
 @pytest.mark.unit

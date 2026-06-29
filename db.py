@@ -238,6 +238,9 @@ def get_data_db():
         "global_market_daily": data_db["global_market_daily"],
         # Market risk scan results (written by quant-data-engine risk_scanner task)
         "risk_reports": data_db["risk_reports"],
+        "market_breadth_daily": data_db["market_breadth_daily"],
+        "index_cape_daily": data_db["index_cape_daily"],
+        "market_regime_reports": data_db["market_regime_reports"],
         # X (Twitter) influencer tweets (written by quant-data-engine run_x_influencer_sync)
         "x_influencer_posts": data_db["x_influencer_posts"],
         # China macro rates/monthly/quarterly (written by run_cn_macro_sync)
