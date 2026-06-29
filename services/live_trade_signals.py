@@ -5,18 +5,22 @@ from __future__ import annotations
 import hashlib
 import os
 from datetime import datetime, time as dt_time, timedelta, timezone
-from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
 from typing import Any, Dict, Iterable, List, Optional
 from zoneinfo import ZoneInfo
 
 from fastapi import HTTPException
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from services.execution_policy import (
+    protected_limit_price as _protected_limit_price,
+    build_price_guard,
+    resolve_execution_policy,
+)
+
 
 LIVE_SIGNAL_SOURCE_PORTFOLIO_PLAN = "portfolio_plan"
 TERMINAL_SIGNAL_STATUSES = {"filled", "executed", "rejected", "cancelled", "canceled", "partial_cancelled", "failed"}
 ACTIVE_SIGNAL_STATUSES = {"pending", "retry_pending", "submitted", "partial_filled", "cancel_requested"}
-PRICE_TICK = Decimal("0.01")
 CN_TZ = ZoneInfo("Asia/Shanghai")
 CN_A_MORNING_OPEN = dt_time(9, 25)
 CN_A_MORNING_CLOSE = dt_time(11, 30)
@@ -89,22 +93,6 @@ def default_valid_until(now: datetime, activate_after: Optional[datetime] = None
     else:
         anchor = activate_after or now
     return anchor + timedelta(seconds=ttl)
-
-
-def _round_price_to_tick(price: float, *, action: str) -> float:
-    """Round protected limit prices to the A-share 0.01 price tick."""
-
-    decimal_price = Decimal(str(price))
-    rounding = ROUND_FLOOR if action == "sell" else ROUND_CEILING
-    return float(decimal_price.quantize(PRICE_TICK, rounding=rounding))
-
-
-def _protected_limit_price(reference_price: float, max_slippage_bps: int, *, action: str) -> float:
-    reference = Decimal(str(reference_price))
-    slippage = Decimal(int(max_slippage_bps)) / Decimal("10000")
-    multiplier = Decimal("1") - slippage if action == "sell" else Decimal("1") + slippage
-    rounding = ROUND_FLOOR if action == "sell" else ROUND_CEILING
-    return float((reference * multiplier).quantize(PRICE_TICK, rounding=rounding))
 
 
 class LiveTradeSignal(BaseModel):
@@ -317,17 +305,14 @@ def build_portfolio_plan_live_signal(
         price = float(price)
     rank = item.get("rank")
     plan_item_rank = int(rank) if rank is not None else None
-    risk_limits = account.get("risk_limits") or {}
-    max_slippage_bps = int(risk_limits.get("max_slippage_bps") or account.get("max_slippage_bps") or 100)
+    reference_price_source = str(item.get("price_source") or "estimated_price")
+    policy = resolve_execution_policy(account, reference_price_source=reference_price_source)
     reference_price = price if price and price > 0 else None
-    price_floor = None
-    price_ceiling = None
-    if reference_price is not None:
-        if action == "sell":
-            price_floor = _protected_limit_price(reference_price, max_slippage_bps, action=action)
-        else:
-            price_ceiling = _protected_limit_price(reference_price, max_slippage_bps, action=action)
-    effective_limit_price = price_floor if action == "sell" else price_ceiling
+    guard = build_price_guard(reference_price, action, policy)
+    max_slippage_bps = guard.max_slippage_bps
+    price_floor = guard.price_floor
+    price_ceiling = guard.price_ceiling
+    effective_limit_price = guard.effective_limit_price
     execution_priority = int(plan_item_rank if plan_item_rank is not None else 1000)
     if action == "sell":
         execution_priority -= 10000
@@ -359,12 +344,12 @@ def build_portfolio_plan_live_signal(
         action=action,
         size=size,
         price=price,
-        order_type="limit" if price else "market",
+        order_type=guard.order_type if reference_price is not None else "market",
         execution_phase=execution_phase,
         execution_priority=execution_priority,
         plan_item_rank=plan_item_rank,
         reference_price=reference_price,
-        reference_price_source=str(item.get("price_source") or "estimated_price"),
+        reference_price_source=reference_price_source,
         max_slippage_bps=max_slippage_bps,
         fee_model=account.get("fee_model") or {},
         price_floor=price_floor,

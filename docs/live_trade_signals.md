@@ -216,11 +216,21 @@ Portfolio-plan signals are published with this first-level execution policy:
 sell phase -> buy phase
 ```
 
-Within the same phase, `execution_priority` and `plan_item_rank` keep the order deterministic. For sell orders, the backend also provides a protected limit reference:
+Within the same phase, `execution_priority` and `plan_item_rank` keep the order deterministic. Protected limit prices are computed in `services/execution_policy.py`:
 
 ```text
-price_floor = reference_price * (1 - max_slippage_bps / 10000)
+buy ceiling  = reference_price * (1 + max_slippage_bps / 10000)   # rounded up to 0.01
+sell floor   = reference_price * (1 - max_slippage_bps / 10000)   # rounded down to 0.01
 ```
+
+Default `max_slippage_bps` depends on the price anchor:
+
+| Context | `reference_price_source` examples | Default style | Default bps |
+|---|---|---|---|
+| Intraday / manual fast-action | `realtime`, `estimated_price` | `balanced` | 30 |
+| Next-open / stale close anchor | `daily_close`, `latest_close` | `open_auction` | 100 |
+
+`reference_price` is the publish-time anchor; `effective_limit_price` is the **protected limit** sent to the trader (buy ceiling or sell floor), not the expected fill price. Account `risk_limits.max_slippage_bps` overrides the style default when set.
 
 `quantTrader` should use `effective_limit_price` or recompute the protected limit before sending the broker order. If no reference price is available for a live sell order, the trader should reject or retry the signal rather than submit an unprotected market sell.
 

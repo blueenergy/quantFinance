@@ -33,9 +33,9 @@ from datetime import datetime
 from decimal import Decimal, ROUND_FLOOR
 from typing import Any, Callable, Dict, List, Optional
 
+from services.execution_policy import build_price_guard, resolve_execution_policy
 from services.live_trade_signals import (
     LiveTradeSignal,
-    _protected_limit_price,
     default_activate_after,
     default_valid_until,
 )
@@ -331,19 +331,16 @@ def build_topup_signal_doc(
     if not spec.actionable or spec.topup_shares <= 0 or spec.action not in {"buy", "sell"}:
         raise ValueError("spec is not actionable")
 
-    risk_limits = account.get("risk_limits") or {}
-    max_slippage_bps = int(
-        risk_limits.get("max_slippage_bps") or account.get("max_slippage_bps") or 100
+    policy = resolve_execution_policy(
+        account,
+        reference_price_source=spec.reference_price_source,
     )
     reference_price = spec.reference_price
-    price_floor = None
-    price_ceiling = None
-    if reference_price and reference_price > 0:
-        if spec.action == "sell":
-            price_floor = _protected_limit_price(reference_price, max_slippage_bps, action="sell")
-        else:
-            price_ceiling = _protected_limit_price(reference_price, max_slippage_bps, action="buy")
-    effective_limit_price = price_floor if spec.action == "sell" else price_ceiling
+    guard = build_price_guard(reference_price, spec.action, policy)
+    max_slippage_bps = guard.max_slippage_bps
+    price_floor = guard.price_floor
+    price_ceiling = guard.price_ceiling
+    effective_limit_price = guard.effective_limit_price
 
     execution_priority = int(spec.rank if spec.rank is not None else 1000)
     if spec.action == "sell":
@@ -365,7 +362,7 @@ def build_topup_signal_doc(
         action=spec.action,
         size=int(spec.topup_shares),
         price=effective_limit_price if effective_limit_price else reference_price,
-        order_type="limit" if (effective_limit_price or reference_price) else "market",
+        order_type=guard.order_type if (effective_limit_price or reference_price) else "market",
         execution_phase=spec.action,
         execution_priority=execution_priority,
         plan_item_rank=spec.rank,

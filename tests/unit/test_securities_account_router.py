@@ -230,3 +230,57 @@ def test_update_account_rejects_negative_risk_limits(monkeypatch):
         assert "max_order_amount" in exc.detail
     else:
         raise AssertionError("expected negative risk limit to be rejected")
+
+
+def test_update_account_saves_max_slippage_bps(monkeypatch):
+    account_id = ObjectId()
+    accounts = _Collection(
+        [
+            {
+                "_id": account_id,
+                "user_id": "user-1",
+                "broker": "miniQMT",
+                "account_id": "A123",
+                "account_type": "real",
+                "created_at": securities_account.datetime.utcnow(),
+            }
+        ]
+    )
+    monkeypatch.setattr(securities_account, "get_db_collections", lambda: {"securities_accounts": accounts})
+
+    securities_account.update_account(
+        str(account_id),
+        SecuritiesAccountUpdate(risk_limits={"max_slippage_bps": 50}),
+        current_user={"id": "user-1"},
+    )
+
+    assert accounts.docs[0]["risk_limits"] == {"max_slippage_bps": 50}
+
+
+def test_update_account_rejects_invalid_max_slippage_bps(monkeypatch):
+    account_id = ObjectId()
+    accounts = _Collection(
+        [
+            {
+                "_id": account_id,
+                "user_id": "user-1",
+                "broker": "miniQMT",
+                "account_id": "A123",
+                "account_type": "real",
+                "created_at": securities_account.datetime.utcnow(),
+            }
+        ]
+    )
+    monkeypatch.setattr(securities_account, "get_db_collections", lambda: {"securities_accounts": accounts})
+
+    try:
+        securities_account.update_account(
+            str(account_id),
+            SecuritiesAccountUpdate(risk_limits={"max_slippage_bps": 2000}),
+            current_user={"id": "user-1"},
+        )
+    except securities_account.HTTPException as exc:
+        assert exc.status_code == 400
+        assert "max_slippage_bps" in exc.detail
+    else:
+        raise AssertionError("expected oversized max_slippage_bps to be rejected")

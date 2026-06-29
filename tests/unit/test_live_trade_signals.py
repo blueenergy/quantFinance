@@ -1,5 +1,6 @@
 from datetime import datetime, timezone
 
+from services.execution_policy import protected_limit_price
 from services.live_trade_signals import (
     PHASE_BARRIER_PLAN_SELLS_TERMINAL,
     PLAN_PHASE_APPROVED_PUBLISHED,
@@ -8,6 +9,7 @@ from services.live_trade_signals import (
     PLAN_PHASE_SELL_SETTLED,
     PLAN_PHASE_SELLING,
     build_plan_sells_terminal_barrier,
+    build_portfolio_plan_live_signal,
     default_activate_after,
     derive_execution_phase_state,
     sells_barrier_satisfied,
@@ -104,3 +106,53 @@ def test_derive_phase_state_sell_only_plan_is_done_when_sells_terminal():
     signals = [{"execution_phase": "sell", "status": "filled", "mode": "live"}]
 
     assert derive_execution_phase_state(signals) == PLAN_PHASE_DONE
+
+
+def test_build_portfolio_plan_live_signal_uses_balanced_slippage_for_estimated_price():
+    now = datetime(2026, 6, 19, 3, 0, tzinfo=timezone.utc)
+    signal = build_portfolio_plan_live_signal(
+        plan={
+            "plan_id": "plan-1",
+            "user_id": "user-1",
+            "strategy_template_id": "st-1",
+        },
+        item={
+            "symbol": "600519.SH",
+            "delta_shares": 100,
+            "target_shares": 100,
+            "estimated_price": 66.71,
+            "rank": 1,
+        },
+        account={"_id": "acct-1", "account_id": "a1", "broker": "miniQMT"},
+        now=now,
+    )
+
+    assert signal is not None
+    assert signal.max_slippage_bps == 30
+    assert signal.effective_limit_price == 66.92
+    assert signal.reference_price == 66.71
+
+
+def test_build_portfolio_plan_live_signal_uses_open_auction_for_daily_close():
+    now = datetime(2026, 6, 19, 3, 0, tzinfo=timezone.utc)
+    signal = build_portfolio_plan_live_signal(
+        plan={
+            "plan_id": "plan-1",
+            "user_id": "user-1",
+            "strategy_template_id": "st-1",
+        },
+        item={
+            "symbol": "600519.SH",
+            "delta_shares": 100,
+            "target_shares": 100,
+            "estimated_price": 66.71,
+            "price_source": "daily_close",
+            "rank": 1,
+        },
+        account={"_id": "acct-1", "account_id": "a1", "broker": "miniQMT"},
+        now=now,
+    )
+
+    assert signal is not None
+    assert signal.max_slippage_bps == 100
+    assert signal.effective_limit_price == protected_limit_price(66.71, 100, action="buy")

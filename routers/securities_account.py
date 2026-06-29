@@ -36,11 +36,22 @@ def _account_response(d: dict) -> SecuritiesAccountResponse:
 def _normalize_risk_limits(raw: Optional[dict]) -> dict:
     if not raw:
         return {}
-    allowed_fields = ("max_order_amount", "max_daily_amount", "max_position_pct")
+    allowed_fields = ("max_order_amount", "max_daily_amount", "max_position_pct", "max_slippage_bps")
     limits = {}
     for field in allowed_fields:
         value = raw.get(field)
         if value in (None, ""):
+            continue
+        if field == "max_slippage_bps":
+            try:
+                number = int(value)
+            except (TypeError, ValueError):
+                raise HTTPException(status_code=400, detail=f"{field} 必须是整数")
+            if number < 0:
+                raise HTTPException(status_code=400, detail=f"{field} 不能小于 0")
+            if number > 1000:
+                raise HTTPException(status_code=400, detail=f"{field} 不能大于 1000")
+            limits[field] = number
             continue
         try:
             number = float(value)

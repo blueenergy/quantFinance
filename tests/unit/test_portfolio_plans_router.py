@@ -1247,9 +1247,9 @@ def test_publish_live_signals_dry_run_builds_contract(monkeypatch):
     assert signal["execution_priority"] == 1
     assert signal["plan_item_rank"] == 1
     assert signal["reference_price"] == 10.0
-    assert signal["max_slippage_bps"] == 100
-    assert signal["price_ceiling"] == 10.1
-    assert signal["effective_limit_price"] == 10.1
+    assert signal["max_slippage_bps"] == 30
+    assert signal["price_ceiling"] == 10.03
+    assert signal["effective_limit_price"] == 10.03
     assert signal["activate_after"]
     assert signal["valid_until"]
     activate_after = datetime.fromisoformat(signal["activate_after"])
@@ -1259,7 +1259,7 @@ def test_publish_live_signals_dry_run_builds_contract(monkeypatch):
     sell_signal = response["data"]["signals"][1]
     assert sell_signal["execution_phase"] == "sell"
     assert sell_signal["execution_priority"] == -9998
-    assert sell_signal["price_floor"] == 11.88
+    assert sell_signal["price_floor"] == 11.96
     assert sell_signal["phase_barrier"] is None
     assert response["data"]["risk_report"]["blocked_count"] == 0
     assert response["data"]["reprice_summary"]["equity_used"] == 1_200_000
@@ -1652,10 +1652,10 @@ def test_publish_live_signals_rounds_protected_prices_to_tick(monkeypatch):
 
     buy_signal = response["data"]["signals"][0]
     sell_signal = response["data"]["signals"][1]
-    assert buy_signal["price_ceiling"] == 10.1
-    assert buy_signal["effective_limit_price"] == 10.1
-    assert sell_signal["price_floor"] == 11.88
-    assert sell_signal["effective_limit_price"] == 11.88
+    assert buy_signal["price_ceiling"] == 10.03
+    assert buy_signal["effective_limit_price"] == 10.03
+    assert sell_signal["price_floor"] == 11.96
+    assert sell_signal["effective_limit_price"] == 11.96
 
 
 def test_publish_live_signals_rejects_empty_signal_set(monkeypatch):

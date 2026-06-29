@@ -13,9 +13,13 @@ from bson.errors import InvalidId
 
 from db import get_data_db
 from routers.stock import _symbol_candidates
+from services.execution_policy import (
+    build_price_guard,
+    protected_limit_price,
+    resolve_execution_policy,
+)
 from services.live_trade_signals import (
     LiveTradeSignal,
-    _protected_limit_price,
     default_activate_after,
     default_valid_until,
 )
@@ -190,15 +194,21 @@ def build_reprice_preview(
         raise RepriceError("signal missing securities_account_id", 400)
 
     market_px, market_src = resolve_market_reference_price(symbol)
-    max_slippage_bps = int(signal.get("max_slippage_bps") or 100)
+    signal_bps = signal.get("max_slippage_bps")
+    policy = resolve_execution_policy(
+        max_slippage_bps=int(signal_bps) if signal_bps is not None else None,
+        reference_price_source=str(signal.get("reference_price_source") or market_src),
+    )
+    max_slippage_bps = policy.max_slippage_bps
+    chase_bps = max_slippage_bps + policy.chase_extra_bps
     old_limit = _first_float(signal.get("effective_limit_price"), signal.get("price_ceiling"), signal.get("price"))
     old_ref = _first_float(signal.get("reference_price")) or old_limit
 
     suggested_limit = None
     if market_px and market_px > 0:
-        suggested_limit = _protected_limit_price(market_px, max_slippage_bps + 30, action="buy")
+        suggested_limit = protected_limit_price(market_px, chase_bps, action="buy")
     elif old_ref and old_ref > 0:
-        suggested_limit = _protected_limit_price(old_ref, max_slippage_bps + 30, action="buy")
+        suggested_limit = protected_limit_price(old_ref, chase_bps, action="buy")
 
     size = int(signal.get("size") or 0)
     if size <= 0:
@@ -285,6 +295,11 @@ def confirm_reprice_and_insert_signal(
     now = datetime.utcnow()
     new_order_id = f"live-reprice-{uuid.uuid4().hex[:20]}"
     activate_after = default_activate_after(now)
+    signal_bps = signal.get("max_slippage_bps")
+    reprice_policy = resolve_execution_policy(
+        max_slippage_bps=int(signal_bps) if signal_bps is not None else None,
+        reference_price_source=str(market_src or signal.get("reference_price_source") or "manual_reprice"),
+    )
 
     lt = LiveTradeSignal(
         order_id=new_order_id,
@@ -306,7 +321,7 @@ def confirm_reprice_and_insert_signal(
         plan_item_rank=signal.get("plan_item_rank"),
         reference_price=float(market_px) if market_px else float(effective_limit_price),
         reference_price_source=str(market_src or "manual_reprice"),
-        max_slippage_bps=int(signal.get("max_slippage_bps") or 100),
+        max_slippage_bps=reprice_policy.max_slippage_bps,
         fee_model=signal.get("fee_model") or {},
         price_floor=None,
         price_ceiling=float(effective_limit_price),
