@@ -931,6 +931,22 @@ def _enrich_plan_items_with_score_snapshot(
     return enriched
 
 
+def _enrich_plan_items_with_estimated_amount(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Fill missing trade notional from delta and estimated price for display."""
+    enriched: List[Dict[str, Any]] = []
+    for item in items:
+        if item.get("estimated_amount") is not None:
+            enriched.append(item)
+            continue
+        delta = _optional_float(item.get("delta_shares"))
+        price = _optional_float(item.get("estimated_price"))
+        if delta is None or delta == 0 or price is None or price <= 0:
+            enriched.append(item)
+            continue
+        enriched.append({**item, "estimated_amount": abs(delta) * price})
+    return enriched
+
+
 def _build_plan_bench_payload(
     plan: Dict[str, Any],
     holdings: List[Dict[str, Any]],
@@ -3613,6 +3629,7 @@ async def get_portfolio_plan(plan_id: str, current_user: dict = Depends(get_curr
         plan=plan,
         items=items,
     )
+    items = _enrich_plan_items_with_estimated_amount(items)
     mark("score_snapshot")
     items, live_overlay = _enrich_plan_items_with_overlay(
         data_collections=data_collections,
@@ -3691,6 +3708,7 @@ async def get_portfolio_plan_items(plan_id: str, current_user: dict = Depends(ge
         plan=plan,
         items=items,
     )
+    items = _enrich_plan_items_with_estimated_amount(items)
     items, live_overlay = _enrich_plan_items_with_overlay(
         data_collections=data_collections,
         plan=plan,

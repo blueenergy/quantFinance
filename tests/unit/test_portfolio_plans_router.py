@@ -1755,6 +1755,8 @@ def test_plan_detail_fills_missing_item_metadata_from_score_snapshot(monkeypatch
             "current_shares": 100,
             "target_shares": 0,
             "delta_shares": -100,
+            "estimated_price": 84.5,
+            "estimated_amount": None,
             "rank": None,
         }
     )
@@ -1784,6 +1786,7 @@ def test_plan_detail_fills_missing_item_metadata_from_score_snapshot(monkeypatch
     assert item["name"] == "意华股份"
     assert item["industry"] == "元器件"
     assert item["score_value"] == pytest.approx(84.015)
+    assert item["estimated_amount"] == pytest.approx(8450.0)
     assert item["rank"] is None
 
 
