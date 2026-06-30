@@ -155,6 +155,8 @@ def get_analyzer_db():
         "x_influencer_post_analysis": analyzer_db["x_influencer_post_analysis"],
         # Macro deep-dive analysis (china_macro / us_macro)
         "macro_analysis": analyzer_db["macro_analysis"],
+        # A-share market breadth / valuation LLM interpretation
+        "market_regime_analysis": analyzer_db["market_regime_analysis"],
         # Retrospective analysis quality evaluations
         "analysis_evaluations": analyzer_db["analysis_evaluations"],
         # Daily limit-up panorama narrative (written by quantAnalyzer)

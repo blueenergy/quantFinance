@@ -7,7 +7,9 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 
 from auth import get_current_active_user
-from db import get_data_db
+from db import get_analyzer_db, get_data_db
+import db as _app_db
+from services.analysis_tasks import build_task_doc
 
 router = APIRouter(prefix="/market-regime", tags=["A股广度估值扫描"])
 
@@ -24,7 +26,74 @@ def _serialize(doc: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
 
 
 def _serialize_list(docs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    return [_serialize(doc) for doc in docs if doc]
+    items: List[Dict[str, Any]] = []
+    for doc in docs:
+        item = _serialize(doc)
+        if item is not None:
+            items.append(item)
+    return items
+
+
+@router.get("/analysis/latest", summary="最新A股广度估值 AI 解读")
+async def get_market_regime_analysis_latest(
+    current_user: dict = Depends(get_current_active_user),
+):
+    coll = get_analyzer_db()["market_regime_analysis"]
+    doc = coll.find_one({}, {"_id": 0}, sort=[("analysis_date", -1)])
+    if not doc:
+        raise HTTPException(404, "暂无 A 股广度估值 AI 解读，请先触发分析")
+    return _serialize(doc)
+
+
+@router.get("/analysis/history", summary="A股广度估值 AI 解读历史")
+async def get_market_regime_analysis_history(
+    limit: int = Query(10, ge=1, le=60, description="返回最近 N 条，最多 60"),
+    current_user: dict = Depends(get_current_active_user),
+):
+    coll = get_analyzer_db()["market_regime_analysis"]
+    docs = list(coll.find({}, {"_id": 0}).sort("analysis_date", -1).limit(limit))
+    return {"data": _serialize_list(docs)}
+
+
+@router.post("/analysis/trigger", summary="触发A股广度估值 AI 解读")
+async def trigger_market_regime_analysis(
+    date: Optional[str] = Query(None, description="扫描日期 YYYYMMDD，默认最新日报"),
+    force: bool = Query(False, description="强制重新分析（即使当日已有任务）"),
+    current_user: dict = Depends(get_current_active_user),
+):
+    data_coll = get_data_db()["market_regime_reports"]
+    report = data_coll.find_one({"scan_date": date}, {"_id": 0}) if date else data_coll.find_one({}, {"_id": 0}, sort=[("scan_date", -1)])
+    if not report:
+        raise HTTPException(404, "暂无 A 股广度估值扫描数据，无法触发 AI 解读")
+
+    analysis_date = str(report.get("scan_date") or date)
+    if not force:
+        existing_task = _app_db.db["analysis_tasks"].find_one({
+            "type": "market_regime_analysis",
+            "params.date": analysis_date,
+            "status": {"$in": ["pending", "processing"]},
+        })
+        if existing_task:
+            return {
+                "task_id": str(existing_task["_id"]),
+                "status": existing_task.get("status", "pending"),
+                "analysis_date": analysis_date,
+                "message": "当日广度估值 AI 解读任务已在队列中",
+            }
+
+    task_doc = build_task_doc(
+        current_user=current_user,
+        task_type="market_regime_analysis",
+        priority=5,
+        params={"date": analysis_date},
+        source="manual_trigger",
+    )
+    result = _app_db.db["analysis_tasks"].insert_one(task_doc)
+    return {
+        "task_id": str(result.inserted_id),
+        "status": "pending",
+        "analysis_date": analysis_date,
+    }
 
 
 @router.get("/latest", summary="最新A股广度估值扫描日报")
@@ -52,7 +121,7 @@ async def get_market_regime_detail(
 
 @router.get("/history", summary="A股广度估值扫描历史列表")
 async def get_market_regime_history(
-    limit: int = Query(30, ge=1, le=180, description="返回最近 N 条，最多 180"),
+    limit: int = Query(30, ge=1, le=500, description="返回最近 N 条，最多 500"),
     start: Optional[str] = Query(None, description="起始日期 YYYYMMDD；指定后按区间查询"),
     end: Optional[str] = Query(None, description="结束日期 YYYYMMDD"),
     current_user: dict = Depends(get_current_active_user),
