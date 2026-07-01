@@ -52,6 +52,9 @@ class FakeIndexConstituentsCollection:
         ("000016.SH", "sse50"),
         ("csi1000", "csi1000"),
         ("000852.SH", "csi1000"),
+        ("csi2000", "csi2000"),
+        ("932000.CSI", "csi2000"),
+        ("932000.SH", "csi2000"),
     ],
 )
 def test_store_key_for_index(code: str, expected: str) -> None:

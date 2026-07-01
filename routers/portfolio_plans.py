@@ -82,7 +82,7 @@ from services.portfolio_plan_market import (
 
 router = APIRouter(prefix="/portfolio-plans", tags=["portfolio-plans"])
 log = logging.getLogger(__name__)
-ALLOWED_UNIVERSE_INDICES = {"hs300", "a500", "csi500", "csi1000", "star50"}
+ALLOWED_UNIVERSE_INDICES = {"hs300", "a500", "csi500", "csi1000", "csi2000", "star50"}
 PORTFOLIO_RISK_LLM_TASK_TYPE = "portfolio_risk_llm"
 PORTFOLIO_RISK_LLM_PRIORITY = 10
 PORTFOLIO_RISK_LLM_RUNNING_STATUSES = {"pending", "processing"}

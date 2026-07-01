@@ -45,6 +45,7 @@ STOCK_RANKING_INDEX_CODES: Tuple[str, ...] = (
     "a500",
     "csi500",
     "csi1000",
+    "csi2000",
     "star50",
 )
 

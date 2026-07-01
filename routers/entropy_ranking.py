@@ -185,7 +185,7 @@ def get_entropy_dates(limit: int = Query(60, ge=1, le=500)):
 @router.get("/entropy/rankings")
 def get_entropy_rankings(
     score_date: Optional[str] = None,
-    index_code: str = "csi1000",
+    index_code: str = Query("csi1000", description="指数池: hs300/a500/csi500/csi1000/csi2000/star50"),
     limit: int = Query(100, ge=1, le=1000),
 ):
     coll = get_db_collections()["entropy_scores"]

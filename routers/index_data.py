@@ -54,3 +54,14 @@ async def get_csi1000_constituents():
         return IndexConstituentsResponse(success=True, data=data, total_count=len(data))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# 中证2000
+@router.get("/csi2000/constituents", response_model=IndexConstituentsResponse)
+async def get_csi2000_constituents():
+    try:
+        service = IndexService()
+        data = await service.get_index_constituents("csi2000")
+        return IndexConstituentsResponse(success=True, data=data, total_count=len(data))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))

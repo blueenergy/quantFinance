@@ -33,7 +33,7 @@ class IndexService:
         """将路由别名或 Tushare 指数代码映射为 Mongo 中的 ``index_code``（与 engine ``store_key`` 一致）。"""
         c = (index_code or "").strip()
         low = c.lower()
-        if low in ("hs300", "sse50", "csi500", "star50", "csi1000", "a500"):
+        if low in ("hs300", "sse50", "csi500", "star50", "csi1000", "csi2000", "a500"):
             return low
         if low in ("000300.sh", "399300.sz"):
             return "hs300"
@@ -45,6 +45,8 @@ class IndexService:
             return "star50"
         if low == "000852.sh":
             return "csi1000"
+        if low in ("932000.csi", "932000.sh"):
+            return "csi2000"
         # A500 常见代码；亦可通过 engine 的 INDEX_CONSTITUENTS_PROFILES 自定义 store_key
         if low in ("000510.sh", "000510.sz"):
             return "a500"
@@ -287,4 +289,6 @@ class IndexService:
             return "a500"
         if code_lower in ("000905.sh", "csi500"):
             return "csi500"
+        if code_lower in ("932000.csi", "932000.sh", "csi2000"):
+            return "csi2000"
         return code

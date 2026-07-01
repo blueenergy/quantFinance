@@ -66,7 +66,7 @@ class BacktestBatchCreate(BaseModel):
     symbols: List[str] = Field(default_factory=list, description="Symbols for manual universe")
     asset_type: str = Field(default="stock", description="Asset type for child tasks: stock or etf")
     universe_type: str = Field(default="manual", description="manual, index, watchlist, or strategy_pool")
-    universe_value: Optional[str] = Field(default=None, description="Universe key, e.g. csi1000")
+    universe_value: Optional[str] = Field(default=None, description="Universe key, e.g. csi1000 or csi2000")
     strategy_key: str = Field(..., description="Strategy key from STRATEGY_MAP")
     preset: Optional[str] = Field(default=None, description="Optional preset name")
     strategy_params: Dict[str, Any] = Field(default_factory=dict)

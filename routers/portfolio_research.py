@@ -22,6 +22,11 @@ from db import get_db_collections, get_trading_db_collections
 
 router = APIRouter(prefix="/portfolio-research", tags=["portfolio-research"])
 
+UNIVERSE_BENCHMARK_SYMBOLS = {
+    "csi1000": "000852.SH",
+    "csi2000": "932000.CSI",
+}
+
 
 class CreateResearchJobRequest(BaseModel):
     name: str = Field(default="组合研究")
@@ -278,6 +283,8 @@ async def create_portfolio_research_job(request: CreateResearchJobRequest, curre
     params["start_date"] = start_date
     params["end_date"] = end_date
     params["rebalance_interval_days"] = request.rebalance_interval_days or [request.horizon]
+    if request.universe_index == "csi2000" and request.index_benchmark_symbol == "000852.SH":
+        params["index_benchmark_symbol"] = UNIVERSE_BENCHMARK_SYMBOLS["csi2000"]
     job = {
         "job_id": str(uuid.uuid4()),
         "user_id": user_id,

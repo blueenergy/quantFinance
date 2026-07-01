@@ -590,12 +590,12 @@ async def hermes_earnings_signals(
 # 股票评分排行榜
 # ---------------------------------------------------------------------------
 
-_RANKING_INDEX_CODES = ("hs300", "a500", "csi500", "csi1000", "star50")
+_RANKING_INDEX_CODES = ("hs300", "a500", "csi500", "csi1000", "csi2000", "star50")
 
 
 @router.get("/stock/ranking", operation_id="stock_ranking", tags=[MCP_READ_TAG])
 async def stock_ranking(
-    index_code: str = Query("hs300", description="指数: hs300/a500/csi500/csi1000/star50"),
+    index_code: str = Query("hs300", description="指数: hs300/a500/csi500/csi1000/csi2000/star50"),
     top: int = Query(20, ge=1, le=100, description="返回前 N 名，默认 20"),
     strategy: str = Query("balanced", description="策略: balanced/aggressive/conservative"),
     _: bool = Depends(require_hermes_quant_internal_key),
@@ -603,7 +603,7 @@ async def stock_ranking(
     """
     获取 A 股量化评分排行榜 Top N（按指数成分筛选）。
 
-    - index_code: hs300（沪深300）、a500、csi500（中证500）、csi1000、star50（科创50）
+    - index_code: hs300（沪深300）、a500、csi500（中证500）、csi1000、csi2000（中证2000）、star50（科创50）
     - strategy: balanced（均衡，默认）、aggressive（进取）、conservative（保守）
     - 返回每只股票的综合评分及六维子评分（周期/价值/基本面/成长/技术/资金流）
     """

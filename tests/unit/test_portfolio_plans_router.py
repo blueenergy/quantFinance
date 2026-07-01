@@ -6,6 +6,10 @@ import pytest
 from routers import portfolio_plans
 
 
+def test_allowed_universe_indices_include_csi2000():
+    assert "csi2000" in portfolio_plans.ALLOWED_UNIVERSE_INDICES
+
+
 def _sort_key(value):
     """Type-stable sort key so the fake can order mixed/missing values without
     raising on cross-type comparisons (mirrors a real Mongo multi-key sort)."""

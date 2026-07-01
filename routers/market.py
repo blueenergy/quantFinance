@@ -2118,7 +2118,7 @@ def get_market_spectrum_realtime_daily_status(
 )
 def get_theme_lag_panel(
     trade_date: str = Query(..., description="交易日期 YYYYMMDD 或 YYYY-MM-DD"),
-    index_store_key: str = Query("csi1000", description="index_constituents.index_code"),
+    index_store_key: str = Query("csi1000", description="index_constituents.index_code，如 csi1000 或 csi2000"),
     current_user: dict = Depends(get_current_active_user),
 ):
     """
