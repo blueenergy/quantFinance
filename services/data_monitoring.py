@@ -4,46 +4,38 @@ Data ingestion catalog + latest run docs (pipeline_tasks preferred, job_status f
 """
 from __future__ import annotations
 
-import os
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-
-import yaml
 
 # finance DB (main) and quant_data handle
 from datetime import timedelta
 from db import data_db, db
 
-_CATALOG_PATH = Path(__file__).resolve().parent.parent / "config" / "data_pipelines_catalog.yaml"
 
+def _load_shared_pipeline_catalog() -> List[Dict[str, Any]]:
+    """Load the canonical catalog from stock_data_access.
 
-def _resolve_catalog_path() -> str:
-    """Locate the catalog: env override > shared library > repo-local config.
-
-    The shared ``stock_data_access`` library bundles the canonical catalog, so
-    quantFinance and the quant-data-engine executor read an identical copy with
-    no runtime file mount. The repo-local path remains a fallback for
-    pre-library setups.
+    Docker/CI install the package. The local source fallback keeps ad-hoc
+    development runs working without a duplicate catalog under ``config/``.
     """
-    env_path = os.environ.get("DATA_PIPELINES_CATALOG")
-    if env_path:
-        return env_path
     try:
-        from stock_data_access import catalog_path as _lib_catalog_path
+        from stock_data_access import load_pipeline_catalog
+    except ModuleNotFoundError:
+        local_src = Path(__file__).resolve().parent.parent / "data-access-lib" / "src"
+        if local_src.is_dir() and str(local_src) not in sys.path:
+            sys.path.insert(0, str(local_src))
+        from stock_data_access import load_pipeline_catalog
 
-        return str(_lib_catalog_path())
-    except Exception:
-        return str(_CATALOG_PATH)
+    return load_pipeline_catalog()
 
 
 def load_pipelines_catalog() -> List[Dict[str, Any]]:
-    p = Path(_resolve_catalog_path())
-    if not p.is_file():
+    try:
+        return _load_shared_pipeline_catalog()
+    except FileNotFoundError:
         return []
-    with open(p, "r", encoding="utf-8") as f:
-        data = yaml.safe_load(f) or {}
-    return list(data.get("pipelines") or [])
 
 
 def build_pipeline_dag(date: Optional[str] = None) -> Dict[str, Any]:

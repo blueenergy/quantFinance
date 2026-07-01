@@ -164,7 +164,7 @@
 
 ### 6.5 文档滞后（本轮已"顺手"修复）
 - ✅ `MONGODB_COLLECTIONS.md` 顶部"数据库名：finance"更正为**多库架构说明**（finance / quant_data / quant_realtime / quant_trading / quant_analyzer 及各自 env 覆盖）。
-- ✅ `job_status` 行的"权威管线列表"指向更正为共享库 catalog `data-access-lib/.../data_pipelines_catalog.yaml`（`quantFinance/config/...` 降级为 fallback）。
+- ✅ `job_status` 行的"权威管线列表"指向更正为共享库 catalog `data-access-lib/.../data_pipelines_catalog.yaml`。
 - 待办：`analysis_evaluations` 等若确实在用但未入字典，实施时补录。
 
 ---
