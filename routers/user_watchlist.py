@@ -19,7 +19,6 @@ router = APIRouter()
 
 # 与 quant-data-engine 东财自选轮询一致：按上海日历日匹配 ``trade_date``，避免 API 容器为 UTC 时错位。
 _CN_TZ = ZoneInfo("Asia/Shanghai")
-_WATCHLIST_REALTIME_INDEXES_READY = False
 
 
 def _cn_calendar_today_yyyymmdd() -> str:
@@ -123,53 +122,6 @@ def _unique_etf_variants_for_symbols(symbols: List[str]) -> List[str]:
                 seen.add(variant)
                 out.append(variant)
     return out
-
-
-def _ensure_watchlist_realtime_indexes(data_collections: Dict[str, Any]) -> None:
-    """为自选股实时接口的热路径创建幂等索引。"""
-    global _WATCHLIST_REALTIME_INDEXES_READY
-    if _WATCHLIST_REALTIME_INDEXES_READY:
-        return
-
-    try:
-        volume_price_col = data_collections.get("volume_price")
-        if volume_price_col is not None:
-            volume_price_col.create_index(
-                [("source", 1), ("symbol", 1), ("trade_date", -1)],
-                name="vp_source_symbol_trade_date_idx",
-                background=True,
-            )
-            volume_price_col.create_index(
-                [("source", 1), ("ts_code", 1), ("trade_date", -1)],
-                name="vp_source_ts_code_trade_date_idx",
-                background=True,
-            )
-            volume_price_col.create_index(
-                [("ts_code", 1), ("trade_date", -1)],
-                name="vp_ts_code_trade_date_idx",
-                background=True,
-            )
-
-        stock_info_col = data_collections.get("stock_info")
-        if stock_info_col is not None:
-            stock_info_col.create_index([("symbol", 1)], name="stock_info_symbol_idx", background=True)
-
-        etf_basic_col = data_collections.get("etf_basic")
-        if etf_basic_col is not None:
-            etf_basic_col.create_index([("ts_code", 1)], name="etf_basic_ts_code_idx", background=True)
-
-        etf_daily_col = data_collections.get("etf_daily")
-        if etf_daily_col is not None:
-            etf_daily_col.create_index(
-                [("ts_code", 1), ("trade_date", -1)],
-                name="etf_daily_ts_code_trade_date_idx",
-                background=True,
-            )
-    except Exception:
-        # 索引创建失败不应阻断页面刷新；查询仍会按原逻辑运行。
-        pass
-    finally:
-        _WATCHLIST_REALTIME_INDEXES_READY = True
 
 
 def _safe_round_price(val: Any, ndigits: int = 2) -> Optional[float]:
@@ -958,12 +910,12 @@ def _batch_intraday_volume_price_map(
 def get_user_watchlist_realtime(current_user: dict = Depends(get_current_active_user)):
     """获取当前用户自选股的实时数据。
 
-    股票：① 当日 ``minute_bars``；② 当日 ``volume_price``（优先东财 ``eastmoney_snapshot``）；
-    ③ 若日历「今日」尚无记录，可用 **最近若干自然日内** 的东财快照（休市/长假/数据仍停在上一交易日，如库中为 ``20260502`` 而上海已为 ``20260503``）。
-    ④ 最近 ``volume_price`` 仅收盘价。``trade_date`` 与「今天」按 **Asia/Shanghai** 对齐，并兼容多种存法。
+    股票：优先当日 ``volume_price``（东财 ``eastmoney_snapshot`` 快照），若日历「今日」
+    尚无记录，可用最近若干自然日内的东财快照；再回退到最近 ``volume_price`` 收盘价。
+    ``trade_date`` 与「今天」按 **Asia/Shanghai** 对齐，并兼容多种存法。
 
-    ETF：一般无分钟线；东财 ulist 与自选轮询 **仅覆盖带交易所后缀的 ts_code**（裸代码不会进东财任务），
-    故在 ①② 不可用时回退到 **``etf_daily``**（优先当日已同步的 Tushare 日线，否则最新一根日线，
+    ETF：东财 ulist 与自选轮询 **仅覆盖带交易所后缀的 ts_code**（裸代码不会进东财任务），
+    故在快照不可用时回退到 **``etf_daily``**（优先当日已同步的 Tushare 日线，否则最新一根日线，
     涨跌相对前一交易日收盘）。**非交易时段 / 日线未落地时 ETF 仍可能只有昨收级别数据。**
     """
     try:
@@ -972,7 +924,6 @@ def get_user_watchlist_realtime(current_user: dict = Depends(get_current_active_
         # 1. 获取用户自选股列表
         collections = get_db_collections()
         data_collections = get_data_db()
-        _ensure_watchlist_realtime_indexes(data_collections)
         user_watchlists_collection = collections["user_watchlists"]
         watchlist_doc = user_watchlists_collection.find_one({"user_id": user_id})
         
@@ -1012,40 +963,6 @@ def get_user_watchlist_realtime(current_user: dict = Depends(get_current_active_
             elif symbol in etf_close_map:
                 yesterday_close_map[symbol] = etf_close_map[symbol]
 
-        minute_bars_col = data_collections["minute_bars"]
-
-        minute_match_symbols = list(
-            dict.fromkeys(v for symbol in symbols for v in sym_ctx[symbol]["variants"])
-        )
-        
-        pipeline = [
-            {
-                "$match": {
-                    "symbol": {"$in": minute_match_symbols},
-                    "trade_date": {"$regex": f"^{today}"},
-                }
-            },
-            {"$sort": {"trade_date": 1}},
-            {
-                "$group": {
-                    "_id": "$symbol",
-                    "open": {"$first": "$open"},
-                    "close": {"$last": "$close"},
-                    "high": {"$max": "$high"},
-                    "low": {"$min": "$low"},
-                    "volume": {"$sum": "$volume"},
-                    "latest_time": {"$last": "$trade_date"},
-                }
-            },
-        ]
-        realtime_data = list(minute_bars_col.aggregate(pipeline))
-        realtime_by_norm: Dict[str, Dict[str, Any]] = {}
-        for item in realtime_data:
-            nid = remove_exchange_suffix(str(item["_id"]))
-            prev = realtime_by_norm.get(nid)
-            if prev is None or str(item.get("latest_time") or "") > str(prev.get("latest_time") or ""):
-                realtime_by_norm[nid] = item
-
         vp_batch = _batch_intraday_volume_price_map(
             volume_price_col, symbols, sym_ctx, today
         )
@@ -1076,54 +993,6 @@ def get_user_watchlist_realtime(current_user: dict = Depends(get_current_active_
                 else:
                     name = symbol
                     asset_type = "unknown"
-            
-            item = realtime_by_norm.get(norm)
-            
-            if item is not None:
-                vp_snap = vp_batch.get(symbol)
-                o = (
-                    item.get("open")
-                    if item.get("open") is not None
-                    else (vp_snap.get("open") if vp_snap else None)
-                )
-                h = (
-                    item.get("high")
-                    if item.get("high") is not None
-                    else (vp_snap.get("high") if vp_snap else None)
-                )
-                lo = (
-                    item.get("low")
-                    if item.get("low") is not None
-                    else (vp_snap.get("low") if vp_snap else None)
-                )
-                current_price = item["close"]
-                yesterday_close = yesterday_close_map.get(symbol, item.get("open"))
-                change = current_price - yesterday_close if yesterday_close else 0
-                change_pct = (change / yesterday_close * 100) if yesterday_close else 0
-                latest_time_str = item["latest_time"]
-                if latest_time_str and len(str(latest_time_str)) >= 12:
-                    lts = str(latest_time_str)
-                    formatted_time = (
-                        f"{lts[0:4]}-{lts[4:6]}-{lts[6:8]} {lts[8:10]}:{lts[10:12]}:00"
-                    )
-                else:
-                    formatted_time = str(latest_time_str)
-                result.append({
-                    "symbol": symbol,
-                    "name": name,
-                    "industry": industry,
-                    "sw_industry": sw_industry,
-                    "asset_type": asset_type,
-                    "price": _safe_round_price(current_price),
-                    "open": _safe_round_price(o),
-                    "high": _safe_round_price(h),
-                    "low": _safe_round_price(lo),
-                    "volume": _safe_round_price(item.get("volume"), 2),
-                    "change": _safe_round_price(change, 2),
-                    "change_pct": _safe_round_price(change_pct, 2),
-                    "update_time": formatted_time,
-                })
-                continue
 
             vp = vp_batch.get(symbol)
             if vp and vp.get("close") is not None:
