@@ -13,6 +13,7 @@ from pydantic import BaseModel
 from datetime import datetime, timedelta
 from calendar import monthrange
 from bson import ObjectId
+from stock_data_access.prices import AdjustedPriceDataAccess
 
 router = APIRouter(tags=["股票排名"])
 
@@ -313,6 +314,49 @@ def _trade_date_str(doc: Optional[dict]) -> Optional[str]:
     return s.replace("-", "")[:8] if s else None
 
 
+def _adj_dao_from_volume_price_col(volume_price_col: Any) -> AdjustedPriceDataAccess:
+    return AdjustedPriceDataAccess(db=volume_price_col.database)
+
+
+def _factor_pair(sym: str, doc: Optional[dict]) -> Optional[Tuple[str, str]]:
+    td = _trade_date_str(doc)
+    if sym and td:
+        return (sym, td)
+    return None
+
+
+def _hfq_return_pct(
+    end_doc: Optional[dict],
+    base_doc: Optional[dict],
+    *,
+    sym: str,
+    factor_map: Optional[Dict[Tuple[str, str], float]] = None,
+    adj_dao: Optional[AdjustedPriceDataAccess] = None,
+) -> Optional[float]:
+    """Compute percent return using hfq prices; degrade to raw when factor missing."""
+    end_close = _close_from_volume_price_doc(end_doc)
+    base_close = _close_from_volume_price_doc(base_doc)
+    if end_close is None or base_close is None:
+        return None
+
+    def _lookup_factor(pair: Optional[Tuple[str, str]]) -> Optional[float]:
+        if not pair:
+            return None
+        if factor_map and pair in factor_map:
+            return factor_map[pair]
+        if adj_dao:
+            return adj_dao.factor_for(pair[0], pair[1], variants=_symbol_key_variants(pair[0]))
+        return None
+
+    end_af = _lookup_factor(_factor_pair(sym, end_doc))
+    base_af = _lookup_factor(_factor_pair(sym, base_doc))
+    end_adj = end_close * (end_af if end_af is not None else 1.0)
+    base_adj = base_close * (base_af if base_af is not None else 1.0)
+    if base_adj <= 0:
+        return None
+    return (end_adj / base_adj - 1.0) * 100.0
+
+
 def _fetch_base_doc_single(volume_price_col: Any, symbol: str, sd: str) -> Optional[dict]:
     """单只股票基准 K：字符串 / BSON date / int 三种 trade_date 存法依次尝试。"""
     base_doc = volume_price_col.find_one(
@@ -341,13 +385,24 @@ def _fetch_base_doc_single(volume_price_col: Any, symbol: str, sd: str) -> Optio
     return base_doc
 
 
-def _return_since_from_docs(latest_doc: Optional[dict], base_doc: Optional[dict]) -> dict:
+def _return_since_from_docs(
+    latest_doc: Optional[dict],
+    base_doc: Optional[dict],
+    *,
+    sym: str = "",
+    factor_map: Optional[Dict[Tuple[str, str], float]] = None,
+    adj_dao: Optional[AdjustedPriceDataAccess] = None,
+) -> dict:
     out = dict(RETURN_SINCE_EMPTY)
-    latest_close = _close_from_volume_price_doc(latest_doc)
-    base_close = _close_from_volume_price_doc(base_doc)
-    if latest_close is None or base_close is None:
+    pct = _hfq_return_pct(
+        latest_doc,
+        base_doc,
+        sym=sym,
+        factor_map=factor_map,
+        adj_dao=adj_dao,
+    )
+    if pct is None:
         return out
-    pct = (latest_close / base_close - 1.0) * 100.0
     out["return_since_score_pct"] = round(pct, 2)
     out["price_base_trade_date"] = _trade_date_str(base_doc)
     out["price_latest_trade_date"] = _trade_date_str(latest_doc)
@@ -371,13 +426,24 @@ def _yyyymmdd_months_before(date_str: str, months: int) -> Optional[str]:
     return f"{y:04d}{m:02d}{d:02d}"
 
 
-def _prior_3m_return_from_docs(end_doc: Optional[dict], base_doc: Optional[dict]) -> dict:
+def _prior_3m_return_from_docs(
+    end_doc: Optional[dict],
+    base_doc: Optional[dict],
+    *,
+    sym: str = "",
+    factor_map: Optional[Dict[Tuple[str, str], float]] = None,
+    adj_dao: Optional[AdjustedPriceDataAccess] = None,
+) -> dict:
     out = dict(PRIOR_3M_EMPTY)
-    end_close = _close_from_volume_price_doc(end_doc)
-    base_close = _close_from_volume_price_doc(base_doc)
-    if end_close is None or base_close is None:
+    pct = _hfq_return_pct(
+        end_doc,
+        base_doc,
+        sym=sym,
+        factor_map=factor_map,
+        adj_dao=adj_dao,
+    )
+    if pct is None:
         return out
-    pct = (end_close / base_close - 1.0) * 100.0
     out["prior_3m_return_pct"] = round(pct, 2)
     out["prior_3m_base_trade_date"] = _trade_date_str(base_doc)
     out["prior_3m_end_trade_date"] = _trade_date_str(end_doc)
@@ -451,6 +517,7 @@ def compute_return_since_score(
     score_date: str,
     latest_by_symbol: Dict[str, Any],
     base_by_key: Dict[Tuple[str, str], Any],
+    adj_dao: Optional[AdjustedPriceDataAccess] = None,
 ) -> dict:
     """
     Baseline: last trading day's close on or before score_date.
@@ -472,7 +539,19 @@ def compute_return_since_score(
         base_by_key[bkey] = _fetch_base_doc_single(volume_price_col, symbol, sd)
     base_doc = base_by_key[bkey]
 
-    return _return_since_from_docs(latest_doc, base_doc)
+    if adj_dao is None:
+        adj_dao = _adj_dao_from_volume_price_col(volume_price_col)
+    factor_map = adj_dao.factor_map_for_pairs(
+        [p for p in (_factor_pair(symbol, latest_doc), _factor_pair(symbol, base_doc)) if p],
+        variants_by_symbol={symbol: _symbol_key_variants(symbol)},
+    )
+    return _return_since_from_docs(
+        latest_doc,
+        base_doc,
+        sym=symbol,
+        factor_map=factor_map,
+        adj_dao=adj_dao,
+    )
 
 
 def compute_prior_3m_return(
@@ -481,6 +560,7 @@ def compute_prior_3m_return(
     score_date: str,
     end_by_key: Dict[Tuple[str, str], Any],
     base_by_key: Dict[Tuple[str, str], Any],
+    adj_dao: Optional[AdjustedPriceDataAccess] = None,
 ) -> dict:
     """
     Baseline: last trading day's close on or before score_date minus 3 calendar months.
@@ -500,7 +580,24 @@ def compute_prior_3m_return(
     if base_key not in base_by_key:
         base_by_key[base_key] = _fetch_base_doc_single(volume_price_col, symbol, base_sd)
 
-    return _prior_3m_return_from_docs(end_by_key[end_key], base_by_key[base_key])
+    if base_key not in base_by_key:
+        base_by_key[base_key] = _fetch_base_doc_single(volume_price_col, symbol, base_sd)
+
+    end_doc = end_by_key[end_key]
+    base_doc = base_by_key[base_key]
+    if adj_dao is None:
+        adj_dao = _adj_dao_from_volume_price_col(volume_price_col)
+    factor_map = adj_dao.factor_map_for_pairs(
+        [p for p in (_factor_pair(symbol, end_doc), _factor_pair(symbol, base_doc)) if p],
+        variants_by_symbol={symbol: _symbol_key_variants(symbol)},
+    )
+    return _prior_3m_return_from_docs(
+        end_doc,
+        base_doc,
+        sym=symbol,
+        factor_map=factor_map,
+        adj_dao=adj_dao,
+    )
 
 
 def enrich_rows_return_since_score(rows: List[dict], volume_price_col: Any) -> None:
@@ -510,6 +607,7 @@ def enrich_rows_return_since_score(rows: List[dict], volume_price_col: Any) -> N
     if not hasattr(volume_price_col, "aggregate"):
         latest_by_symbol: Dict[str, Any] = {}
         base_by_key: Dict[Tuple[str, str], Any] = {}
+        adj_dao = _adj_dao_from_volume_price_col(volume_price_col)
         for row in rows:
             row.update(
                 compute_return_since_score(
@@ -518,6 +616,7 @@ def enrich_rows_return_since_score(rows: List[dict], volume_price_col: Any) -> N
                     str(row.get("score_date") or ""),
                     latest_by_symbol,
                     base_by_key,
+                    adj_dao=adj_dao,
                 )
             )
         return
@@ -560,6 +659,24 @@ def enrich_rows_return_since_score(rows: List[dict], volume_price_col: Any) -> N
                     break
             base_map[(sym, sd)] = doc
 
+    adj_dao = _adj_dao_from_volume_price_col(volume_price_col)
+    factor_pairs: List[Tuple[str, str]] = []
+    seen_pairs: Set[Tuple[str, str]] = set()
+    for row in rows:
+        sym = row.get("symbol") or ""
+        sd = str(row.get("score_date") or "").strip()[:8]
+        if not sym or len(sd) < 8:
+            continue
+        latest_doc = _pick_vp_doc(latest_map, sym)
+        base_doc = base_map.get((sym, sd))
+        for doc in (latest_doc, base_doc):
+            pair = _factor_pair(sym, doc)
+            if pair and pair not in seen_pairs:
+                seen_pairs.add(pair)
+                factor_pairs.append(pair)
+    variants_by_symbol = {sym: _symbol_key_variants(sym) for sym in symbols}
+    factor_map = adj_dao.factor_map_for_pairs(factor_pairs, variants_by_symbol=variants_by_symbol)
+
     for row in rows:
         sym = row.get("symbol") or ""
         sd = str(row.get("score_date") or "").strip()[:8]
@@ -568,7 +685,15 @@ def enrich_rows_return_since_score(rows: List[dict], volume_price_col: Any) -> N
             continue
         latest_doc = _pick_vp_doc(latest_map, sym)
         base_doc = base_map.get((sym, sd))
-        row.update(_return_since_from_docs(latest_doc, base_doc))
+        row.update(
+            _return_since_from_docs(
+                latest_doc,
+                base_doc,
+                sym=sym,
+                factor_map=factor_map,
+                adj_dao=adj_dao,
+            )
+        )
 
 
 def enrich_rows_prior_3m_return(rows: List[dict], volume_price_col: Any) -> None:
@@ -578,6 +703,7 @@ def enrich_rows_prior_3m_return(rows: List[dict], volume_price_col: Any) -> None
     if not hasattr(volume_price_col, "aggregate"):
         end_by_key: Dict[Tuple[str, str], Any] = {}
         base_by_key: Dict[Tuple[str, str], Any] = {}
+        adj_dao = _adj_dao_from_volume_price_col(volume_price_col)
         for row in rows:
             row.update(
                 compute_prior_3m_return(
@@ -586,6 +712,7 @@ def enrich_rows_prior_3m_return(rows: List[dict], volume_price_col: Any) -> None
                     str(row.get("score_date") or ""),
                     end_by_key,
                     base_by_key,
+                    adj_dao=adj_dao,
                 )
             )
         return
@@ -634,6 +761,24 @@ def enrich_rows_prior_3m_return(rows: List[dict], volume_price_col: Any) -> None
                         break
                 base_map[(sym, base_sd)] = doc
 
+    adj_dao = _adj_dao_from_volume_price_col(volume_price_col)
+    factor_pairs: List[Tuple[str, str]] = []
+    seen_pairs: Set[Tuple[str, str]] = set()
+    for row in rows:
+        sym = row.get("symbol") or ""
+        sd = str(row.get("score_date") or "").strip()[:8]
+        base_sd = _yyyymmdd_months_before(sd, 3)
+        if not sym or len(sd) < 8 or not base_sd:
+            continue
+        for doc in (end_map.get((sym, sd)), base_map.get((sym, base_sd))):
+            pair = _factor_pair(sym, doc)
+            if pair and pair not in seen_pairs:
+                seen_pairs.add(pair)
+                factor_pairs.append(pair)
+    symbols_for_variants = list({row.get("symbol") or "" for row in rows if row.get("symbol")})
+    variants_by_symbol = {sym: _symbol_key_variants(sym) for sym in symbols_for_variants}
+    factor_map = adj_dao.factor_map_for_pairs(factor_pairs, variants_by_symbol=variants_by_symbol)
+
     for row in rows:
         sym = row.get("symbol") or ""
         sd = str(row.get("score_date") or "").strip()[:8]
@@ -645,6 +790,9 @@ def enrich_rows_prior_3m_return(rows: List[dict], volume_price_col: Any) -> None
             _prior_3m_return_from_docs(
                 end_map.get((sym, sd)),
                 base_map.get((sym, base_sd)),
+                sym=sym,
+                factor_map=factor_map,
+                adj_dao=adj_dao,
             )
         )
 

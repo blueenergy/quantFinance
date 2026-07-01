@@ -5,6 +5,7 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Query
 
 from db import get_data_db, get_db_collections
+from stock_data_access.prices import AdjustedPriceDataAccess
 
 
 router = APIRouter(tags=["熵值因子排名"])
@@ -104,6 +105,27 @@ def _find_price_doc(volume_price: Any, symbol: str, date_str: str, *, direction:
     return volume_price.find_one(query, sort=sort)
 
 
+def _hfq_return_pct(
+    base_doc: Optional[Dict[str, Any]],
+    future_doc: Optional[Dict[str, Any]],
+    symbol: str,
+    adj_dao: AdjustedPriceDataAccess,
+) -> Optional[float]:
+    base_close = _close_from_price_doc(base_doc)
+    future_close = _close_from_price_doc(future_doc)
+    if base_close is None or future_close is None:
+        return None
+    base_td = _normalize_date(base_doc.get("trade_date") if base_doc else None)
+    future_td = _normalize_date(future_doc.get("trade_date") if future_doc else None)
+    base_af = adj_dao.factor_for(symbol, base_td or "", variants=_symbol_variants(symbol)) if base_td else None
+    future_af = adj_dao.factor_for(symbol, future_td or "", variants=_symbol_variants(symbol)) if future_td else None
+    base_adj = base_close * (base_af if base_af is not None else 1.0)
+    future_adj = future_close * (future_af if future_af is not None else 1.0)
+    if base_adj <= 0:
+        return None
+    return round((future_adj / base_adj - 1.0) * 100.0, 2)
+
+
 def _future_returns(symbol: str, score_date: Optional[str]) -> Dict[str, Any]:
     empty = {
         "future_return_1m_pct": None,
@@ -118,6 +140,7 @@ def _future_returns(symbol: str, score_date: Optional[str]) -> Dict[str, Any]:
         return empty
 
     volume_price = get_data_db()["volume_price"]
+    adj_dao = AdjustedPriceDataAccess(db=get_data_db())
     base_doc = _find_price_doc(volume_price, symbol, str(score_date), direction="backward")
     base_close = _close_from_price_doc(base_doc)
     if base_close is None:
@@ -128,12 +151,12 @@ def _future_returns(symbol: str, score_date: Optional[str]) -> Dict[str, Any]:
     for months in (1, 2, 3):
         target = _add_months(str(score_date), months)
         future_doc = _find_price_doc(volume_price, symbol, target or "", direction="forward")
-        future_close = _close_from_price_doc(future_doc)
         date_key = f"future_return_{months}m_date"
         pct_key = f"future_return_{months}m_pct"
         out[date_key] = _normalize_date(future_doc.get("trade_date")) if future_doc else None
-        if future_close is not None:
-            out[pct_key] = round((future_close / base_close - 1.0) * 100.0, 2)
+        pct = _hfq_return_pct(base_doc, future_doc, symbol, adj_dao)
+        if pct is not None:
+            out[pct_key] = pct
     return out
 
 

@@ -137,11 +137,58 @@ class FakeDB:
         return self._collections[key]
 
 
+class FakeAdjFactorCollection:
+  def __init__(self, docs=None):
+    self.docs = docs or []
+
+  def find_one(self, query, projection=None, sort=None):
+    sym = query.get("symbol")
+    td = query.get("trade_date")
+    rows = [d for d in self.docs if d.get("symbol") == sym]
+    if isinstance(td, dict) and "$lte" in td:
+      ub = str(td["$lte"])
+      rows = [d for d in rows if str(d.get("trade_date", "")) <= ub]
+      if sort and sort[0][0] == "trade_date" and sort[0][1] == -1:
+        rows.sort(key=lambda d: str(d.get("trade_date", "")), reverse=True)
+      return rows[0] if rows else None
+    if td is not None:
+      rows = [d for d in rows if str(d.get("trade_date")) == str(td)]
+    return rows[0] if rows else None
+
+  def find(self, query, projection=None):
+    syms = query.get("symbol")
+    tds = query.get("trade_date")
+    allow_syms = set(syms["$in"]) if isinstance(syms, dict) and "$in" in syms else None
+    allow_tds = set(tds["$in"]) if isinstance(tds, dict) and "$in" in tds else None
+    out = []
+    for d in self.docs:
+      if allow_syms is not None and d.get("symbol") not in allow_syms:
+        continue
+      if allow_tds is not None and str(d.get("trade_date")) not in allow_tds:
+        continue
+      out.append(d)
+    return out
+
+
+class FakeDataDbForVp:
+  def __init__(self, vp_coll, adj_docs=None):
+    self._vp = vp_coll
+    self._adj = FakeAdjFactorCollection(adj_docs)
+
+  def __getitem__(self, key):
+    if key == "volume_price":
+      return self._vp
+    if key == "stock_adj_factor":
+      return self._adj
+    raise KeyError(key)
+
+
 class FakeVolumePriceCollection:
     """Supports find_one with sort and trade_date $lte for return_since_score tests."""
 
-    def __init__(self, docs):
+    def __init__(self, docs, adj_docs=None):
         self.docs = list(docs)
+        self.database = FakeDataDbForVp(self, adj_docs)
 
     def find_one(self, query, sort=None):
         sym = query.get("symbol")
@@ -1062,3 +1109,25 @@ def test_by_index_invalid_code_400():
     client = TestClient(app)
     r = client.get("/api/stock-rankings/by-index/zztop")
     assert r.status_code == 400
+
+
+@pytest.mark.unit
+def test_return_since_uses_hfq_factors():
+    latest = {"symbol": "AAA.SH", "trade_date": "20251001", "close": 110.0}
+    base = {"symbol": "AAA.SH", "trade_date": "20250920", "close": 100.0}
+    factor_map = {
+        ("AAA.SH", "20251001"): 1.2,
+        ("AAA.SH", "20250920"): 1.0,
+    }
+    out = stock_ranking._return_since_from_docs(
+        latest, base, sym="AAA.SH", factor_map=factor_map
+    )
+    assert out["return_since_score_pct"] == pytest.approx(32.0)
+
+
+@pytest.mark.unit
+def test_return_since_degrades_without_factor():
+    latest = {"symbol": "AAA.SH", "trade_date": "20251001", "close": 110.0}
+    base = {"symbol": "AAA.SH", "trade_date": "20250920", "close": 100.0}
+    out = stock_ranking._return_since_from_docs(latest, base, sym="AAA.SH", factor_map={})
+    assert out["return_since_score_pct"] == pytest.approx(10.0)
