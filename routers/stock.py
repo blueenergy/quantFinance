@@ -7,35 +7,19 @@ from typing import Any, Dict, List
 from bson import ObjectId
 from fastapi import APIRouter, HTTPException, Query
 from db import get_data_db
-
-try:
-    from pypinyin import Style, load_phrases_dict, pinyin
-except ImportError:  # pragma: no cover - dependency is optional at import time
-    Style = None
-    load_phrases_dict = None
-    pinyin = None
+from utils.pinyin_utils import stock_name_pinyin_fields
 
 router = APIRouter()
 
-if load_phrases_dict is not None:
-    # pypinyin defaults "长" to zhang, but many A-share names use chang.
-    load_phrases_dict(
-        {
-            "长海": [["chang"], ["hai"]],
-            "长江": [["chang"], ["jiang"]],
-            "长城": [["chang"], ["cheng"]],
-            "长安": [["chang"], ["an"]],
-            "长电": [["chang"], ["dian"]],
-            "长春": [["chang"], ["chun"]],
-            "长白": [["chang"], ["bai"]],
-            "长源": [["chang"], ["yuan"]],
-            "长虹": [["chang"], ["hong"]],
-            "长亮": [["chang"], ["liang"]],
-            "长信": [["chang"], ["xin"]],
-            "长盛": [["chang"], ["sheng"]],
-            "长青": [["chang"], ["qing"]],
-        }
-    )
+SEARCH_PROJECTION = {
+    "_id": 1,
+    "symbol": 1,
+    "ts_code": 1,
+    "name": 1,
+    "industry": 1,
+    "pinyin": 1,
+    "pinyin_full": 1,
+}
 
 
 def _json_safe(value: Any) -> Any:
@@ -72,15 +56,6 @@ def _symbol_candidates(symbol: str) -> List[str]:
     return list(dict.fromkeys(candidates))
 
 
-def _pinyin_initials(text: Any) -> str:
-    if not text or pinyin is None or Style is None:
-        return ""
-    try:
-        return "".join(row[0] for row in pinyin(str(text), style=Style.FIRST_LETTER)).upper()
-    except Exception:
-        return ""
-
-
 def _dedupe_docs(docs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     seen = set()
     result = []
@@ -93,31 +68,57 @@ def _dedupe_docs(docs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return result
 
 
-def _runtime_pinyin_matches(stock_col: Any, q: str, existing: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Fallback for databases that have not backfilled stock_info.pinyin yet."""
-    if not re.fullmatch(r"[A-Za-z]+", q or ""):
-        return []
-    needle = q.upper()
-    existing_symbols = {str(doc.get("symbol") or "") for doc in existing}
-    matches: List[Dict[str, Any]] = []
-    cursor = stock_col.find(
-        {},
-        {"_id": 1, "symbol": 1, "name": 1, "stock_name": 1, "industry": 1, "pinyin": 1},
-    ).limit(6000)
-    for doc in cursor:
-        if str(doc.get("symbol") or "") in existing_symbols:
-            continue
-        initials = str(doc.get("pinyin") or "").upper() or _pinyin_initials(doc.get("name") or doc.get("stock_name"))
-        if not initials:
-            continue
-        if initials.startswith(needle) or needle in initials:
-            doc["pinyin"] = initials
-            matches.append(doc)
-        if len(matches) >= 30:
-            break
-    return matches
+def _build_stock_search_query(q: str) -> Dict[str, Any]:
+    """Build an index-friendly stock_info query for autocomplete."""
+    q_esc = re.escape(q)
+    if q.isdigit():
+        return {"symbol": {"$regex": f"^{q_esc}"}}
+    if re.fullmatch(r"[A-Za-z]+", q):
+        needle = re.escape(q.upper())
+        return {
+            "$or": [
+                {"symbol": {"$regex": f"^{needle}"}},
+                {"pinyin": {"$regex": f"^{needle}"}},
+                {"pinyin_full": {"$regex": f"^{needle}"}},
+            ]
+        }
+    return {
+        "$or": [
+            {"symbol": {"$regex": q_esc, "$options": "i"}},
+            {"name": {"$regex": q_esc, "$options": "i"}},
+            {"pinyin": {"$regex": q_esc, "$options": "i"}},
+        ]
+    }
 
 
+def _build_etf_search_query(q: str) -> Dict[str, Any]:
+    q_esc = re.escape(q)
+    if q.isdigit():
+        return {"ts_code": {"$regex": f"^{q_esc}", "$options": "i"}}
+    if re.fullmatch(r"[A-Za-z]+", q):
+        needle = re.escape(q.upper())
+        return {
+            "$or": [
+                {"ts_code": {"$regex": f"^{needle}"}},
+                {"name": {"$regex": q_esc, "$options": "i"}},
+            ]
+        }
+    return {
+        "$or": [
+            {"ts_code": {"$regex": q_esc, "$options": "i"}},
+            {"name": {"$regex": q_esc, "$options": "i"}},
+        ]
+    }
+
+
+def _ensure_display_pinyin(doc: Dict[str, Any]) -> Dict[str, Any]:
+    if doc.get("pinyin"):
+        return doc
+    name = doc.get("name") or doc.get("stock_name")
+    fields = stock_name_pinyin_fields(name)
+    if fields.get("pinyin"):
+        doc["pinyin"] = fields["pinyin"]
+    return doc
 
 
 @router.get("/info/{symbol}")
@@ -147,29 +148,13 @@ def search_stocks(q: str):
     data_collections = get_data_db()
     stock_col = data_collections["stock_info"]
     etf_col = data_collections.get("etf_basic")
-    q_regex = re.escape(q)
-    
-    # 搜索匹配的股票，支持股票代码和名称的模糊匹配
-    # 如果查询是数字开头，优先匹配股票代码
-    if q.isdigit():
-        # 对于数字查询，查找以该数字开头的股票代码
-        stock_query = {"symbol": {"$regex": f"^{q_regex}", "$options": "i"}}
-        etf_query = {"ts_code": {"$regex": f"^{q_regex}", "$options": "i"}}
-    else:
-        # 对于非数字查询，匹配股票代码、名称或拼音
-        stock_query = {"$or": [
-            {"symbol": {"$regex": q_regex, "$options": "i"}},
-            {"name": {"$regex": q_regex, "$options": "i"}},
-            {"pinyin": {"$regex": q_regex, "$options": "i"}}
-        ]}
-        etf_query = {"$or": [
-            {"ts_code": {"$regex": q_regex, "$options": "i"}},
-            {"name": {"$regex": q_regex, "$options": "i"}}
-        ]}
-    
-    stocks = list(stock_col.find(stock_query).limit(30))
-    stocks = _dedupe_docs(stocks + _runtime_pinyin_matches(stock_col, q, stocks))
-    etfs = list(etf_col.find(etf_query).limit(15)) if etf_col is not None else []
+
+    stock_query = _build_stock_search_query(q)
+    etf_query = _build_etf_search_query(q)
+
+    stocks = list(stock_col.find(stock_query, SEARCH_PROJECTION).limit(30))
+    stocks = _dedupe_docs(stocks)
+    etfs = list(etf_col.find(etf_query, {"_id": 1, "ts_code": 1, "name": 1}).limit(15)) if etf_col is not None else []
 
     def rank(doc: Dict[str, Any], *, is_etf: bool = False) -> tuple:
         symbol = str(doc.get("symbol") or doc.get("ts_code") or "").upper()
@@ -199,7 +184,7 @@ def search_stocks(q: str):
     results = []
     for stock in stocks:
         stock["_id"] = str(stock["_id"])
-        results.append(stock)
+        results.append(_ensure_display_pinyin(stock))
         
     for etf in etfs:
         etf["_id"] = str(etf["_id"])

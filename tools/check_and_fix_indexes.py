@@ -225,6 +225,9 @@ EXPECTED: Dict[str, List[IndexSpec]] = {
         # 基础信息
         IndexSpec("stock_info", [("ts_code", 1)], unique=True, reason="股票基础信息主键"),
         IndexSpec("stock_info", [("symbol", 1)], sparse=True, reason="按6位代码查"),
+        IndexSpec("stock_info", [("pinyin", 1)], sparse=True, reason="缩写首字母前缀联想"),
+        IndexSpec("stock_info", [("pinyin_full", 1)], sparse=True, reason="全拼前缀联想"),
+        IndexSpec("stock_info", [("name", 1)], sparse=True, reason="中文名前缀联想"),
         IndexSpec("etf_basic", [("ts_code", 1)], unique=True, reason="ETF 基础信息"),
         IndexSpec("etf_daily", [("ts_code", 1), ("trade_date", -1)],
                   reason="ETF 日线"),
