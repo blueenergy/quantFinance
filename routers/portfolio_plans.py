@@ -2109,6 +2109,60 @@ def _load_stock_guard_docs(data_collections: Dict[str, Any], symbols: List[str])
     return docs
 
 
+# Live publish hard blocks for extreme single-stock volatility (annualized fraction).
+VOL_LIVE_BLOCK_ANNUAL = 1.0
+VOL_LIVE_BLOCK_ATR_PCT = 0.15
+
+
+def _load_volatility_features_by_symbol(
+    data_collections: Dict[str, Any],
+    symbols: List[str],
+    base_date: Optional[str] = None,
+) -> Dict[str, Dict[str, Any]]:
+    try:
+        from stock_data_access.indicators.volatility import compute_volatility_features
+    except ImportError:
+        return {}
+
+    if not symbols:
+        return {}
+    as_of = (base_date or datetime.utcnow().strftime("%Y%m%d")).replace("-", "")[:8]
+    coll = data_collections["volume_price"]
+    out: Dict[str, Dict[str, Any]] = {}
+    for symbol in symbols:
+        if not symbol:
+            continue
+        try:
+            rows = list(
+                coll.find(
+                    {"symbol": symbol, "trade_date": {"$lte": as_of}},
+                    {"_id": 0, "trade_date": 1, "open": 1, "high": 1, "low": 1, "close": 1},
+                )
+                .sort("trade_date", 1)
+                .limit(320)
+            )
+            if rows:
+                out[symbol] = compute_volatility_features(rows)
+        except Exception:
+            continue
+    return out
+
+
+def _volatility_buy_blockers(features: Optional[Dict[str, Any]]) -> List[str]:
+    if not features:
+        return []
+    blockers: List[str] = []
+    vol_20 = features.get("vol_20d_annual")
+    atr_pct_20 = features.get("atr_pct_20d")
+    if isinstance(vol_20, (int, float)) and float(vol_20) >= VOL_LIVE_BLOCK_ANNUAL:
+        blockers.append("extreme_volatility")
+    if isinstance(atr_pct_20, (int, float)) and float(atr_pct_20) >= VOL_LIVE_BLOCK_ATR_PCT:
+        blockers.append("extreme_atr_volatility")
+    if features.get("abnormal_range_flag"):
+        blockers.append("abnormal_intraday_range")
+    return blockers
+
+
 def _buy_blockers_from_market_doc(signal: Dict[str, Any], market_doc: Dict[str, Any]) -> List[str]:
     blockers: List[str] = []
     price = _numeric(signal.get("price"))
@@ -2156,6 +2210,8 @@ def _build_live_publish_risk_report(
     max_position_pct = _numeric(risk_limits.get("max_position_pct") or account.get("max_position_pct"), 0.0)
     daily_used_amount = _daily_live_signal_amount(finance_collections, account, user_id)
     market_docs = _load_stock_guard_docs(data_collections, [signal["symbol"] for signal in signals])
+    buy_symbols = [signal["symbol"] for signal in signals if signal.get("action") == "buy" and signal.get("symbol")]
+    vol_features_by_symbol = _load_volatility_features_by_symbol(data_collections, buy_symbols)
 
     cash_reserved = 0.0
     day_reserved = 0.0
@@ -2173,6 +2229,7 @@ def _build_live_publish_risk_report(
             blockers.append("max_daily_amount_exceeded")
         if signal.get("action") == "buy":
             blockers.extend(_buy_blockers_from_market_doc(signal, market_docs.get(signal["symbol"], {})))
+            blockers.extend(_volatility_buy_blockers(vol_features_by_symbol.get(signal.get("symbol"))))
             if available_cash and cash_reserved + amount > available_cash:
                 blockers.append("insufficient_cash")
             if total_assets > 0 and max_position_pct > 0:
