@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections import defaultdict
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
+import functools
 import logging
 import math
 import os
@@ -13,6 +14,7 @@ import uuid
 
 from bson import ObjectId
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from auth import get_current_user
@@ -82,6 +84,23 @@ from services.portfolio_plan_market import (
 
 router = APIRouter(prefix="/portfolio-plans", tags=["portfolio-plans"])
 log = logging.getLogger(__name__)
+
+
+def _offload(func):
+    """Run a synchronous (blocking pymongo) endpoint body in the threadpool.
+
+    Read endpoints here do blocking pymongo I/O. Declared as plain ``def`` and
+    wrapped with this, FastAPI still sees a coroutine (so unit tests that call
+    the handler via ``asyncio.run`` keep working) but the blocking work runs off
+    the event loop, so one slow query no longer stalls the whole worker and
+    blocks concurrent dashboard requests.
+    """
+
+    @functools.wraps(func)
+    async def wrapper(*args, **kwargs):
+        return await run_in_threadpool(func, *args, **kwargs)
+
+    return wrapper
 ALLOWED_UNIVERSE_INDICES = {"hs300", "a500", "csi500", "csi1000", "csi2000", "star50"}
 PORTFOLIO_RISK_LLM_TASK_TYPE = "portfolio_risk_llm"
 PORTFOLIO_RISK_LLM_PRIORITY = 10
@@ -2297,7 +2316,8 @@ def _build_live_publish_risk_report(
 
 
 @router.get("/strategies")
-async def list_portfolio_strategies(
+@_offload
+def list_portfolio_strategies(
     status: Optional[str] = Query(default=None),
     current_user: dict = Depends(get_current_user),
 ):
@@ -2311,7 +2331,8 @@ async def list_portfolio_strategies(
 
 
 @router.get("/parameter-presets")
-async def list_portfolio_parameter_presets(
+@_offload
+def list_portfolio_parameter_presets(
     strategy_template_id: Optional[str] = Query(default=None),
     status: Optional[str] = Query(default=None),
     current_user: dict = Depends(get_current_user),
@@ -2359,7 +2380,8 @@ async def create_portfolio_parameter_preset(request: ParamPresetRequest, current
 
 
 @router.get("/plans")
-async def list_portfolio_plans(
+@_offload
+def list_portfolio_plans(
     strategy_template_id: Optional[str] = Query(default=None),
     status: Optional[str] = Query(default=None),
     plan_type: Optional[str] = Query(default=None),
@@ -4283,7 +4305,8 @@ async def enqueue_portfolio_plan_llm_risk(
 
 
 @router.get("/plans/{plan_id}/llm-risk-review/runs/{run_id}")
-async def get_portfolio_plan_llm_risk_run(
+@_offload
+def get_portfolio_plan_llm_risk_run(
     plan_id: str,
     run_id: str,
     target_scope: str = Query(default="plan", pattern="^(plan|bench)$"),
@@ -4316,7 +4339,8 @@ async def get_portfolio_plan_llm_risk_run(
 
 
 @router.get("/plans/generation-tasks")
-async def list_portfolio_plan_generation_tasks(
+@_offload
+def list_portfolio_plan_generation_tasks(
     status: Optional[str] = Query(default=None),
     limit: int = Query(default=20, ge=1, le=100),
     current_user: dict = Depends(get_current_user),
@@ -4335,7 +4359,8 @@ async def list_portfolio_plan_generation_tasks(
 
 
 @router.get("/plans/generation-tasks/{task_id}")
-async def get_portfolio_plan_generation_task(task_id: str, current_user: dict = Depends(get_current_user)):
+@_offload
+def get_portfolio_plan_generation_task(task_id: str, current_user: dict = Depends(get_current_user)):
     collections = get_trading_db_collections()
     task = collections["portfolio_plan_generation_tasks"].find_one(
         {"task_id": task_id, "user_id": _current_user_id(current_user)}
@@ -4346,7 +4371,8 @@ async def get_portfolio_plan_generation_task(task_id: str, current_user: dict = 
 
 
 @router.get("/workers/status")
-async def list_portfolio_worker_status(
+@_offload
+def list_portfolio_worker_status(
     worker_type: Optional[str] = Query(default="portfolio_plan_generator"),
     limit: int = Query(default=20, ge=1, le=100),
     current_user: dict = Depends(get_current_user),
@@ -4361,7 +4387,8 @@ async def list_portfolio_worker_status(
 
 
 @router.get("/data-watermarks/plan-generation")
-async def get_portfolio_plan_generation_watermark(
+@_offload
+def get_portfolio_plan_generation_watermark(
     strategy_template_id: Optional[str] = Query(default=None),
     base_date: Optional[str] = Query(default=None),
     current_user: dict = Depends(get_current_user),
@@ -4403,7 +4430,8 @@ async def get_portfolio_plan_generation_watermark(
 
 
 @router.get("/plans/{plan_id}")
-async def get_portfolio_plan(plan_id: str, current_user: dict = Depends(get_current_user)):
+@_offload
+def get_portfolio_plan(plan_id: str, current_user: dict = Depends(get_current_user)):
     started_at = time.perf_counter()
     marks: List[tuple[str, float]] = []
 
@@ -4476,7 +4504,8 @@ async def get_portfolio_plan(plan_id: str, current_user: dict = Depends(get_curr
 
 
 @router.get("/plans/{plan_id}/operation-logs")
-async def get_portfolio_plan_operation_logs(
+@_offload
+def get_portfolio_plan_operation_logs(
     plan_id: str,
     limit: int = Query(default=100, ge=1, le=500),
     current_user: dict = Depends(get_current_user),
@@ -4494,7 +4523,8 @@ async def get_portfolio_plan_operation_logs(
 
 
 @router.get("/plans/{plan_id}/items")
-async def get_portfolio_plan_items(plan_id: str, current_user: dict = Depends(get_current_user)):
+@_offload
+def get_portfolio_plan_items(plan_id: str, current_user: dict = Depends(get_current_user)):
     collections = get_trading_db_collections()
     finance_collections = get_db_collections()
     data_collections = get_data_db()
@@ -4523,7 +4553,8 @@ async def get_portfolio_plan_items(plan_id: str, current_user: dict = Depends(ge
 
 
 @router.get("/plans/{plan_id}/bench")
-async def get_portfolio_plan_bench(
+@_offload
+def get_portfolio_plan_bench(
     plan_id: str,
     bench_multiplier: float = Query(default=1.5, ge=1.0, le=3.0),
     current_user: dict = Depends(get_current_user),
@@ -4611,7 +4642,8 @@ async def enqueue_portfolio_bench_risk(
 
 
 @router.get("/plans/{plan_id}/holdings-reconcile")
-async def reconcile_portfolio_holdings(
+@_offload
+def reconcile_portfolio_holdings(
     plan_id: str,
     current_user: dict = Depends(get_current_user),
 ):
@@ -4838,7 +4870,8 @@ def _cancel_plan(plan_id: str, comment: str, current_user: Dict[str, Any]):
 
 
 @router.get("/plans/{plan_id}/executions")
-async def get_portfolio_plan_executions(plan_id: str, current_user: dict = Depends(get_current_user)):
+@_offload
+def get_portfolio_plan_executions(plan_id: str, current_user: dict = Depends(get_current_user)):
     collections = get_trading_db_collections()
     _require_plan(collections, plan_id, current_user)
     rows = list(collections["portfolio_paper_executions"].find({"plan_id": plan_id, "user_id": _current_user_id(current_user)}).sort("created_at", 1))
@@ -4846,7 +4879,8 @@ async def get_portfolio_plan_executions(plan_id: str, current_user: dict = Depen
 
 
 @router.get("/plans/{plan_id}/equity")
-async def get_portfolio_plan_equity(
+@_offload
+def get_portfolio_plan_equity(
     plan_id: str,
     start_date: Optional[str] = Query(default=None),
     end_date: Optional[str] = Query(default=None),
@@ -4867,7 +4901,8 @@ async def get_portfolio_plan_equity(
 
 
 @router.get("/plans/{plan_id}/lineage-equity")
-async def get_portfolio_plan_lineage_equity(
+@_offload
+def get_portfolio_plan_lineage_equity(
     plan_id: str,
     start_date: Optional[str] = Query(default=None),
     end_date: Optional[str] = Query(default=None),
@@ -4957,7 +4992,8 @@ async def get_portfolio_plan_lineage_equity(
 
 
 @router.get("/plans/{plan_id}/lineage-paper-positions")
-async def get_lineage_paper_positions(plan_id: str, current_user: dict = Depends(get_current_user)):
+@_offload
+def get_lineage_paper_positions(plan_id: str, current_user: dict = Depends(get_current_user)):
     """Latest paper position snapshot across the plan's params_hash lineage."""
 
     collections = get_trading_db_collections()
@@ -5013,7 +5049,8 @@ async def get_lineage_paper_positions(plan_id: str, current_user: dict = Depends
 
 
 @router.get("/plans/{plan_id}/lineage-paper-executions")
-async def get_lineage_paper_executions(plan_id: str, current_user: dict = Depends(get_current_user)):
+@_offload
+def get_lineage_paper_executions(plan_id: str, current_user: dict = Depends(get_current_user)):
     """FIFO round-trip trade rows from paper executions across the plan lineage."""
 
     trading_collections = get_trading_db_collections()
@@ -5086,7 +5123,8 @@ async def get_lineage_paper_executions(plan_id: str, current_user: dict = Depend
 
 
 @router.get("/plans/{plan_id}/live-executions")
-async def get_portfolio_plan_live_executions(plan_id: str, current_user: dict = Depends(get_current_user)):
+@_offload
+def get_portfolio_plan_live_executions(plan_id: str, current_user: dict = Depends(get_current_user)):
     trading_collections = get_trading_db_collections()
     finance_collections = get_db_collections()
     data_collections = get_data_db()
@@ -5121,7 +5159,8 @@ async def get_portfolio_plan_live_executions(plan_id: str, current_user: dict = 
 
 
 @router.get("/plans/{plan_id}/live-equity")
-async def get_portfolio_plan_live_equity(
+@_offload
+def get_portfolio_plan_live_equity(
     plan_id: str,
     start_date: Optional[str] = Query(default=None),
     end_date: Optional[str] = Query(default=None),
@@ -5140,7 +5179,8 @@ async def get_portfolio_plan_live_equity(
 
 
 @router.get("/plans/{plan_id}/live-realtime-equity")
-async def get_portfolio_plan_live_realtime_equity(plan_id: str, current_user: dict = Depends(get_current_user)):
+@_offload
+def get_portfolio_plan_live_realtime_equity(plan_id: str, current_user: dict = Depends(get_current_user)):
     trading_collections = get_trading_db_collections()
     finance_collections = get_db_collections()
     data_collections = get_data_db()
@@ -6025,7 +6065,8 @@ def _build_lineage_timeline_payload(
 
 
 @router.get("/portfolios")
-async def list_portfolios(current_user: dict = Depends(get_current_user)):
+@_offload
+def list_portfolios(current_user: dict = Depends(get_current_user)):
     """Enumerate live and paper portfolio lineages (strategy_template_id + params_hash)."""
 
     trading_collections = get_trading_db_collections()
@@ -6036,7 +6077,8 @@ async def list_portfolios(current_user: dict = Depends(get_current_user)):
 
 
 @router.get("/live-portfolios")
-async def list_live_portfolios(current_user: dict = Depends(get_current_user)):
+@_offload
+def list_live_portfolios(current_user: dict = Depends(get_current_user)):
     """Enumerate live-traded plan lineages (strategy_template_id + params_hash) for the user."""
 
     trading_collections = get_trading_db_collections()
@@ -6050,7 +6092,8 @@ async def list_live_portfolios(current_user: dict = Depends(get_current_user)):
 
 
 @router.get("/plans/{plan_id}/lineage-timeline")
-async def get_portfolio_plan_lineage_timeline(
+@_offload
+def get_portfolio_plan_lineage_timeline(
     plan_id: str,
     limit: int = Query(default=60, ge=1, le=240),
     offset: int = Query(default=0, ge=0),
@@ -6074,7 +6117,8 @@ async def get_portfolio_plan_lineage_timeline(
 
 
 @router.get("/plans/{plan_id}/lineage-live-executions")
-async def get_lineage_live_executions(plan_id: str, current_user: dict = Depends(get_current_user)):
+@_offload
+def get_lineage_live_executions(plan_id: str, current_user: dict = Depends(get_current_user)):
     trading_collections = get_trading_db_collections()
     finance_collections = get_db_collections()
     data_collections = get_data_db()
@@ -6129,7 +6173,8 @@ async def get_lineage_live_executions(plan_id: str, current_user: dict = Depends
 
 
 @router.get("/plans/{plan_id}/lineage-live-positions")
-async def get_lineage_live_positions(plan_id: str, current_user: dict = Depends(get_current_user)):
+@_offload
+def get_lineage_live_positions(plan_id: str, current_user: dict = Depends(get_current_user)):
     trading_collections = get_trading_db_collections()
     finance_collections = get_db_collections()
     data_collections = get_data_db()
@@ -6169,7 +6214,8 @@ async def get_lineage_live_positions(plan_id: str, current_user: dict = Depends(
 
 
 @router.get("/plans/{plan_id}/lineage-live-equity")
-async def get_lineage_live_equity(
+@_offload
+def get_lineage_live_equity(
     plan_id: str,
     start_date: Optional[str] = Query(default=None),
     end_date: Optional[str] = Query(default=None),
@@ -6816,7 +6862,8 @@ def _append_remainder_audit(
 
 
 @router.get("/strategies/{strategy_template_id}/equity")
-async def get_portfolio_strategy_equity(
+@_offload
+def get_portfolio_strategy_equity(
     strategy_template_id: str,
     start_date: Optional[str] = Query(default=None),
     end_date: Optional[str] = Query(default=None),
@@ -6837,7 +6884,8 @@ async def get_portfolio_strategy_equity(
 
 
 @router.get("/strategies/{strategy_template_id}/realtime-equity")
-async def get_portfolio_strategy_realtime_equity(
+@_offload
+def get_portfolio_strategy_realtime_equity(
     strategy_template_id: str,
     current_user: dict = Depends(get_current_user),
 ):
