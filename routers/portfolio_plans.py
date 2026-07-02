@@ -4325,7 +4325,12 @@ async def list_portfolio_plan_generation_tasks(
     query: Dict[str, Any] = {"user_id": _current_user_id(current_user)}
     if status:
         query["status"] = status
-    rows = list(collections["portfolio_plan_generation_tasks"].find(query).sort("created_at", -1).limit(limit))
+    rows = list(
+        collections["portfolio_plan_generation_tasks"]
+        .find(query, GENERATION_TASK_LIST_PROJECTION)
+        .sort("created_at", -1)
+        .limit(limit)
+    )
     return {"success": True, "data": _jsonable(rows)}
 
 
@@ -5751,24 +5756,26 @@ def _timeline_node_drift_brief(
     trading_collections: Dict[str, Any],
     plan: Dict[str, Any],
     user_id: str,
+    items: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
-    items = list(
-        trading_collections["portfolio_trade_plan_items"].find(
-            {"plan_id": plan.get("plan_id"), "user_id": user_id},
-            {
-                "_id": 0,
-                "symbol": 1,
-                "name": 1,
-                "rank": 1,
-                "action": 1,
-                "delta_shares": 1,
-                "drift_delta_shares": 1,
-                "estimated_price": 1,
-                "current_shares": 1,
-                "target_shares": 1,
-            },
+    if items is None:
+        items = list(
+            trading_collections["portfolio_trade_plan_items"].find(
+                {"plan_id": plan.get("plan_id"), "user_id": user_id},
+                {
+                    "_id": 0,
+                    "symbol": 1,
+                    "name": 1,
+                    "rank": 1,
+                    "action": 1,
+                    "delta_shares": 1,
+                    "drift_delta_shares": 1,
+                    "estimated_price": 1,
+                    "current_shares": 1,
+                    "target_shares": 1,
+                },
+            )
         )
-    )
     equity = _numeric((plan.get("summary") or {}).get("equity"), default=0.0)
     summary = _compute_drift_summary(items, equity=equity or None)
     executable = bool(plan.get("executable"))
@@ -5812,6 +5819,62 @@ def _timeline_node_drift_brief(
         "mode": "executable" if executable else "drift",
         "items": trade_items,
     }
+
+
+def _timeline_items_by_plan(
+    trading_collections: Dict[str, Any],
+    plan_ids: List[str],
+    user_id: str,
+) -> Dict[str, List[Dict[str, Any]]]:
+    if not plan_ids:
+        return {}
+    rows = list(
+        trading_collections["portfolio_trade_plan_items"].find(
+            {"plan_id": {"$in": plan_ids}, "user_id": user_id},
+            {
+                "_id": 0,
+                "plan_id": 1,
+                "symbol": 1,
+                "name": 1,
+                "rank": 1,
+                "action": 1,
+                "delta_shares": 1,
+                "drift_delta_shares": 1,
+                "estimated_price": 1,
+                "current_shares": 1,
+                "target_shares": 1,
+            },
+        )
+    )
+    grouped: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        grouped[str(row.get("plan_id") or "")].append(row)
+    return grouped
+
+
+GENERATION_TASK_LIST_PROJECTION = {
+    "_id": 0,
+    "task_id": 1,
+    "task_type": 1,
+    "operation_type": 1,
+    "operation_symbol": 1,
+    "operation_symbols": 1,
+    "user_id": 1,
+    "plan_id": 1,
+    "strategy_template_id": 1,
+    "params_hash": 1,
+    "base_date": 1,
+    "mode": 1,
+    "force": 1,
+    "status": 1,
+    "attempts": 1,
+    "worker_id": 1,
+    "error_message": 1,
+    "created_at": 1,
+    "updated_at": 1,
+    "completed_at": 1,
+    "symbol_count": 1,
+}
 
 
 def _build_lineage_timeline_payload(
@@ -5901,11 +5964,18 @@ def _build_lineage_timeline_payload(
 
     total = len(plans)
     page_plans = plans[offset : offset + limit]
+    page_plan_ids = [str(row.get("plan_id")) for row in page_plans if row.get("plan_id")]
+    page_items_by_plan = _timeline_items_by_plan(trading_collections, page_plan_ids, user_id)
     timeline: List[Dict[str, Any]] = []
     for row in page_plans:
         record_kind = require_record_kind(row)
         node_type = _NODE_TYPE_BY_RECORD_KIND[record_kind]
-        drift_brief = _timeline_node_drift_brief(trading_collections, row, user_id)
+        drift_brief = _timeline_node_drift_brief(
+            trading_collections,
+            row,
+            user_id,
+            page_items_by_plan.get(str(row.get("plan_id") or ""), []),
+        )
         timeline.append(
             {
                 "date": row.get("base_date"),

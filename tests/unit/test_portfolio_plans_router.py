@@ -858,6 +858,45 @@ def test_get_portfolio_plan_generation_task_is_scoped_to_current_user(monkeypatc
     assert exc.value.status_code == 404
 
 
+def test_list_portfolio_plan_generation_tasks_uses_light_projection(monkeypatch):
+    class _ProjectingCollection(_Collection):
+        def find(self, query=None, projection=None):
+            rows = super().find(query, projection)
+            if not projection:
+                return rows
+            include_fields = {key for key, enabled in projection.items() if enabled and key != "_id"}
+            return _Cursor([{key: row.get(key) for key in include_fields if key in row} for row in rows])
+
+    collections = _collections()
+    collections["portfolio_plan_generation_tasks"] = _ProjectingCollection(
+        [
+            {
+                "task_id": "task-1",
+                "task_type": "holdings_risk_review",
+                "user_id": "user-1",
+                "status": "completed",
+                "worker_id": "worker-1",
+                "created_at": "2025-01-01T10:00:00",
+                "result": {"positions": [{"symbol": "000001.SZ"}] * 1000},
+            }
+        ]
+    )
+    monkeypatch.setattr(portfolio_plans, "get_trading_db_collections", lambda: collections)
+
+    response = asyncio.run(
+        portfolio_plans.list_portfolio_plan_generation_tasks(
+            status=None,
+            limit=20,
+            current_user={"id": "user-1"},
+        )
+    )
+
+    task = response["data"][0]
+    assert task["task_id"] == "task-1"
+    assert task["worker_id"] == "worker-1"
+    assert "result" not in task
+
+
 def test_list_portfolio_worker_status_returns_recent_workers(monkeypatch):
     collections = _collections()
     collections["portfolio_worker_status"].docs.extend(
