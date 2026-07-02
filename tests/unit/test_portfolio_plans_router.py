@@ -3847,11 +3847,15 @@ def test_list_portfolios_includes_param_summary_and_paper_holdings(monkeypatch):
     resp = asyncio.run(portfolio_plans.list_portfolios(current_user={"id": "user-1"}))
     ports = {row["params_hash"]: row for row in resp["data"]["portfolios"]}
     assert ports["hx-a"]["param_summary"] == "csi1000 · Top20 · 20d · top_n"
-    assert ports["hx-a"]["paper_holding_count"] == 1
-    assert ports["hx-a"]["paper_execution_mode"] == "auto_shadow"
+    assert "paper_holding_count" not in ports["hx-a"]
+    assert "paper_execution_mode" not in ports["hx-a"]
     assert ports["hx-b"]["param_summary"] == "csi500 · Top30 · 10d · industry_capped"
-    assert ports["hx-b"]["paper_holding_count"] == 0
-    assert ports["hx-b"]["paper_execution_mode"] == "auto_shadow"
+    summary_resp = asyncio.run(
+        portfolio_plans.get_portfolio_plan_summary("paper-a", current_user={"id": "user-1"})
+    )
+    summary = summary_resp["data"]
+    assert summary["paper_holding_count"] == 1
+    assert summary["paper_execution_mode"] == "auto_shadow"
 
 
 def test_lineage_paper_positions_returns_latest_snapshot(monkeypatch):

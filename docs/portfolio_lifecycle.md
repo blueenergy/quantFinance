@@ -29,7 +29,9 @@
   - 含义：**成交场所（execution venue）**——`live` = 向券商发单成交，
     `paper` = 纸面账本模拟。
   - **不是**资金属性；旧名 `funding_mode` 易误解为“资金模式”，故重命名。
-  - 组合级**派生字段，不入库**，每次请求现算。
+  - **权威字段**物化于 `portfolio_lineage_controls.execution_venue`（见
+    [portfolio_domain_model.md](./portfolio_domain_model.md)）；读路径在
+    未回填时 fallback 到 `trade_signals.mode=live` 推断。
 
 - **plan_type**：`rebalance` / `monitor` / `manual`
   - `rebalance`：到期调仓计划（参与调仓节奏 cadence）。
@@ -70,6 +72,8 @@
 | 方法 | 路径 | 作用 |
 |---|---|---|
 | GET | `/portfolio/plans` (list) | 列出所有 lineage（含 `execution_venue`） |
+| GET | `/portfolio-plans/portfolios` | 轻量 lineage 列表（身份 + venue；无 paper 摘要） |
+| GET | `/portfolio-plans/plans/{plan_id}/portfolio-summary` | 延迟加载纸面快照、持仓数、权益、审批策略 |
 | GET | `/portfolio/live-portfolios` | 仅 `execution_venue == 'live'` 的组合 |
 | GET | `/plans/{plan_id}/bench` | 今日阵容（持仓首发）+ 替补席 |
 | GET | `/plans/{plan_id}/holdings-reconcile` | 账本 vs 券商持仓对账 |

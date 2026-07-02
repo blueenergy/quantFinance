@@ -47,6 +47,10 @@ from services.portfolio_lineage_paper import (
     build_lineage_paper_trades,
     merge_lineage_paper_executions,
 )
+from services.portfolio_lineage_state import (
+    mark_lineage_live,
+    resolve_execution_venue,
+)
 from services.portfolio_record_kind import (
     RECORD_KIND_LEDGER_EVENT,
     RECORD_KIND_OBSERVATION,
@@ -101,6 +105,8 @@ def _offload(func):
         return await run_in_threadpool(func, *args, **kwargs)
 
     return wrapper
+
+
 ALLOWED_UNIVERSE_INDICES = {"hs300", "a500", "csi500", "csi1000", "csi2000", "star50"}
 PORTFOLIO_RISK_LLM_TASK_TYPE = "portfolio_risk_llm"
 PORTFOLIO_RISK_LLM_PRIORITY = 10
@@ -5275,33 +5281,6 @@ def _lineage_live_account_id_from_fills(
     return _account_id_from_filled_signals(signals, executions)
 
 
-def _portfolio_plan_groups(
-    trading_collections: Dict[str, Any], user_id: str
-) -> Dict[tuple, List[Dict[str, Any]]]:
-    plans = list(
-        trading_collections["portfolio_trade_plans"].find(
-            {"user_id": user_id, "params_hash": {"$exists": True, "$nin": [None, ""]}},
-            {
-                "_id": 0,
-                "plan_id": 1,
-                "strategy_template_id": 1,
-                "params_hash": 1,
-                "base_date": 1,
-                "strategy_name": 1,
-                "status": 1,
-            },
-        )
-    )
-    groups: Dict[tuple, List[Dict[str, Any]]] = defaultdict(list)
-    for plan in plans:
-        stid = plan.get("strategy_template_id")
-        phash = plan.get("params_hash")
-        if not stid or not phash:
-            continue
-        groups[(str(stid), str(phash))].append(plan)
-    return groups
-
-
 def _portfolio_execution_venue(
     trading_collections: Dict[str, Any],
     finance_collections: Dict[str, Any],
@@ -5489,95 +5468,53 @@ def _resilient_record_kind(row: Dict[str, Any]) -> Optional[str]:
     return classified
 
 
-def _build_portfolio_entry(
+def _resolve_paper_execution_mode(
+    plan: Dict[str, Any],
+    params: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Plan-level paper approval policy; paper defaults to auto_shadow."""
+    params = params if params is not None else dict(plan.get("params_snapshot") or {})
+    explicit = params.get("paper_execution_mode") or plan.get("paper_execution_mode")
+    if explicit in ("auto_shadow", "manual_review"):
+        return str(explicit)
+    return "auto_shadow"
+
+
+def _build_portfolio_summary_payload(
     trading_collections: Dict[str, Any],
     finance_collections: Dict[str, Any],
+    plan: Dict[str, Any],
     user_id: str,
-    strategy_template_id: str,
-    params_hash: str,
-) -> Optional[Dict[str, Any]]:
-    all_lineage = list(
-        trading_collections["portfolio_trade_plans"].find(
-            {
-                "user_id": user_id,
-                "strategy_template_id": strategy_template_id,
-                "params_hash": params_hash,
-            },
-            {
-                "_id": 0,
-                "plan_id": 1,
-                "base_date": 1,
-                "strategy_name": 1,
-                "status": 1,
-                "plan_type": 1,
-                "manual_action": 1,
-                "record_kind": 1,
-                "params_snapshot": 1,
-            },
-        )
+) -> Dict[str, Any]:
+    strategy_template_id = str(plan.get("strategy_template_id") or "")
+    params_hash = str(plan.get("params_hash") or "")
+    lineage_control = _get_lineage_control_doc(
+        trading_collections, strategy_template_id, params_hash, user_id
     )
-    if not all_lineage:
-        return None
-
-    sample_plan = dict(all_lineage[0])
-    sample_plan["strategy_template_id"] = strategy_template_id
-    sample_plan["params_hash"] = params_hash
-    has_live_fills = _lineage_has_live_fills(trading_collections, finance_collections, sample_plan, user_id)
-    has_live_signals = _lineage_has_live_signals(trading_collections, finance_collections, sample_plan, user_id)
-    has_live = has_live_fills or has_live_signals
-    has_paper = any(row.get("status") in PAPER_ACTIVE_STATUSES for row in all_lineage)
-    if not has_live and not has_paper:
-        return None
-
-    latest = max(all_lineage, key=lambda row: str(row.get("base_date") or ""))
-    earliest = min(all_lineage, key=lambda row: str(row.get("base_date") or ""))
-    sec_id = ""
-    if has_live:
-        sec_id = _lineage_live_account_id_from_fills(
-            trading_collections, finance_collections, sample_plan, user_id
-        ) or _lineage_live_account_id_from_signals(
-            trading_collections, finance_collections, sample_plan, user_id
-        )
-
-    params = dict(latest.get("params_snapshot") or {})
-    paper_execution_mode = params.get("paper_execution_mode")
-    if not paper_execution_mode and latest.get("paper_execution_mode"):
-        paper_execution_mode = latest.get("paper_execution_mode")
-    if not paper_execution_mode:
-        paper_execution_mode = "manual_review" if has_live else "auto_shadow"
-    paper_snapshot = _latest_lineage_paper_snapshot(trading_collections, sample_plan, user_id)
+    has_live = _lineage_has_live_signals(
+        trading_collections, finance_collections, plan, user_id
+    ) or _lineage_has_live_fills(trading_collections, finance_collections, plan, user_id)
+    execution_venue = resolve_execution_venue(lineage_control, has_live_signals=has_live)
+    params = dict(plan.get("params_snapshot") or {})
+    paper_snapshot = _latest_lineage_paper_snapshot(trading_collections, plan, user_id)
     paper_positions = list(paper_snapshot.get("positions") or [])
     paper_holding_count = sum(1 for row in paper_positions if _int_value(row.get("shares")) > 0)
-    lineage_control = _get_lineage_control_doc(trading_collections, strategy_template_id, params_hash, user_id)
-
+    sec_id = ""
+    if execution_venue == "live":
+        sec_id = (
+            _lineage_live_account_id_from_fills(trading_collections, finance_collections, plan, user_id)
+            or _lineage_live_account_id_from_signals(trading_collections, finance_collections, plan, user_id)
+            or str(lineage_control.get("securities_account_id") or "")
+        )
     return {
         "strategy_template_id": strategy_template_id,
         "params_hash": params_hash,
-        "params_hash_short": str(params_hash or "")[:8],
-        "latest_plan_id": latest.get("plan_id"),
-        "latest_plan_status": latest.get("status"),
-        "latest_plan_type": latest.get("plan_type"),
-        "param_summary": _portfolio_param_summary(params),
-        "universe_index": params.get("universe_index"),
-        "top_n": params.get("top_n"),
-        "rebalance_days": params.get("rebalance_days"),
-        "construction_mode": params.get("construction_mode"),
-        "initial_capital": params.get("initial_capital"),
-        # "期" = executable rebalance cycles only. Observations (daily monitor
-        # snapshots) and ledger events share this collection but are not cycles,
-        # so counting len(all_lineage) wildly inflates the number.
-        "plan_count": sum(
-            1 for row in all_lineage if _resilient_record_kind(row) == RECORD_KIND_TRADE_PLAN
-        ),
-        "first_base_date": earliest.get("base_date"),
-        "last_base_date": latest.get("base_date"),
-        "strategy_name": latest.get("strategy_name") or earliest.get("strategy_name") or "",
-        "securities_account_id": sec_id,
-        "execution_venue": "live" if has_live else "paper",
-        "paper_execution_mode": paper_execution_mode,
+        "execution_venue": execution_venue,
+        "paper_execution_mode": _resolve_paper_execution_mode(plan, params),
         "paper_snapshot_date": paper_snapshot.get("as_of_date"),
         "paper_holding_count": paper_holding_count,
         "paper_equity": paper_snapshot.get("equity"),
+        "securities_account_id": sec_id,
         "paused": bool(lineage_control.get("paused")),
         "excluded_symbols": lineage_control.get("excluded_symbols") or [],
     }
@@ -5588,18 +5525,165 @@ def _list_portfolios_payload(
     finance_collections: Dict[str, Any],
     user_id: str,
 ) -> List[Dict[str, Any]]:
-    groups = _portfolio_plan_groups(trading_collections, user_id)
-    portfolios: List[Dict[str, Any]] = []
-    for (strategy_template_id, params_hash) in groups:
-        entry = _build_portfolio_entry(
-            trading_collections,
-            finance_collections,
-            user_id,
-            strategy_template_id,
-            params_hash,
+    plans = list(
+        trading_collections["portfolio_trade_plans"].find(
+            {"user_id": user_id, "params_hash": {"$exists": True, "$nin": [None, ""]}},
+            {
+                "_id": 0,
+                "plan_id": 1,
+                "strategy_template_id": 1,
+                "params_hash": 1,
+                "base_date": 1,
+                "strategy_name": 1,
+                "status": 1,
+                "plan_type": 1,
+                "manual_action": 1,
+                "record_kind": 1,
+                "params_snapshot": 1,
+                "paper_execution_mode": 1,
+            },
         )
-        if entry:
-            portfolios.append(entry)
+    )
+    groups: Dict[tuple, List[Dict[str, Any]]] = defaultdict(list)
+    plan_group_by_id: Dict[str, tuple] = {}
+    for plan in plans:
+        stid = plan.get("strategy_template_id")
+        phash = plan.get("params_hash")
+        if not stid or not phash:
+            continue
+        key = (str(stid), str(phash))
+        groups[key].append(plan)
+        if plan.get("plan_id"):
+            plan_group_by_id[str(plan.get("plan_id"))] = key
+    if not groups:
+        return []
+
+    plan_ids = sorted(plan_group_by_id)
+    strategy_template_ids = sorted({key[0] for key in groups})
+    params_hashes = sorted({key[1] for key in groups})
+
+    signals_by_group: Dict[tuple, List[Dict[str, Any]]] = defaultdict(list)
+    executions_by_group: Dict[tuple, List[Dict[str, Any]]] = defaultdict(list)
+    if plan_ids:
+        signals = list(
+            finance_collections["trade_signals"].find(
+                {"user_id": user_id, "plan_id": {"$in": plan_ids}, "mode": "live"},
+                {
+                    "_id": 0,
+                    "plan_id": 1,
+                    "order_id": 1,
+                    "securities_account_id": 1,
+                    "created_at": 1,
+                },
+            )
+        )
+        order_group_by_id: Dict[str, tuple] = {}
+        for signal in signals:
+            key = plan_group_by_id.get(str(signal.get("plan_id") or ""))
+            if not key:
+                continue
+            signals_by_group[key].append(signal)
+            if signal.get("order_id"):
+                order_group_by_id[str(signal.get("order_id"))] = key
+        for rows in signals_by_group.values():
+            rows.sort(key=lambda row: str(row.get("created_at") or ""))
+
+        order_ids = sorted(order_group_by_id)
+        if order_ids:
+            executions = list(
+                finance_collections["trade_executions"].find(
+                    {"user_id": user_id, "order_id": {"$in": order_ids}},
+                    {
+                        "_id": 0,
+                        "order_id": 1,
+                        "filled_size": 1,
+                        "quantity": 1,
+                        "filled_qty": 1,
+                    },
+                )
+            )
+            for execution in executions:
+                key = order_group_by_id.get(str(execution.get("order_id") or ""))
+                if key:
+                    executions_by_group[key].append(execution)
+
+    lineage_control_by_group: Dict[tuple, Dict[str, Any]] = {}
+    controls_coll = trading_collections.get("portfolio_lineage_controls")
+    if controls_coll is not None:
+        controls = list(
+            controls_coll.find(
+                {
+                    "user_id": user_id,
+                    "strategy_template_id": {"$in": strategy_template_ids},
+                    "params_hash": {"$in": params_hashes},
+                },
+                {"_id": 0},
+            )
+        )
+        for control in controls:
+            key = (
+                str(control.get("strategy_template_id") or ""),
+                str(control.get("params_hash") or ""),
+            )
+            if key in groups:
+                lineage_control_by_group[key] = control
+
+    portfolios: List[Dict[str, Any]] = []
+    for (strategy_template_id, params_hash), all_lineage in groups.items():
+        sample_plan = dict(all_lineage[0])
+        sample_plan["strategy_template_id"] = strategy_template_id
+        sample_plan["params_hash"] = params_hash
+        signals = signals_by_group.get((strategy_template_id, params_hash), [])
+        executions = executions_by_group.get((strategy_template_id, params_hash), [])
+        has_live = bool(signals)
+        has_paper = any(row.get("status") in PAPER_ACTIVE_STATUSES for row in all_lineage)
+        if not has_live and not has_paper:
+            continue
+
+        latest = max(all_lineage, key=lambda row: str(row.get("base_date") or ""))
+        earliest = min(all_lineage, key=lambda row: str(row.get("base_date") or ""))
+        sec_id = ""
+        if has_live:
+            sec_id = _account_id_from_filled_signals(signals, executions)
+            if not sec_id:
+                for signal in reversed(signals):
+                    sec_id = str(signal.get("securities_account_id") or "")
+                    if sec_id:
+                        break
+
+        params = dict(latest.get("params_snapshot") or {})
+        lineage_control = lineage_control_by_group.get(
+            (strategy_template_id, params_hash),
+            {"paused": False, "excluded_symbols": []},
+        )
+        execution_venue = resolve_execution_venue(lineage_control, has_live_signals=has_live)
+
+        portfolios.append(
+            {
+                "strategy_template_id": strategy_template_id,
+                "params_hash": params_hash,
+                "params_hash_short": str(params_hash or "")[:8],
+                "latest_plan_id": latest.get("plan_id"),
+                "latest_plan_status": latest.get("status"),
+                "latest_plan_type": latest.get("plan_type"),
+                "param_summary": _portfolio_param_summary(params),
+                "universe_index": params.get("universe_index"),
+                "top_n": params.get("top_n"),
+                "rebalance_days": params.get("rebalance_days"),
+                "construction_mode": params.get("construction_mode"),
+                "initial_capital": params.get("initial_capital"),
+                "plan_count": sum(
+                    1 for row in all_lineage if _resilient_record_kind(row) == RECORD_KIND_TRADE_PLAN
+                ),
+                "first_base_date": earliest.get("base_date"),
+                "last_base_date": latest.get("base_date"),
+                "strategy_name": latest.get("strategy_name") or earliest.get("strategy_name") or "",
+                "securities_account_id": sec_id,
+                "execution_venue": execution_venue,
+                "paused": bool(lineage_control.get("paused")),
+                "excluded_symbols": lineage_control.get("excluded_symbols") or [],
+            }
+        )
     portfolios.sort(key=lambda row: str(row.get("last_base_date") or ""), reverse=True)
     return portfolios
 
@@ -6074,6 +6158,24 @@ def list_portfolios(current_user: dict = Depends(get_current_user)):
     user_id = _current_user_id(current_user)
     portfolios = _list_portfolios_payload(trading_collections, finance_collections, user_id)
     return {"success": True, "data": _jsonable({"portfolios": portfolios})}
+
+
+@router.get("/plans/{plan_id}/portfolio-summary")
+@_offload
+def get_portfolio_plan_summary(
+    plan_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """Deferred portfolio summary: paper snapshot, holdings, equity, approval policy."""
+
+    trading_collections = get_trading_db_collections()
+    finance_collections = get_db_collections()
+    user_id = _current_user_id(current_user)
+    plan = _require_plan(trading_collections, plan_id, current_user)
+    summary = _build_portfolio_summary_payload(
+        trading_collections, finance_collections, plan, user_id
+    )
+    return {"success": True, "data": _jsonable(summary)}
 
 
 @router.get("/live-portfolios")
@@ -6607,6 +6709,13 @@ async def publish_portfolio_plan_live_signals(
         )
         finance_collections["trade_signals"].insert_many(new_signals)
         inserted_count = len(new_signals)
+        mark_lineage_live(
+            trading_collections.get("portfolio_lineage_controls"),
+            user_id=user_id,
+            strategy_template_id=str(plan.get("strategy_template_id") or ""),
+            params_hash=str(plan.get("params_hash") or ""),
+            securities_account_id=securities_account_id,
+        )
         trading_collections["portfolio_trade_plans"].update_one(
             {"plan_id": plan_id, "user_id": user_id},
             {
