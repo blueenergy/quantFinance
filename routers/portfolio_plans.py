@@ -1230,6 +1230,42 @@ def _load_latest_daily_bars_loose(volume_price, symbols: List[str]) -> Dict[str,
     return bars
 
 
+def _ranked_score_projection(config: Dict[str, Any]) -> Dict[str, int]:
+    """Only the score inputs needed to rank -- never name/industry/composite_score.
+
+    In prod, transferring the full ~1100-row universe with the ``composite_score``
+    dict and the name/industry strings cost ~3s per call, while the scalar score
+    fields alone come back in ~40ms. name/industry for the handful of displayed
+    symbols are fetched separately by the caller.
+    """
+    projection = {"_id": 0, "symbol": 1}
+    score_type = str(config.get("score_type") or "growth_cycle_weighted")
+    if score_type == "growth_cycle_weighted":
+        projection["growth_score"] = 1
+        projection["cycle_score"] = 1
+    else:
+        projection["composite_score"] = 1
+    return projection
+
+
+def _score_symbol_meta(
+    stock_scores,
+    score_date: str,
+    symbols,
+) -> Dict[str, Dict[str, Any]]:
+    """name/industry for a small display set, keyed by suffix-insensitive symbol."""
+    meta: Dict[str, Dict[str, Any]] = {}
+    variants = sorted({v for sym in symbols for v in _symbol_query_values(sym) if v})
+    if not variants:
+        return meta
+    for row in stock_scores.find(
+        {"score_date": score_date, "symbol": {"$in": variants}},
+        {"_id": 0, "symbol": 1, "name": 1, "industry": 1},
+    ):
+        meta[_symbol_key(row.get("symbol"))] = row
+    return meta
+
+
 def _build_ranked_score_universe(
     stock_scores,
     score_date: str,
@@ -1239,15 +1275,7 @@ def _build_ranked_score_universe(
     rows = list(
         stock_scores.find(
             {"score_date": score_date, "index_codes": universe_index},
-            {
-                "_id": 0,
-                "symbol": 1,
-                "name": 1,
-                "industry": 1,
-                "growth_score": 1,
-                "cycle_score": 1,
-                "composite_score": 1,
-            },
+            _ranked_score_projection(config),
         )
     )
     ranked: List[Dict[str, Any]] = []
@@ -1261,8 +1289,6 @@ def _build_ranked_score_universe(
         ranked.append(
             {
                 "symbol": str(symbol),
-                "name": row.get("name") or "",
-                "industry": row.get("industry") or "",
                 "score_value": score_value,
             }
         )
@@ -1740,8 +1766,8 @@ def _build_plan_bench_payload(
         starters.append(
             {
                 "symbol": symbol,
-                "name": pos.get("name") or score_row.get("name") or "",
-                "industry": score_row.get("industry") or "",
+                "name": pos.get("name") or "",
+                "industry": "",
                 "rank": score_row.get("rank"),
                 "score_value": score_row.get("score_value"),
                 "target_shares": shares,
@@ -1757,6 +1783,18 @@ def _build_plan_bench_payload(
         for row in ranked_pool
         if _symbol_key(row["symbol"]) not in on_field_keys
     ]
+
+    # name/industry are not carried on the ranked universe (fetching them for all
+    # ~1100 rows cost seconds in prod); resolve them only for displayed symbols.
+    display_symbols = {starter["symbol"] for starter in starters} | set(bench_symbols)
+    score_meta_by_key = _score_symbol_meta(finance_db["stock_scores"], score_date, display_symbols)
+    for starter in starters:
+        meta = score_meta_by_key.get(_symbol_key(starter["symbol"])) or {}
+        if not starter["name"]:
+            starter["name"] = meta.get("name") or ""
+        if not starter["industry"]:
+            starter["industry"] = meta.get("industry") or ""
+
     starters_missing_price = [s["symbol"] for s in starters if s.get("estimated_price") is None]
     latest_bars = _load_latest_daily_bars_loose(
         data_collections["volume_price"], list({*bench_symbols, *starters_missing_price})
@@ -1765,12 +1803,13 @@ def _build_plan_bench_payload(
     bench: List[Dict[str, Any]] = []
     for symbol in bench_symbols:
         score_row = rank_by_key.get(_symbol_key(symbol)) or {}
+        meta = score_meta_by_key.get(_symbol_key(symbol)) or {}
         latest_bar = latest_bars.get(symbol) or {}
         bench.append(
             {
                 "symbol": symbol,
-                "name": score_row.get("name") or "",
-                "industry": score_row.get("industry") or "",
+                "name": meta.get("name") or "",
+                "industry": meta.get("industry") or "",
                 "rank": score_row.get("rank"),
                 "score_value": score_row.get("score_value"),
                 "latest_close": _optional_float(latest_bar.get("close")),
