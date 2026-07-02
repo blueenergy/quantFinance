@@ -1179,9 +1179,49 @@ def _load_latest_daily_bars_loose(volume_price, symbols: List[str]) -> Dict[str,
         "update_time": 1,
         "source": 1,
     }
+    if not symbols:
+        return bars
+    candidates_by_symbol = {symbol: list(_symbol_query_values(symbol)) for symbol in symbols}
+    all_candidates = sorted({c for cands in candidates_by_symbol.values() for c in cands})
+
+    # Batch the latest bar for every requested symbol in one aggregation instead
+    # of one find_one per symbol (bench previously issued ~15-25 sequential
+    # round-trips here). The (symbol, trade_date) index serves the sort so $first
+    # returns each symbol's newest bar; fall back to per-symbol on any failure.
+    aggregate = getattr(volume_price, "aggregate", None)
+    if aggregate is not None:
+        try:
+            latest_by_stored: Dict[str, Dict[str, Any]] = {}
+            for row in aggregate(
+                [
+                    {"$match": {"symbol": {"$in": all_candidates}}},
+                    {"$sort": {"symbol": 1, "trade_date": -1}},
+                    {"$group": {"_id": "$symbol", "doc": {"$first": "$$ROOT"}}},
+                ]
+            ):
+                doc = row.get("doc") or {}
+                sym = doc.get("symbol")
+                if sym:
+                    latest_by_stored[str(sym)] = {k: doc.get(k) for k in projection if k in doc}
+            for symbol, candidates in candidates_by_symbol.items():
+                best = None
+                best_date = ""
+                for candidate in candidates:
+                    candidate_row = latest_by_stored.get(candidate)
+                    if not candidate_row:
+                        continue
+                    row_date = str(candidate_row.get("trade_date") or "")
+                    if best is None or row_date > best_date:
+                        best, best_date = candidate_row, row_date
+                if best:
+                    bars[symbol] = best
+            return bars
+        except Exception:
+            bars = {}
+
     for symbol in symbols:
         row = volume_price.find_one(
-            {"symbol": {"$in": _symbol_query_values(symbol)}},
+            {"symbol": {"$in": candidates_by_symbol[symbol]}},
             sort=[("trade_date", -1)],
             projection=projection,
         )

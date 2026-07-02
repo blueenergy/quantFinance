@@ -25,6 +25,32 @@ class _Collection:
         return dict(rows[0]) if rows else None
 
 
+class _AggCollection(_Collection):
+    """Collection stub that also supports the batched aggregation pipeline."""
+
+    def __init__(self, docs):
+        super().__init__(docs)
+        self.find_one_called = 0
+
+    def find_one(self, query, sort=None, projection=None):
+        self.find_one_called += 1
+        return super().find_one(query, sort=sort, projection=projection)
+
+    def aggregate(self, pipeline):
+        allowed = set(pipeline[0]["$match"]["symbol"]["$in"])
+        grouped = {}
+        for row in self.docs:
+            symbol = row.get("symbol")
+            if symbol in allowed:
+                grouped.setdefault(str(symbol), []).append(dict(row))
+        out = []
+        for symbol, rows in grouped.items():
+            # $sort symbol asc, trade_date desc + $group $first => newest per symbol
+            newest = max(rows, key=lambda r: str(r.get("trade_date") or ""))
+            out.append({"_id": symbol, "doc": newest})
+        return out
+
+
 def _symbol_query_values(symbol):
     return [symbol]
 
@@ -64,6 +90,31 @@ def test_market_price_quotes_collection_lookup():
     }
     quotes = market_price_quotes(data, ["600000"], symbol_query_values=_symbol_query_values)
     assert quotes["600000"]["price_source"] == PRICE_SOURCE_REALTIME
+
+
+def test_market_price_quotes_batches_via_aggregation():
+    daily = _AggCollection(
+        [
+            {"symbol": "600000", "trade_date": "20260625", "close": 9.0},
+            {"symbol": "600000", "trade_date": "20260626", "close": 11.0},
+            {"symbol": "000001", "trade_date": "20260626", "close": 5.0},
+        ]
+    )
+    realtime = _AggCollection(
+        [{"symbol": "600000", "trade_date": "20260626", "close": 11.5}]
+    )
+    data = {"volume_price": daily, "volume_price_realtime_latest": realtime}
+    quotes = market_price_quotes(
+        data, ["600000", "000001"], symbol_query_values=_symbol_query_values
+    )
+    # newest daily bar wins for the pure-daily symbol; fresher realtime wins otherwise
+    assert quotes["600000"]["price_source"] == PRICE_SOURCE_REALTIME
+    assert quotes["600000"]["price"] == 11.5
+    assert quotes["000001"]["price_source"] == PRICE_SOURCE_DAILY_CLOSE
+    assert quotes["000001"]["price"] == 5.0
+    # batched path must not fall back to per-symbol round-trips
+    assert daily.find_one_called == 0
+    assert realtime.find_one_called == 0
 
 
 def test_reprice_uses_target_weight_and_equity():

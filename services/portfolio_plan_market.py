@@ -113,41 +113,133 @@ def _quote_from_docs(
     }
 
 
+_DAILY_QUOTE_FIELDS = ("symbol", "trade_date", "date", "close")
+_REALTIME_QUOTE_FIELDS = (
+    "symbol",
+    "trade_date",
+    "date",
+    "close",
+    "price",
+    "latest_price",
+    "realtime_trade_time",
+    "snapshot_time",
+    "updated_at",
+    "created_at",
+)
+
+
+def _latest_variant_docs(
+    coll: Any,
+    candidates: List[str],
+    fields: Tuple[str, ...],
+) -> Optional[Dict[str, Dict[str, Any]]]:
+    """Latest doc per stored ``symbol`` for a candidate set, via one aggregation.
+
+    Returns ``None`` when the collection cannot aggregate (e.g. a test stub), so
+    the caller can fall back to per-symbol ``find_one`` lookups. The ``$sort`` on
+    ``(symbol, trade_date desc)`` is served by the ``(symbol, trade_date)`` index,
+    and ``$first`` keeps the newest bar per stored symbol.
+    """
+    if not candidates:
+        return {}
+    aggregate = getattr(coll, "aggregate", None)
+    if aggregate is None:
+        return None
+    pipeline = [
+        {"$match": {"symbol": {"$in": candidates}}},
+        {"$sort": {"symbol": 1, "trade_date": -1}},
+        {"$group": {"_id": "$symbol", "doc": {"$first": "$$ROOT"}}},
+    ]
+    try:
+        result: Dict[str, Dict[str, Any]] = {}
+        for row in aggregate(pipeline):
+            doc = row.get("doc") or {}
+            sym = doc.get("symbol")
+            if not sym:
+                continue
+            result[str(sym)] = {key: doc.get(key) for key in fields if key in doc}
+        return result
+    except Exception:
+        return None
+
+
+def _pick_latest_variant(
+    docs_by_symbol: Dict[str, Dict[str, Any]],
+    candidates: List[str],
+) -> Optional[Dict[str, Any]]:
+    """Pick the newest doc among a symbol's suffix variants (mirrors find_one sort)."""
+    best: Optional[Dict[str, Any]] = None
+    best_key = ""
+    for candidate in candidates:
+        doc = docs_by_symbol.get(candidate)
+        if not doc:
+            continue
+        key = _market_doc_yyyymmdd(doc)
+        if best is None or key > best_key:
+            best, best_key = doc, key
+    return best
+
+
+def _market_price_quotes_per_symbol(
+    daily_coll: Any,
+    realtime_coll: Any,
+    symbols: List[str],
+    candidates_by_symbol: Dict[str, List[str]],
+) -> Dict[str, Dict[str, Any]]:
+    """Fallback path: one daily + one realtime ``find_one`` per symbol."""
+    quotes: Dict[str, Dict[str, Any]] = {}
+    for symbol in symbols:
+        candidates = candidates_by_symbol[symbol]
+        daily_doc = daily_coll.find_one(
+            {"symbol": {"$in": candidates}},
+            sort=[("trade_date", -1)],
+            projection={key: 1 for key in _DAILY_QUOTE_FIELDS} | {"_id": 0},
+        )
+        realtime_doc = realtime_coll.find_one(
+            {"symbol": {"$in": candidates}},
+            sort=[("trade_date", -1)],
+            projection={key: 1 for key in _REALTIME_QUOTE_FIELDS} | {"_id": 0},
+        )
+        quotes[symbol] = _quote_from_docs(symbol=symbol, daily_doc=daily_doc, realtime_doc=realtime_doc)
+    return quotes
+
+
 def market_price_quotes(
     data_collections: Dict[str, Any],
     symbols: List[str],
     *,
     symbol_query_values: Callable[[str], List[str]],
 ) -> Dict[str, Dict[str, Any]]:
-    """Return per-symbol price quotes with source metadata."""
-    quotes: Dict[str, Dict[str, Any]] = {}
+    """Return per-symbol price quotes with source metadata.
+
+    Previously this issued two ``find_one`` calls per symbol (daily + realtime),
+    i.e. ``2N`` sequential round-trips. It now fetches the latest daily and
+    realtime docs for every requested symbol in two batched aggregations and
+    resolves per-symbol in memory, falling back to the per-symbol path when the
+    collection cannot aggregate.
+    """
+    if not symbols:
+        return {}
     daily_coll = data_collections["volume_price"]
     realtime_coll = data_collections["volume_price_realtime_latest"]
+    candidates_by_symbol = {symbol: list(symbol_query_values(symbol)) for symbol in symbols}
+    all_candidates = sorted({c for cands in candidates_by_symbol.values() for c in cands})
+
+    daily_by_symbol = _latest_variant_docs(daily_coll, all_candidates, _DAILY_QUOTE_FIELDS)
+    realtime_by_symbol = _latest_variant_docs(realtime_coll, all_candidates, _REALTIME_QUOTE_FIELDS)
+    if daily_by_symbol is None or realtime_by_symbol is None:
+        return _market_price_quotes_per_symbol(
+            daily_coll, realtime_coll, symbols, candidates_by_symbol
+        )
+
+    quotes: Dict[str, Dict[str, Any]] = {}
     for symbol in symbols:
-        candidates = symbol_query_values(symbol)
-        daily_doc = daily_coll.find_one(
-            {"symbol": {"$in": candidates}},
-            sort=[("trade_date", -1)],
-            projection={"_id": 0, "symbol": 1, "trade_date": 1, "date": 1, "close": 1},
+        candidates = candidates_by_symbol[symbol]
+        quotes[symbol] = _quote_from_docs(
+            symbol=symbol,
+            daily_doc=_pick_latest_variant(daily_by_symbol, candidates),
+            realtime_doc=_pick_latest_variant(realtime_by_symbol, candidates),
         )
-        realtime_doc = realtime_coll.find_one(
-            {"symbol": {"$in": candidates}},
-            sort=[("trade_date", -1)],
-            projection={
-                "_id": 0,
-                "symbol": 1,
-                "trade_date": 1,
-                "date": 1,
-                "close": 1,
-                "price": 1,
-                "latest_price": 1,
-                "realtime_trade_time": 1,
-                "snapshot_time": 1,
-                "updated_at": 1,
-                "created_at": 1,
-            },
-        )
-        quotes[symbol] = _quote_from_docs(symbol=symbol, daily_doc=daily_doc, realtime_doc=realtime_doc)
     return quotes
 
 
