@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 import functools
 import logging
@@ -5802,11 +5802,14 @@ def _build_portfolio_summary_payload(
     paper_holding_count = sum(1 for row in paper_positions if _int_value(row.get("shares")) > 0)
     sec_id = ""
     if execution_venue == "live":
-        sec_id = (
-            _lineage_live_account_id_from_fills(trading_collections, finance_collections, plan, user_id)
-            or _lineage_live_account_id_from_signals(trading_collections, finance_collections, plan, user_id)
-            or str(lineage_control.get("securities_account_id") or "")
-        )
+        # Prefer the materialized account id; only replay the lineage
+        # signals/executions bundle when the control has not captured it yet.
+        sec_id = str(lineage_control.get("securities_account_id") or "")
+        if not sec_id:
+            sec_id = (
+                _lineage_live_account_id_from_fills(trading_collections, finance_collections, plan, user_id)
+                or _lineage_live_account_id_from_signals(trading_collections, finance_collections, plan, user_id)
+            )
     return {
         "strategy_template_id": strategy_template_id,
         "params_hash": params_hash,
@@ -5989,16 +5992,34 @@ def _list_portfolios_payload(
     return portfolios
 
 
+def _add_calendar_days(yyyymmdd: str, days: int) -> Optional[str]:
+    try:
+        return (datetime.strptime(yyyymmdd, "%Y%m%d") + timedelta(days=days)).strftime("%Y%m%d")
+    except (ValueError, TypeError):
+        return None
+
+
+def _distinct_trade_dates(data_collections: Dict[str, Any], query: Dict[str, Any]) -> List[str]:
+    """Server-side distinct trade dates.
+
+    ``volume_price`` holds one row per (symbol, trade_date), so fetching rows to
+    dedupe dates in Python pulls the whole market table. ``distinct`` returns
+    only the distinct dates and lets MongoDB do the dedupe.
+    """
+    try:
+        days = data_collections["volume_price"].distinct("trade_date", query)
+    except Exception:
+        cursor = data_collections["volume_price"].find(query, {"_id": 0, "trade_date": 1})
+        days = [row.get("trade_date") for row in cursor]
+    return sorted({str(d) for d in days if d})
+
+
 def _trading_dates_between(data_collections: Dict[str, Any], start_date: str, end_date: str) -> List[str]:
     start = _normalize_yyyymmdd(start_date) or ""
     end = _normalize_yyyymmdd(end_date) or ""
     if not start or not end or start > end:
         return []
-    rows = data_collections["volume_price"].find(
-        {"trade_date": {"$gte": start, "$lte": end}},
-        {"_id": 0, "trade_date": 1},
-    )
-    return sorted({str(row.get("trade_date")) for row in rows if row.get("trade_date")})
+    return _distinct_trade_dates(data_collections, {"trade_date": {"$gte": start, "$lte": end}})
 
 
 def _advance_trading_days(data_collections: Dict[str, Any], from_date: str, trading_day_offset: int) -> Optional[str]:
@@ -6007,11 +6028,20 @@ def _advance_trading_days(data_collections: Dict[str, Any], from_date: str, trad
     anchor = _normalize_yyyymmdd(from_date) or ""
     if not anchor:
         return None
-    rows = data_collections["volume_price"].find(
-        {"trade_date": {"$gt": anchor}},
-        {"_id": 0, "trade_date": 1},
-    )
-    future_dates = sorted({str(row.get("trade_date")) for row in rows if row.get("trade_date")})
+    # Bound the forward scan instead of reading every future row of the whole
+    # market table. Trading days are ~5/7 of calendar days, so these windows
+    # comfortably contain ``trading_day_offset`` sessions; widen progressively
+    # and only fall back to an unbounded scan in the pathological case.
+    for span in (trading_day_offset * 2 + 15, trading_day_offset * 4 + 45):
+        upper = _add_calendar_days(anchor, span)
+        if not upper:
+            break
+        future_dates = _distinct_trade_dates(
+            data_collections, {"trade_date": {"$gt": anchor, "$lte": upper}}
+        )
+        if len(future_dates) >= trading_day_offset:
+            return future_dates[trading_day_offset - 1]
+    future_dates = _distinct_trade_dates(data_collections, {"trade_date": {"$gt": anchor}})
     if len(future_dates) < trading_day_offset:
         return future_dates[-1] if future_dates else None
     return future_dates[trading_day_offset - 1]

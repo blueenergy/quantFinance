@@ -376,6 +376,13 @@ def _expected_indexes() -> List[ExpectedIndex]:
         ),
         ExpectedIndex(
             "data",
+            "volume_price",
+            [("trade_date", ASCENDING)],
+            "volume_price_trade_date",
+            "trading-calendar distinct scan for lineage cycle math",
+        ),
+        ExpectedIndex(
+            "data",
             "volume_price_realtime_latest",
             [("symbol", ASCENDING)],
             "realtime_latest_symbol",
