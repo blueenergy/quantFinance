@@ -34,7 +34,7 @@ def ensure_live_snapshot_indexes(
         snapshots.create_index(
             [("user_id", ASCENDING), ("strategy_template_id", ASCENDING), ("params_hash", ASCENDING)],
             unique=True,
-            name="live_snapshot_lineage_unique",
+            name="portfolio_live_snapshots_lineage_unique",
         )
         snapshots.create_index(
             [("updated_at", DESCENDING)],
