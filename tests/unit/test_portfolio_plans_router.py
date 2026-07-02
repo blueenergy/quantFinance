@@ -5016,6 +5016,45 @@ def test_current_lineage_holdings_live_empty_does_not_fallback_to_paper():
     assert portfolio_plans._current_lineage_holdings(cols, fin, data, plan, "user-1") == []
 
 
+def test_current_lineage_holdings_live_reads_snapshot_without_replay():
+    # Live holdings must come from the materialized snapshot, not a full replay
+    # of the lineage signals/executions bundle. trade_signals raises if scanned.
+    cols = _collections()
+    fin = _finance_collections()
+    data = _data_collections()
+    plan = {
+        "plan_id": "live-plan",
+        "strategy_template_id": "s1",
+        "user_id": "user-1",
+        "base_date": "20250110",
+        "params_hash": "hx-live",
+    }
+    cols["portfolio_trade_plans"] = _Collection([plan])
+    cols["portfolio_lineage_controls"] = _Collection(
+        [{"user_id": "user-1", "strategy_template_id": "s1", "params_hash": "hx-live", "execution_venue": "live"}]
+    )
+    cols["portfolio_live_snapshots"] = _Collection(
+        [
+            {
+                "user_id": "user-1",
+                "strategy_template_id": "s1",
+                "params_hash": "hx-live",
+                "securities_account_id": "acct-x",
+                "positions": [
+                    {"symbol": "000001.SZ", "name": "PAB", "shares": 100, "avg_cost": 10.0},
+                    {"symbol": "600000.SH", "name": "SPD", "shares": 0, "avg_cost": 11.0},
+                ],
+                "watermark": {"execution_count": 0, "signal_count": 0},
+            }
+        ]
+    )
+    fin["trade_executions"] = _Collection()
+    fin["trade_signals"] = _RaisingSignalCollection()
+
+    holdings = portfolio_plans._current_lineage_holdings(cols, fin, data, plan, "user-1")
+    assert {row["symbol"] for row in holdings} == {"000001.SZ"}  # shares>0 only, from snapshot
+
+
 def test_enqueue_portfolio_bench_risk_enqueues_bench_symbols(monkeypatch):
     cols = _collections()
     data = _data_collections()

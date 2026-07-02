@@ -3204,9 +3204,14 @@ def _current_lineage_holdings(
     """
     try:
         if _portfolio_execution_venue(trading_collections, finance_collections, plan, user_id) == "live":
-            return _lineage_live_holdings(
+            # Serve live holdings from the materialized snapshot (build-on-miss)
+            # instead of replaying the whole lineage signals/executions bundle.
+            _snapshot, overlay = _load_snapshot_with_realtime(
                 trading_collections, finance_collections, data_collections, plan, user_id
             )
+            return [
+                row for row in (overlay.get("positions") or []) if _int_value(row.get("shares")) > 0
+            ]
         snapshot = _latest_lineage_paper_snapshot(trading_collections, plan, user_id)
         return [
             row
