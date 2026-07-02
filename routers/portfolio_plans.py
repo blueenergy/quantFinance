@@ -4897,19 +4897,44 @@ def get_portfolio_plan_bench(
     data_collections = get_data_db()
     plan = _require_plan(collections, plan_id, current_user)
     user_id = _current_user_id(current_user)
+    started_at = time.perf_counter()
+    marks: List[tuple[str, float]] = []
+
+    def _mark(label: str) -> None:
+        marks.append((label, time.perf_counter() - started_at))
+
     # Starters mirror the actual current holdings (live if the lineage has any
     # live fills, otherwise the latest paper snapshot) so the lineup stays in
     # sync with 最新持仓 across the whole rebalance cadence.
     holdings = _current_lineage_holdings(
         collections, finance_collections, data_collections, plan, user_id
     )
+    _mark("holdings")
     payload = _build_plan_bench_payload(
         plan,
         holdings,
         bench_multiplier=bench_multiplier,
         data_collections=data_collections,
     )
+    _mark("bench_payload")
     payload = _enrich_bench_payload_with_llm_risk(plan=plan, payload=payload, user_id=user_id)
+    _mark("llm_risk")
+
+    total_elapsed = time.perf_counter() - started_at
+    threshold = float(os.getenv("PORTFOLIO_PLAN_DETAIL_TIMING_SECONDS", "1"))
+    if total_elapsed >= threshold:
+        previous = 0.0
+        parts = []
+        for label, elapsed in marks:
+            parts.append(f"{label}={elapsed - previous:.3f}s")
+            previous = elapsed
+        log.warning(
+            "Portfolio plan bench timing total=%.3fs plan_id=%s holdings=%d %s",
+            total_elapsed,
+            plan_id,
+            len(holdings),
+            " ".join(parts),
+        )
     return {"success": True, "data": _jsonable(payload)}
 
 
@@ -6475,6 +6500,12 @@ def _build_lineage_timeline_payload(
     limit: int = 60,
     offset: int = 0,
 ) -> Dict[str, Any]:
+    started_at = time.perf_counter()
+    marks: List[tuple[str, float]] = []
+
+    def _mark(label: str) -> None:
+        marks.append((label, time.perf_counter() - started_at))
+
     lineage_query = _lineage_query_for_plan(
         trading_collections,
         plan,
@@ -6494,6 +6525,7 @@ def _build_lineage_timeline_payload(
     )
     if not plans:
         raise HTTPException(status_code=404, detail="lineage plans not found")
+    _mark("load_plans")
 
     latest_plan = plans[0]
     # record_kind is the authoritative type (stamped at write time). External
@@ -6524,6 +6556,7 @@ def _build_lineage_timeline_payload(
         (row for row in plans if require_record_kind(row) == RECORD_KIND_OBSERVATION),
         None,
     )
+    _mark("picks")
     lineage_control = _get_lineage_control_doc(
         trading_collections,
         str(latest_plan.get("strategy_template_id") or ""),
@@ -6545,6 +6578,7 @@ def _build_lineage_timeline_payload(
         live_account_id = _lineage_live_account_id_from_signals(
             trading_collections, finance_collections, latest_plan, user_id
         )
+    _mark("venue_account")
 
     drift_plan = cadence_plan
     drift_items = list(
@@ -6569,11 +6603,13 @@ def _build_lineage_timeline_payload(
             "base_date": drift_plan.get("base_date"),
         }
     )
+    _mark("drift")
 
     total = len(plans)
     page_plans = plans[offset : offset + limit]
     page_plan_ids = [str(row.get("plan_id")) for row in page_plans if row.get("plan_id")]
     page_items_by_plan = _timeline_items_by_plan(trading_collections, page_plan_ids, user_id)
+    _mark("page_items")
     timeline: List[Dict[str, Any]] = []
     for row in page_plans:
         record_kind = require_record_kind(row)
@@ -6600,6 +6636,29 @@ def _build_lineage_timeline_payload(
                 "drift_brief": drift_brief,
             }
         )
+    _mark("nodes")
+
+    current_cycle = _compute_current_cycle(
+        cadence_plan, latest_rebalance, latest_monitor, data_collections
+    )
+    _mark("current_cycle")
+
+    total_elapsed = time.perf_counter() - started_at
+    threshold = float(os.getenv("PORTFOLIO_PLAN_DETAIL_TIMING_SECONDS", "1"))
+    if total_elapsed >= threshold:
+        previous = 0.0
+        parts = []
+        for label, elapsed in marks:
+            parts.append(f"{label}={elapsed - previous:.3f}s")
+            previous = elapsed
+        log.warning(
+            "Lineage timeline timing total=%.3fs plan_id=%s plans=%d page=%d %s",
+            total_elapsed,
+            plan.get("plan_id"),
+            total,
+            len(page_plans),
+            " ".join(parts),
+        )
 
     return {
         "portfolio_identity": {
@@ -6621,9 +6680,7 @@ def _build_lineage_timeline_payload(
             "today_state": _plan_today_state_label(headline_plan),
             "action_required": _plan_action_required(headline_plan),
         },
-        "current_cycle": _compute_current_cycle(
-            cadence_plan, latest_rebalance, latest_monitor, data_collections
-        ),
+        "current_cycle": current_cycle,
         "today_state": _plan_today_state_label(headline_plan),
         "action_required": _plan_action_required(headline_plan),
         "latest_drift_summary": latest_drift_summary,
