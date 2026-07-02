@@ -99,6 +99,19 @@ def _expected_indexes() -> List[ExpectedIndex]:
         ),
         ExpectedIndex(
             "trading",
+            "portfolio_trade_plans",
+            [
+                ("user_id", ASCENDING),
+                ("strategy_template_id", ASCENDING),
+                ("params_hash", ASCENDING),
+                ("base_date", DESCENDING),
+                ("created_at", DESCENDING),
+            ],
+            "lineage_plans_user_strategy_params_base_created_desc",
+            "lineage timeline lookup sorted by base_date and created_at",
+        ),
+        ExpectedIndex(
+            "trading",
             "portfolio_trade_plan_items",
             [("plan_id", ASCENDING), ("user_id", ASCENDING), ("rank", ASCENDING)],
             "plan_user_rank_1",
@@ -189,6 +202,18 @@ def _expected_indexes() -> List[ExpectedIndex]:
             "trade_signals",
             [
                 ("user_id", ASCENDING),
+                ("plan_id", ASCENDING),
+                ("mode", ASCENDING),
+                ("created_at", ASCENDING),
+            ],
+            "trade_signals_user_plan_mode_created_asc",
+            "lineage live signal lookup sorted by created_at",
+        ),
+        ExpectedIndex(
+            "finance",
+            "trade_signals",
+            [
+                ("user_id", ASCENDING),
                 ("mode", ASCENDING),
                 ("securities_account_id", ASCENDING),
                 ("created_at", DESCENDING),
@@ -228,6 +253,13 @@ def _expected_indexes() -> List[ExpectedIndex]:
         ExpectedIndex(
             "finance",
             "trade_executions",
+            [("user_id", ASCENDING), ("order_id", ASCENDING), ("timestamp", ASCENDING)],
+            "trade_exec_user_order_timestamp_asc",
+            "lineage execution lookup by order ids sorted by timestamp",
+        ),
+        ExpectedIndex(
+            "finance",
+            "trade_executions",
             [("user_id", ASCENDING), ("timestamp", DESCENDING)],
             "trade_exec_user_timestamp_desc",
             "trade execution/activity list by user sorted by timestamp",
@@ -250,6 +282,27 @@ def _expected_indexes() -> List[ExpectedIndex]:
             ],
             "trade_exec_user_account_status_timestamp_desc",
             "trader execution list by account and status sorted by timestamp",
+        ),
+        ExpectedIndex(
+            "finance",
+            "trade_executions",
+            [("user_id", ASCENDING), ("securities_account_id", ASCENDING), ("timestamp", ASCENDING)],
+            "trade_exec_user_account_timestamp_asc",
+            "account-level ledger reconstruction sorted by timestamp",
+        ),
+        ExpectedIndex(
+            "finance",
+            "trader_account_equity",
+            [("user_id", ASCENDING), ("securities_account_id", ASCENDING), ("date", ASCENDING)],
+            "trader_account_equity_user_account_date",
+            "lineage live equity chart by account and date",
+        ),
+        ExpectedIndex(
+            "trading",
+            "portfolio_live_equity",
+            [("user_id", ASCENDING), ("plan_id", ASCENDING), ("date", ASCENDING)],
+            "portfolio_live_equity_user_plan_date",
+            "legacy live equity chart by plan ids and date",
         ),
         ExpectedIndex(
             "finance",

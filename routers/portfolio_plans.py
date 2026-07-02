@@ -412,12 +412,22 @@ def _lineage_plan_ids_for_plan(collections: Dict[str, Any], plan: Dict[str, Any]
     return sorted(plan_ids)
 
 
-def _lineage_query_for_plan(collections: Dict[str, Any], plan: Dict[str, Any], user_id: str) -> Dict[str, Any]:
+def _lineage_query_for_plan(
+    collections: Dict[str, Any],
+    plan: Dict[str, Any],
+    user_id: str,
+    *,
+    include_plan_id_fallback: bool = True,
+) -> Dict[str, Any]:
     query: Dict[str, Any] = {
         "strategy_template_id": plan.get("strategy_template_id"),
         "user_id": user_id,
     }
     params_hash = plan.get("params_hash")
+    if params_hash and not include_plan_id_fallback:
+        query["params_hash"] = params_hash
+        return query
+
     plan_ids = _lineage_plan_ids_for_plan(collections, plan, user_id)
     branches = []
     if params_hash:
@@ -477,7 +487,27 @@ def _lineage_live_signal_execution_bundle(
     }
     signals = list(
         finance_collections["trade_signals"]
-        .find(signal_query)
+        .find(
+            signal_query,
+            {
+                "_id": 0,
+                "order_id": 1,
+                "plan_id": 1,
+                "user_id": 1,
+                "mode": 1,
+                "symbol": 1,
+                "name": 1,
+                "stock_name": 1,
+                "action": 1,
+                "size": 1,
+                "status": 1,
+                "securities_account_id": 1,
+                "created_at": 1,
+                "updated_at": 1,
+                "timestamp": 1,
+                "signal_time": 1,
+            },
+        )
         .sort("created_at", 1)
     )
     order_ids = [row.get("order_id") for row in signals if row.get("order_id")]
@@ -485,7 +515,38 @@ def _lineage_live_signal_execution_bundle(
         return lineage_ids, signals, []
     executions = list(
         finance_collections["trade_executions"]
-        .find({"user_id": user_id, "order_id": {"$in": order_ids}})
+        .find(
+            {"user_id": user_id, "order_id": {"$in": order_ids}},
+            {
+                "_id": 0,
+                "order_id": 1,
+                "plan_id": 1,
+                "user_id": 1,
+                "securities_account_id": 1,
+                "symbol": 1,
+                "name": 1,
+                "stock_name": 1,
+                "side": 1,
+                "action": 1,
+                "status": 1,
+                "execution_status": 1,
+                "filled_size": 1,
+                "filled_qty": 1,
+                "quantity": 1,
+                "size": 1,
+                "filled_price": 1,
+                "traded_price": 1,
+                "avg_price": 1,
+                "price": 1,
+                "target_price": 1,
+                "total_fee": 1,
+                "commission": 1,
+                "fee": 1,
+                "timestamp": 1,
+                "created_at": 1,
+                "updated_at": 1,
+            },
+        )
         .sort("timestamp", 1)
     )
     return lineage_ids, signals, executions
@@ -2629,13 +2690,54 @@ def _account_level_live_holdings(
     securities_account_id: str,
 ) -> List[Dict[str, Any]]:
     """Net live positions for the whole securities account (all live plans)."""
+    execution_projection = {
+        "_id": 0,
+        "order_id": 1,
+        "user_id": 1,
+        "securities_account_id": 1,
+        "symbol": 1,
+        "name": 1,
+        "stock_name": 1,
+        "side": 1,
+        "action": 1,
+        "status": 1,
+        "execution_status": 1,
+        "filled_size": 1,
+        "filled_qty": 1,
+        "quantity": 1,
+        "size": 1,
+        "filled_price": 1,
+        "traded_price": 1,
+        "avg_price": 1,
+        "price": 1,
+        "target_price": 1,
+        "total_fee": 1,
+        "commission": 1,
+        "fee": 1,
+        "timestamp": 1,
+        "created_at": 1,
+    }
+    executions = list(
+        finance_collections["trade_executions"]
+        .find(
+            {"user_id": user_id, "securities_account_id": securities_account_id},
+            execution_projection,
+        )
+        .sort("timestamp", 1)
+    )
+    if executions:
+        return _holdings_from_executions(executions, data_collections)
+
+    # Legacy execution rows may lack securities_account_id. Fall back to the
+    # signal join only when the direct account-scoped execution query is empty.
     signals = list(
         finance_collections["trade_signals"].find(
             {
                 "user_id": user_id,
                 "mode": "live",
                 "securities_account_id": securities_account_id,
-            }
+            },
+            {"_id": 0, "order_id": 1},
         )
     )
     order_ids = [row.get("order_id") for row in signals if row.get("order_id")]
@@ -2643,7 +2745,7 @@ def _account_level_live_holdings(
         return []
     executions = list(
         finance_collections["trade_executions"]
-        .find({"user_id": user_id, "order_id": {"$in": order_ids}})
+        .find({"user_id": user_id, "order_id": {"$in": order_ids}}, execution_projection)
         .sort("timestamp", 1)
     )
     return _holdings_from_executions(executions, data_collections)
@@ -2775,7 +2877,8 @@ def _settling_symbol_keys(
                 "user_id": user_id,
                 "mode": "live",
                 "securities_account_id": securities_account_id,
-            }
+            },
+            {"_id": 0, "order_id": 1, "symbol": 1, "status": 1},
         )
     )
     if not signals:
@@ -2794,15 +2897,22 @@ def _settling_symbol_keys(
                 settling.add(key)
 
     executions_col = finance_collections.get("trade_executions")
-    if (
-        executions_col is not None
-        and order_ids
-        and isinstance(account_synced_at, (int, float))
-    ):
-        for ex in executions_col.find(
-            {"user_id": user_id, "order_id": {"$in": order_ids}},
-            {"_id": 0, "symbol": 1, "timestamp": 1},
-        ):
+    if executions_col is not None and isinstance(account_synced_at, (int, float)):
+        direct_query = {
+            "user_id": user_id,
+            "securities_account_id": securities_account_id,
+            "timestamp": {"$gt": account_synced_at},
+        }
+        direct_rows = list(executions_col.find(direct_query, {"_id": 0, "symbol": 1, "timestamp": 1}))
+        fallback_rows = []
+        if not direct_rows and order_ids:
+            fallback_rows = list(
+                executions_col.find(
+                    {"user_id": user_id, "order_id": {"$in": order_ids}},
+                    {"_id": 0, "symbol": 1, "timestamp": 1},
+                )
+            )
+        for ex in [*direct_rows, *fallback_rows]:
             ts = ex.get("timestamp")
             if isinstance(ts, (int, float)) and ts > account_synced_at:
                 key = _symbol_key(ex.get("symbol"))
@@ -2831,9 +2941,21 @@ def _reconcile_live_holdings(
     ``in_sync`` verdict, so an in-app add/reduce does not flash a false mismatch
     during the fill -> position-sync window.
     """
-    account_id = _lineage_live_account_id_from_fills(
-        trading_collections, finance_collections, plan, user_id
+    lineage_control = _get_lineage_control_doc(
+        trading_collections,
+        str(plan.get("strategy_template_id") or ""),
+        str(plan.get("params_hash") or ""),
+        user_id,
     )
+    account_id = str(lineage_control.get("securities_account_id") or "")
+    if not account_id and finance_collections.get("trade_signals") is not None:
+        account_id = _lineage_live_account_id_from_signals(
+            trading_collections, finance_collections, plan, user_id
+        )
+    if not account_id:
+        account_id = _lineage_live_account_id_from_fills(
+            trading_collections, finance_collections, plan, user_id
+        )
     if not account_id:
         return {"applicable": False, "in_sync": True, "diffs": [], "securities_account_id": ""}
 
@@ -5239,7 +5361,16 @@ def _lineage_live_signals(
         return []
     return list(
         finance_collections["trade_signals"]
-        .find({"user_id": user_id, "plan_id": {"$in": lineage_ids}, "mode": "live"})
+        .find(
+            {"user_id": user_id, "plan_id": {"$in": lineage_ids}, "mode": "live"},
+            {
+                "_id": 0,
+                "plan_id": 1,
+                "order_id": 1,
+                "securities_account_id": 1,
+                "created_at": 1,
+            },
+        )
         .sort("created_at", 1)
     )
 
@@ -5251,7 +5382,15 @@ def _lineage_has_live_signals(
     user_id: str,
 ) -> bool:
     """True when any plan in the lineage has been published to live trading."""
-    return bool(_lineage_live_signals(trading_collections, finance_collections, plan, user_id))
+    lineage_ids = _lineage_plan_ids_for_plan(trading_collections, plan, user_id)
+    if not lineage_ids:
+        return False
+    return bool(
+        finance_collections["trade_signals"].find_one(
+            {"user_id": user_id, "plan_id": {"$in": lineage_ids}, "mode": "live"},
+            {"_id": 1},
+        )
+    )
 
 
 def _lineage_live_account_id_from_signals(
@@ -5260,6 +5399,14 @@ def _lineage_live_account_id_from_signals(
     plan: Dict[str, Any],
     user_id: str,
 ) -> str:
+    control = _get_lineage_control_doc(
+        trading_collections,
+        str(plan.get("strategy_template_id") or ""),
+        str(plan.get("params_hash") or ""),
+        user_id,
+    )
+    if control.get("securities_account_id"):
+        return str(control.get("securities_account_id") or "")
     for signal in reversed(_lineage_live_signals(trading_collections, finance_collections, plan, user_id)):
         account_id = str(signal.get("securities_account_id") or "")
         if account_id:
@@ -5293,11 +5440,16 @@ def _portfolio_execution_venue(
     after a fill is reported back — otherwise a placed-but-unfilled live order
     would be misclassified as paper and vanish from the live overview.
     """
-    if _lineage_has_live_signals(
-        trading_collections, finance_collections, plan, user_id
-    ) or _lineage_has_live_fills(trading_collections, finance_collections, plan, user_id):
-        return "live"
-    return "paper"
+    control = _get_lineage_control_doc(
+        trading_collections,
+        str(plan.get("strategy_template_id") or ""),
+        str(plan.get("params_hash") or ""),
+        user_id,
+    )
+    stored = control.get("execution_venue")
+    if stored in {"live", "paper"}:
+        return str(stored)
+    return "live" if _lineage_has_live_signals(trading_collections, finance_collections, plan, user_id) else "paper"
 
 
 def _portfolio_param_summary(params_snapshot: Optional[Dict[str, Any]]) -> str:
@@ -6011,7 +6163,12 @@ def _build_lineage_timeline_payload(
     limit: int = 60,
     offset: int = 0,
 ) -> Dict[str, Any]:
-    lineage_query = _lineage_query_for_plan(trading_collections, plan, user_id)
+    lineage_query = _lineage_query_for_plan(
+        trading_collections,
+        plan,
+        user_id,
+        include_plan_id_fallback=False,
+    )
     projection = dict(PLAN_LIST_PROJECTION)
     projection["live_signals_published_at"] = 1
     projection["origin"] = 1
@@ -6055,12 +6212,27 @@ def _build_lineage_timeline_payload(
         (row for row in plans if require_record_kind(row) == RECORD_KIND_OBSERVATION),
         None,
     )
-    execution_venue = _portfolio_execution_venue(
-        trading_collections, finance_collections, latest_plan, user_id
+    lineage_control = _get_lineage_control_doc(
+        trading_collections,
+        str(latest_plan.get("strategy_template_id") or ""),
+        str(latest_plan.get("params_hash") or ""),
+        user_id,
     )
-    live_account_id = _lineage_live_account_id_from_fills(
-        trading_collections, finance_collections, latest_plan, user_id
+    stored_venue = lineage_control.get("execution_venue")
+    has_live_signals = False
+    if stored_venue not in {"live", "paper"}:
+        has_live_signals = _lineage_has_live_signals(
+            trading_collections, finance_collections, latest_plan, user_id
+        )
+    execution_venue = resolve_execution_venue(
+        lineage_control,
+        has_live_signals=has_live_signals,
     )
+    live_account_id = str(lineage_control.get("securities_account_id") or "")
+    if execution_venue == "live" and not live_account_id:
+        live_account_id = _lineage_live_account_id_from_signals(
+            trading_collections, finance_collections, latest_plan, user_id
+        )
 
     drift_plan = cadence_plan
     drift_items = list(
@@ -6457,18 +6629,6 @@ def get_lineage_live_equity(
             }
         )
 
-    # One-book lineage equity: treat all live executions across the lineage as a
-    # single rolling portfolio (combo-scoped) so the headline equity does not reset
-    # to ``initial_capital`` each rebalance plan_id. This mirrors the generator's
-    # ``account_equity`` baseline reconstruction.
-    book_equity = _compute_lineage_book_equity(
-        trading_collections=trading_collections,
-        finance_collections=finance_collections,
-        data_collections=data_collections,
-        plan=plan,
-        user_id=user_id,
-    )
-
     if account_equity_rows:
         rows_for_chart = account_equity_rows
         row_source = "trader_account_equity"
@@ -6483,6 +6643,26 @@ def get_lineage_live_equity(
             "未找到该组合关联账户的 trader_account_equity 日快照，暂回退到旧的 "
             "portfolio_live_equity plan 级快照；建议先生成账户级每日权益快照。"
         )
+    latest_equity_row = rows_for_chart[-1] if rows_for_chart else {}
+    initial_capital = _lineage_initial_capital(plan)
+    current_equity = _numeric(latest_equity_row.get("equity"))
+    current_cash = _numeric(latest_equity_row.get("cash"))
+    current_market_value = _numeric(latest_equity_row.get("market_value"))
+    if row_source == "portfolio_live_equity_legacy":
+        current_equity = initial_capital
+        current_cash = initial_capital
+        current_market_value = 0.0
+    execution_count = 0 if row_source == "portfolio_live_equity_legacy" else None
+    current_book_equity = {
+        "equity": current_equity,
+        "cash": current_cash,
+        "market_value": current_market_value,
+        "initial_capital": initial_capital,
+        "lineage_plan_ids": lineage_ids,
+        "execution_count": execution_count,
+        "latest_price_update": latest_equity_row.get("updated_at"),
+        "source": row_source,
+    }
     return {
         "success": True,
         "data": _jsonable(
@@ -6496,7 +6676,7 @@ def get_lineage_live_equity(
                 "securities_account_ids": account_ids,
                 "source_plan_ids": plan_ids_in_data,
                 "legacy_plan_rows": enriched,
-                "current_book_equity": book_equity,
+                "current_book_equity": current_book_equity,
                 "caveat": caveat,
             }
         ),
