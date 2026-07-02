@@ -1266,12 +1266,44 @@ def _score_symbol_meta(
     return meta
 
 
+_RANKED_UNIVERSE_CACHE: Dict[tuple, tuple] = {}
+_RANKED_UNIVERSE_CACHE_LOCK = threading.Lock()
+_RANKED_UNIVERSE_TTL_SECONDS = float(os.getenv("RANKED_UNIVERSE_CACHE_TTL_SECONDS", "600"))
+
+
+def _ranked_universe_cache_key(score_date: str, universe_index: str, config: Dict[str, Any]) -> tuple:
+    return (
+        str(score_date),
+        str(universe_index),
+        str(config.get("score_type") or "growth_cycle_weighted"),
+        str(config.get("growth_weight", 0.3)),
+        str(config.get("cycle_weight", 0.7)),
+        str(config.get("score_column") or ""),
+    )
+
+
 def _build_ranked_score_universe(
     stock_scores,
     score_date: str,
     universe_index: str,
     config: Dict[str, Any],
 ) -> List[Dict[str, Any]]:
+    """Ranked universe for (score_date, universe, score config).
+
+    Fetching + ranking the full ~1100-row universe costs a variable 0.5-0.8s in
+    prod (the row transfer, not the 5ms server-side query), and it is recomputed
+    on every bench / live-overlay / plan-detail call even though the result is
+    identical for a given score_date and config. Cache it in-process with a short
+    TTL so only the first call per key pays the transfer. Callers only read the
+    returned rows, so sharing the cached list is safe.
+    """
+    key = _ranked_universe_cache_key(score_date, universe_index, config)
+    now = time.monotonic()
+    with _RANKED_UNIVERSE_CACHE_LOCK:
+        cached = _RANKED_UNIVERSE_CACHE.get(key)
+        if cached is not None and now - cached[0] < _RANKED_UNIVERSE_TTL_SECONDS:
+            return cached[1]
+
     rows = list(
         stock_scores.find(
             {"score_date": score_date, "index_codes": universe_index},
@@ -1295,6 +1327,15 @@ def _build_ranked_score_universe(
     ranked.sort(key=lambda item: (-item["score_value"], item["symbol"]))
     for idx, row in enumerate(ranked, start=1):
         row["rank"] = idx
+
+    with _RANKED_UNIVERSE_CACHE_LOCK:
+        _RANKED_UNIVERSE_CACHE[key] = (now, ranked)
+        if len(_RANKED_UNIVERSE_CACHE) > 64:
+            for stale_key in [
+                k for k, (ts, _) in _RANKED_UNIVERSE_CACHE.items()
+                if now - ts >= _RANKED_UNIVERSE_TTL_SECONDS
+            ]:
+                _RANKED_UNIVERSE_CACHE.pop(stale_key, None)
     return ranked
 
 
