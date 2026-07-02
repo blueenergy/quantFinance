@@ -94,6 +94,14 @@ class _Collection:
     def count_documents(self, query=None):
         return len(self.find(query or {}))
 
+    def distinct(self, key, query=None):
+        seen = []
+        for doc in self.find(query or {}):
+            value = self._get_value(doc, key)
+            if value not in seen:
+                seen.append(value)
+        return seen
+
     def _get_value(self, doc, key):
         value = doc
         for part in str(key).split("."):
@@ -3311,6 +3319,70 @@ def test_list_portfolios_treats_unfilled_live_signals_as_live(monkeypatch):
     assert len(ports) == 1
     assert ports[0]["execution_venue"] == "live"
     assert ports[0]["securities_account_id"] == "acct-1"
+
+
+class _RaisingSignalCollection(_Collection):
+    """Signals collection that fails if scanned, proving the caller reads the
+    materialized lineage control instead of replaying signals/executions."""
+
+    def find(self, query=None, projection=None):
+        raise AssertionError("signals must not be scanned when control is materialized")
+
+    def distinct(self, key, query=None):
+        raise AssertionError("signals must not be distinct-scanned when control is materialized")
+
+
+def test_list_portfolios_reads_venue_and_account_from_control_without_replay(monkeypatch):
+    cols = _collections()
+    fin = _finance_collections()
+    data = _data_collections()
+    cols["portfolio_trade_plans"] = _Collection(
+        [
+            {"plan_id": "pl1", "strategy_template_id": "stc", "user_id": "user-1", "base_date": "20250101", "status": "approved", "params_hash": "hc", "record_kind": "trade_plan"},
+        ]
+    )
+    cols["portfolio_lineage_controls"] = _Collection(
+        [
+            {"user_id": "user-1", "strategy_template_id": "stc", "params_hash": "hc", "execution_venue": "live", "securities_account_id": "acct-mat"},
+        ]
+    )
+    fin["trade_signals"] = _RaisingSignalCollection()
+    fin["trade_executions"] = _FailingFindCollection()
+    _patch_lineage_live_env(monkeypatch, cols, fin, data)
+    resp = asyncio.run(portfolio_plans.list_portfolios(current_user={"id": "user-1"}))
+    ports = resp["data"]["portfolios"]
+    assert len(ports) == 1
+    assert ports[0]["execution_venue"] == "live"
+    assert ports[0]["securities_account_id"] == "acct-mat"
+
+
+def test_lineage_has_live_fills_uses_existence_probe(monkeypatch):
+    cols = _collections()
+    fin = _finance_collections()
+    cols["portfolio_trade_plans"] = _Collection(
+        [{"plan_id": "pl1", "strategy_template_id": "stf", "user_id": "user-1", "base_date": "20250101", "params_hash": "hf"}]
+    )
+    fin["trade_signals"].docs = [{"order_id": "o1", "user_id": "user-1", "mode": "live", "plan_id": "pl1"}]
+    fin["trade_executions"].docs = [{"order_id": "o1", "user_id": "user-1", "filled_size": 100}]
+    plan = {"plan_id": "pl1", "strategy_template_id": "stf", "params_hash": "hf"}
+    assert portfolio_plans._lineage_has_live_fills(cols, fin, plan, "user-1") is True
+    fin["trade_executions"].docs = [{"order_id": "o1", "user_id": "user-1", "filled_size": 0}]
+    assert portfolio_plans._lineage_has_live_fills(cols, fin, plan, "user-1") is False
+
+
+def test_lineage_live_account_id_prefers_control(monkeypatch):
+    cols = _collections()
+    fin = _finance_collections()
+    cols["portfolio_trade_plans"] = _Collection(
+        [{"plan_id": "pl1", "strategy_template_id": "sta", "user_id": "user-1", "base_date": "20250101", "params_hash": "ha"}]
+    )
+    cols["portfolio_lineage_controls"] = _Collection(
+        [{"user_id": "user-1", "strategy_template_id": "sta", "params_hash": "ha", "securities_account_id": "acct-ctrl"}]
+    )
+    fin["trade_signals"] = _RaisingSignalCollection()
+    fin["trade_executions"] = _FailingFindCollection()
+    plan = {"plan_id": "pl1", "strategy_template_id": "sta", "params_hash": "ha"}
+    assert portfolio_plans._lineage_live_account_id_from_fills(cols, fin, plan, "user-1") == "acct-ctrl"
 
 
 def test_lineage_paper_positions_uses_latest_snapshot(monkeypatch):

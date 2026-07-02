@@ -205,3 +205,36 @@ def test_probe_stale_detects_newer_execution():
     finance["trade_executions"].docs[0]["updated_at"] = "2025-01-01T10:00:00"
     finance["trade_executions"].docs[0]["timestamp"] = 1.0
     assert probe_stale(finance, snapshot) is False
+
+
+def test_probe_stale_ignores_execution_count_when_watermark_current():
+    # Count differs from the watermark (e.g. a rare deletion) but the latest
+    # execution is not newer: we intentionally skip the expensive full-account
+    # count_documents and treat the snapshot as fresh (EOD rebuild reconciles).
+    snapshot = {
+        "user_id": "user-1",
+        "securities_account_id": "acct-1",
+        "watermark": {
+            "execution_count": 5,
+            "last_execution_updated_at": "2025-01-01T10:00:00",
+            "max_execution_ts": 1.0,
+        },
+    }
+
+    class _NoCountCollection(_Collection):
+        def count_documents(self, query=None):
+            raise AssertionError("probe_stale must not run a full-account count")
+
+    finance = {
+        "trade_executions": _NoCountCollection(
+            [
+                {
+                    "user_id": "user-1",
+                    "securities_account_id": "acct-1",
+                    "updated_at": "2025-01-01T10:00:00",
+                    "timestamp": 1.0,
+                }
+            ]
+        )
+    }
+    assert probe_stale(finance, snapshot) is False

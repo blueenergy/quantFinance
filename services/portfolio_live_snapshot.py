@@ -240,10 +240,11 @@ def probe_stale(
     if isinstance(ts, (int, float)) and float(ts) > max_ts:
         return True
 
-    current_count = executions.count_documents(
-        {"user_id": user_id, "securities_account_id": account_id},
-    )
-    return current_count != int(watermark.get("execution_count") or 0)
+    # Any insert/update bumps updated_at/timestamp, both compared above. We
+    # deliberately skip a full-account count_documents here: it scanned the
+    # whole account on every snapshot read and only guarded against deletions,
+    # which the EOD rebuild reconciles anyway.
+    return False
 
 
 def overlay_realtime(

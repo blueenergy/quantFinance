@@ -58,6 +58,8 @@ from services.portfolio_lineage_paper import (
     merge_lineage_paper_executions,
 )
 from services.portfolio_lineage_state import (
+    EXECUTION_VENUE_LIVE,
+    VALID_EXECUTION_VENUES,
     mark_lineage_live,
     resolve_execution_venue,
 )
@@ -4146,13 +4148,15 @@ async def enqueue_portfolio_holdings_risk(plan_id: str, current_user: dict = Dep
     snapshot = _latest_lineage_paper_snapshot(collections, plan, user_id)
     positions = [row for row in (snapshot.get("positions") or []) if _int_value(row.get("shares")) > 0]
     base_date = _normalize_yyyymmdd(snapshot.get("as_of_date")) or _normalize_yyyymmdd(plan.get("base_date"))
-    if not positions and _lineage_has_live_fills(collections, finance_collections, plan, user_id):
-        _, _, executions = _lineage_live_signal_execution_bundle(collections, finance_collections, plan, user_id)
-        grouped = group_executions_by_order(executions)
-        symbols = sorted({str(row.get("symbol")) for row in grouped if row.get("symbol")})
-        prices, _ = _load_fresh_market_prices(data_collections, symbols)
-        live_payload = build_lineage_live_positions(grouped, prices)
-        positions = [row for row in (live_payload.get("positions") or []) if _int_value(row.get("shares")) > 0]
+    if not positions:
+        # Serve live holdings from the materialized snapshot (build-on-miss)
+        # instead of replaying the lineage signals/executions bundle here.
+        _snapshot, overlay = _load_snapshot_with_realtime(
+            collections, finance_collections, data_collections, plan, user_id
+        )
+        positions = [
+            row for row in (overlay.get("positions") or []) if _int_value(row.get("shares")) > 0
+        ]
     if not base_date:
         base_date = datetime.now().strftime("%Y%m%d")
     control = _get_lineage_control_doc(
@@ -5491,12 +5495,45 @@ def _lineage_has_live_fills(
     plan: Dict[str, Any],
     user_id: str,
 ) -> bool:
-    """True when the lineage has at least one live fill in trade_executions."""
+    """True when the lineage has at least one live fill in trade_executions.
 
-    _lineage_ids, _signals, executions = _lineage_live_signal_execution_bundle(
-        trading_collections, finance_collections, plan, user_id
+    Existence-only: resolve the lineage's live ``order_id`` set via a server-side
+    ``distinct`` and probe ``trade_executions`` with a bounded ``find_one`` instead
+    of replaying the full signals+executions bundle just to derive a boolean.
+    """
+
+    lineage_ids = _lineage_plan_ids_for_plan(trading_collections, plan, user_id)
+    if not lineage_ids:
+        return False
+    signals_col = finance_collections.get("trade_signals")
+    executions_col = finance_collections.get("trade_executions")
+    if signals_col is None or executions_col is None:
+        return False
+    order_ids = [
+        oid
+        for oid in signals_col.distinct(
+            "order_id",
+            {"user_id": user_id, "plan_id": {"$in": lineage_ids}, "mode": "live"},
+        )
+        if oid
+    ]
+    if not order_ids:
+        return False
+    return (
+        executions_col.find_one(
+            {
+                "user_id": user_id,
+                "order_id": {"$in": order_ids},
+                "$or": [
+                    {"filled_size": {"$gt": 0}},
+                    {"quantity": {"$gt": 0}},
+                    {"filled_qty": {"$gt": 0}},
+                ],
+            },
+            {"_id": 1},
+        )
+        is not None
     )
-    return any(_execution_fill_quantity(row) > 0 for row in executions)
 
 
 def _lineage_live_signals(
@@ -5569,12 +5606,66 @@ def _lineage_live_account_id_from_fills(
     plan: Dict[str, Any],
     user_id: str,
 ) -> str:
-    """Prefer the securities account tied to signals that actually received fills."""
+    """Prefer the securities account tied to signals that actually received fills.
 
-    _lineage_ids, signals, executions = _lineage_live_signal_execution_bundle(
-        trading_collections, finance_collections, plan, user_id
+    Read the materialized ``portfolio_lineage_controls.securities_account_id``
+    first; only when it is missing do we probe the latest execution/signal that
+    carries an account id (single ``find_one`` each), instead of replaying the
+    whole lineage bundle just to pull one string.
+    """
+
+    control = _get_lineage_control_doc(
+        trading_collections,
+        str(plan.get("strategy_template_id") or ""),
+        str(plan.get("params_hash") or ""),
+        user_id,
     )
-    return _account_id_from_filled_signals(signals, executions)
+    if control.get("securities_account_id"):
+        return str(control.get("securities_account_id") or "")
+
+    lineage_ids = _lineage_plan_ids_for_plan(trading_collections, plan, user_id)
+    if not lineage_ids:
+        return ""
+    signals_col = finance_collections.get("trade_signals")
+    executions_col = finance_collections.get("trade_executions")
+    order_ids = (
+        [
+            oid
+            for oid in signals_col.distinct(
+                "order_id",
+                {"user_id": user_id, "plan_id": {"$in": lineage_ids}, "mode": "live"},
+            )
+            if oid
+        ]
+        if signals_col is not None
+        else []
+    )
+    if executions_col is not None and order_ids:
+        latest_exec = executions_col.find_one(
+            {
+                "user_id": user_id,
+                "order_id": {"$in": order_ids},
+                "securities_account_id": {"$nin": ["", None]},
+            },
+            {"_id": 0, "securities_account_id": 1},
+            sort=[("timestamp", -1)],
+        )
+        if latest_exec and latest_exec.get("securities_account_id"):
+            return str(latest_exec.get("securities_account_id"))
+    if signals_col is not None:
+        latest_signal = signals_col.find_one(
+            {
+                "user_id": user_id,
+                "plan_id": {"$in": lineage_ids},
+                "mode": "live",
+                "securities_account_id": {"$nin": ["", None]},
+            },
+            {"_id": 0, "securities_account_id": 1},
+            sort=[("created_at", -1)],
+        )
+        if latest_signal and latest_signal.get("securities_account_id"):
+            return str(latest_signal.get("securities_account_id"))
+    return ""
 
 
 def _portfolio_execution_venue(
@@ -5862,54 +5953,12 @@ def _list_portfolios_payload(
     if not groups:
         return []
 
-    plan_ids = sorted(plan_group_by_id)
     strategy_template_ids = sorted({key[0] for key in groups})
     params_hashes = sorted({key[1] for key in groups})
 
-    signals_by_group: Dict[tuple, List[Dict[str, Any]]] = defaultdict(list)
-    executions_by_group: Dict[tuple, List[Dict[str, Any]]] = defaultdict(list)
-    if plan_ids:
-        signals = list(
-            finance_collections["trade_signals"].find(
-                {"user_id": user_id, "plan_id": {"$in": plan_ids}, "mode": "live"},
-                {
-                    "_id": 0,
-                    "plan_id": 1,
-                    "order_id": 1,
-                    "securities_account_id": 1,
-                    "created_at": 1,
-                },
-            )
-        )
-        order_group_by_id: Dict[str, tuple] = {}
-        for signal in signals:
-            key = plan_group_by_id.get(str(signal.get("plan_id") or ""))
-            if not key:
-                continue
-            signals_by_group[key].append(signal)
-            if signal.get("order_id"):
-                order_group_by_id[str(signal.get("order_id"))] = key
-        for rows in signals_by_group.values():
-            rows.sort(key=lambda row: str(row.get("created_at") or ""))
-
-        order_ids = sorted(order_group_by_id)
-        if order_ids:
-            executions = list(
-                finance_collections["trade_executions"].find(
-                    {"user_id": user_id, "order_id": {"$in": order_ids}},
-                    {
-                        "_id": 0,
-                        "order_id": 1,
-                        "filled_size": 1,
-                        "quantity": 1,
-                        "filled_qty": 1,
-                    },
-                )
-            )
-            for execution in executions:
-                key = order_group_by_id.get(str(execution.get("order_id") or ""))
-                if key:
-                    executions_by_group[key].append(execution)
+    group_plan_ids: Dict[tuple, List[str]] = defaultdict(list)
+    for pid, key in plan_group_by_id.items():
+        group_plan_ids[key].append(pid)
 
     lineage_control_by_group: Dict[tuple, Dict[str, Any]] = {}
     controls_coll = trading_collections.get("portfolio_lineage_controls")
@@ -5932,34 +5981,66 @@ def _list_portfolios_payload(
             if key in groups:
                 lineage_control_by_group[key] = control
 
+    # Live-ness comes from the materialized execution_venue; only lineages whose
+    # control lacks a definitive venue (pre-backfill) need a probe, resolved for
+    # all of them at once via a single server-side distinct instead of pulling
+    # every live signal/execution just to compute a boolean + account id.
+    signals_col = finance_collections.get("trade_signals")
+    venue_by_group: Dict[tuple, str] = {}
+    groups_needing_probe: List[tuple] = []
+    for key in groups:
+        stored = (lineage_control_by_group.get(key) or {}).get("execution_venue")
+        if stored in VALID_EXECUTION_VENUES:
+            venue_by_group[key] = str(stored)
+        else:
+            groups_needing_probe.append(key)
+
+    live_plan_ids: set = set()
+    if groups_needing_probe and signals_col is not None:
+        probe_plan_ids = [pid for key in groups_needing_probe for pid in group_plan_ids.get(key, [])]
+        if probe_plan_ids:
+            live_plan_ids = {
+                str(pid)
+                for pid in signals_col.distinct(
+                    "plan_id",
+                    {"user_id": user_id, "plan_id": {"$in": probe_plan_ids}, "mode": "live"},
+                )
+                if pid
+            }
+
     portfolios: List[Dict[str, Any]] = []
     for (strategy_template_id, params_hash), all_lineage in groups.items():
-        sample_plan = dict(all_lineage[0])
-        sample_plan["strategy_template_id"] = strategy_template_id
-        sample_plan["params_hash"] = params_hash
-        signals = signals_by_group.get((strategy_template_id, params_hash), [])
-        executions = executions_by_group.get((strategy_template_id, params_hash), [])
-        has_live = bool(signals)
+        key = (strategy_template_id, params_hash)
+        if key in venue_by_group:
+            has_live = venue_by_group[key] == EXECUTION_VENUE_LIVE
+        else:
+            has_live = any(pid in live_plan_ids for pid in group_plan_ids.get(key, []))
         has_paper = any(row.get("status") in PAPER_ACTIVE_STATUSES for row in all_lineage)
         if not has_live and not has_paper:
             continue
 
         latest = max(all_lineage, key=lambda row: str(row.get("base_date") or ""))
         earliest = min(all_lineage, key=lambda row: str(row.get("base_date") or ""))
-        sec_id = ""
-        if has_live:
-            sec_id = _account_id_from_filled_signals(signals, executions)
-            if not sec_id:
-                for signal in reversed(signals):
-                    sec_id = str(signal.get("securities_account_id") or "")
-                    if sec_id:
-                        break
-
-        params = dict(latest.get("params_snapshot") or {})
         lineage_control = lineage_control_by_group.get(
-            (strategy_template_id, params_hash),
+            key,
             {"paused": False, "excluded_symbols": []},
         )
+        sec_id = str(lineage_control.get("securities_account_id") or "")
+        if not sec_id and has_live and signals_col is not None:
+            latest_signal = signals_col.find_one(
+                {
+                    "user_id": user_id,
+                    "plan_id": {"$in": group_plan_ids.get(key, [])},
+                    "mode": "live",
+                    "securities_account_id": {"$nin": ["", None]},
+                },
+                {"_id": 0, "securities_account_id": 1},
+                sort=[("created_at", -1)],
+            )
+            if latest_signal:
+                sec_id = str(latest_signal.get("securities_account_id") or "")
+
+        params = dict(latest.get("params_snapshot") or {})
         execution_venue = resolve_execution_venue(lineage_control, has_live_signals=has_live)
 
         portfolios.append(
