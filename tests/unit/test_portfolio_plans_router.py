@@ -2295,6 +2295,43 @@ def test_plan_detail_fills_missing_item_metadata_from_score_snapshot(monkeypatch
     assert item["rank"] is None
 
 
+def test_score_snapshot_batch_falls_back_to_any_index(monkeypatch):
+    # One symbol is scored under the plan's universe; another only exists under
+    # a different index. The batched lookup must resolve both (universe-scoped
+    # first, then the any-index fallback) without per-symbol round-trips.
+    plan = {
+        "plan_id": "p-fallback",
+        "score_date": "20250102",
+        "params_snapshot": {
+            "universe_index": "csi1000",
+            "score_type": "growth_cycle_weighted",
+            "growth_weight": 0.3,
+            "cycle_weight": 0.7,
+        },
+    }
+    items = [
+        {"symbol": "000001.SZ", "name": "", "industry": "", "score_value": None},
+        {"symbol": "600000.SH", "name": "", "industry": "", "score_value": None},
+    ]
+    score_rows = _Collection(
+        [
+            {"score_date": "20250102", "symbol": "000001.SZ", "index_codes": ["csi1000"], "name": "平安银行", "industry": "银行", "growth_score": 70.0, "cycle_score": 80.0},
+            {"score_date": "20250102", "symbol": "600000.SH", "index_codes": ["csi300"], "name": "浦发银行", "industry": "银行", "growth_score": 60.0, "cycle_score": 90.0},
+        ]
+    )
+    monkeypatch.setattr(portfolio_plans, "finance_db", {"stock_scores": score_rows})
+
+    enriched = portfolio_plans._enrich_plan_items_with_score_snapshot(
+        data_collections=_data_collections(),
+        plan=plan,
+        items=items,
+    )
+    by_symbol = {row["symbol"]: row for row in enriched}
+    assert by_symbol["000001.SZ"]["name"] == "平安银行"
+    assert by_symbol["600000.SH"]["name"] == "浦发银行"  # resolved via any-index fallback
+    assert by_symbol["600000.SH"]["industry"] == "银行"
+
+
 def test_paper_executed_plan_with_live_signals_prefers_live_context(monkeypatch):
     collections = _collections()
     collections["portfolio_trade_plans"].docs[0]["status"] = "executed_paper"

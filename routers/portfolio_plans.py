@@ -1250,49 +1250,56 @@ def _enrich_plan_items_with_score_snapshot(
     if not score_date or not symbols:
         return items
 
+    # Resolve all symbols in two batched `$in` queries instead of 2-3 find_one
+    # round-trips per symbol. Prefer rows scoped to the plan's universe index,
+    # then fall back (any index) for symbols still unresolved.
+    score_projection = {
+        "_id": 0,
+        "symbol": 1,
+        "name": 1,
+        "industry": 1,
+        "growth_score": 1,
+        "cycle_score": 1,
+        "composite_score": 1,
+    }
+    all_variants = sorted({value for symbol in symbols for value in _symbol_query_values(symbol)})
     stock_scores = finance_db["stock_scores"]
     score_rows: Dict[str, Dict[str, Any]] = {}
-    for symbol in symbols:
-        row = stock_scores.find_one(
+    if all_variants:
+        for row in stock_scores.find(
+            {"score_date": score_date, "symbol": {"$in": all_variants}, "index_codes": universe_index},
+            score_projection,
+        ):
+            key = _symbol_key(row.get("symbol"))
+            if key and key not in score_rows:
+                score_rows[key] = row
+        missing_variants = sorted(
             {
-                "score_date": score_date,
-                "symbol": {"$in": _symbol_query_values(symbol)},
-                "index_codes": universe_index,
-            },
-            {
-                "_id": 0,
-                "symbol": 1,
-                "name": 1,
-                "industry": 1,
-                "growth_score": 1,
-                "cycle_score": 1,
-                "composite_score": 1,
-            },
-        ) or stock_scores.find_one(
-            {"score_date": score_date, "symbol": {"$in": _symbol_query_values(symbol)}},
-            {
-                "_id": 0,
-                "symbol": 1,
-                "name": 1,
-                "industry": 1,
-                "growth_score": 1,
-                "cycle_score": 1,
-                "composite_score": 1,
-            },
+                value
+                for symbol in symbols
+                if _symbol_key(symbol) not in score_rows
+                for value in _symbol_query_values(symbol)
+            }
         )
-        if row:
-            score_rows[_symbol_key(symbol)] = row
+        if missing_variants:
+            for row in stock_scores.find(
+                {"score_date": score_date, "symbol": {"$in": missing_variants}},
+                score_projection,
+            ):
+                key = _symbol_key(row.get("symbol"))
+                if key and key not in score_rows:
+                    score_rows[key] = row
 
     stock_info_rows: Dict[str, Dict[str, Any]] = {}
     stock_info = data_collections.get("stock_info") if data_collections else None
-    if stock_info is not None:
-        for symbol in symbols:
-            row = stock_info.find_one(
-                {"symbol": {"$in": _symbol_query_values(symbol)}},
-                {"_id": 0, "symbol": 1, "name": 1, "industry": 1},
-            )
-            if row:
-                stock_info_rows[_symbol_key(symbol)] = row
+    if stock_info is not None and all_variants:
+        for row in stock_info.find(
+            {"symbol": {"$in": all_variants}},
+            {"_id": 0, "symbol": 1, "name": 1, "industry": 1},
+        ):
+            key = _symbol_key(row.get("symbol"))
+            if key and key not in stock_info_rows:
+                stock_info_rows[key] = row
 
     enriched: List[Dict[str, Any]] = []
     for item in items:

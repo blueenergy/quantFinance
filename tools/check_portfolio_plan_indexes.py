@@ -337,6 +337,21 @@ def _expected_indexes() -> List[ExpectedIndex]:
             "trader_accounts_user_account_synced_desc",
             "latest account snapshot lookup",
         ),
+        # finance: stock score snapshot lookups used by plan detail/overlay.
+        ExpectedIndex(
+            "finance",
+            "stock_scores",
+            [("index_codes", ASCENDING), ("score_date", DESCENDING)],
+            "stock_scores_index_codes_score_date_desc",
+            "latest/at-or-before score date and ranked universe by index",
+        ),
+        ExpectedIndex(
+            "finance",
+            "stock_scores",
+            [("score_date", ASCENDING), ("index_codes", ASCENDING), ("symbol", ASCENDING)],
+            "stock_scores_score_date_index_codes_symbol",
+            "batched per-symbol score snapshot lookup on plan detail",
+        ),
         # finance: dashboard data-pulse/home summary health checks.
         ExpectedIndex(
             "finance",
