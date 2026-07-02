@@ -130,6 +130,7 @@ def get_trading_db_collections() -> Dict[str, Collection]:
         "portfolio_research_results": trading_db["portfolio_research_results"],
         "portfolio_research_reviews": trading_db["portfolio_research_reviews"],
         "portfolio_lineage_controls": trading_db["portfolio_lineage_controls"],
+        "portfolio_live_snapshots": trading_db["portfolio_live_snapshots"],
     }
 
 def get_analyzer_db():

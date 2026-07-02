@@ -305,6 +305,25 @@ def _expected_indexes() -> List[ExpectedIndex]:
             "legacy live equity chart by plan ids and date",
         ),
         ExpectedIndex(
+            "trading",
+            "portfolio_live_snapshots",
+            [
+                ("user_id", ASCENDING),
+                ("strategy_template_id", ASCENDING),
+                ("params_hash", ASCENDING),
+            ],
+            "portfolio_live_snapshots_lineage_unique",
+            "materialized live lineage snapshot lookup",
+            unique=True,
+        ),
+        ExpectedIndex(
+            "finance",
+            "trade_executions",
+            [("user_id", ASCENDING), ("securities_account_id", ASCENDING), ("updated_at", DESCENDING)],
+            "trade_exec_user_account_updated_desc",
+            "live snapshot stale probe by account updated_at",
+        ),
+        ExpectedIndex(
             "finance",
             "trader_positions",
             [("user_id", ASCENDING), ("securities_account_id", ASCENDING), ("symbol", ASCENDING)],

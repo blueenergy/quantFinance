@@ -9,6 +9,7 @@ import functools
 import logging
 import math
 import os
+import threading
 import time
 import uuid
 
@@ -40,8 +41,17 @@ from services.live_equity import (
 )
 from services.portfolio_lineage_live import (
     build_lineage_live_positions,
-    build_lineage_live_trades,
-    merge_lineage_live_executions,
+)
+from services.portfolio_lineage_live_bundle import (
+    fetch_lineage_live_bundle,
+    lineage_plan_ids_for_plan as _lineage_plan_ids_for_plan,
+)
+from services.portfolio_live_snapshot import (
+    get_live_snapshot,
+    overlay_account_positions,
+    overlay_realtime,
+    probe_stale,
+    rebuild_live_snapshot_for_plan,
 )
 from services.portfolio_lineage_paper import (
     build_lineage_paper_trades,
@@ -394,22 +404,231 @@ def _require_plan(collections: Dict[str, Any], plan_id: str, current_user: Optio
     return plan
 
 
-def _lineage_plan_ids_for_plan(collections: Dict[str, Any], plan: Dict[str, Any], user_id: str) -> List[str]:
-    params_hash = plan.get("params_hash")
-    if not params_hash:
-        return [str(plan.get("plan_id"))] if plan.get("plan_id") else []
-    rows = collections["portfolio_trade_plans"].find(
-        {
-            "strategy_template_id": plan.get("strategy_template_id"),
-            "user_id": user_id,
-            "params_hash": params_hash,
-        },
-        {"_id": 0, "plan_id": 1},
+def _lineage_live_signal_execution_bundle(
+    trading_collections: Dict[str, Any],
+    finance_collections: Dict[str, Any],
+    plan: Dict[str, Any],
+    user_id: str,
+) -> Tuple[List[str], List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Live signals + raw executions for all plans in the same params_hash lineage."""
+
+    bundle = fetch_lineage_live_bundle(trading_collections, finance_collections, plan, user_id)
+    return bundle["lineage_ids"], bundle["signals"], bundle["executions"]
+
+
+def _load_snapshot_with_realtime(
+    trading_collections: Dict[str, Any],
+    finance_collections: Dict[str, Any],
+    data_collections: Dict[str, Any],
+    plan: Dict[str, Any],
+    user_id: str,
+    *,
+    schedule_rebuild_if_stale: bool = True,
+) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
+    """Read materialized snapshot and overlay realtime prices."""
+
+    strategy_template_id = str(plan.get("strategy_template_id") or "")
+    params_hash = str(plan.get("params_hash") or "")
+    snapshot = get_live_snapshot(
+        trading_collections,
+        user_id=user_id,
+        strategy_template_id=strategy_template_id,
+        params_hash=params_hash,
     )
-    plan_ids = {str(row.get("plan_id")) for row in rows if row.get("plan_id")}
-    if plan.get("plan_id"):
-        plan_ids.add(str(plan.get("plan_id")))
-    return sorted(plan_ids)
+    if snapshot is None:
+        snapshot = rebuild_live_snapshot_for_plan(
+            trading_collections, finance_collections, plan, user_id
+        )
+    elif schedule_rebuild_if_stale and probe_stale(finance_collections, snapshot):
+
+        def _rebuild() -> None:
+            try:
+                rebuild_live_snapshot_for_plan(
+                    trading_collections, finance_collections, plan, user_id
+                )
+            except Exception:
+                logging.getLogger(__name__).exception(
+                    "async snapshot rebuild failed for %s/%s",
+                    strategy_template_id,
+                    params_hash[:8] if params_hash else "",
+                )
+
+        threading.Thread(target=_rebuild, daemon=True).start()
+
+    if not snapshot:
+        return None, {}
+
+    symbols = sorted(
+        {
+            str(row.get("symbol"))
+            for row in (snapshot.get("positions") or [])
+            if row.get("symbol")
+        }
+    )
+    prices, realtime_docs = _load_fresh_market_prices(data_collections, symbols)
+    overlay = overlay_realtime(snapshot, prices, realtime_docs=realtime_docs)
+    return snapshot, overlay
+
+
+def _build_lineage_live_equity_chart(
+    trading_collections: Dict[str, Any],
+    finance_collections: Dict[str, Any],
+    plan: Dict[str, Any],
+    user_id: str,
+    plan_id: str,
+    *,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+) -> Dict[str, Any]:
+    lineage_ids = _lineage_plan_ids_for_plan(trading_collections, plan, user_id)
+    if not lineage_ids:
+        return {
+            "anchor_plan_id": plan_id,
+            "lineage_plan_ids": [],
+            "rows": [],
+            "caveat": "No lineage plan ids; equity curve unavailable.",
+        }
+
+    date_query: Dict[str, str] = {}
+    if start_date:
+        date_query["$gte"] = start_date.replace("-", "")
+    if end_date:
+        date_query["$lte"] = end_date.replace("-", "")
+
+    signal_rows = list(
+        finance_collections["trade_signals"].find(
+            {"user_id": user_id, "mode": "live", "plan_id": {"$in": lineage_ids}},
+            {"_id": 0, "securities_account_id": 1},
+        )
+    )
+    account_ids = sorted(
+        {
+            str(row.get("securities_account_id") or "")
+            for row in signal_rows
+            if str(row.get("securities_account_id") or "")
+        }
+    )
+
+    account_equity_rows: List[Dict[str, Any]] = []
+    if account_ids:
+        account_query: Dict[str, Any] = {
+            "user_id": user_id,
+            "securities_account_id": {"$in": account_ids},
+        }
+        if date_query:
+            account_query["date"] = date_query
+        raw_account_rows = list(
+            finance_collections["trader_account_equity"].find(account_query).sort("date", 1)
+        )
+        latest_by_account_date: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        for row in raw_account_rows:
+            date = str(row.get("date") or "")
+            account_id = str(row.get("securities_account_id") or "")
+            if not date or not account_id:
+                continue
+            key = (date, account_id)
+            existing = latest_by_account_date.get(key)
+            if existing is None or str(row.get("updated_at") or "") >= str(existing.get("updated_at") or ""):
+                latest_by_account_date[key] = row
+
+        daily_totals: Dict[str, Dict[str, Any]] = {}
+        for (date, account_id), row in latest_by_account_date.items():
+            bucket = daily_totals.setdefault(
+                date,
+                {
+                    "date": date,
+                    "source": "trader_account_equity",
+                    "account_ids": [],
+                    "equity": 0.0,
+                    "cash": 0.0,
+                    "market_value": 0.0,
+                    "available_cash": 0.0,
+                    "updated_at": "",
+                },
+            )
+            bucket["account_ids"].append(account_id)
+            bucket["equity"] += _numeric(row.get("total_asset", row.get("total_assets")))
+            bucket["cash"] += _numeric(row.get("cash"))
+            bucket["market_value"] += _numeric(row.get("market_value"))
+            bucket["available_cash"] += _numeric(row.get("available_cash"))
+            bucket["updated_at"] = max(str(bucket.get("updated_at") or ""), str(row.get("updated_at") or ""))
+
+        account_equity_rows = [
+            {
+                **row,
+                "account_ids": sorted(set(row.get("account_ids") or [])),
+                "equity": round(_numeric(row.get("equity")), 2),
+                "cash": round(_numeric(row.get("cash")), 2),
+                "market_value": round(_numeric(row.get("market_value")), 2),
+                "available_cash": round(_numeric(row.get("available_cash")), 2),
+            }
+            for row in sorted(daily_totals.values(), key=lambda r: str(r.get("date") or ""))
+        ]
+
+    query: Dict[str, Any] = {"user_id": user_id, "plan_id": {"$in": lineage_ids}}
+    if date_query:
+        query["date"] = date_query
+
+    equity_rows = list(trading_collections["portfolio_live_equity"].find(query).sort("date", 1))
+    latest_by_date: Dict[str, Dict[str, Any]] = {}
+    for row in equity_rows:
+        date = str(row.get("date") or "")
+        if not date:
+            continue
+        existing = latest_by_date.get(date)
+        if existing is None or str(row.get("updated_at") or "") >= str(existing.get("updated_at") or ""):
+            latest_by_date[date] = row
+
+    rows_sorted = sorted(latest_by_date.values(), key=lambda r: str(r.get("date") or ""))
+    plan_ids_in_data = sorted({row.get("plan_id") for row in rows_sorted if row.get("plan_id")})
+    plan_map = {
+        row.get("plan_id"): row
+        for row in trading_collections["portfolio_trade_plans"].find(
+            {"plan_id": {"$in": plan_ids_in_data}, "user_id": user_id},
+            {"_id": 0, "plan_id": 1, "base_date": 1, "plan_type": 1, "status": 1},
+        )
+    } if plan_ids_in_data else {}
+
+    enriched: List[Dict[str, Any]] = []
+    for row in rows_sorted:
+        src = plan_map.get(row.get("plan_id"), {})
+        enriched.append(
+            {
+                **row,
+                "source_plan_base_date": src.get("base_date"),
+                "source_plan_type": src.get("plan_type"),
+                "source_plan_status": src.get("status"),
+                "is_current_plan": row.get("plan_id") == plan_id,
+            }
+        )
+
+    if account_equity_rows:
+        rows_for_chart = account_equity_rows
+        row_source = "trader_account_equity"
+        caveat = (
+            "净值曲线使用该组合关联证券账户的每日总资产(total_asset)，按日期聚合；"
+            "横轴为交易日/自然日快照日期，纵轴为账户整体权益。"
+        )
+    else:
+        rows_for_chart = enriched
+        row_source = "portfolio_live_equity_legacy"
+        caveat = (
+            "未找到该组合关联账户的 trader_account_equity 日快照，暂回退到旧的 "
+            "portfolio_live_equity plan 级快照；建议先生成账户级每日权益快照。"
+        )
+
+    return {
+        "anchor_plan_id": plan_id,
+        "strategy_template_id": plan.get("strategy_template_id"),
+        "params_hash": plan.get("params_hash"),
+        "lineage_plan_ids": lineage_ids,
+        "rows": rows_for_chart,
+        "row_source": row_source,
+        "securities_account_ids": account_ids,
+        "source_plan_ids": plan_ids_in_data,
+        "legacy_plan_rows": enriched,
+        "caveat": caveat,
+    }
 
 
 def _lineage_query_for_plan(
@@ -467,89 +686,6 @@ def _lineage_open_trade_plan(
         if _resilient_record_kind(row) == RECORD_KIND_TRADE_PLAN:
             return row
     return None
-
-
-def _lineage_live_signal_execution_bundle(
-    trading_collections: Dict[str, Any],
-    finance_collections: Dict[str, Any],
-    plan: Dict[str, Any],
-    user_id: str,
-) -> Tuple[List[str], List[Dict[str, Any]], List[Dict[str, Any]]]:
-    """Live signals + raw executions for all plans in the same params_hash lineage."""
-
-    lineage_ids = _lineage_plan_ids_for_plan(trading_collections, plan, user_id)
-    if not lineage_ids:
-        return [], [], []
-    signal_query: Dict[str, Any] = {
-        "user_id": user_id,
-        "plan_id": {"$in": lineage_ids},
-        "mode": "live",
-    }
-    signals = list(
-        finance_collections["trade_signals"]
-        .find(
-            signal_query,
-            {
-                "_id": 0,
-                "order_id": 1,
-                "plan_id": 1,
-                "user_id": 1,
-                "mode": 1,
-                "symbol": 1,
-                "name": 1,
-                "stock_name": 1,
-                "action": 1,
-                "size": 1,
-                "status": 1,
-                "securities_account_id": 1,
-                "created_at": 1,
-                "updated_at": 1,
-                "timestamp": 1,
-                "signal_time": 1,
-            },
-        )
-        .sort("created_at", 1)
-    )
-    order_ids = [row.get("order_id") for row in signals if row.get("order_id")]
-    if not order_ids:
-        return lineage_ids, signals, []
-    executions = list(
-        finance_collections["trade_executions"]
-        .find(
-            {"user_id": user_id, "order_id": {"$in": order_ids}},
-            {
-                "_id": 0,
-                "order_id": 1,
-                "plan_id": 1,
-                "user_id": 1,
-                "securities_account_id": 1,
-                "symbol": 1,
-                "name": 1,
-                "stock_name": 1,
-                "side": 1,
-                "action": 1,
-                "status": 1,
-                "execution_status": 1,
-                "filled_size": 1,
-                "filled_qty": 1,
-                "quantity": 1,
-                "size": 1,
-                "filled_price": 1,
-                "traded_price": 1,
-                "avg_price": 1,
-                "price": 1,
-                "target_price": 1,
-                "total_fee": 1,
-                "commission": 1,
-                "fee": 1,
-                "timestamp": 1,
-                "created_at": 1,
-                "updated_at": 1,
-            },
-        )
-        .sort("timestamp", 1)
-    )
-    return lineage_ids, signals, executions
 
 
 def _lineage_initial_capital(plan: Dict[str, Any]) -> float:
@@ -2928,6 +3064,8 @@ def _reconcile_live_holdings(
     data_collections: Dict[str, Any],
     plan: Dict[str, Any],
     user_id: str,
+    *,
+    snapshot: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Diff the account-level system ledger against broker-synced positions.
 
@@ -2959,12 +3097,23 @@ def _reconcile_live_holdings(
     if not account_id:
         return {"applicable": False, "in_sync": True, "diffs": [], "securities_account_id": ""}
 
-    ledger = _account_level_live_holdings(
-        finance_collections,
-        data_collections,
-        user_id=user_id,
-        securities_account_id=account_id,
-    )
+    if snapshot and (snapshot.get("account_positions") or snapshot.get("positions")):
+        account_symbols = sorted(
+            {
+                str(row.get("symbol"))
+                for row in (snapshot.get("account_positions") or snapshot.get("positions") or [])
+                if row.get("symbol")
+            }
+        )
+        prices, realtime_docs = _load_fresh_market_prices(data_collections, account_symbols)
+        ledger = overlay_account_positions(snapshot, prices, realtime_docs=realtime_docs)
+    else:
+        ledger = _account_level_live_holdings(
+            finance_collections,
+            data_collections,
+            user_id=user_id,
+            securities_account_id=account_id,
+        )
 
     ledger_by_key: Dict[str, Dict[str, Any]] = {
         _symbol_key(row.get("symbol")): row for row in ledger if row.get("symbol")
@@ -6399,47 +6548,43 @@ def get_lineage_live_executions(plan_id: str, current_user: dict = Depends(get_c
     user_id = _current_user_id(current_user)
     plan = _require_plan(trading_collections, plan_id, current_user)
 
-    lineage_ids, signals, executions = _lineage_live_signal_execution_bundle(
-        trading_collections, finance_collections, plan, user_id
+    snapshot, overlay = _load_snapshot_with_realtime(
+        trading_collections, finance_collections, data_collections, plan, user_id
     )
-    plan_rows = list(
-        trading_collections["portfolio_trade_plans"].find(
-            {"user_id": user_id, "plan_id": {"$in": lineage_ids}},
-            {"_id": 0, "plan_id": 1, "base_date": 1},
-        )
-    )
-    plan_meta = {str(r.get("plan_id")): dict(r) for r in plan_rows if r.get("plan_id")}
+    if not snapshot:
+        return {
+            "success": True,
+            "data": _jsonable(
+                {
+                    "anchor_plan_id": plan_id,
+                    "lineage_plan_ids": [],
+                    "strategy_template_id": plan.get("strategy_template_id"),
+                    "params_hash": plan.get("params_hash"),
+                    "signals": [],
+                    "executions": [],
+                    "trades": [],
+                    "signal_count": 0,
+                    "execution_count": 0,
+                    "trade_count": 0,
+                }
+            ),
+        }
 
-    signals_named = _attach_signal_names(
-        data_collections, [add_display_time_fields(row) for row in signals]
-    )
-    grouped = group_executions_by_order(executions)
-    executions_display = [add_display_time_fields(row) for row in grouped]
-    merged = merge_lineage_live_executions(signals_named, executions_display, plan_meta)
-    symbols = sorted({str(row.get("symbol")) for row in merged if row.get("symbol")})
-    prices, _realtime_docs = _load_fresh_market_prices(data_collections, symbols)
-    name_map = {
-        str(row.get("symbol")): str(row.get("name") or row.get("stock_name") or "")
-        for row in signals_named
-        if row.get("symbol") and (row.get("name") or row.get("stock_name"))
-    }
-    for symbol, name in list(name_map.items()):
-        name_map.setdefault(symbol.split(".", 1)[0], name)
-    trades = build_lineage_live_trades(merged, prices, name_map=name_map)
-
+    trades = overlay.get("trades") or []
+    watermark = snapshot.get("watermark") or {}
     return {
         "success": True,
         "data": _jsonable(
             {
                 "anchor_plan_id": plan_id,
-                "lineage_plan_ids": lineage_ids,
+                "lineage_plan_ids": snapshot.get("lineage_plan_ids") or [],
                 "strategy_template_id": plan.get("strategy_template_id"),
                 "params_hash": plan.get("params_hash"),
-                "signals": signals_named,
-                "executions": merged,
+                "signals": [],
+                "executions": [],
                 "trades": trades,
-                "signal_count": len(signals_named),
-                "execution_count": len(merged),
+                "signal_count": int(watermark.get("signal_count") or 0),
+                "execution_count": int(watermark.get("execution_count") or 0),
                 "trade_count": len(trades),
             }
         ),
@@ -6455,33 +6600,43 @@ def get_lineage_live_positions(plan_id: str, current_user: dict = Depends(get_cu
     user_id = _current_user_id(current_user)
     plan = _require_plan(trading_collections, plan_id, current_user)
 
-    lineage_ids, signals, executions = _lineage_live_signal_execution_bundle(
-        trading_collections, finance_collections, plan, user_id
+    snapshot, overlay = _load_snapshot_with_realtime(
+        trading_collections, finance_collections, data_collections, plan, user_id
     )
-    grouped = group_executions_by_order(executions)
-    symbols = sorted({str(row.get("symbol")) for row in grouped if row.get("symbol")})
-    signals_named = _attach_signal_names(
-        data_collections, [add_display_time_fields(row) for row in signals]
-    )
-    name_map = {
-        str(row.get("symbol")): str(row.get("name") or row.get("stock_name") or "")
-        for row in signals_named
-        if row.get("symbol") and (row.get("name") or row.get("stock_name"))
-    }
-    for symbol, name in list(name_map.items()):
-        name_map.setdefault(symbol.split(".", 1)[0], name)
-    prices, realtime_docs = _load_fresh_market_prices(data_collections, symbols)
+    if not snapshot:
+        return {
+            "success": True,
+            "data": _jsonable(
+                {
+                    "anchor_plan_id": plan_id,
+                    "lineage_plan_ids": [],
+                    "strategy_template_id": plan.get("strategy_template_id"),
+                    "params_hash": plan.get("params_hash"),
+                    "positions": [],
+                    "summary": {
+                        "total_market_value": 0.0,
+                        "total_realized_pnl": 0.0,
+                        "total_unrealized_pnl": 0.0,
+                        "total_cost_basis": 0.0,
+                        "holding_count": 0,
+                        "position_row_count": 0,
+                    },
+                    "latest_price_update": "",
+                }
+            ),
+        }
 
-    payload = build_lineage_live_positions(grouped, prices, realtime_docs=realtime_docs, name_map=name_map)
     return {
         "success": True,
         "data": _jsonable(
             {
                 "anchor_plan_id": plan_id,
-                "lineage_plan_ids": lineage_ids,
+                "lineage_plan_ids": snapshot.get("lineage_plan_ids") or [],
                 "strategy_template_id": plan.get("strategy_template_id"),
                 "params_hash": plan.get("params_hash"),
-                **payload,
+                "positions": overlay.get("positions") or [],
+                "summary": overlay.get("summary") or {},
+                "latest_price_update": overlay.get("latest_price_update") or "",
             }
         ),
     }
@@ -6502,167 +6657,92 @@ def get_lineage_live_equity(
     data_collections = get_data_db()
     user_id = _current_user_id(current_user)
     plan = _require_plan(trading_collections, plan_id, current_user)
-    lineage_ids = _lineage_plan_ids_for_plan(trading_collections, plan, user_id)
-    if not lineage_ids:
-        return {
-            "success": True,
-            "data": _jsonable(
-                {
-                    "anchor_plan_id": plan_id,
-                    "lineage_plan_ids": [],
-                    "rows": [],
-                    "caveat": "No lineage plan ids; equity curve unavailable.",
-                }
-            ),
-        }
 
-    date_query: Dict[str, str] = {}
-    if start_date:
-        date_query["$gte"] = start_date.replace("-", "")
-    if end_date:
-        date_query["$lte"] = end_date.replace("-", "")
-
-    signal_rows = list(
-        finance_collections["trade_signals"].find(
-            {"user_id": user_id, "mode": "live", "plan_id": {"$in": lineage_ids}},
-            {"_id": 0, "securities_account_id": 1},
-        )
+    chart_payload = _build_lineage_live_equity_chart(
+        trading_collections,
+        finance_collections,
+        plan,
+        user_id,
+        plan_id,
+        start_date=start_date,
+        end_date=end_date,
     )
-    account_ids = sorted(
-        {
-            str(row.get("securities_account_id") or "")
-            for row in signal_rows
-            if str(row.get("securities_account_id") or "")
-        }
+    snapshot, overlay = _load_snapshot_with_realtime(
+        trading_collections, finance_collections, data_collections, plan, user_id
     )
-
-    account_equity_rows: List[Dict[str, Any]] = []
-    if account_ids:
-        account_query: Dict[str, Any] = {
-            "user_id": user_id,
-            "securities_account_id": {"$in": account_ids},
-        }
-        if date_query:
-            account_query["date"] = date_query
-        raw_account_rows = list(
-            finance_collections["trader_account_equity"].find(account_query).sort("date", 1)
-        )
-        latest_by_account_date: Dict[Tuple[str, str], Dict[str, Any]] = {}
-        for row in raw_account_rows:
-            date = str(row.get("date") or "")
-            account_id = str(row.get("securities_account_id") or "")
-            if not date or not account_id:
-                continue
-            key = (date, account_id)
-            existing = latest_by_account_date.get(key)
-            if existing is None or str(row.get("updated_at") or "") >= str(existing.get("updated_at") or ""):
-                latest_by_account_date[key] = row
-
-        daily_totals: Dict[str, Dict[str, Any]] = {}
-        for (date, account_id), row in latest_by_account_date.items():
-            bucket = daily_totals.setdefault(
-                date,
-                {
-                    "date": date,
-                    "source": "trader_account_equity",
-                    "account_ids": [],
-                    "equity": 0.0,
-                    "cash": 0.0,
-                    "market_value": 0.0,
-                    "available_cash": 0.0,
-                    "updated_at": "",
-                },
-            )
-            bucket["account_ids"].append(account_id)
-            bucket["equity"] += _numeric(row.get("total_asset", row.get("total_assets")))
-            bucket["cash"] += _numeric(row.get("cash"))
-            bucket["market_value"] += _numeric(row.get("market_value"))
-            bucket["available_cash"] += _numeric(row.get("available_cash"))
-            bucket["updated_at"] = max(str(bucket.get("updated_at") or ""), str(row.get("updated_at") or ""))
-
-        account_equity_rows = [
-            {
-                **row,
-                "account_ids": sorted(set(row.get("account_ids") or [])),
-                "equity": round(_numeric(row.get("equity")), 2),
-                "cash": round(_numeric(row.get("cash")), 2),
-                "market_value": round(_numeric(row.get("market_value")), 2),
-                "available_cash": round(_numeric(row.get("available_cash")), 2),
-            }
-            for row in sorted(daily_totals.values(), key=lambda r: str(r.get("date") or ""))
-        ]
-
-    query: Dict[str, Any] = {"user_id": user_id, "plan_id": {"$in": lineage_ids}}
-    if date_query:
-        query["date"] = date_query
-
-    equity_rows = list(trading_collections["portfolio_live_equity"].find(query).sort("date", 1))
-    latest_by_date: Dict[str, Dict[str, Any]] = {}
-    for row in equity_rows:
-        date = str(row.get("date") or "")
-        if not date:
-            continue
-        existing = latest_by_date.get(date)
-        if existing is None or str(row.get("updated_at") or "") >= str(existing.get("updated_at") or ""):
-            latest_by_date[date] = row
-
-    rows_sorted = sorted(latest_by_date.values(), key=lambda r: str(r.get("date") or ""))
-    plan_ids_in_data = sorted({row.get("plan_id") for row in rows_sorted if row.get("plan_id")})
-    plan_map = {
-        row.get("plan_id"): row
-        for row in trading_collections["portfolio_trade_plans"].find(
-            {"plan_id": {"$in": plan_ids_in_data}, "user_id": user_id},
-            {"_id": 0, "plan_id": 1, "base_date": 1, "plan_type": 1, "status": 1},
-        )
-    } if plan_ids_in_data else {}
-
-    enriched: List[Dict[str, Any]] = []
-    for row in rows_sorted:
-        src = plan_map.get(row.get("plan_id"), {})
-        enriched.append(
-            {
-                **row,
-                "source_plan_base_date": src.get("base_date"),
-                "source_plan_type": src.get("plan_type"),
-                "source_plan_status": src.get("status"),
-                "is_current_plan": row.get("plan_id") == plan_id,
-            }
-        )
-
-    if account_equity_rows:
-        rows_for_chart = account_equity_rows
-        row_source = "trader_account_equity"
-        caveat = (
-            "净值曲线使用该组合关联证券账户的每日总资产(total_asset)，按日期聚合；"
-            "横轴为交易日/自然日快照日期，纵轴为账户整体权益。"
-        )
+    if snapshot and overlay.get("current_book_equity"):
+        current_book_equity = overlay["current_book_equity"]
     else:
-        rows_for_chart = enriched
-        row_source = "portfolio_live_equity_legacy"
-        caveat = (
-            "未找到该组合关联账户的 trader_account_equity 日快照，暂回退到旧的 "
-            "portfolio_live_equity plan 级快照；建议先生成账户级每日权益快照。"
-        )
-    latest_equity_row = rows_for_chart[-1] if rows_for_chart else {}
-    initial_capital = _lineage_initial_capital(plan)
-    current_equity = _numeric(latest_equity_row.get("equity"))
-    current_cash = _numeric(latest_equity_row.get("cash"))
-    current_market_value = _numeric(latest_equity_row.get("market_value"))
-    if row_source == "portfolio_live_equity_legacy":
-        current_equity = initial_capital
-        current_cash = initial_capital
-        current_market_value = 0.0
-    execution_count = 0 if row_source == "portfolio_live_equity_legacy" else None
-    current_book_equity = {
-        "equity": current_equity,
-        "cash": current_cash,
-        "market_value": current_market_value,
-        "initial_capital": initial_capital,
-        "lineage_plan_ids": lineage_ids,
-        "execution_count": execution_count,
-        "latest_price_update": latest_equity_row.get("updated_at"),
-        "source": row_source,
+        rows_for_chart = chart_payload.get("rows") or []
+        row_source = chart_payload.get("row_source") or ""
+        latest_equity_row = rows_for_chart[-1] if rows_for_chart else {}
+        initial_capital = _lineage_initial_capital(plan)
+        current_equity = _numeric(latest_equity_row.get("equity"))
+        current_cash = _numeric(latest_equity_row.get("cash"))
+        current_market_value = _numeric(latest_equity_row.get("market_value"))
+        if row_source == "portfolio_live_equity_legacy":
+            current_equity = initial_capital
+            current_cash = initial_capital
+            current_market_value = 0.0
+        execution_count = 0 if row_source == "portfolio_live_equity_legacy" else None
+        current_book_equity = {
+            "equity": current_equity,
+            "cash": current_cash,
+            "market_value": current_market_value,
+            "initial_capital": initial_capital,
+            "lineage_plan_ids": chart_payload.get("lineage_plan_ids") or [],
+            "execution_count": execution_count,
+            "latest_price_update": latest_equity_row.get("updated_at"),
+            "source": row_source,
+        }
+
+    return {
+        "success": True,
+        "data": _jsonable({**chart_payload, "current_book_equity": current_book_equity}),
     }
+
+
+@router.get("/plans/{plan_id}/live-summary")
+@_offload
+def get_portfolio_plan_live_summary(plan_id: str, current_user: dict = Depends(get_current_user)):
+    """Consolidated live lineage snapshot for overview (positions, trades, equity book)."""
+
+    trading_collections = get_trading_db_collections()
+    finance_collections = get_db_collections()
+    data_collections = get_data_db()
+    user_id = _current_user_id(current_user)
+    plan = _require_plan(trading_collections, plan_id, current_user)
+
+    chart_payload = _build_lineage_live_equity_chart(
+        trading_collections, finance_collections, plan, user_id, plan_id
+    )
+    snapshot, overlay = _load_snapshot_with_realtime(
+        trading_collections, finance_collections, data_collections, plan, user_id
+    )
+    reconcile_payload: Dict[str, Any]
+    try:
+        reconcile_payload = _reconcile_live_holdings(
+            trading_collections, finance_collections, data_collections, plan, user_id, snapshot=snapshot
+        )
+    except Exception:
+        reconcile_payload = {"applicable": False, "in_sync": True, "diffs": [], "securities_account_id": ""}
+
+    current_book_equity = overlay.get("current_book_equity")
+    if not current_book_equity:
+        rows_for_chart = chart_payload.get("rows") or []
+        latest_equity_row = rows_for_chart[-1] if rows_for_chart else {}
+        initial_capital = _lineage_initial_capital(plan)
+        current_book_equity = {
+            "equity": _numeric(latest_equity_row.get("equity"), initial_capital),
+            "cash": _numeric(latest_equity_row.get("cash"), initial_capital),
+            "market_value": _numeric(latest_equity_row.get("market_value")),
+            "initial_capital": initial_capital,
+            "lineage_plan_ids": chart_payload.get("lineage_plan_ids") or [],
+            "execution_count": 0,
+            "latest_price_update": latest_equity_row.get("updated_at"),
+            "source": chart_payload.get("row_source") or "portfolio_live_equity_legacy",
+        }
+
     return {
         "success": True,
         "data": _jsonable(
@@ -6670,14 +6750,49 @@ def get_lineage_live_equity(
                 "anchor_plan_id": plan_id,
                 "strategy_template_id": plan.get("strategy_template_id"),
                 "params_hash": plan.get("params_hash"),
-                "lineage_plan_ids": lineage_ids,
-                "rows": rows_for_chart,
-                "row_source": row_source,
-                "securities_account_ids": account_ids,
-                "source_plan_ids": plan_ids_in_data,
-                "legacy_plan_rows": enriched,
-                "current_book_equity": current_book_equity,
-                "caveat": caveat,
+                "lineage_plan_ids": snapshot.get("lineage_plan_ids") if snapshot else chart_payload.get("lineage_plan_ids"),
+                "equity": {
+                    "rows": chart_payload.get("rows") or [],
+                    "caveat": chart_payload.get("caveat") or "",
+                    "current_book_equity": current_book_equity,
+                },
+                "positions": {
+                    "positions": overlay.get("positions") or [],
+                    "summary": overlay.get("summary") or {},
+                    "latest_price_update": overlay.get("latest_price_update") or "",
+                },
+                "trades": overlay.get("trades") or [],
+                "reconcile": reconcile_payload,
+            }
+        ),
+    }
+
+
+@router.post("/plans/{plan_id}/recalculate-live-snapshot")
+@_offload
+def recalculate_portfolio_plan_live_snapshot(
+    plan_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    trading_collections = get_trading_db_collections()
+    finance_collections = get_db_collections()
+    user_id = _current_user_id(current_user)
+    plan = _require_plan(trading_collections, plan_id, current_user)
+    snapshot = rebuild_live_snapshot_for_plan(
+        trading_collections, finance_collections, plan, user_id
+    )
+    if not snapshot:
+        raise HTTPException(status_code=400, detail="unable to rebuild live snapshot for plan")
+    return {
+        "success": True,
+        "data": _jsonable(
+            {
+                "anchor_plan_id": plan_id,
+                "strategy_template_id": plan.get("strategy_template_id"),
+                "params_hash": plan.get("params_hash"),
+                "updated_at": snapshot.get("updated_at"),
+                "build_ms": snapshot.get("build_ms"),
+                "watermark": snapshot.get("watermark"),
             }
         ),
     }
@@ -6918,6 +7033,12 @@ async def publish_portfolio_plan_live_signals(
                 acted_by=user_id,
                 pause_on_empty=False,
             )
+        threading.Thread(
+            target=lambda: rebuild_live_snapshot_for_plan(
+                trading_collections, finance_collections, plan, user_id
+            ),
+            daemon=True,
+        ).start()
 
     return {
         "success": True,

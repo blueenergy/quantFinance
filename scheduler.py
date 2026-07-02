@@ -341,6 +341,7 @@ def equity_snapshot_eod_task():
     """Persist account-level and live plan-level EOD equity snapshots."""
     from db import get_data_db, get_db_collections, get_trading_db_collections
     from services.live_equity import ensure_live_equity_indexes, snapshot_account_equity, snapshot_live_plan_equity
+    from services.portfolio_live_snapshot import ensure_live_snapshot_indexes, rebuild_all_live_snapshots
 
     job_id = "equity_snapshot_eod"
     if not _acquire_scheduler_job_lock(job_id):
@@ -351,11 +352,39 @@ def equity_snapshot_eod_task():
         trading_collections = get_trading_db_collections()
         data_collections = get_data_db()
         ensure_live_equity_indexes(finance_collections, trading_collections)
+        ensure_live_snapshot_indexes(trading_collections, finance_collections)
         account_result = snapshot_account_equity(finance_collections)
         plan_result = snapshot_live_plan_equity(trading_collections, finance_collections, data_collections)
-        log.info("[EquitySnapshot] account=%s live_plan=%s", account_result, plan_result)
+        snapshot_result = rebuild_all_live_snapshots(trading_collections, finance_collections)
+        log.info(
+            "[EquitySnapshot] account=%s live_plan=%s lineage_snapshots=%s",
+            account_result,
+            plan_result,
+            snapshot_result,
+        )
     except Exception as exc:
         log.error("[EquitySnapshot] failed: %s", exc, exc_info=True)
+    finally:
+        _release_scheduler_job_lock(job_id)
+
+
+def live_snapshot_intraday_task():
+    """Refresh materialized live lineage snapshots during market hours."""
+    from db import get_db_collections, get_trading_db_collections
+    from services.portfolio_live_snapshot import ensure_live_snapshot_indexes, rebuild_all_live_snapshots
+
+    job_id = "live_snapshot_intraday"
+    if not _acquire_scheduler_job_lock(job_id):
+        log.info("[LiveSnapshot] Another scheduler instance owns the lock, skipping.")
+        return
+    try:
+        finance_collections = get_db_collections()
+        trading_collections = get_trading_db_collections()
+        ensure_live_snapshot_indexes(trading_collections, finance_collections)
+        result = rebuild_all_live_snapshots(trading_collections, finance_collections)
+        log.info("[LiveSnapshot] intraday rebuild=%s", result)
+    except Exception as exc:
+        log.error("[LiveSnapshot] intraday failed: %s", exc, exc_info=True)
     finally:
         _release_scheduler_job_lock(job_id)
 
@@ -418,6 +447,7 @@ TASK_MAP = {
     'market_insight_focus_review_1530': market_insight_focus_review_task,
     'strategy_lab_loop_tick': strategy_lab_loop_tick_task,
     'equity_snapshot_eod': equity_snapshot_eod_task,
+    'live_snapshot_intraday': live_snapshot_intraday_task,
 }
 
 # Default trigger configurations
@@ -502,6 +532,14 @@ DEFAULT_SCHEDULES = {
         'type': "cron",
         'hour': 16,
         'minute': 0,
+        'day_of_week': 'mon-fri',
+        'is_active': True,
+    },
+    'live_snapshot_intraday': {
+        'name': "实盘组合快照盘中刷新 (每10分钟)",
+        'type': "cron",
+        'hour': '9-15',
+        'minute': '*/10',
         'day_of_week': 'mon-fri',
         'is_active': True,
     },

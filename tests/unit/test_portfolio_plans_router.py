@@ -177,6 +177,7 @@ def _collections():
         "portfolio_plan_operation_logs": _Collection(),
         "portfolio_worker_status": _Collection(),
         "portfolio_lineage_controls": _Collection(),
+        "portfolio_live_snapshots": _Collection(),
         "portfolio_strategy_param_presets": _Collection(
             [
                 {
@@ -2995,9 +2996,10 @@ def test_lineage_live_executions_spans_two_plans(monkeypatch):
     ]
     _patch_lineage_live_env(monkeypatch, cols, fin, data)
     resp = asyncio.run(portfolio_plans.get_lineage_live_executions("pla", current_user={"id": "user-1"}))
-    ex = resp["data"]["executions"]
-    assert len(ex) == 2
-    assert {ex[0]["source_plan_base_date"], ex[1]["source_plan_base_date"]} == {"20250101", "20250125"}
+    trades = resp["data"]["trades"]
+    assert len(trades) == 2
+    assert {trade["symbol"] for trade in trades} == {"000001.SZ", "600000.SH"}
+    assert resp["data"]["execution_count"] == 2
 
 
 def test_lineage_live_positions_aggregates_lineage_executions(monkeypatch):
@@ -3124,6 +3126,59 @@ def test_lineage_live_equity_prefers_account_daily_equity(monkeypatch):
     assert [row["date"] for row in resp["data"]["rows"]] == ["20250129", "20250130"]
     assert [row["equity"] for row in resp["data"]["rows"]] == [1_010_000, 1_020_000]
     assert resp["data"]["rows"][0]["account_ids"] == ["acct-1"]
+
+
+def test_get_portfolio_plan_live_summary_consolidates_payload(monkeypatch):
+    cols = _collections()
+    fin = _finance_collections()
+    data = _data_collections()
+    cols["portfolio_trade_plans"] = _Collection(
+        [
+            {
+                "plan_id": "pla",
+                "strategy_template_id": "stx",
+                "user_id": "user-1",
+                "base_date": "20250101",
+                "status": "approved",
+                "params_hash": "hx",
+                "params_snapshot": {"initial_capital": 1_000_000},
+            }
+        ]
+    )
+    fin["trade_signals"].docs = [
+        {
+            "order_id": "oa",
+            "user_id": "user-1",
+            "mode": "live",
+            "plan_id": "pla",
+            "symbol": "000001.SZ",
+            "name": "Ping",
+            "securities_account_id": "acct-1",
+            "created_at": 1,
+        }
+    ]
+    fin["trade_executions"].docs = [
+        {
+            "order_id": "oa",
+            "user_id": "user-1",
+            "securities_account_id": "acct-1",
+            "symbol": "000001.SZ",
+            "side": "BUY",
+            "filled_size": 100,
+            "filled_price": 10.0,
+            "timestamp": 1.0,
+        }
+    ]
+    fin["trader_positions"].docs = [
+        {"user_id": "user-1", "securities_account_id": "acct-1", "symbol": "000001", "qty": 100}
+    ]
+    _patch_lineage_live_env(monkeypatch, cols, fin, data)
+    resp = asyncio.run(portfolio_plans.get_portfolio_plan_live_summary("pla", current_user={"id": "user-1"}))
+    payload = resp["data"]
+    assert payload["positions"]["positions"][0]["shares"] == 100
+    assert payload["trades"]
+    assert payload["equity"]["current_book_equity"]["initial_capital"] == 1_000_000
+    assert payload["reconcile"]["applicable"] is True
 
 
 def test_list_portfolios_includes_live_and_paper_lineages(monkeypatch):
