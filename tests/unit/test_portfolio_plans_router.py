@@ -5600,7 +5600,11 @@ def test_force_rebalance_enqueues_rebalance_task_with_lineage_params(monkeypatch
                     "cycle_weight": 0.7,
                     "top_n": 10,
                     "rebalance_days": 10,
+                    "initial_capital": 500_000,
                     "lot_size": 100,
+                    "cash_buffer": 0.03,
+                    "candidate_pool_enabled": True,
+                    "candidate_pool_multiplier": 3,
                     "monitor_can_trade": True,
                 },
             }
@@ -5622,6 +5626,10 @@ def test_force_rebalance_enqueues_rebalance_task_with_lineage_params(monkeypatch
     assert task["force"] is True
     assert task["base_date"] == "20250110"
     assert task["params_override"]["top_n"] == 10
+    assert task["params_override"]["initial_capital"] == 500_000
+    assert task["params_override"]["lot_size"] == 100
+    assert task["params_override"]["candidate_pool_enabled"] is True
+    assert task["params_override"]["candidate_pool_multiplier"] == 3
     assert "monitor_can_trade" not in task["params_override"]
     assert len(cols["portfolio_plan_generation_tasks"].docs) == 1
 

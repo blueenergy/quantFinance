@@ -154,8 +154,8 @@ GROWTH_CYCLE_PARAMETER_SCHEMA = {
     # real account equity, paper -> paper snapshot). Not part of params_hash.
     "capital_basis": {"type": "enum", "options": ["account_equity", "rolling_paper", "fixed_notional"], "nullable": True},
 }
-# Mirrors stock-scoring-system/tools/portfolio_trading.py PLAN_PARAM_KEYS — keep in sync
-# when filtering params_override for force-rebalance so lineage params_hash is preserved.
+# Mirrors stock-scoring-system/tools/portfolio_trading.py PLAN_PARAM_KEYS.
+# These keys define the strategy lineage params_hash.
 PLAN_PARAM_KEYS = {
     "universe_index",
     "index_benchmark_symbol",
@@ -167,6 +167,12 @@ PLAN_PARAM_KEYS = {
     "rebalance_days",
     "construction_mode",
     "max_industry_weight",
+}
+# Mirrors stock-scoring-system/tools/portfolio_trading.py PLAN_SNAPSHOT_PARAM_KEYS.
+# Keep this broader set when carrying params_override forward for force-rebalance:
+# the scorer records these values in params_snapshot, but only PLAN_PARAM_KEYS
+# participates in params_hash.
+PLAN_SNAPSHOT_PARAM_KEYS = PLAN_PARAM_KEYS | {
     "lot_size",
     "transaction_cost",
     "buy_commission_rate",
@@ -1132,7 +1138,7 @@ def _resolve_plan_score_date(plan: Dict[str, Any], universe_index: str) -> Optio
 
 
 def _normalized_plan_params_from_snapshot(params_snapshot: Dict[str, Any]) -> Dict[str, Any]:
-    return {key: params_snapshot[key] for key in sorted(PLAN_PARAM_KEYS) if key in params_snapshot}
+    return {key: params_snapshot[key] for key in sorted(PLAN_SNAPSHOT_PARAM_KEYS) if key in params_snapshot}
 
 
 def _load_latest_close_prices_loose(volume_price, symbols: List[str]) -> Dict[str, float]:
