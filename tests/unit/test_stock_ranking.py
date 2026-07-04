@@ -132,11 +132,21 @@ class FakeCollection:
             reverse=True,
         )
 
-    def find_one(self, query):
-        for d in self.docs:
-            if self._doc_matches_query(d, query):
-                return d
-        return None
+    def find_one(self, query=None, projection=None, sort=None):
+        rows = [d for d in self.docs if self._doc_matches_query(d, query or {})]
+        if sort:
+            for key, direction in reversed(sort):
+                rows.sort(
+                    key=lambda d: ("" if d.get(key) is None else str(d.get(key))),
+                    reverse=direction == -1,
+                )
+        if not rows:
+            return None
+        doc = rows[0]
+        if projection:
+            keep = [k for k, v in projection.items() if v == 1]
+            return {k: doc.get(k) for k in keep if k in doc}
+        return doc
 
 
 class FakeDB:
@@ -1138,6 +1148,59 @@ def test_by_index_rankings_latest_per_symbol_and_sort(monkeypatch):
     assert r_growth.status_code == 200
     # A 最新 growth=5，B=9 → 按成长分降序 B 在前。
     assert [x["symbol"] for x in r_growth.json()["data"]] == ["B.SH", "A.SH"]
+
+
+@pytest.mark.unit
+def test_by_index_rankings_uses_latest_index_score_date_snapshot(monkeypatch):
+    """无 date：取该指数最新评分日的截面；仅在更早日期评分、最新日缺席的个股被略去。"""
+    docs = [
+        # 最新评分日 20250921 的成分
+        {
+            "symbol": "NEW.SH",
+            "composite_score": {"balanced": 60},
+            "cycle_score": 1, "value_score": 1, "fundamental_score": 1,
+            "growth_score": 1, "technical_score": 1, "money_flow_score": 1,
+            "score_date": "20250921",
+            "index_codes": ["hs300"],
+        },
+        # 同一 symbol 的旧评分日，应被最新日快照覆盖（不重复）
+        {
+            "symbol": "NEW.SH",
+            "composite_score": {"balanced": 10},
+            "cycle_score": 1, "value_score": 1, "fundamental_score": 1,
+            "growth_score": 1, "technical_score": 1, "money_flow_score": 1,
+            "score_date": "20250920",
+            "index_codes": ["hs300"],
+        },
+        # 仅在更早日期评分、最新日缺席（如停牌），按快照语义被略去
+        {
+            "symbol": "STALE.SH",
+            "composite_score": {"balanced": 99},
+            "cycle_score": 1, "value_score": 1, "fundamental_score": 1,
+            "growth_score": 1, "technical_score": 1, "money_flow_score": 1,
+            "score_date": "20250920",
+            "index_codes": ["hs300"],
+        },
+    ]
+    info_docs = [
+        {"symbol": "NEW.SH", "name": "New", "industry": "X"},
+        {"symbol": "STALE.SH", "name": "Stale", "industry": "Y"},
+    ]
+    fake_db = FakeDB(stock_scores_docs=docs, stock_info_docs=info_docs)
+    monkeypatch.setattr(stock_ranking, "get_db_collections", lambda: fake_db)
+    monkeypatch.setattr(
+        stock_ranking,
+        "get_data_db",
+        lambda: {"volume_price": FakeVolumePriceCollection([])},
+    )
+
+    client = TestClient(app)
+    r = client.get("/api/stock-rankings/by-index/hs300")
+    assert r.status_code == 200
+    j = r.json()
+    assert [x["symbol"] for x in j["data"]] == ["NEW.SH"]
+    assert j["total"] == 1
+    assert j["data"][0]["composite_score"]["balanced"] == 60
 
 
 @pytest.mark.unit

@@ -117,24 +117,42 @@ SCORE_SORT_FIELDS: Dict[str, str] = {
 }
 
 
+def _latest_index_score_date(stock_scores: Any, index_code: str) -> Optional[str]:
+    """Latest ``score_date`` that has any doc tagged with ``index_code``.
+
+    Backed by the ``(score_date -1, index_codes 1)`` compound index, so this is
+    a single indexed lookup instead of scanning history.
+    """
+    latest_doc = stock_scores.find_one(
+        {"index_codes": index_code},
+        {"score_date": 1, "_id": 0},
+        sort=[("score_date", -1)],
+    )
+    return (latest_doc or {}).get("score_date") if latest_doc else None
+
+
 def _aggregate_index_ranking_score_docs(
     stock_scores: Any, index_code: str, score_date: Optional[str]
 ) -> List[dict]:
-    """按 index_codes 拉取评分行：有 date 则当日截面；否则每 symbol 取 score_date 最新一条再筛指数。"""
-    if score_date:
-        pipeline = [
-            {"$match": {"score_date": score_date, "index_codes": index_code}},
-            {"$project": _STOCK_SCORE_LIST_PROJECTION},
-        ]
-    else:
-        pipeline = [
-            {"$sort": {"score_date": -1}},
-            {"$group": {"_id": "$symbol", "doc": {"$first": "$$ROOT"}}},
-            {"$replaceRoot": {"newRoot": "$doc"}},
-            {"$match": {"index_codes": index_code}},
-            {"$project": _STOCK_SCORE_LIST_PROJECTION},
-        ]
+    """按 index_codes 拉取评分行。
+
+    有 date：取该日截面。无 date：取该指数「最新评分日」的截面。评分按 score_date
+    批量全量写入（同一轮 run 共用一个 score_date），故最新评分日的成分即当前榜单，
+    无需对全表做 ``$sort + $group`` 逐 symbol 取最新——那会随历史增长而变慢。
+    两条路径都以 ``{score_date, index_codes}`` 命中 ``(score_date -1, index_codes 1)``
+    复合索引。
+
+    语义变化：未评分于最新日的个股（如当日停牌）不再以更早一日的旧分回填，而是从
+    当前榜单中略去——对「最新成分排名」而言更符合预期。
+    """
     try:
+        target_date = score_date or _latest_index_score_date(stock_scores, index_code)
+        if not target_date:
+            return []
+        pipeline = [
+            {"$match": {"score_date": target_date, "index_codes": index_code}},
+            {"$project": _STOCK_SCORE_LIST_PROJECTION},
+        ]
         return list(stock_scores.aggregate(pipeline))
     except Exception:
         return []
