@@ -1127,7 +1127,7 @@ async def get_stock_rankings_by_index(
     ),
     date: Optional[str] = Query(
         None,
-        description="YYYYMMDD；不传则每只股票取最新 score_date 后再筛 index_codes",
+        description="YYYYMMDD；不传则取该指数最新评分日的完整截面",
     ),
     exclude_st: bool = Query(True, description="是否排除名称含 ST 的股票"),
     offset: int = Query(0, ge=0, description="分页起点"),
