@@ -2,36 +2,46 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import pytest
 
 from services.index_services import IndexService
 
 
-def _aggregate_latest_per_symbol(docs: List[Dict[str, Any]], store_key: str) -> List[Dict[str, Any]]:
-    """Mimic IndexService pipeline: match index_code, sort by update_date/time desc, first per symbol."""
-    matched = [d for d in docs if d.get("index_code") == store_key]
-    matched.sort(
-        key=lambda d: (d.get("update_date", ""), d.get("update_time", "")),
-        reverse=True,
-    )
-    seen: Dict[str, Dict[str, Any]] = {}
-    for d in matched:
-        sym = d.get("symbol")
-        if sym and sym not in seen:
-            seen[sym] = d
-    return list(seen.values())
+def _matches(doc: Dict[str, Any], query: Dict[str, Any]) -> bool:
+    for key, expected in query.items():
+        value = doc.get(key)
+        if isinstance(expected, dict):
+            if "$lte" in expected and not (value is not None and str(value) <= str(expected["$lte"])):
+                return False
+            continue
+        if value != expected:
+            return False
+    return True
 
 
 class FakeIndexConstituentsCollection:
     def __init__(self, docs: List[Dict[str, Any]]):
         self.docs = list(docs)
 
-    def aggregate(self, pipeline: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        match = pipeline[0].get("$match", {})
-        store_key = match.get("index_code")
-        return _aggregate_latest_per_symbol(self.docs, store_key)
+    def find_one(self, query=None, projection=None, sort=None):
+        query = query or {}
+        matched = [dict(d) for d in self.docs if _matches(d, query)]
+        if not matched:
+            return None
+        if sort:
+            for field, direction in reversed(sort):
+                matched.sort(key=lambda row: row.get(field, ""), reverse=direction < 0)
+        return matched[0]
+
+    def find(self, query=None, projection=None):
+        query = query or {}
+        return [dict(d) for d in self.docs if _matches(d, query)]
+
+    def distinct(self, field, query=None):
+        query = query or {}
+        return sorted({d.get(field) for d in self.docs if _matches(d, query) and d.get(field)})
 
     def create_index(self, *args: Any, **kwargs: Any) -> None:
         pass
@@ -83,20 +93,11 @@ def test_ensure_ts_code_unknown_returns_stripped() -> None:
 
 
 @pytest.mark.unit
-def test_get_index_constituents_prefers_newer_snapshot(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_get_index_constituents_uses_latest_snapshot_only(monkeypatch: pytest.MonkeyPatch) -> None:
     docs = [
         {
             "index_code": "hs300",
-            "update_date": "20260101",
-            "update_time": "10:00:00",
-            "symbol": "000001.SZ",
-            "name": "OldName",
-            "industry": "银行",
-            "market_cap": 1.0,
-            "weight": 1.0,
-        },
-        {
-            "index_code": "hs300",
+            "weight_trade_date": "20260102",
             "update_date": "20260102",
             "update_time": "09:00:00",
             "symbol": "000001.SZ",
@@ -104,6 +105,17 @@ def test_get_index_constituents_prefers_newer_snapshot(monkeypatch: pytest.Monke
             "industry": "银行",
             "market_cap": 2.0,
             "weight": 2.0,
+        },
+        {
+            "index_code": "hs300",
+            "weight_trade_date": "20260101",
+            "update_date": "20260101",
+            "update_time": "10:00:00",
+            "symbol": "000002.SZ",
+            "name": "Removed",
+            "industry": "银行",
+            "market_cap": 1.0,
+            "weight": 1.0,
         },
     ]
 

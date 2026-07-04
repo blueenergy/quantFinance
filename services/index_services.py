@@ -3,6 +3,7 @@ from typing import List
 
 from db import get_data_db
 from models.index_models import IndexConstituent, HS300Constituent
+from stock_data_access.index_constituents import load_snapshot
 
 
 class IndexService:
@@ -90,21 +91,22 @@ class IndexService:
         return s
 
     def _load_latest_constituents(self, store_key: str) -> List[IndexConstituent]:
-        """按 ``index_code`` 取库中最新一批（按 ``update_date`` / ``update_time`` 排序后按 symbol 去重）。"""
+        """按 ``index_code`` 取库中最新一批成分（单张快照，非历史并集）。"""
         try:
             coll = self._index_constituents_collection()
-            pipeline = [
-                {"$match": {"index_code": store_key}},
-                {"$sort": {"update_date": -1, "update_time": -1}},
-                {
-                    "$group": {
-                        "_id": "$symbol",
-                        "doc": {"$first": "$$ROOT"},
+            snapshot = load_snapshot(coll, store_key)
+            if snapshot is None:
+                print(f"本地库未找到 {store_key} 成分股数据")
+                return []
+            records = list(
+                coll.find(
+                    {
+                        "index_code": store_key,
+                        "weight_trade_date": snapshot.weight_trade_date,
+                        "update_date": snapshot.update_date,
                     }
-                },
-                {"$replaceRoot": {"newRoot": "$doc"}},
-            ]
-            records = list(coll.aggregate(pipeline))
+                )
+            )
             if not records:
                 print(f"本地库未找到 {store_key} 成分股数据")
                 return []
@@ -122,7 +124,7 @@ class IndexService:
                 )
             print(
                 f"从本地库读取 {len(out)} 条 {store_key} 成分股，"
-                f"快照日期: {records[0].get('update_date')}"
+                f"快照日期: {snapshot.update_date}"
             )
             return out
         except Exception as e:
