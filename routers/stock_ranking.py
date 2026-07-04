@@ -94,6 +94,9 @@ _STOCK_SCORE_LIST_PROJECTION = {
     # Read-only industry relative-strength (cycle_v2); reference only, not part
     # of composite. Absent on docs not yet backfilled -> rendered as "—".
     "industry_rs_score": 1,
+    # Index memberships (e.g. hs300 / csi500 / star50) for tooltip display.
+    # Absent on docs not yet backfilled -> rendered as empty.
+    "index_codes": 1,
 }
 
 # 与 stock-scoring-system data_manager.SCORE_INDEX_LABEL_CODES 一致；按 index_codes 查榜
@@ -105,6 +108,26 @@ STOCK_RANKING_INDEX_CODES: Tuple[str, ...] = (
     "csi2000",
     "star50",
 )
+
+def _normalize_index_codes(value: Any) -> List[str]:
+    """Coerce a score doc's ``index_codes`` into a clean list of code strings.
+
+    Tolerates missing / scalar / dirty values so response rows stay stable even
+    for docs not yet backfilled with index memberships.
+    """
+    if not value:
+        return []
+    if isinstance(value, str):
+        value = [value]
+    if not isinstance(value, (list, tuple, set)):
+        return []
+    out: List[str] = []
+    for item in value:
+        code = str(item).strip().lower()
+        if code and code not in out:
+            out.append(code)
+    return out
+
 
 SCORE_SORT_FIELDS: Dict[str, str] = {
     "cycle": "cycle_score",
@@ -1349,6 +1372,7 @@ async def get_stock_rankings_by_index(
                 "technical_score": safe_round(stock.get("technical_score", 0), 2),
                 "money_flow_score": safe_round(stock.get("money_flow_score", 0), 2),
                 "industry_rs_score": stock.get("industry_rs_score"),
+                "index_codes": _normalize_index_codes(stock.get("index_codes")),
                 "score_date": stock.get("score_date", ""),
             }
             if sort_key == "weighted":
@@ -1456,6 +1480,7 @@ async def get_stock_rankings(
                     "technical_score": 1,
                     "money_flow_score": 1,
                     "industry_rs_score": 1,
+                    "index_codes": 1,
                     "score_date": 1
                 }},
                 {"$sort": {"composite_score": -1}},
@@ -1513,6 +1538,7 @@ async def get_stock_rankings(
                 'technical_score': safe_round(stock.get('technical_score', 0), 2),
                 'money_flow_score': safe_round(stock.get('money_flow_score', 0), 2),
                 'industry_rs_score': stock.get('industry_rs_score'),
+                'index_codes': _normalize_index_codes(stock.get('index_codes')),
                 'score_date': stock.get('score_date', '')
             }
             if sort_key == "weighted":
@@ -1980,6 +2006,7 @@ async def get_selected_stock_rankings(
                     'symbol': sym,
                     'name': info.get('name', '') if info else '',
                     'industry': info.get('industry', '') if info else '',
+                    'index_codes': _normalize_index_codes(latest_any.get('index_codes')) if latest_any else [],
                     'composite_score': latest_any.get('composite_score', {}) if latest_any else {},
                     'per_date_scores': per_date_scores,
                     'per_date_fields': per_date_fields,
@@ -2107,6 +2134,7 @@ async def get_selected_stock_rankings(
                 'technical_score': safe_round(stock.get('technical_score', 0), 2),
                 'money_flow_score': safe_round(stock.get('money_flow_score', 0), 2),
                 'industry_rs_score': stock.get('industry_rs_score'),
+                'index_codes': _normalize_index_codes(stock.get('index_codes')),
                 'score_date': stock.get('score_date', date if date else '')
             }
             if sort_key == "weighted":
