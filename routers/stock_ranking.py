@@ -168,6 +168,16 @@ PRIOR_3M_EMPTY: Dict[str, Any] = {
     "prior_3m_end_trade_date": None,
 }
 
+FUTURE_RETURN_HORIZONS: Tuple[int, ...] = (10, 20)
+
+FUTURE_RETURN_EMPTY: Dict[str, Any] = {
+    "future_return_base_trade_date": None,
+    "future_return_10d_pct": None,
+    "future_return_10d_trade_date": None,
+    "future_return_20d_pct": None,
+    "future_return_20d_trade_date": None,
+}
+
 
 def _symbol_key_variants(sym: str) -> List[str]:
     """同一标的在库中可能存 ``600519``、``600519.SH`` 等，用于查询与匹配。"""
@@ -406,6 +416,131 @@ def _return_since_from_docs(
     out["return_since_score_pct"] = round(pct, 2)
     out["price_base_trade_date"] = _trade_date_str(base_doc)
     out["price_latest_trade_date"] = _trade_date_str(latest_doc)
+    return out
+
+
+def _future_window_after_base(
+    volume_price_col: Any,
+    symbol: str,
+    base_doc: Optional[dict],
+    max_days: int,
+) -> List[dict]:
+    """Return up to ``max_days`` valid daily bars strictly after the base bar.
+
+    Fetched once per (symbol, base) so callers can slice out each horizon
+    without issuing an extra round trip per horizon.
+    """
+    if not symbol or not base_doc or max_days <= 0:
+        return []
+    base_raw = base_doc.get("trade_date")
+    base_td = _trade_date_str(base_doc)
+    if base_raw is None or not base_td:
+        return []
+
+    if hasattr(volume_price_col, "aggregate"):
+        try:
+            docs = list(
+                volume_price_col.aggregate(
+                    [
+                        {"$match": {"symbol": symbol, "trade_date": {"$gt": base_raw}}},
+                        {"$sort": {"trade_date": 1}},
+                        {"$limit": max_days},
+                    ]
+                )
+            )
+            valid = [d for d in docs if _close_from_volume_price_doc(d) is not None]
+            if valid:
+                return valid
+        except Exception:
+            pass
+
+    # Test fakes and some lightweight adapters expose in-memory docs only.
+    docs = getattr(volume_price_col, "docs", None)
+    if isinstance(docs, list):
+        rows = [
+            d
+            for d in docs
+            if d.get("symbol") == symbol
+            and (_trade_date_str(d) or "") > base_td
+            and _close_from_volume_price_doc(d) is not None
+        ]
+        rows.sort(key=lambda d: _trade_date_str(d) or "")
+        return rows[:max_days]
+    return []
+
+
+def compute_future_returns_after_score(
+    volume_price_col: Any,
+    symbol: str,
+    score_date: str,
+    base_by_key: Dict[Tuple[str, str], Any],
+    future_by_key: Dict[Tuple[str, str], List[dict]],
+    adj_dao: Optional[AdjustedPriceDataAccess] = None,
+) -> dict:
+    """Compute 10/20-trading-day forward returns from the score-date close."""
+    out = dict(FUTURE_RETURN_EMPTY)
+    if not symbol or not score_date or len(str(score_date).strip()) < 8:
+        return out
+    sd = str(score_date).strip()[:8]
+
+    used_symbol = symbol
+    base_doc = None
+    for candidate in _symbol_key_variants(symbol):
+        bkey = (candidate, sd)
+        if bkey not in base_by_key:
+            base_by_key[bkey] = _fetch_base_doc_single(volume_price_col, candidate, sd)
+        candidate_doc = base_by_key[bkey]
+        if candidate_doc and _close_from_volume_price_doc(candidate_doc) is not None:
+            used_symbol = candidate
+            base_doc = candidate_doc
+            break
+    if not base_doc:
+        return out
+
+    base_trade_date = _trade_date_str(base_doc)
+    out["future_return_base_trade_date"] = base_trade_date
+    # Fetch the forward window once (up to the largest horizon), then slice each
+    # horizon out of it to avoid an extra query per horizon.
+    max_horizon = max(FUTURE_RETURN_HORIZONS)
+    wkey = (used_symbol, base_trade_date or sd)
+    if wkey not in future_by_key:
+        future_by_key[wkey] = _future_window_after_base(
+            volume_price_col, used_symbol, base_doc, max_horizon
+        )
+    window = future_by_key[wkey]
+    future_docs: Dict[int, Optional[dict]] = {}
+    for trading_days in FUTURE_RETURN_HORIZONS:
+        future_docs[trading_days] = (
+            window[trading_days - 1] if len(window) >= trading_days else None
+        )
+
+    if adj_dao is None:
+        adj_dao = _adj_dao_from_volume_price_col(volume_price_col)
+    factor_pairs: List[Tuple[str, str]] = []
+    seen_pairs: Set[Tuple[str, str]] = set()
+    for doc in [base_doc, *future_docs.values()]:
+        pair = _factor_pair(used_symbol, doc)
+        if pair and pair not in seen_pairs:
+            seen_pairs.add(pair)
+            factor_pairs.append(pair)
+    factor_map = adj_dao.factor_map_for_pairs(
+        factor_pairs,
+        variants_by_symbol={used_symbol: _symbol_key_variants(used_symbol)},
+    )
+
+    for trading_days, future_doc in future_docs.items():
+        date_key = f"future_return_{trading_days}d_trade_date"
+        pct_key = f"future_return_{trading_days}d_pct"
+        out[date_key] = _trade_date_str(future_doc) if future_doc else None
+        pct = _hfq_return_pct(
+            future_doc,
+            base_doc,
+            sym=used_symbol,
+            factor_map=factor_map,
+            adj_dao=adj_dao,
+        )
+        if pct is not None:
+            out[pct_key] = round(pct, 2)
     return out
 
 
@@ -797,6 +932,109 @@ def enrich_rows_prior_3m_return(rows: List[dict], volume_price_col: Any) -> None
         )
 
 
+def enrich_rows_future_returns(rows: List[dict], volume_price_col: Any) -> None:
+    """Add 10/20-trading-day forward returns to already formatted rows.
+
+    Batched to match the other enrich passes: base bars are fetched in bulk per
+    distinct ``score_date`` and the ``adj_factor`` lookup is issued **once** for
+    all rows (instead of once per symbol), keeping Mongo round trips roughly
+    proportional to the number of distinct score dates rather than to N rows.
+    """
+    if not rows:
+        return
+    max_horizon = max(FUTURE_RETURN_HORIZONS)
+    adj_dao = _adj_dao_from_volume_price_col(volume_price_col)
+    has_agg = hasattr(volume_price_col, "aggregate")
+
+    # 1) base bar on/just-before score_date, bulked per distinct score_date.
+    by_sd: Dict[str, List[str]] = {}
+    for row in rows:
+        sym = row.get("symbol") or ""
+        sd = str(row.get("score_date") or "").strip()[:8]
+        if len(sd) < 8 or not sym:
+            row.update(dict(FUTURE_RETURN_EMPTY))
+            continue
+        by_sd.setdefault(sd, []).append(sym)
+
+    base_map: Dict[Tuple[str, str], Any] = {}
+    for sd, syms in by_sd.items():
+        uniq_syms = list(dict.fromkeys(syms))
+        bulk: Dict[str, Any] = {}
+        if has_agg:
+            bulk = _bulk_base_by_symbol_string(
+                volume_price_col, _expanded_query_symbols(uniq_syms), sd
+            )
+        for sym in uniq_syms:
+            doc = _pick_vp_doc(bulk, sym) if bulk else None
+            if not (doc and _close_from_volume_price_doc(doc) is not None):
+                doc = None
+                for k in _symbol_key_variants(sym):
+                    fd = _fetch_base_doc_single(volume_price_col, k, sd)
+                    if fd and _close_from_volume_price_doc(fd) is not None:
+                        doc = fd
+                        break
+            if doc and _close_from_volume_price_doc(doc) is not None:
+                base_map[(sym, sd)] = doc
+
+    # 2) forward window per symbol (one indexed lookup, capped at max horizon).
+    window_by_key: Dict[Tuple[str, str], List[dict]] = {}
+    for (sym, sd), bdoc in base_map.items():
+        btd = _trade_date_str(bdoc) or sd
+        wkey = (sym, btd)
+        if wkey not in window_by_key:
+            window_by_key[wkey] = _future_window_after_base(
+                volume_price_col, sym, bdoc, max_horizon
+            )
+
+    # 3) single shared adj_factor lookup for every base + target forward bar.
+    factor_pairs: List[Tuple[str, str]] = []
+    seen_pairs: Set[Tuple[str, str]] = set()
+
+    def _consider(sym: str, doc: Optional[dict]) -> None:
+        pair = _factor_pair(sym, doc)
+        if pair and pair not in seen_pairs:
+            seen_pairs.add(pair)
+            factor_pairs.append(pair)
+
+    for (sym, sd), bdoc in base_map.items():
+        _consider(sym, bdoc)
+        window = window_by_key.get((sym, _trade_date_str(bdoc) or sd), [])
+        for trading_days in FUTURE_RETURN_HORIZONS:
+            if len(window) >= trading_days:
+                _consider(sym, window[trading_days - 1])
+    variants_by_symbol = {sym: _symbol_key_variants(sym) for (sym, _sd) in base_map}
+    factor_map = adj_dao.factor_map_for_pairs(
+        factor_pairs, variants_by_symbol=variants_by_symbol
+    )
+
+    # 4) fill rows from the pre-fetched docs.
+    for row in rows:
+        sym = row.get("symbol") or ""
+        sd = str(row.get("score_date") or "").strip()[:8]
+        bdoc = base_map.get((sym, sd)) if (sym and len(sd) >= 8) else None
+        if not bdoc:
+            row.update(dict(FUTURE_RETURN_EMPTY))
+            continue
+        out = dict(FUTURE_RETURN_EMPTY)
+        out["future_return_base_trade_date"] = _trade_date_str(bdoc)
+        window = window_by_key.get((sym, _trade_date_str(bdoc) or sd), [])
+        for trading_days in FUTURE_RETURN_HORIZONS:
+            future_doc = window[trading_days - 1] if len(window) >= trading_days else None
+            out[f"future_return_{trading_days}d_trade_date"] = (
+                _trade_date_str(future_doc) if future_doc else None
+            )
+            pct = _hfq_return_pct(
+                future_doc,
+                bdoc,
+                sym=sym,
+                factor_map=factor_map,
+                adj_dao=adj_dao,
+            )
+            if pct is not None:
+                out[f"future_return_{trading_days}d_pct"] = round(pct, 2)
+        row.update(out)
+
+
 @router.get("/stock-rankings/by-index/{index_code}")
 async def get_stock_rankings_by_index(
     request: Request,
@@ -890,6 +1128,7 @@ async def get_stock_rankings_by_index(
                 row["weighted_score_weights"] = weighted_weights
             row.update(dict(RETURN_SINCE_EMPTY))
             row.update(dict(PRIOR_3M_EMPTY))
+            row.update(dict(FUTURE_RETURN_EMPTY))
             formatted.append(row)
         try:
             vp_col = get_data_db()["volume_price"]
@@ -897,6 +1136,7 @@ async def get_stock_rankings_by_index(
             # large constituent universes cheap while preserving table parity.
             enrich_rows_return_since_score(formatted, vp_col)
             enrich_rows_prior_3m_return(formatted, vp_col)
+            enrich_rows_future_returns(formatted, vp_col)
         except Exception as ex:
             print(f"[stock-rankings/by-index] enrich price returns failed: {ex}")
         return {
@@ -1053,12 +1293,14 @@ async def get_stock_rankings(
                 row["weighted_score_weights"] = weighted_weights
             row.update(dict(RETURN_SINCE_EMPTY))
             row.update(dict(PRIOR_3M_EMPTY))
+            row.update(dict(FUTURE_RETURN_EMPTY))
             formatted.append(row)
 
         try:
             vp_col = get_data_db()["volume_price"]
             enrich_rows_return_since_score(formatted, vp_col)
             enrich_rows_prior_3m_return(formatted, vp_col)
+            enrich_rows_future_returns(formatted, vp_col)
         except Exception as ex:
             print(f"[stock-rankings] enrich price returns failed: {ex}")
 
@@ -1441,10 +1683,13 @@ async def get_selected_stock_rankings(
                 per_date_fields = {}
                 per_date_return_since: Dict[str, dict] = {}
                 per_date_prior_3m_return: Dict[str, dict] = {}
+                per_date_future_return: Dict[str, dict] = {}
                 latest_by_symbol: Dict[str, Any] = {}
                 base_by_key: Dict[Tuple[str, str], Any] = {}
                 prior_end_by_key: Dict[Tuple[str, str], Any] = {}
                 prior_base_by_key: Dict[Tuple[str, str], Any] = {}
+                future_base_by_key: Dict[Tuple[str, str], Any] = {}
+                future_by_key: Dict[Tuple[str, str], List[dict]] = {}
                 latest_any = None
                 for d in dates:
                     if vp_col is not None:
@@ -1454,6 +1699,9 @@ async def get_selected_stock_rankings(
                         per_date_prior_3m_return[d] = compute_prior_3m_return(
                             vp_col, sym, d, prior_end_by_key, prior_base_by_key
                         )
+                        per_date_future_return[d] = compute_future_returns_after_score(
+                            vp_col, sym, d, future_base_by_key, future_by_key
+                        )
                     else:
                         per_date_return_since[d] = {
                             "return_since_score_pct": None,
@@ -1461,6 +1709,7 @@ async def get_selected_stock_rankings(
                             "price_latest_trade_date": None,
                         }
                         per_date_prior_3m_return[d] = dict(PRIOR_3M_EMPTY)
+                        per_date_future_return[d] = dict(FUTURE_RETURN_EMPTY)
                     doc = _find_one_stock_score(stock_scores, sym, d)
                     if doc:
                         latest_any = latest_any or doc
@@ -1501,6 +1750,7 @@ async def get_selected_stock_rankings(
                     ),
                     'per_date_return_since': per_date_return_since,
                     'per_date_prior_3m_return': per_date_prior_3m_return,
+                    'per_date_future_return': per_date_future_return,
                     'score_date': latest_any.get('score_date') if latest_any else '',
                     **(
                         {
@@ -1623,6 +1873,7 @@ async def get_selected_stock_rankings(
                 formatted_stock["weighted_score_weights"] = weighted_weights
             formatted_stock.update(dict(RETURN_SINCE_EMPTY))
             formatted_stock.update(dict(PRIOR_3M_EMPTY))
+            formatted_stock.update(dict(FUTURE_RETURN_EMPTY))
             formatted_stocks.append(formatted_stock)
         total_all = len(formatted_stocks)
         if page_size is not None:
@@ -1636,12 +1887,14 @@ async def get_selected_stock_rankings(
                     page_rows, vp_col
                 )
                 enrich_rows_prior_3m_return(page_rows, vp_col)
+                enrich_rows_future_returns(page_rows, vp_col)
             except Exception as ex:
                 print(f"[stock-rankings/selected] enrich price returns failed: {ex}")
         else:
             for fs in page_rows:
                 fs.update(RETURN_SINCE_EMPTY)
                 fs.update(PRIOR_3M_EMPTY)
+                fs.update(FUTURE_RETURN_EMPTY)
         for fs in page_rows:
             fs["symbol"] = _requested_symbol_for_db_row(fs.get("symbol", ""), symbols)
         eff_page_size = page_size if page_size is not None else total_all

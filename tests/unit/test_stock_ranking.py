@@ -430,6 +430,46 @@ def test_selected_multi_date_per_date_return_since(monkeypatch):
 
 
 @pytest.mark.unit
+def test_selected_stock_rankings_includes_future_10d_20d_returns(monkeypatch):
+    docs = [
+        {
+            'symbol': 'FFF.SH',
+            'composite_score': {'balanced': 70},
+            'cycle_score': 1,
+            'value_score': 2,
+            'fundamental_score': 3,
+            'growth_score': 4,
+            'technical_score': 5,
+            'money_flow_score': 6,
+            'score_date': '20250910',
+        },
+    ]
+    info_docs = [{'symbol': 'FFF.SH', 'name': 'F Corp', 'industry': 'Y'}]
+    fake_db = FakeDB(stock_scores_docs=docs, stock_info_docs=info_docs)
+    monkeypatch.setattr(stock_ranking, 'get_db_collections', lambda: fake_db)
+    vp = [{"symbol": "FFF.SH", "trade_date": "20250910", "close": 100}]
+    vp.extend(
+        {"symbol": "FFF.SH", "trade_date": f"202509{day:02d}", "close": 100 + idx}
+        for idx, day in enumerate(range(11, 31), start=1)
+    )
+    monkeypatch.setattr(
+        stock_ranking,
+        'get_data_db',
+        lambda: {'volume_price': FakeVolumePriceCollection(vp)},
+    )
+
+    client = TestClient(app)
+    resp = client.post('/api/stock-rankings/selected', json={'symbols': ['FFF.SH']})
+    assert resp.status_code == 200
+    row = resp.json()['data'][0]
+    assert row['future_return_base_trade_date'] == '20250910'
+    assert row['future_return_10d_pct'] == pytest.approx(10.0)
+    assert row['future_return_10d_trade_date'] == '20250920'
+    assert row['future_return_20d_pct'] == pytest.approx(20.0)
+    assert row['future_return_20d_trade_date'] == '20250930'
+
+
+@pytest.mark.unit
 def test_selected_stock_rankings_sorts_by_strategy_query(monkeypatch):
     """balanced vs aggressive 名次相反时，顺序随 ?strategy= 变化。"""
     docs = [
