@@ -38,6 +38,18 @@ def safe_round(val: Any, ndigits: int = 2) -> float:
     return round(safe_float(val, 0.0), ndigits)
 
 
+def safe_round_or_none(val: Any, ndigits: int = 2) -> Optional[float]:
+    """Round like ``safe_round`` but preserve NA.
+
+    Returns ``None`` when the value is missing/NA (``None``) so skipped scoring
+    dimensions surface as null (rendered as "—" on the frontend) instead of
+    being silently coerced to 0.0.
+    """
+    if val is None:
+        return None
+    return round(safe_float(val, 0.0), ndigits)
+
+
 def extract_strategy_score(cs: Union[Dict[str, float], float, int], strategy: str = 'balanced') -> float:
     if isinstance(cs, dict):
         if strategy in cs:

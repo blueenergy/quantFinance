@@ -7,6 +7,7 @@ from db import get_db_collections, get_data_db
 from utils.score_utils import (
     parse_score_weights,
     safe_round,
+    safe_round_or_none,
     safe_float,
     extract_strategy_score,
     weighted_dimension_score,
@@ -1357,20 +1358,22 @@ async def get_stock_rankings_by_index(
         for stock in page:
             sym = stock.get("symbol") or ""
             inf = info_map.get(sym)
-            cs = stock.get("composite_score", 0)
-            if not isinstance(cs, dict):
+            cs = stock.get("composite_score")
+            # 精简评分模式下 composite 为 NA(None)，保持 None 让前端渲染「—」；
+            # 旧数据/单值时仍归一化为 {"balanced": value}。
+            if cs is not None and not isinstance(cs, dict):
                 cs = {"balanced": cs}
             row = {
                 "symbol": sym,
                 "name": (inf or {}).get("name", "") if inf else "",
                 "industry": (inf or {}).get("industry", "") if inf else "",
                 "composite_score": cs,
-                "cycle_score": safe_round(stock.get("cycle_score", 0), 2),
-                "value_score": safe_round(stock.get("value_score", 0), 2),
-                "fundamental_score": safe_round(stock.get("fundamental_score", 0), 2),
-                "growth_score": safe_round(stock.get("growth_score", 0), 2),
-                "technical_score": safe_round(stock.get("technical_score", 0), 2),
-                "money_flow_score": safe_round(stock.get("money_flow_score", 0), 2),
+                "cycle_score": safe_round_or_none(stock.get("cycle_score"), 2),
+                "value_score": safe_round_or_none(stock.get("value_score"), 2),
+                "fundamental_score": safe_round_or_none(stock.get("fundamental_score"), 2),
+                "growth_score": safe_round_or_none(stock.get("growth_score"), 2),
+                "technical_score": safe_round_or_none(stock.get("technical_score"), 2),
+                "money_flow_score": safe_round_or_none(stock.get("money_flow_score"), 2),
                 "industry_rs_score": stock.get("industry_rs_score"),
                 "index_codes": _normalize_index_codes(stock.get("index_codes")),
                 "score_date": stock.get("score_date", ""),
@@ -1521,9 +1524,10 @@ async def get_stock_rankings(
 
         formatted = []
         for stock in top_stocks[:limit]:
-            cs = stock.get('composite_score', 0)
-            # ensure composite_score is a dict for consistent responses
-            if not isinstance(cs, dict):
+            cs = stock.get('composite_score')
+            # ensure composite_score is a dict for consistent responses;
+            # 精简评分模式下 composite 为 NA(None)，保持 None 让前端渲染「—」。
+            if cs is not None and not isinstance(cs, dict):
                 cs = {'balanced': cs}
 
             row = {
@@ -1531,12 +1535,12 @@ async def get_stock_rankings(
                 'name': stock.get('name', ''),
                 'industry': stock.get('industry', ''),
                 'composite_score': cs,
-                'cycle_score': safe_round(stock.get('cycle_score', 0), 2),
-                'value_score': safe_round(stock.get('value_score', 0), 2),
-                'fundamental_score': safe_round(stock.get('fundamental_score', 0), 2),
-                'growth_score': safe_round(stock.get('growth_score', 0), 2),
-                'technical_score': safe_round(stock.get('technical_score', 0), 2),
-                'money_flow_score': safe_round(stock.get('money_flow_score', 0), 2),
+                'cycle_score': safe_round_or_none(stock.get('cycle_score'), 2),
+                'value_score': safe_round_or_none(stock.get('value_score'), 2),
+                'fundamental_score': safe_round_or_none(stock.get('fundamental_score'), 2),
+                'growth_score': safe_round_or_none(stock.get('growth_score'), 2),
+                'technical_score': safe_round_or_none(stock.get('technical_score'), 2),
+                'money_flow_score': safe_round_or_none(stock.get('money_flow_score'), 2),
                 'industry_rs_score': stock.get('industry_rs_score'),
                 'index_codes': _normalize_index_codes(stock.get('index_codes')),
                 'score_date': stock.get('score_date', '')
@@ -1982,17 +1986,17 @@ async def get_selected_stock_rankings(
                     doc = _find_one_stock_score(stock_scores, sym, d)
                     if doc:
                         latest_any = latest_any or doc
-                        cs = doc.get('composite_score', 0)
-                        if not isinstance(cs, dict):
+                        cs = doc.get('composite_score')
+                        if cs is not None and not isinstance(cs, dict):
                             cs = {'balanced': cs}
                         per_date_scores[d] = cs
                         per_date_fields[d] = {
-                            'cycle_score': safe_round(doc.get('cycle_score', 0), 2),
-                            'growth_score': safe_round(doc.get('growth_score', 0), 2),
-                            'fundamental_score': safe_round(doc.get('fundamental_score', 0), 2),
-                            'value_score': safe_round(doc.get('value_score', 0), 2),
-                            'technical_score': safe_round(doc.get('technical_score', 0), 2),
-                            'money_flow_score': safe_round(doc.get('money_flow_score', 0), 2),
+                            'cycle_score': safe_round_or_none(doc.get('cycle_score'), 2),
+                            'growth_score': safe_round_or_none(doc.get('growth_score'), 2),
+                            'fundamental_score': safe_round_or_none(doc.get('fundamental_score'), 2),
+                            'value_score': safe_round_or_none(doc.get('value_score'), 2),
+                            'technical_score': safe_round_or_none(doc.get('technical_score'), 2),
+                            'money_flow_score': safe_round_or_none(doc.get('money_flow_score'), 2),
                             'industry_rs_score': doc.get('industry_rs_score')
                         }
                 info = None
@@ -2119,20 +2123,21 @@ async def get_selected_stock_rankings(
         for stock in selected_stocks:
             if '_id' in stock:
                 stock['_id'] = str(stock['_id'])
-            cs = stock.get('composite_score', 0)
-            if not isinstance(cs, dict):
+            cs = stock.get('composite_score')
+            # 精简评分模式下 composite 为 NA(None)，保持 None 让前端渲染「—」。
+            if cs is not None and not isinstance(cs, dict):
                 cs = {'balanced': cs}
             formatted_stock = {
                 'symbol': stock.get('symbol', ''),
                 'name': stock.get('name', ''),
                 'industry': stock.get('industry', ''),
                 'composite_score': cs,
-                'cycle_score': safe_round(stock.get('cycle_score', 0), 2),
-                'value_score': safe_round(stock.get('value_score', 0), 2),
-                'fundamental_score': safe_round(stock.get('fundamental_score', 0), 2),
-                'growth_score': safe_round(stock.get('growth_score', 0), 2),
-                'technical_score': safe_round(stock.get('technical_score', 0), 2),
-                'money_flow_score': safe_round(stock.get('money_flow_score', 0), 2),
+                'cycle_score': safe_round_or_none(stock.get('cycle_score'), 2),
+                'value_score': safe_round_or_none(stock.get('value_score'), 2),
+                'fundamental_score': safe_round_or_none(stock.get('fundamental_score'), 2),
+                'growth_score': safe_round_or_none(stock.get('growth_score'), 2),
+                'technical_score': safe_round_or_none(stock.get('technical_score'), 2),
+                'money_flow_score': safe_round_or_none(stock.get('money_flow_score'), 2),
                 'industry_rs_score': stock.get('industry_rs_score'),
                 'index_codes': _normalize_index_codes(stock.get('index_codes')),
                 'score_date': stock.get('score_date', date if date else '')
