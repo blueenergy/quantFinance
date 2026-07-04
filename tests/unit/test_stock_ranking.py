@@ -403,6 +403,44 @@ def test_stock_rankings_no_date_uses_latest_score_date_snapshot(monkeypatch):
 
 
 @pytest.mark.unit
+def test_enrich_rows_price_returns_shares_score_date_base(monkeypatch):
+    """orchestrator 一次跑完三个 pass，return-since 与 prior-3m 共用评分日基准 K。"""
+    vp = FakeVolumePriceCollection([
+        {"symbol": "AAA.SH", "trade_date": "20250620", "close": 80},   # prior-3m base
+        {"symbol": "AAA.SH", "trade_date": "20250920", "close": 100},  # score-date base / prior-3m end
+        {"symbol": "AAA.SH", "trade_date": "20251001", "close": 110},  # latest
+    ])
+    rows = [{"symbol": "AAA.SH", "score_date": "20250920"}]
+    stock_ranking.enrich_rows_price_returns(rows, vp)
+    row = rows[0]
+    # return-since: latest 110 vs score-date base 100 -> +10%
+    assert row["return_since_score_pct"] == pytest.approx(10.0)
+    assert row["price_base_trade_date"] == "20250920"
+    assert row["price_latest_trade_date"] == "20251001"
+    # prior-3m: end (score-date base) 100 vs base 80 -> +25%
+    assert row["prior_3m_return_pct"] == pytest.approx(25.0)
+    assert row["prior_3m_end_trade_date"] == "20250920"
+    assert row["prior_3m_base_trade_date"] == "20250620"
+
+
+@pytest.mark.unit
+def test_build_score_date_base_map_keys_by_symbol_and_date():
+    vp = FakeVolumePriceCollection([
+        {"symbol": "AAA.SH", "trade_date": "20250918", "close": 90},
+        {"symbol": "AAA.SH", "trade_date": "20250920", "close": 100},
+        {"symbol": "BBB.SH", "trade_date": "20250920", "close": 200},
+    ])
+    rows = [
+        {"symbol": "AAA.SH", "score_date": "20250920"},
+        {"symbol": "BBB.SH", "score_date": "20250920"},
+    ]
+    base_map = stock_ranking._build_score_date_base_map(rows, vp)
+    # on/just-before 20250920: AAA -> 20250920 bar, BBB -> 20250920 bar
+    assert stock_ranking._trade_date_str(base_map[("AAA.SH", "20250920")]) == "20250920"
+    assert stock_ranking._trade_date_str(base_map[("BBB.SH", "20250920")]) == "20250920"
+
+
+@pytest.mark.unit
 def test_stock_rankings_can_sort_by_weighted_dimensions(monkeypatch):
     docs = [
         {

@@ -824,14 +824,88 @@ def compute_prior_3m_return(
     )
 
 
-def enrich_rows_return_since_score(rows: List[dict], volume_price_col: Any) -> None:
-    """批量写涨跌字段：Mongo 往返约 1 + 不同 score_date 种数 + 少量回退查询。"""
+def _build_score_date_base_map(
+    rows: List[dict], volume_price_col: Any
+) -> Dict[Tuple[str, str], Any]:
+    """评分日基准 K 线：不晚于每行 score_date 的最近一根日线，键 ``(symbol, score_date)``。
+
+    这根基准 K 被三个价格涨跌 enrich pass 共用（涨跌以来的基准、前 3 月窗口的末端、
+    未来收益的基准），预取一次共享即可避免三次对同一批 symbol/日期的 volume_price
+    批量聚合。仅保留 close 有效的条目；缺失键 ``.get`` 得 None，与逐行回退语义一致。
+    """
+    base_map: Dict[Tuple[str, str], Any] = {}
+    if not rows:
+        return base_map
+    has_agg = hasattr(volume_price_col, "aggregate")
+    by_sd: Dict[str, List[str]] = {}
+    for row in rows:
+        sym = row.get("symbol") or ""
+        sd = str(row.get("score_date") or "").strip()[:8]
+        if len(sd) < 8 or not sym:
+            continue
+        by_sd.setdefault(sd, []).append(sym)
+    for sd, syms in by_sd.items():
+        uniq_syms = list(dict.fromkeys(syms))
+        bulk: Dict[str, Any] = {}
+        if has_agg:
+            bulk = _bulk_base_by_symbol_string(
+                volume_price_col, _expanded_query_symbols(uniq_syms), sd
+            )
+        for sym in uniq_syms:
+            doc = _pick_vp_doc(bulk, sym) if bulk else None
+            if not (doc and _close_from_volume_price_doc(doc) is not None):
+                doc = None
+                for k in _symbol_key_variants(sym):
+                    fd = _fetch_base_doc_single(volume_price_col, k, sd)
+                    if fd and _close_from_volume_price_doc(fd) is not None:
+                        doc = fd
+                        break
+            if doc and _close_from_volume_price_doc(doc) is not None:
+                base_map[(sym, sd)] = doc
+    return base_map
+
+
+def enrich_rows_price_returns(rows: List[dict], volume_price_col: Any) -> None:
+    """一次性跑完三个价格涨跌 enrich pass，共享评分日基准 K 线与 adj_factor DAO。
+
+    评分日基准 K（return-since 基准 / prior-3m 窗口末端 / future 基准）只取一次，
+    ``AdjustedPriceDataAccess`` 也只建一次（其 factor 缓存跨三个 pass 复用），把
+    三次重复的基准聚合与因子取用收敛为一次。
+    """
     if not rows:
         return
+    score_base_map = _build_score_date_base_map(rows, volume_price_col)
+    adj_dao = _adj_dao_from_volume_price_col(volume_price_col)
+    enrich_rows_return_since_score(
+        rows, volume_price_col, score_base_map=score_base_map, adj_dao=adj_dao
+    )
+    enrich_rows_prior_3m_return(
+        rows, volume_price_col, score_base_map=score_base_map, adj_dao=adj_dao
+    )
+    enrich_rows_future_returns(
+        rows, volume_price_col, score_base_map=score_base_map, adj_dao=adj_dao
+    )
+
+
+def enrich_rows_return_since_score(
+    rows: List[dict],
+    volume_price_col: Any,
+    *,
+    score_base_map: Optional[Dict[Tuple[str, str], Any]] = None,
+    adj_dao: Optional[AdjustedPriceDataAccess] = None,
+) -> None:
+    """批量写涨跌字段：Mongo 往返约 1 + 不同 score_date 种数 + 少量回退查询。
+
+    ``score_base_map``（评分日基准 K，键 ``(symbol, score_date)``）与 ``adj_dao`` 可由
+    上层预取后在三个 enrich pass 间共享，避免重复拉取同一批基准 K 与重复建 DAO。
+    """
+    if not rows:
+        return
+    if adj_dao is None:
+        adj_dao = _adj_dao_from_volume_price_col(volume_price_col)
     if not hasattr(volume_price_col, "aggregate"):
         latest_by_symbol: Dict[str, Any] = {}
-        base_by_key: Dict[Tuple[str, str], Any] = {}
-        adj_dao = _adj_dao_from_volume_price_col(volume_price_col)
+        base_by_key: Dict[Tuple[str, str], Any] = dict(score_base_map) if score_base_map else {}
         for row in rows:
             row.update(
                 compute_return_since_score(
@@ -855,35 +929,12 @@ def enrich_rows_return_since_score(rows: List[dict], volume_price_col: Any) -> N
     symbols_vp = _expanded_query_symbols(symbols)
     latest_map = _bulk_latest_by_symbol(volume_price_col, symbols_vp)
 
-    by_sd: Dict[str, List[str]] = {}
-    for row in rows:
-        sym = row.get("symbol") or ""
-        sd = str(row.get("score_date") or "").strip()[:8]
-        if len(sd) < 8 or not sym:
-            continue
-        by_sd.setdefault(sd, []).append(sym)
+    base_map = (
+        score_base_map
+        if score_base_map is not None
+        else _build_score_date_base_map(rows, volume_price_col)
+    )
 
-    base_map: Dict[Tuple[str, str], Any] = {}
-    for sd, syms in by_sd.items():
-        uniq_syms = list(dict.fromkeys(syms))
-        uniq_vp = _expanded_query_symbols(uniq_syms)
-        bulk = _bulk_base_by_symbol_string(volume_price_col, uniq_vp, sd)
-        for sym in uniq_syms:
-            doc = _pick_vp_doc(bulk, sym)
-            if doc and _close_from_volume_price_doc(doc) is not None:
-                base_map[(sym, sd)] = doc
-        for sym in uniq_syms:
-            if (sym, sd) in base_map:
-                continue
-            doc = None
-            for k in _symbol_key_variants(sym):
-                fd = _fetch_base_doc_single(volume_price_col, k, sd)
-                if fd and _close_from_volume_price_doc(fd) is not None:
-                    doc = fd
-                    break
-            base_map[(sym, sd)] = doc
-
-    adj_dao = _adj_dao_from_volume_price_col(volume_price_col)
     factor_pairs: List[Tuple[str, str]] = []
     seen_pairs: Set[Tuple[str, str]] = set()
     for row in rows:
@@ -920,14 +971,25 @@ def enrich_rows_return_since_score(rows: List[dict], volume_price_col: Any) -> N
         )
 
 
-def enrich_rows_prior_3m_return(rows: List[dict], volume_price_col: Any) -> None:
-    """批量写评分日前 3 个月涨跌字段。"""
+def enrich_rows_prior_3m_return(
+    rows: List[dict],
+    volume_price_col: Any,
+    *,
+    score_base_map: Optional[Dict[Tuple[str, str], Any]] = None,
+    adj_dao: Optional[AdjustedPriceDataAccess] = None,
+) -> None:
+    """批量写评分日前 3 个月涨跌字段。
+
+    ``score_base_map`` 提供评分日基准 K（即 3 月窗口的末端 K，键 ``(symbol, score_date)``），
+    可与其它 pass 共享；3 月前的基准 K 仍按需另取。``adj_dao`` 同样可共享复用。
+    """
     if not rows:
         return
-    if not hasattr(volume_price_col, "aggregate"):
-        end_by_key: Dict[Tuple[str, str], Any] = {}
-        base_by_key: Dict[Tuple[str, str], Any] = {}
+    if adj_dao is None:
         adj_dao = _adj_dao_from_volume_price_col(volume_price_col)
+    if not hasattr(volume_price_col, "aggregate"):
+        end_by_key: Dict[Tuple[str, str], Any] = dict(score_base_map) if score_base_map else {}
+        base_by_key: Dict[Tuple[str, str], Any] = {}
         for row in rows:
             row.update(
                 compute_prior_3m_return(
@@ -950,7 +1012,9 @@ def enrich_rows_prior_3m_return(rows: List[dict], volume_price_col: Any) -> None
             continue
         by_sd.setdefault(sd, []).append(sym)
 
-    end_map: Dict[Tuple[str, str], Any] = {}
+    # End bar (on/just-before score_date) is the shared score-date base K when
+    # provided; only the 3-month-prior base bar needs its own bulk fetch here.
+    end_map: Dict[Tuple[str, str], Any] = dict(score_base_map) if score_base_map else {}
     base_map: Dict[Tuple[str, str], Any] = {}
     for sd, syms in by_sd.items():
         base_sd = _yyyymmdd_months_before(sd, 3)
@@ -958,12 +1022,15 @@ def enrich_rows_prior_3m_return(rows: List[dict], volume_price_col: Any) -> None
             continue
         uniq_syms = list(dict.fromkeys(syms))
         uniq_vp = _expanded_query_symbols(uniq_syms)
-        end_bulk = _bulk_base_by_symbol_string(volume_price_col, uniq_vp, sd)
         base_bulk = _bulk_base_by_symbol_string(volume_price_col, uniq_vp, base_sd)
+        end_bulk = None
         for sym in uniq_syms:
-            end_doc = _pick_vp_doc(end_bulk, sym)
-            if end_doc and _close_from_volume_price_doc(end_doc) is not None:
-                end_map[(sym, sd)] = end_doc
+            if (sym, sd) not in end_map:
+                if end_bulk is None:
+                    end_bulk = _bulk_base_by_symbol_string(volume_price_col, uniq_vp, sd)
+                end_doc = _pick_vp_doc(end_bulk, sym)
+                if end_doc and _close_from_volume_price_doc(end_doc) is not None:
+                    end_map[(sym, sd)] = end_doc
             base_doc = _pick_vp_doc(base_bulk, sym)
             if base_doc and _close_from_volume_price_doc(base_doc) is not None:
                 base_map[(sym, base_sd)] = base_doc
@@ -985,7 +1052,6 @@ def enrich_rows_prior_3m_return(rows: List[dict], volume_price_col: Any) -> None
                         break
                 base_map[(sym, base_sd)] = doc
 
-    adj_dao = _adj_dao_from_volume_price_col(volume_price_col)
     factor_pairs: List[Tuple[str, str]] = []
     seen_pairs: Set[Tuple[str, str]] = set()
     for row in rows:
@@ -1021,49 +1087,38 @@ def enrich_rows_prior_3m_return(rows: List[dict], volume_price_col: Any) -> None
         )
 
 
-def enrich_rows_future_returns(rows: List[dict], volume_price_col: Any) -> None:
+def enrich_rows_future_returns(
+    rows: List[dict],
+    volume_price_col: Any,
+    *,
+    score_base_map: Optional[Dict[Tuple[str, str], Any]] = None,
+    adj_dao: Optional[AdjustedPriceDataAccess] = None,
+) -> None:
     """Add 10/20-trading-day forward returns to already formatted rows.
 
     Batched to match the other enrich passes: base bars are fetched in bulk per
     distinct ``score_date`` and the ``adj_factor`` lookup is issued **once** for
     all rows (instead of once per symbol), keeping Mongo round trips roughly
     proportional to the number of distinct score dates rather than to N rows.
+
+    ``score_base_map`` (score-date base K per ``(symbol, score_date)``) and
+    ``adj_dao`` can be supplied by the caller so the score-date base fetch and
+    the DAO are shared with the other enrich passes.
     """
     if not rows:
         return
     max_horizon = max(FUTURE_RETURN_HORIZONS)
-    adj_dao = _adj_dao_from_volume_price_col(volume_price_col)
-    has_agg = hasattr(volume_price_col, "aggregate")
+    if adj_dao is None:
+        adj_dao = _adj_dao_from_volume_price_col(volume_price_col)
 
-    # 1) base bar on/just-before score_date, bulked per distinct score_date.
-    by_sd: Dict[str, List[str]] = {}
-    for row in rows:
-        sym = row.get("symbol") or ""
-        sd = str(row.get("score_date") or "").strip()[:8]
-        if len(sd) < 8 or not sym:
-            row.update(dict(FUTURE_RETURN_EMPTY))
-            continue
-        by_sd.setdefault(sd, []).append(sym)
-
-    base_map: Dict[Tuple[str, str], Any] = {}
-    for sd, syms in by_sd.items():
-        uniq_syms = list(dict.fromkeys(syms))
-        bulk: Dict[str, Any] = {}
-        if has_agg:
-            bulk = _bulk_base_by_symbol_string(
-                volume_price_col, _expanded_query_symbols(uniq_syms), sd
-            )
-        for sym in uniq_syms:
-            doc = _pick_vp_doc(bulk, sym) if bulk else None
-            if not (doc and _close_from_volume_price_doc(doc) is not None):
-                doc = None
-                for k in _symbol_key_variants(sym):
-                    fd = _fetch_base_doc_single(volume_price_col, k, sd)
-                    if fd and _close_from_volume_price_doc(fd) is not None:
-                        doc = fd
-                        break
-            if doc and _close_from_volume_price_doc(doc) is not None:
-                base_map[(sym, sd)] = doc
+    # 1) base bar on/just-before score_date, shared when provided.
+    # Missing/invalid rows are filled with FUTURE_RETURN_EMPTY in step 4 below.
+    if score_base_map is not None:
+        base_map: Dict[Tuple[str, str], Any] = {
+            key: doc for key, doc in score_base_map.items() if doc is not None
+        }
+    else:
+        base_map = _build_score_date_base_map(rows, volume_price_col)
 
     # 2) forward window per symbol (one indexed lookup, capped at max horizon).
     window_by_key: Dict[Tuple[str, str], List[dict]] = {}
@@ -1237,9 +1292,7 @@ async def get_stock_rankings_by_index(
             vp_col = get_data_db()["volume_price"]
             # Index rankings are paged; enrich only the visible page to keep
             # large constituent universes cheap while preserving table parity.
-            enrich_rows_return_since_score(formatted, vp_col)
-            enrich_rows_prior_3m_return(formatted, vp_col)
-            enrich_rows_future_returns(formatted, vp_col)
+            enrich_rows_price_returns(formatted, vp_col)
         except Exception as ex:
             print(f"[stock-rankings/by-index] enrich price returns failed: {ex}")
         payload = {
@@ -1402,9 +1455,7 @@ async def get_stock_rankings(
 
         try:
             vp_col = get_data_db()["volume_price"]
-            enrich_rows_return_since_score(formatted, vp_col)
-            enrich_rows_prior_3m_return(formatted, vp_col)
-            enrich_rows_future_returns(formatted, vp_col)
+            enrich_rows_price_returns(formatted, vp_col)
         except Exception as ex:
             print(f"[stock-rankings] enrich price returns failed: {ex}")
 
@@ -2007,11 +2058,7 @@ async def get_selected_stock_rankings(
         if _should_enrich_return_since(body, len(symbols)):
             try:
                 vp_col = get_data_db()["volume_price"]
-                enrich_rows_return_since_score(
-                    page_rows, vp_col
-                )
-                enrich_rows_prior_3m_return(page_rows, vp_col)
-                enrich_rows_future_returns(page_rows, vp_col)
+                enrich_rows_price_returns(page_rows, vp_col)
             except Exception as ex:
                 print(f"[stock-rankings/selected] enrich price returns failed: {ex}")
         else:
