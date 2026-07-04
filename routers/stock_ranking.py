@@ -558,6 +558,69 @@ def _future_window_after_base(
     return []
 
 
+def _bulk_future_windows(
+    volume_price_col: Any,
+    items: List[Tuple[str, dict]],
+    max_days: int,
+) -> Dict[Tuple[str, str], List[dict]]:
+    """Forward windows for many ``(symbol, base_doc)`` pairs, batched by base date.
+
+    ``_future_window_after_base`` issues one aggregation per symbol; a full page
+    then costs N sequential round trips, which is the dominant latency against a
+    remote MongoDB. Symbols sharing the same base ``trade_date`` (the common case
+    for a single score_date snapshot) are collapsed into one aggregation that
+    ``$slice``-limits each symbol to ``max_days`` forward bars. Returns a map
+    keyed by ``(symbol, base_trade_date_str)`` matching ``_future_window_after_base``.
+    """
+    windows: Dict[Tuple[str, str], List[dict]] = {}
+    if not items or max_days <= 0:
+        return windows
+    has_agg = hasattr(volume_price_col, "aggregate")
+
+    # Group symbols by their base bar's raw trade_date (identical storage form
+    # across symbols within the same collection/date).
+    by_td: Dict[str, Dict[str, Any]] = {}
+    for sym, bdoc in items:
+        btd = _trade_date_str(bdoc)
+        braw = bdoc.get("trade_date") if bdoc else None
+        if not sym or not btd or braw is None:
+            continue
+        grp = by_td.setdefault(btd, {"raw": braw, "syms": []})
+        grp["syms"].append(sym)
+
+    for btd, grp in by_td.items():
+        syms = list(dict.fromkeys(grp["syms"]))
+        braw = grp["raw"]
+        by_stored: Dict[str, List[dict]] = {}
+        if has_agg:
+            try:
+                cur = volume_price_col.aggregate(
+                    [
+                        {"$match": {"symbol": {"$in": _expanded_query_symbols(syms)}, "trade_date": {"$gt": braw}}},
+                        {"$sort": {"symbol": 1, "trade_date": 1}},
+                        {"$group": {"_id": "$symbol", "docs": {"$push": "$$ROOT"}}},
+                        {"$project": {"docs": {"$slice": ["$docs", max_days]}}},
+                    ]
+                )
+                for row in cur:
+                    sid = row.get("_id")
+                    docs = row.get("docs") or []
+                    valid = [d for d in docs if _close_from_volume_price_doc(d) is not None]
+                    if sid and valid:
+                        by_stored[str(sid)] = valid
+            except Exception:
+                by_stored = {}
+        for sym in syms:
+            win = _pick_vp_list(by_stored, sym)
+            if win is None:
+                # Per-symbol fallback (also the path for aggregate-less fakes).
+                win = _future_window_after_base(
+                    volume_price_col, sym, {"trade_date": braw}, max_days
+                )
+            windows[(sym, btd)] = win or []
+    return windows
+
+
 def compute_future_returns_after_score(
     volume_price_col: Any,
     symbol: str,
@@ -680,6 +743,15 @@ def _pick_vp_doc(vp_by_symbol: Dict[str, Any], sym: str) -> Optional[dict]:
         d = vp_by_symbol.get(k)
         if d:
             return d
+    return None
+
+
+def _pick_vp_list(vp_by_symbol: Dict[str, List[dict]], sym: str) -> Optional[List[dict]]:
+    """Like :func:`_pick_vp_doc` but for a per-symbol list of bars (variant-aware)."""
+    for k in _symbol_key_variants(sym):
+        v = vp_by_symbol.get(k)
+        if v:
+            return v
     return None
 
 
@@ -1120,15 +1192,13 @@ def enrich_rows_future_returns(
     else:
         base_map = _build_score_date_base_map(rows, volume_price_col)
 
-    # 2) forward window per symbol (one indexed lookup, capped at max horizon).
-    window_by_key: Dict[Tuple[str, str], List[dict]] = {}
-    for (sym, sd), bdoc in base_map.items():
-        btd = _trade_date_str(bdoc) or sd
-        wkey = (sym, btd)
-        if wkey not in window_by_key:
-            window_by_key[wkey] = _future_window_after_base(
-                volume_price_col, sym, bdoc, max_horizon
-            )
+    # 2) forward windows, batched by base trade_date (one aggregation per
+    #    distinct base date instead of one per symbol).
+    window_by_key = _bulk_future_windows(
+        volume_price_col,
+        [(sym, bdoc) for (sym, _sd), bdoc in base_map.items()],
+        max_horizon,
+    )
 
     # 3) single shared adj_factor lookup for every base + target forward bar.
     factor_pairs: List[Tuple[str, str]] = []

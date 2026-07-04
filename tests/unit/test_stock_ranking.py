@@ -1388,3 +1388,49 @@ def test_return_since_degrades_without_factor():
     base = {"symbol": "AAA.SH", "trade_date": "20250920", "close": 100.0}
     out = stock_ranking._return_since_from_docs(latest, base, sym="AAA.SH", factor_map={})
     assert out["return_since_score_pct"] == pytest.approx(10.0)
+
+
+class _FakeAggVolumePrice:
+    """Volume-price fake that supports the batched forward-window aggregation."""
+
+    def __init__(self, docs):
+        self.docs = list(docs)
+        self.agg_calls = 0
+
+    def aggregate(self, pipeline):
+        self.agg_calls += 1
+        match = pipeline[0]["$match"]
+        allow = set(match["symbol"]["$in"])
+        gt = match["trade_date"]["$gt"]
+        limit = pipeline[-1]["$project"]["docs"]["$slice"][1]
+        rows = [
+            d for d in self.docs
+            if d.get("symbol") in allow and str(d.get("trade_date")) > str(gt)
+        ]
+        grouped = {}
+        for d in sorted(rows, key=lambda x: (x["symbol"], str(x["trade_date"]))):
+            grouped.setdefault(d["symbol"], []).append(d)
+        return [{"_id": sym, "docs": docs[:limit]} for sym, docs in grouped.items()]
+
+
+@pytest.mark.unit
+def test_bulk_future_windows_batches_symbols_sharing_base_date():
+    docs = [
+        {"symbol": "AAA.SH", "trade_date": "20250101", "close": 10.0},
+        {"symbol": "AAA.SH", "trade_date": "20250102", "close": 11.0},
+        {"symbol": "AAA.SH", "trade_date": "20250103", "close": 12.0},
+        {"symbol": "BBB.SH", "trade_date": "20250101", "close": 20.0},
+        {"symbol": "BBB.SH", "trade_date": "20250102", "close": 22.0},
+    ]
+    vp = _FakeAggVolumePrice(docs)
+    base_aaa = {"symbol": "AAA.SH", "trade_date": "20250101", "close": 10.0}
+    base_bbb = {"symbol": "BBB.SH", "trade_date": "20250101", "close": 20.0}
+
+    windows = stock_ranking._bulk_future_windows(
+        vp, [("AAA.SH", base_aaa), ("BBB.SH", base_bbb)], max_days=2
+    )
+
+    # Both symbols share base 20250101 -> a single aggregation.
+    assert vp.agg_calls == 1
+    assert [d["close"] for d in windows[("AAA.SH", "20250101")]] == [11.0, 12.0]
+    assert [d["close"] for d in windows[("BBB.SH", "20250101")]] == [22.0]
