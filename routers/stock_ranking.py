@@ -117,6 +117,21 @@ SCORE_SORT_FIELDS: Dict[str, str] = {
 }
 
 
+def _latest_score_date(stock_scores: Any) -> Optional[str]:
+    """Latest ``score_date`` across the whole ``stock_scores`` collection.
+
+    Backed by the ``(score_date -1, index_codes 1)`` compound index (score_date
+    is the prefix), so this is a single indexed lookup instead of scanning or
+    grouping the full history.
+    """
+    latest_doc = stock_scores.find_one(
+        {},
+        {"score_date": 1, "_id": 0},
+        sort=[("score_date", -1)],
+    )
+    return (latest_doc or {}).get("score_date") if latest_doc else None
+
+
 def _latest_index_score_date(stock_scores: Any, index_code: str) -> Optional[str]:
     """Latest ``score_date`` that has any doc tagged with ``index_code``.
 
@@ -1292,9 +1307,18 @@ async def get_stock_rankings(
         stock_scores = db['stock_scores']
         stock_info = db['stock_info']
 
-        # Efficient aggregation: $sort -> $group (first doc) -> project -> sort
-        if date:
-            match_stage = {"$match": {"score_date": date}}
+        # Scores are written in per-run batches sharing one score_date, so the
+        # latest scored date is the current full-market snapshot. Resolve that
+        # date with a single indexed lookup and match {score_date} + project +
+        # sort — both the dated and undated paths hit the compound index and
+        # avoid the full-collection $sort + $group over all history.
+        # Semantics: a symbol scored only on an earlier date (e.g. halted on the
+        # latest day) is dropped rather than backfilled with its stale score.
+        effective_date = date or _latest_score_date(stock_scores)
+        if not effective_date:
+            all_stocks = []
+        else:
+            match_stage = {"$match": {"score_date": effective_date}}
             if min_score is not None:
                 match_stage["$match"].update({"composite_score": {"$gte": min_score}})
             pipeline = [
@@ -1313,39 +1337,15 @@ async def get_stock_rankings(
                 }},
                 {"$sort": {"composite_score": -1}},
             ]
-        else:
-            # sort by score_date desc, then group by symbol taking first
-            pipeline = [
-                {"$sort": {"score_date": -1}},
-                {"$group": {"_id": "$symbol", "first": {"$first": "$$ROOT"}}},
-                {"$replaceRoot": {"newRoot": "$first"}},
-                {"$project": {
-                    "symbol": 1,
-                    "composite_score": 1,
-                    "cycle_score": 1,
-                    "value_score": 1,
-                    "fundamental_score": 1,
-                    "growth_score": 1,
-                    "technical_score": 1,
-                    "money_flow_score": 1,
-                    "industry_rs_score": 1,
-                    "score_date": 1
-                }},
-            ]
-            if min_score is not None:
-                pipeline.append({"$match": {"composite_score": {"$gte": min_score}}})
-            pipeline.extend([
-                {"$sort": {"composite_score": -1}},
-            ])
 
-        try:
-            all_stocks = list(stock_scores.aggregate(pipeline))
-        except Exception:
-            # Fallback: simple find with sorting if aggregation fails
-            base_query = {"score_date": date} if date else {}
-            if min_score is not None:
-                base_query["composite_score"] = {"$gte": min_score}
-            all_stocks = list(stock_scores.find(base_query).sort("composite_score", -1).limit(limit * 2))
+            try:
+                all_stocks = list(stock_scores.aggregate(pipeline))
+            except Exception:
+                # Fallback: simple find with sorting if aggregation fails
+                base_query: Dict[str, Any] = {"score_date": effective_date}
+                if min_score is not None:
+                    base_query["composite_score"] = {"$gte": min_score}
+                all_stocks = list(stock_scores.find(base_query).sort("composite_score", -1).limit(limit * 2))
 
         # Batch attach basic info to avoid N+1 queries
         symbols = [s.get('symbol') for s in all_stocks if s.get('symbol')]
