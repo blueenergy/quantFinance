@@ -1,4 +1,7 @@
 # routers/stock_scoring.py
+import os
+import threading
+import time
 from fastapi import APIRouter, HTTPException, Depends, Query, Request
 from db import get_db_collections, get_data_db
 from utils.score_utils import (
@@ -23,6 +26,59 @@ STOCK_INFO_IN_CHUNK = 160
 VOLUME_PRICE_IN_CHUNK = 80
 # 超过该数量时默认不算「评分以来涨跌」（volume_price 聚合很重）；传 skip_return_since=false 可强制计算。
 SELECTED_RETURN_SINCE_AUTO_THRESHOLD = 100
+
+# ==================== 排行榜响应缓存 ====================
+# 排行榜每次请求都要做「全表聚合 + 排序 + 逐行行情 enrich」，同一 (score_date,
+# 参数) 组合结果在短时间内不变，却会被翻页/切策略/多用户/客户端缓存过期反复触发。
+# 用进程内短 TTL 缓存最终响应，仅首个请求付出聚合与 enrich 成本；命中直接复用。
+# 设 TTL<=0（STOCK_RANKING_CACHE_TTL_SECONDS=0）可整体关闭。
+_RANKING_RESPONSE_CACHE: Dict[tuple, Tuple[float, dict]] = {}
+_RANKING_RESPONSE_CACHE_LOCK = threading.Lock()
+_RANKING_RESPONSE_TTL_SECONDS = float(os.getenv("STOCK_RANKING_CACHE_TTL_SECONDS", "120"))
+_RANKING_RESPONSE_CACHE_MAX = 256
+
+
+def _weights_cache_key(weights: Optional[Dict[str, float]]) -> tuple:
+    """Stable, hashable representation of the weighted-sort weights."""
+    if not weights:
+        return ()
+    return tuple(sorted((str(k), float(v)) for k, v in weights.items()))
+
+
+def _ranking_cache_get(key: tuple) -> Optional[dict]:
+    if _RANKING_RESPONSE_TTL_SECONDS <= 0:
+        return None
+    now = time.monotonic()
+    with _RANKING_RESPONSE_CACHE_LOCK:
+        cached = _RANKING_RESPONSE_CACHE.get(key)
+        if cached is not None and now - cached[0] < _RANKING_RESPONSE_TTL_SECONDS:
+            return cached[1]
+    return None
+
+
+def _ranking_cache_put(key: tuple, payload: dict) -> None:
+    if _RANKING_RESPONSE_TTL_SECONDS <= 0:
+        return
+    now = time.monotonic()
+    with _RANKING_RESPONSE_CACHE_LOCK:
+        _RANKING_RESPONSE_CACHE[key] = (now, payload)
+        if len(_RANKING_RESPONSE_CACHE) > _RANKING_RESPONSE_CACHE_MAX:
+            # First drop everything already expired.
+            for stale_key in [
+                k
+                for k, (ts, _payload) in _RANKING_RESPONSE_CACHE.items()
+                if now - ts >= _RANKING_RESPONSE_TTL_SECONDS
+            ]:
+                _RANKING_RESPONSE_CACHE.pop(stale_key, None)
+            # If a burst of distinct keys is still fresh, enforce the hard cap
+            # by evicting the oldest entries so the cache can't grow unbounded.
+            overflow = len(_RANKING_RESPONSE_CACHE) - _RANKING_RESPONSE_CACHE_MAX
+            if overflow > 0:
+                for oldest_key in sorted(
+                    _RANKING_RESPONSE_CACHE,
+                    key=lambda k: _RANKING_RESPONSE_CACHE[k][0],
+                )[:overflow]:
+                    _RANKING_RESPONSE_CACHE.pop(oldest_key, None)
 
 _STOCK_SCORE_LIST_PROJECTION = {
     "_id": 1,
@@ -1071,12 +1127,26 @@ async def get_stock_rankings_by_index(
             % (index_code, ", ".join(STOCK_RANKING_INDEX_CODES)),
         )
     try:
-        db = get_db_collections_from_request(request)
-        stock_scores = db["stock_scores"]
-        stock_info = db["stock_info"]
         effective_strategy = (strategy or "balanced").strip() or "balanced"
         sort_key = _normalize_sort_by(sort_by)
         weighted_weights = _parse_weighted_sort_weights(weights) if sort_key == "weighted" else {}
+        cache_key = (
+            "by-index",
+            ic,
+            str(date or ""),
+            effective_strategy,
+            sort_key,
+            _weights_cache_key(weighted_weights),
+            bool(exclude_st),
+            int(offset),
+            int(page_size),
+        )
+        cached_payload = _ranking_cache_get(cache_key)
+        if cached_payload is not None:
+            return cached_payload
+        db = get_db_collections_from_request(request)
+        stock_scores = db["stock_scores"]
+        stock_info = db["stock_info"]
         raw = _aggregate_index_ranking_score_docs(stock_scores, ic, date)
         raw.sort(
             key=lambda d: _score_sort_value(d, sort_key, effective_strategy, weighted_weights),
@@ -1139,7 +1209,7 @@ async def get_stock_rankings_by_index(
             enrich_rows_future_returns(formatted, vp_col)
         except Exception as ex:
             print(f"[stock-rankings/by-index] enrich price returns failed: {ex}")
-        return {
+        payload = {
             "success": True,
             "data": formatted,
             "total": total,
@@ -1149,6 +1219,8 @@ async def get_stock_rankings_by_index(
             "index_code": ic,
             "message": "按指数 %s 获取评分成功" % ic,
         }
+        _ranking_cache_put(cache_key, payload)
+        return payload
     except HTTPException:
         raise
     except Exception as e:
@@ -1181,12 +1253,26 @@ async def get_stock_rankings(
     获取股票评分排行榜 - 每只股票只显示最新一天的评分（简洁实现）
     """
     try:
-        db = get_db_collections_from_request(request)
-        stock_scores = db['stock_scores']
-        stock_info = db['stock_info']
         effective_strategy = (strategy or "balanced").strip() or "balanced"
         sort_key = _normalize_sort_by(sort_by)
         weighted_weights = _parse_weighted_sort_weights(weights) if sort_key == "weighted" else {}
+        cache_key = (
+            "stock-rankings",
+            int(limit),
+            None if min_score is None else float(min_score),
+            bool(exclude_st),
+            str(date or ""),
+            effective_strategy,
+            sort_key,
+            _weights_cache_key(weighted_weights),
+        )
+        cached_payload = _ranking_cache_get(cache_key)
+        if cached_payload is not None:
+            return cached_payload
+
+        db = get_db_collections_from_request(request)
+        stock_scores = db['stock_scores']
+        stock_info = db['stock_info']
 
         # Efficient aggregation: $sort -> $group (first doc) -> project -> sort
         if date:
@@ -1304,12 +1390,14 @@ async def get_stock_rankings(
         except Exception as ex:
             print(f"[stock-rankings] enrich price returns failed: {ex}")
 
-        return {
+        payload = {
             "success": True,
             "data": formatted,
             "total": len(formatted),
             "message": "获取排行榜成功"
         }
+        _ranking_cache_put(cache_key, payload)
+        return payload
     except HTTPException:
         raise
     except Exception as e:
@@ -1650,10 +1738,6 @@ async def get_selected_stock_rankings(
         symbols = body.symbols
         if not symbols:
             raise HTTPException(status_code=400, detail="股票代码列表不能为空")
-        db = get_db_collections_from_request(request)
-        stock_scores = db['stock_scores']
-        stock_info = db['stock_info']
-        score_query_symbols = _expanded_query_symbols(symbols)
         qs = (strategy or "").strip()
         bs = (body.strategy or "").strip() if body.strategy else ""
         effective_strategy = qs or bs or "balanced"
@@ -1661,6 +1745,26 @@ async def get_selected_stock_rankings(
         weighted_weights = _parse_weighted_sort_weights(weights) if sort_key == "weighted" else {}
         # support optional multi-date per-symbol queries via body.dates
         dates = getattr(body, 'dates', None) or None
+        cache_key = (
+            "selected",
+            tuple(sorted(str(s) for s in symbols)),
+            tuple(str(d) for d in dates) if dates else (),
+            str(date or ""),
+            effective_strategy,
+            sort_key,
+            _weights_cache_key(weighted_weights),
+            int(offset),
+            None if page_size is None else int(page_size),
+            bool(getattr(body, "index_mode", False)),
+            getattr(body, "skip_return_since", None),
+        )
+        cached_payload = _ranking_cache_get(cache_key)
+        if cached_payload is not None:
+            return cached_payload
+        db = get_db_collections_from_request(request)
+        stock_scores = db['stock_scores']
+        stock_info = db['stock_info']
+        score_query_symbols = _expanded_query_symbols(symbols)
         if dates:
             # build a lightweight per-date structure for each requested symbol
             info_docs = _stock_info_find_in_chunks(
@@ -1783,13 +1887,15 @@ async def get_selected_stock_rankings(
                 ),
                 reverse=True,
             )
-            return {
+            payload = {
                 'success': True,
                 'data': formatted_stocks,
                 'total': len(formatted_stocks),
                 'dates': dates,
                 'message': f'成功获取 {len(formatted_stocks)} 只指定股票的多日期评分'
             }
+            _ranking_cache_put(cache_key, payload)
+            return payload
 
         else:
             selected_stocks = []
@@ -1898,7 +2004,7 @@ async def get_selected_stock_rankings(
         for fs in page_rows:
             fs["symbol"] = _requested_symbol_for_db_row(fs.get("symbol", ""), symbols)
         eff_page_size = page_size if page_size is not None else total_all
-        return {
+        payload = {
             "success": True,
             "data": page_rows,
             "total": total_all,
@@ -1911,6 +2017,8 @@ async def get_selected_stock_rankings(
                 else f"成功获取 {len(page_rows)} 只指定股票评分 (每只股票显示最新评分)"
             ),
         }
+        _ranking_cache_put(cache_key, payload)
+        return payload
     except HTTPException:
         raise
     except Exception as e:

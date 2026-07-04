@@ -3,6 +3,19 @@ from fastapi.testclient import TestClient
 from routers import stock_ranking
 from main import app
 
+
+@pytest.fixture(autouse=True)
+def _clear_ranking_response_cache():
+    """Reset the in-process ranking response cache around every test.
+
+    The router caches full responses keyed by request params; without a reset
+    one test's payload (built from its fake DB) could be served to another test
+    that happens to hit the same key.
+    """
+    stock_ranking._RANKING_RESPONSE_CACHE.clear()
+    yield
+    stock_ranking._RANKING_RESPONSE_CACHE.clear()
+
 # Small in-memory fake collection classes to mimic minimal pymongo API used in router
 class FakeCollection:
     def __init__(self, docs=None):
@@ -274,6 +287,82 @@ def test_stock_rankings_can_sort_by_single_dimension(monkeypatch):
     resp = client.get('/api/stock-rankings?limit=2&sort_by=growth')
     assert resp.status_code == 200
     assert [row['symbol'] for row in resp.json()['data']] == ['BBB.SH', 'AAA.SH']
+
+
+@pytest.mark.unit
+def test_stock_rankings_response_is_cached(monkeypatch):
+    """Second identical request is served from the in-process cache and does
+    not touch the database again."""
+    docs = [
+        {'symbol': 'AAA.SH', 'composite_score': {'balanced': 90}, 'cycle_score': 1, 'value_score': 2, 'fundamental_score': 3, 'growth_score': 10, 'technical_score': 5, 'money_flow_score': 20, 'score_date': '20250920'},
+        {'symbol': 'BBB.SH', 'composite_score': {'balanced': 70}, 'cycle_score': 1, 'value_score': 2, 'fundamental_score': 3, 'growth_score': 95, 'technical_score': 5, 'money_flow_score': 10, 'score_date': '20250920'},
+    ]
+    info_docs = [{'symbol': 'AAA.SH', 'name': 'A Corp'}, {'symbol': 'BBB.SH', 'name': 'B Corp'}]
+    fake_db = FakeDB(stock_scores_docs=docs, stock_info_docs=info_docs)
+    monkeypatch.setattr(stock_ranking, 'get_db_collections', lambda: fake_db)
+    monkeypatch.setattr(
+        stock_ranking,
+        'get_data_db',
+        lambda: {'volume_price': FakeVolumePriceCollection([])},
+    )
+
+    client = TestClient(app)
+    first = client.get('/api/stock-rankings?limit=2&strategy=balanced')
+    assert first.status_code == 200
+    first_json = first.json()
+
+    def _boom():
+        raise AssertionError("cache hit must not query the database")
+
+    monkeypatch.setattr(stock_ranking, 'get_db_collections', _boom)
+    second = client.get('/api/stock-rankings?limit=2&strategy=balanced')
+    assert second.status_code == 200
+    assert second.json() == first_json
+
+
+@pytest.mark.unit
+def test_stock_rankings_cache_can_be_disabled(monkeypatch):
+    """With TTL<=0 the cache is bypassed and every request hits the database."""
+    monkeypatch.setattr(stock_ranking, '_RANKING_RESPONSE_TTL_SECONDS', 0.0)
+    docs = [
+        {'symbol': 'AAA.SH', 'composite_score': {'balanced': 90}, 'cycle_score': 1, 'value_score': 2, 'fundamental_score': 3, 'growth_score': 10, 'technical_score': 5, 'money_flow_score': 20, 'score_date': '20250920'},
+    ]
+    info_docs = [{'symbol': 'AAA.SH', 'name': 'A Corp'}]
+    fake_db = FakeDB(stock_scores_docs=docs, stock_info_docs=info_docs)
+    calls = {'n': 0}
+
+    def _counting_get_collections():
+        calls['n'] += 1
+        return fake_db
+
+    monkeypatch.setattr(stock_ranking, 'get_db_collections', _counting_get_collections)
+    monkeypatch.setattr(
+        stock_ranking,
+        'get_data_db',
+        lambda: {'volume_price': FakeVolumePriceCollection([])},
+    )
+
+    client = TestClient(app)
+    assert client.get('/api/stock-rankings?limit=1&strategy=balanced').status_code == 200
+    assert client.get('/api/stock-rankings?limit=1&strategy=balanced').status_code == 200
+    assert calls['n'] == 2
+
+
+@pytest.mark.unit
+def test_ranking_cache_enforces_hard_cap_when_all_fresh(monkeypatch):
+    """Even if no entry has expired, the cache never exceeds its hard cap and
+    evicts the oldest fresh entries first."""
+    monkeypatch.setattr(stock_ranking, '_RANKING_RESPONSE_TTL_SECONDS', 1000.0)
+    monkeypatch.setattr(stock_ranking, '_RANKING_RESPONSE_CACHE_MAX', 3)
+    stock_ranking._RANKING_RESPONSE_CACHE.clear()
+
+    for i in range(5):
+        stock_ranking._ranking_cache_put((f'key-{i}',), {'i': i})
+
+    cache = stock_ranking._RANKING_RESPONSE_CACHE
+    assert len(cache) == 3
+    # Oldest two keys evicted; the three most recent remain.
+    assert set(cache.keys()) == {('key-2',), ('key-3',), ('key-4',)}
 
 
 @pytest.mark.unit
