@@ -263,3 +263,35 @@ def test_resolve_artifact_path_falls_back_to_report_dir(monkeypatch, tmp_path):
     path = portfolio_research._resolve_artifact_path("reports/portfolio-research/job-1_result.html")
 
     assert path == report
+
+
+def test_resolve_combo_file_translates_container_combo_dir(monkeypatch, tmp_path):
+    report_dir = tmp_path / "portfolio-research"
+    combo_dir = report_dir / "job-1_result_combos"
+    combo_dir.mkdir(parents=True)
+    detail = combo_dir / "combo-key.json"
+    detail.write_text("{}", encoding="utf-8")
+    monkeypatch.setenv("PORTFOLIO_RESEARCH_REPORT_DIR", str(report_dir))
+
+    path = portfolio_research._resolve_combo_file(
+        "/app/reports/portfolio-research/job-1_result_combos",
+        "combo-key.json",
+    )
+
+    assert path == detail
+
+
+def test_resolve_combo_file_uses_manifest_relative_path(monkeypatch, tmp_path):
+    report_dir = tmp_path / "portfolio-research"
+    combo_dir = report_dir / "job-1_result_combos"
+    combo_dir.mkdir(parents=True)
+    detail = combo_dir / "combo-key.json"
+    detail.write_text("{}", encoding="utf-8")
+    monkeypatch.setenv("PORTFOLIO_RESEARCH_REPORT_DIR", str(report_dir))
+
+    path = portfolio_research._resolve_combo_file(
+        None,
+        "job-1_result_combos/combo-key.json",
+    )
+
+    assert path == detail

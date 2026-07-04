@@ -224,6 +224,19 @@ PRESET_PARAM_KEYS = {
 }
 
 
+def _report_dir_candidates() -> List[Path]:
+    candidates: List[Path] = []
+    for base_dir in (
+        os.getenv("PORTFOLIO_RESEARCH_REPORT_DIR"),
+        "/app/reports/portfolio-research",
+        "reports/portfolio-research",
+        Path(__file__).resolve().parents[2] / "shared" / "portfolio-research",
+    ):
+        if base_dir:
+            candidates.append(Path(base_dir))
+    return candidates
+
+
 def _preset_params_from_candidate(candidate: Dict[str, Any]) -> Dict[str, Any]:
     return {key: value for key, value in candidate.items() if key in PRESET_PARAM_KEYS}
 
@@ -249,13 +262,8 @@ def _research_evidence(job: Dict[str, Any], result: Dict[str, Any], status: str,
 def _resolve_artifact_path(html_path: str) -> Optional[Path]:
     candidates = [Path(html_path)]
     filename = Path(html_path).name
-    for base_dir in (
-        os.getenv("PORTFOLIO_RESEARCH_REPORT_DIR"),
-        "/app/reports/portfolio-research",
-        "reports/portfolio-research",
-    ):
-        if base_dir:
-            candidates.append(Path(base_dir) / filename)
+    for base_dir in _report_dir_candidates():
+        candidates.append(base_dir / filename)
 
     seen = set()
     for candidate in candidates:
@@ -377,15 +385,17 @@ def _resolve_combo_file(combos_dir: Optional[str], file_rel: Optional[str]) -> O
     found whether the API runs on the host or inside the container mount.
     """
     candidates: List[Path] = []
-    if combos_dir and file_rel:
-        candidates.append(Path(combos_dir) / Path(file_rel).name)
-    for base_dir in (
-        os.getenv("PORTFOLIO_RESEARCH_REPORT_DIR"),
-        "/app/reports/portfolio-research",
-        "reports/portfolio-research",
-    ):
-        if base_dir and file_rel:
-            candidates.append(Path(base_dir) / file_rel)
+    file_path = Path(file_rel) if file_rel else None
+    combos_path = Path(combos_dir) if combos_dir else None
+    if file_path:
+        candidates.append(file_path)
+    if combos_path and file_path:
+        candidates.append(combos_path / file_path.name)
+    for base_dir in _report_dir_candidates():
+        if file_path:
+            candidates.append(base_dir / file_path)
+        if combos_path and file_path:
+            candidates.append(base_dir / combos_path.name / file_path.name)
 
     seen = set()
     for candidate in candidates:
