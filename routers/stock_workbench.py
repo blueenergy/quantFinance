@@ -45,6 +45,18 @@ WORKBENCH_WEEKLY_KLINE_LIMIT = 260
 WORKBENCH_MONTHLY_KLINE_LIMIT = 260
 WORKBENCH_PROFILE_ENABLED = os.getenv("WORKBENCH_PROFILE", "").strip().lower() in {"1", "true", "yes", "on"}
 
+ENTRY_HIGH_WINDOW = 120
+ENTRY_FLOW_WINDOW = 20
+ENTRY_MIN_HIGH_SAMPLES = 60
+ENTRY_MIN_FLOW_SAMPLES = 10
+ENTRY_HIPOS_LOW = 0.90
+ENTRY_HIPOS_MEDIUM = 0.95
+ENTRY_HIPOS_HIGH = 0.97
+ENTRY_DISTRIB_LOW = 0.005
+ENTRY_DISTRIB_MEDIUM = 0.02
+ENTRY_DISTRIB_HIGH = 0.05
+ENTRY_MAINFLOW_HIGH_OUTFLOW = -0.05
+
 KLINE_PROJECTION = {
     "_id": 0,
     "symbol": 1,
@@ -503,6 +515,157 @@ def _money_flow_summary(history_desc: List[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
+def _quote_amount_wan(row: Dict[str, Any]) -> Optional[float]:
+    amount = _to_float(row.get("amount"))
+    if amount is None:
+        volume = _to_float(row.get("vol") if row.get("vol") is not None else row.get("volume"))
+        close = _to_float(row.get("close"))
+        if volume is not None and close is not None:
+            # Tushare daily vol is in hands; convert shares * price to 万元.
+            return volume * 100 * close / 10000
+    if amount is None or amount <= 0:
+        return None
+    # Tushare daily amount is 千元, while money_flow amounts are 万元.
+    return amount / 10
+
+
+def _return_pct_from_closes(closes: List[float], lookback: int) -> Optional[float]:
+    if len(closes) <= lookback:
+        return None
+    latest = closes[-1]
+    past = closes[-1 - lookback]
+    if latest <= 0 or past <= 0:
+        return None
+    return (latest / past - 1.0) * 100.0
+
+
+def _entry_distribution_severity(metrics: Dict[str, Any]) -> str:
+    hipos = _to_float(metrics.get("hipos120"))
+    mainflow = _to_float(metrics.get("mainflow20"))
+    distrib = _to_float(metrics.get("distrib"))
+    if hipos is None or mainflow is None or distrib is None:
+        return "none"
+    if mainflow >= 0 or distrib <= 0:
+        return "none"
+    ret20 = _to_float(metrics.get("ret_20d"))
+    ret60 = _to_float(metrics.get("ret_60d"))
+    surged = (
+        (ret20 is not None and ret20 >= 30.0)
+        or (ret60 is not None and ret60 >= 50.0)
+    )
+    if (
+        hipos >= ENTRY_HIPOS_HIGH
+        and distrib >= ENTRY_DISTRIB_HIGH
+        and (mainflow <= ENTRY_MAINFLOW_HIGH_OUTFLOW or surged)
+    ):
+        return "high"
+    if hipos >= ENTRY_HIPOS_MEDIUM and distrib >= ENTRY_DISTRIB_MEDIUM:
+        return "medium"
+    if hipos >= ENTRY_HIPOS_LOW and distrib >= ENTRY_DISTRIB_LOW:
+        return "low"
+    return "none"
+
+
+def _entry_risk_snapshot(
+    daily_rows_desc: List[Dict[str, Any]],
+    money_flow_rows_desc: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    ordered_prices = []
+    by_date: Dict[str, Dict[str, Any]] = {}
+    for row in reversed(daily_rows_desc or []):
+        trade_date = _trade_date_key(row.get("trade_date"))
+        close = _to_float(row.get("close"))
+        if not trade_date or close is None or close <= 0:
+            continue
+        by_date[trade_date] = {**row, "trade_date": trade_date, "close": close}
+    ordered_prices = list(by_date.values())
+    closes = [_to_float(row.get("close")) for row in ordered_prices]
+    closes = [value for value in closes if value is not None and value > 0]
+    latest = closes[-1] if closes else None
+    if latest is None or len(closes) < ENTRY_MIN_HIGH_SAMPLES:
+        return {
+            "status": "insufficient_data",
+            "severity": "none",
+            "as_of": (ordered_prices[-1] if ordered_prices else {}).get("trade_date"),
+            "sample_count": len(closes),
+            "summary": "暂无足够日线样本计算 120 日高位指标。",
+        }
+
+    high_window = closes[-ENTRY_HIGH_WINDOW:]
+    trailing_high = max(high_window) if high_window else None
+    hipos = latest / trailing_high if trailing_high and trailing_high > 0 else None
+
+    flow_by_date: Dict[str, float] = {}
+    for row in money_flow_rows_desc or []:
+        trade_date = _trade_date_key(row.get("trade_date"))
+        main_net = _to_float(row.get("main_net"))
+        if trade_date and main_net is not None:
+            flow_by_date[trade_date] = main_net
+
+    recent_prices = ordered_prices[-ENTRY_FLOW_WINDOW:]
+    main_values = [
+        flow_by_date[str(row.get("trade_date"))]
+        for row in recent_prices
+        if str(row.get("trade_date")) in flow_by_date
+    ]
+    amount_values = [_quote_amount_wan(row) for row in recent_prices]
+    amount_den = sum(value for value in amount_values if value is not None and value > 0)
+    mainflow = None
+    if len(main_values) >= ENTRY_MIN_FLOW_SAMPLES and amount_den > 0:
+        mainflow = sum(main_values) / amount_den
+    distrib = hipos * (-mainflow) if hipos is not None and mainflow is not None else None
+
+    volumes = [
+        _to_float(row.get("vol") if row.get("vol") is not None else row.get("volume"))
+        for row in ordered_prices
+    ]
+    volumes = [value for value in volumes if value is not None and value > 0]
+    volratio = None
+    if len(volumes) >= ENTRY_FLOW_WINDOW:
+        slow = sum(volumes[-ENTRY_FLOW_WINDOW:]) / ENTRY_FLOW_WINDOW
+        fast = sum(volumes[-5:]) / 5 if len(volumes) >= 5 else None
+        if slow > 0 and fast is not None:
+            volratio = fast / slow
+
+    metrics = {
+        "as_of": ordered_prices[-1].get("trade_date") if ordered_prices else None,
+        "sample_count": len(closes),
+        "flow_sample_count": len(main_values),
+        "latest_close": latest,
+        "trailing_high_120d": trailing_high,
+        "hipos120": hipos,
+        "distance_to_120d_high_pct": (hipos - 1.0) * 100.0 if hipos is not None else None,
+        "mainflow20": mainflow,
+        "main_net_20d": sum(main_values) if main_values else None,
+        "amount_20d_wan": amount_den if amount_den > 0 else None,
+        "volratio": volratio,
+        "distrib": distrib,
+        "ret_20d": _return_pct_from_closes(closes, 20),
+        "ret_60d": _return_pct_from_closes(closes, 60),
+    }
+    severity = _entry_distribution_severity(metrics)
+    if mainflow is None:
+        summary = "资金流样本不足，暂只展示高位位置指标。"
+    elif severity == "high":
+        summary = "股价贴近 120 日高点，且 20 日主力净流出明显，进场前建议重点复核。"
+    elif severity == "medium":
+        summary = "股价处于阶段高位，同时出现 20 日主力净流出，建议谨慎追高。"
+    elif severity == "low":
+        summary = "存在轻微高位资金流出迹象，作为观察项处理。"
+    elif hipos is not None and hipos >= ENTRY_HIPOS_MEDIUM:
+        summary = "股价接近 120 日高点，但暂未形成高位派发信号。"
+    else:
+        summary = "暂未发现高位派发信号。"
+
+    return {
+        "status": "ok",
+        "severity": severity,
+        "summary": summary,
+        "metrics": metrics,
+        "as_of": metrics.get("as_of"),
+    }
+
+
 def _quote_section(symbol: str) -> Dict[str, Any]:
     profiler = _WorkbenchProfiler("quote", symbol)
     data = get_data_db()
@@ -551,6 +714,7 @@ def _quote_section(symbol: str) -> Dict[str, Any]:
     money_flow_history_desc = [_money_flow_history_row(row) for row in money_flow]
     money_flow_history = sorted(money_flow_history_desc, key=lambda row: str(row.get("trade_date") or ""))
     money_flow_summary = _money_flow_summary(money_flow_history_desc)
+    entry_risk = _entry_risk_snapshot(daily_quotes, money_flow_history_desc)
     profiler.lap("money_flow_transform", rows=len(money_flow_history))
     status = _quote_status(quote)
     if not status["as_of"]:
@@ -565,6 +729,7 @@ def _quote_section(symbol: str) -> Dict[str, Any]:
         "money_flow": money_flow[0] if money_flow else None,
         "money_flow_history": money_flow_history,
         "money_flow_summary": money_flow_summary,
+        "entry_risk": entry_risk,
         "data_status": status,
     }
     profiler.finish(
