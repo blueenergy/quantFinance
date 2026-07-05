@@ -349,8 +349,8 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "4"
-          memory: 4g
+          cpus: "${SCORER_CPU_LIMIT:-4}"
+          memory: "${SCORER_MEM_LIMIT:-4g}"
         reservations:
           cpus: "1"
           memory: 512m
@@ -385,8 +385,8 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "2"
-          memory: 6g
+          cpus: "${RESEARCHER_CPU_LIMIT:-2}"
+          memory: "${RESEARCHER_MEM_LIMIT:-6g}"
         reservations:
           cpus: "0"
           memory: 256m
@@ -417,8 +417,8 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "1"
-          memory: 512m
+          cpus: "${PORTFOLIO_CPU_LIMIT:-1}"
+          memory: "${PORTFOLIO_MEM_LIMIT:-512m}"
         reservations:
           cpus: "0"
           memory: 128m
