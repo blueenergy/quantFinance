@@ -168,6 +168,9 @@ RESEARCH_JOB_LIST_PROJECTION = {
     "updated_at": 1,
     "started_at": 1,
     "completed_at": 1,
+    "heartbeat_at": 1,
+    "progress_stage": 1,
+    "progress_message": 1,
     "data_watermark": 1,
 }
 

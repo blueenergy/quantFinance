@@ -105,6 +105,43 @@ def test_create_portfolio_research_job(monkeypatch):
     assert job["params"]["rebalance_interval_days"] == [20]
 
 
+@pytest.mark.unit
+def test_list_portfolio_research_jobs_includes_timing_and_progress_fields(monkeypatch):
+    collections = _collections()
+    monkeypatch.setattr(portfolio_research, "get_trading_db_collections", lambda: collections)
+    monkeypatch.setattr(portfolio_research, "get_db_collections", lambda: {"stock_scores": _Collection()})
+    started = datetime(2026, 7, 5, 3, 30, 0)
+    heartbeat = datetime(2026, 7, 5, 4, 15, 0)
+    collections["portfolio_research_jobs"].insert_one(
+        {
+            "job_id": "job-running",
+            "user_id": "user-1",
+            "name": "running job",
+            "status": "running",
+            "created_at": started,
+            "started_at": started,
+            "heartbeat_at": heartbeat,
+            "progress_stage": "loading_scores",
+            "progress_message": "loading stock scores",
+        }
+    )
+
+    response = asyncio.run(
+        portfolio_research.list_portfolio_research_jobs(
+            status=None,
+            limit=50,
+            current_user={"id": "user-1"},
+        )
+    )
+
+    assert response["success"] is True
+    job = response["data"][0]
+    assert job["started_at"] == started.isoformat()
+    assert job["heartbeat_at"] == heartbeat.isoformat()
+    assert job["progress_stage"] == "loading_scores"
+    assert job["progress_message"] == "loading stock scores"
+
+
 def test_publish_portfolio_research_result_creates_parameter_preset(monkeypatch):
     collections = _collections()
     monkeypatch.setattr(portfolio_research, "get_trading_db_collections", lambda: collections)
