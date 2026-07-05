@@ -349,7 +349,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "6"
+          cpus: "4"
           memory: 4g
         reservations:
           cpus: "1"
@@ -385,7 +385,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "4"
+          cpus: "2"
           memory: 6g
         reservations:
           cpus: "0"
