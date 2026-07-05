@@ -18,6 +18,7 @@ from datetime import datetime, timedelta
 from calendar import monthrange
 from bson import ObjectId
 from stock_data_access.prices import AdjustedPriceDataAccess
+from services.industry_rs import build_industry_rs_details, normalize_stored_industry_rs_details
 
 router = APIRouter(tags=["股票排名"])
 
@@ -1621,7 +1622,7 @@ async def get_stock_rankings(
 async def get_single_score_detail(
     request: Request,
     symbol: str = Query(..., description="股票代码"),
-    category: str = Query(..., description="评分类别: composite|cycle|value|fundamental|growth|technical|money_flow"),
+    category: str = Query(..., description="评分类别: composite|cycle|value|fundamental|growth|technical|money_flow|industry_rs"),
     score_date: Optional[str] = Query(None, description="评分日期 YYYYMMDD, 为空则取最新"),
     strategy: str = Query('balanced', description="策略: balanced|aggressive|conservative 等，与文档中 strategy_scores 对应")
 ):
@@ -1635,6 +1636,7 @@ async def get_single_score_detail(
     growth -> growth_details
     technical -> technical_details
     money_flow -> money_flow_details
+    industry_rs -> industry_rs_details (per-window stock vs SW index returns)
     """
     try:
         cat_map = {
@@ -1645,7 +1647,7 @@ async def get_single_score_detail(
             'technical': 'technical_details',
             'money_flow': 'money_flow_details'
         }
-        supported_categories = set(list(cat_map.keys()) + ['composite'])
+        supported_categories = set(list(cat_map.keys()) + ['composite', 'industry_rs'])
         if category not in supported_categories:
             raise HTTPException(status_code=400, detail=f"不支持的评分类别: {category}")
         db = get_db_collections_from_request(request)
@@ -1723,6 +1725,48 @@ async def get_single_score_detail(
                     'dimensions': dimensions,
                 },
                 'message': '获取综合得分拆解成功'
+            }
+        if category == 'industry_rs':
+            if doc.get('industry_rs_score') is None:
+                raise HTTPException(status_code=404, detail="该股票暂无行业相对强度数据")
+            details_payload = normalize_stored_industry_rs_details(doc)
+            if not details_payload:
+                details_payload = build_industry_rs_details(
+                    data_db=get_data_db(),
+                    symbol=symbol,
+                    score_date=str(doc.get('score_date') or ''),
+                    industry_level=str(doc.get('industry_rs_level') or 'l1'),
+                    stored_score=doc.get('industry_rs_score'),
+                )
+            if details_payload.get('error'):
+                return {
+                    'success': True,
+                    'data': {
+                        'symbol': symbol,
+                        'score_date': doc.get('score_date'),
+                        'category': category,
+                        'details': {
+                            'score': doc.get('industry_rs_score'),
+                            'score_date': doc.get('score_date'),
+                            'windows': [],
+                            'error': str(details_payload['error']),
+                        },
+                        'weights': {},
+                        'dimensions': [],
+                    },
+                    'message': '行业相对强度明细暂不可用',
+                }
+            return {
+                'success': True,
+                'data': {
+                    'symbol': symbol,
+                    'score_date': doc.get('score_date'),
+                    'category': category,
+                    'details': details_payload,
+                    'weights': {},
+                    'dimensions': [],
+                },
+                'message': '获取行业相对强度详情成功',
             }
         # 其它分类处理
         detail_field = cat_map[category]

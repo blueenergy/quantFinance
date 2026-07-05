@@ -175,6 +175,7 @@ def get_data_db():
         "hot_stock_raw": data_db["hot_stock_raw"],
         # Market data
         "volume_price": data_db["volume_price"],
+        "stock_adj_factor": data_db["stock_adj_factor"],
         "volume_price_realtime_latest": realtime_db["volume_price_realtime_latest"],
         "stock_weekly": data_db["stock_weekly"],
         "stock_monthly": data_db["stock_monthly"],
@@ -210,6 +211,9 @@ def get_data_db():
         "stock_info": data_db["stock_info"],
         "stock_basic": data_db["stock_basic"],
         "sw_index_member": data_db["sw_index_member"],
+        "sw_daily": data_db["sw_daily"],
+        "sw_weekly": data_db["sw_weekly"],
+        "sw_monthly": data_db["sw_monthly"],
         # Financial statements
         "financial_daily_basic": data_db["financial_daily_basic"],
         "financial_income": data_db["financial_income"],
