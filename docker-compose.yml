@@ -326,11 +326,39 @@ services:
         max-file: "3"
 
   # 股票评分系统 (每日19:00定时评分)
+  # 与 quant-researcher / quant-portfolio 共用同一镜像，靠 command 区分角色。
   quant-scorer:
     build:
       context: ../stock-scoring-system
       dockerfile: Dockerfile
     container_name: quant-scorer
+    command: [ "/app/start.scorer.sh" ]
+    environment:
+      - MONGO_URI=${DOCKER_MONGO_URI:-mongodb://quant-mongodb:27017/}
+      - MONGO_DB=${MONGO_DB}
+      - TUSHARE_TOKEN=${TUSHARE_TOKEN}
+      - MAX_WORKERS=${SCORING_MAX_WORKERS:-6}
+      - TZ=Asia/Shanghai
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+    volumes:
+      - ../stock-scoring-system/logs:/app/logs
+    networks:
+      - quant-network
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
+
+  # 组合研究 worker (消费 portfolio research 任务队列)
+  quant-researcher:
+    build:
+      context: ../stock-scoring-system
+      dockerfile: Dockerfile
+    container_name: quant-researcher
+    command: [ "/app/start.researcher.sh" ]
     environment:
       - MONGO_URI=${DOCKER_MONGO_URI:-mongodb://quant-mongodb:27017/}
       - MONGO_DB=${MONGO_DB}
@@ -342,8 +370,32 @@ services:
       - "host.docker.internal:host-gateway"
     restart: unless-stopped
     volumes:
-      - ../stock-scoring-system/logs:/app/logs
+      - ../stock-scoring-system/logs/researcher:/app/logs
       - ../shared/portfolio-research:/app/reports/portfolio-research
+    networks:
+      - quant-network
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
+
+  # 组合计划生成 + paper-trading (计划生成 loop + 相关定时任务)
+  quant-portfolio:
+    build:
+      context: ../stock-scoring-system
+      dockerfile: Dockerfile
+    container_name: quant-portfolio
+    command: [ "/app/start.portfolio.sh" ]
+    environment:
+      - MONGO_URI=${DOCKER_MONGO_URI:-mongodb://quant-mongodb:27017/}
+      - MONGO_DB=${MONGO_DB}
+      - TZ=Asia/Shanghai
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+    volumes:
+      - ../stock-scoring-system/logs/portfolio:/app/logs
     networks:
       - quant-network
     logging:
