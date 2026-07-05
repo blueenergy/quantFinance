@@ -346,6 +346,14 @@ services:
       - ../stock-scoring-system/logs:/app/logs
     networks:
       - quant-network
+    deploy:
+      resources:
+        limits:
+          cpus: "6"
+          memory: 4g
+        reservations:
+          cpus: "1"
+          memory: 512m
     logging:
       driver: json-file
       options:
@@ -374,6 +382,14 @@ services:
       - ../shared/portfolio-research:/app/reports/portfolio-research
     networks:
       - quant-network
+    deploy:
+      resources:
+        limits:
+          cpus: "4"
+          memory: 6g
+        reservations:
+          cpus: "0"
+          memory: 256m
     logging:
       driver: json-file
       options:
@@ -398,6 +414,14 @@ services:
       - ../stock-scoring-system/logs/portfolio:/app/logs
     networks:
       - quant-network
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: 512m
+        reservations:
+          cpus: "0"
+          memory: 128m
     logging:
       driver: json-file
       options:
