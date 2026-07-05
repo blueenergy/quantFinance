@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 import functools
 import logging
@@ -12,6 +12,7 @@ import os
 import threading
 import time
 import uuid
+from zoneinfo import ZoneInfo
 
 from bson import ObjectId
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -100,6 +101,25 @@ from services.portfolio_plan_market import (
 
 router = APIRouter(prefix="/portfolio-plans", tags=["portfolio-plans"])
 log = logging.getLogger(__name__)
+CN_TZ = ZoneInfo("Asia/Shanghai")
+
+
+def _beijing_now() -> datetime:
+    return datetime.now(CN_TZ)
+
+
+def _business_today_yyyymmdd() -> str:
+    return _beijing_now().strftime("%Y%m%d")
+
+
+def _business_today_date():
+    return _beijing_now().date()
+
+
+def _datetime_as_beijing_date(value: datetime):
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(CN_TZ).date()
 
 
 def _offload(func):
@@ -2430,7 +2450,8 @@ def _position_snapshot(finance_collections: Dict[str, Any], signal: Dict[str, An
 
 
 def _daily_live_signal_amount(finance_collections: Dict[str, Any], account: Dict[str, Any], user_id: str) -> float:
-    today_prefix = datetime.utcnow().date().isoformat()
+    today = _business_today_date()
+    today_prefix = today.isoformat()
     rows = finance_collections["trade_signals"].find(
         {"user_id": user_id, "securities_account_id": str(account.get("_id")), "mode": "live"}
     )
@@ -2438,7 +2459,7 @@ def _daily_live_signal_amount(finance_collections: Dict[str, Any], account: Dict
     for row in rows:
         created_at = row.get("created_at")
         if isinstance(created_at, datetime):
-            is_today = created_at.date() == datetime.utcnow().date()
+            is_today = _datetime_as_beijing_date(created_at) == today
         else:
             is_today = str(created_at or "").startswith(today_prefix)
         if is_today and str(row.get("status") or "") not in {"cancelled", "canceled", "rejected", "failed"}:
@@ -2483,7 +2504,7 @@ def _load_volatility_features_by_symbol(
 
     if not symbols:
         return {}
-    as_of = (base_date or datetime.utcnow().strftime("%Y%m%d")).replace("-", "")[:8]
+    as_of = (base_date or _business_today_yyyymmdd()).replace("-", "")[:8]
     coll = data_collections["volume_price"]
     out: Dict[str, Dict[str, Any]] = {}
     for symbol in symbols:
@@ -2850,7 +2871,7 @@ async def force_rebalance_portfolio_plan(
         params_override = _normalized_plan_params_from_snapshot(params_override)
     _validate_params_override(params_override)
 
-    base_date = _normalize_yyyymmdd(request.base_date) or datetime.now().strftime("%Y%m%d")
+    base_date = _normalize_yyyymmdd(request.base_date) or _business_today_yyyymmdd()
     now = datetime.utcnow()
     task = {
         "task_id": str(uuid.uuid4()),
@@ -3414,7 +3435,7 @@ async def live_rebalance_portfolio(
     lot_size = _int_value(params_snapshot.get("lot_size"), 100) or 100
 
     now = datetime.utcnow()
-    base_date = datetime.now().strftime("%Y%m%d")
+    base_date = _business_today_yyyymmdd()
     stamp = now.strftime("%Y%m%d%H%M%S")
     new_plan_id = f"{strategy_template_id}_{(params_hash or 'na')[:8]}_{user_id}_liverb_{stamp}{uuid.uuid4().hex[:6]}"
 
@@ -3749,7 +3770,7 @@ async def record_external_manual_record(
         )
 
     now = datetime.utcnow()
-    base_date = datetime.now().strftime("%Y%m%d")
+    base_date = _business_today_yyyymmdd()
     stamp = now.strftime("%Y%m%d%H%M%S")
     new_plan_id = f"{strategy_template_id}_{(params_hash or 'na')[:8]}_{user_id}_extman_{stamp}{uuid.uuid4().hex[:6]}"
 
@@ -4016,7 +4037,7 @@ async def paper_rebalance_portfolio(
     initial_capital = _numeric(params_snapshot.get("initial_capital"), 1_000_000.0)
 
     now = datetime.utcnow()
-    base_date = datetime.now().strftime("%Y%m%d")
+    base_date = _business_today_yyyymmdd()
 
     inherited = _latest_lineage_position_snapshot(trading_collections, plan, user_id, base_date)
     positions: Dict[str, Dict[str, Any]] = {
@@ -4296,7 +4317,7 @@ async def enqueue_portfolio_holdings_risk(plan_id: str, current_user: dict = Dep
             row for row in (overlay.get("positions") or []) if _int_value(row.get("shares")) > 0
         ]
     if not base_date:
-        base_date = datetime.now().strftime("%Y%m%d")
+        base_date = _business_today_yyyymmdd()
     control = _get_lineage_control_doc(
         collections,
         str(plan.get("strategy_template_id") or ""),
@@ -4641,7 +4662,7 @@ async def enqueue_portfolio_plan_llm_risk(
     base_date = (
         _normalize_yyyymmdd(plan.get("base_date"))
         or _normalize_yyyymmdd(plan.get("score_date"))
-        or datetime.now().strftime("%Y%m%d")
+        or _business_today_yyyymmdd()
     )
     score_date = _normalize_yyyymmdd(plan.get("score_date")) or base_date
     task_ids: List[str] = []
@@ -5053,7 +5074,7 @@ async def enqueue_portfolio_bench_risk(
     base_date = (
         _normalize_yyyymmdd(payload.get("score_date"))
         or _normalize_yyyymmdd(plan.get("base_date"))
-        or datetime.now().strftime("%Y%m%d")
+        or _business_today_yyyymmdd()
     )
     now = datetime.utcnow()
     task = {

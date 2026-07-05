@@ -5634,6 +5634,38 @@ def test_force_rebalance_enqueues_rebalance_task_with_lineage_params(monkeypatch
     assert len(cols["portfolio_plan_generation_tasks"].docs) == 1
 
 
+def test_force_rebalance_defaults_base_date_to_beijing_business_day(monkeypatch):
+    cols = _collections()
+    cols["portfolio_trade_plans"] = _Collection(
+        [
+            {
+                "plan_id": "anchor-plan",
+                "strategy_template_id": "s1",
+                "user_id": "user-1",
+                "base_date": "20250102",
+                "params_hash": "hash-abc",
+                "params_snapshot": {"top_n": 10, "rebalance_days": 10},
+                "status": "executed_live",
+                "plan_type": "rebalance",
+                "record_kind": portfolio_plans.RECORD_KIND_TRADE_PLAN,
+            }
+        ]
+    )
+    monkeypatch.setattr(portfolio_plans, "get_trading_db_collections", lambda: cols)
+    monkeypatch.setattr(portfolio_plans, "_business_today_yyyymmdd", lambda: "20260706")
+
+    resp = asyncio.run(
+        portfolio_plans.force_rebalance_portfolio_plan(
+            "anchor-plan",
+            portfolio_plans.ForceRebalanceRequest(),
+            current_user={"id": "user-1"},
+        )
+    )
+
+    assert resp["data"]["base_date"] == "20260706"
+    assert cols["portfolio_plan_generation_tasks"].docs[0]["base_date"] == "20260706"
+
+
 @pytest.mark.parametrize("open_status", ["needs_review", "approved"])
 def test_force_rebalance_blocks_when_lineage_has_open_trade_plan(monkeypatch, open_status):
     cols = _collections()
