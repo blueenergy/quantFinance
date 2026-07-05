@@ -38,6 +38,49 @@ _RANKING_RESPONSE_CACHE_LOCK = threading.Lock()
 _RANKING_RESPONSE_TTL_SECONDS = float(os.getenv("STOCK_RANKING_CACHE_TTL_SECONDS", "120"))
 _RANKING_RESPONSE_CACHE_MAX = 256
 
+# Submodule weights injected at response time (mirrors stock-scoring-system/scorers/*.py).
+SUBMODULE_WEIGHTS: Dict[str, Dict[str, float]] = {
+    'cycle': {
+        '短期周期(5-10日)': 0.4,
+        '中期周期(20-60日)': 0.35,
+        '长期周期(120-250日)': 0.25,
+    },
+    'growth': {
+        '营收增长分析': 0.3,
+        '利润增长分析': 0.3,
+        'ROE变化分析': 0.2,
+        '市场竞争力': 0.1,
+        '创新能力': 0.1,
+    },
+    'fundamental': {
+        '财务健康度': 0.4,
+        '盈利能力': 0.25,
+        '估值水平': 0.2,
+        '市值规模': 0.1,
+        '行业地位': 0.05,
+    },
+    'value': {
+        'PE估值分析': 0.3,
+        'PB估值分析': 0.25,
+        'PS估值分析': 0.15,
+        '股息率分析': 0.15,
+        'PEG分析': 0.1,
+        '相对估值': 0.05,
+    },
+    'technical': {
+        '均线系统': 0.3,
+        '量价配合': 0.25,
+        '技术指标': 0.25,
+        '趋势强度': 0.2,
+    },
+    'money_flow': {
+        '主力资金流向': 0.4,
+        '资金流强度': 0.3,
+        '成交活跃度': 0.2,
+        '机构关注度': 0.1,
+    },
+}
+
 
 def _weights_cache_key(weights: Optional[Dict[str, float]]) -> tuple:
     """Stable, hashable representation of the weighted-sort weights."""
@@ -1654,13 +1697,30 @@ async def get_single_score_detail(
                 details_payload[f"{name_map.get(key, key)} (权重: {w_display})"] = round(score_val, 2) if isinstance(score_val, (int, float)) else score_val
             details_payload['当前策略'] = strategy
             details_payload['综合得分(当前策略)'] = composite_score.get(strategy)
+            dimensions = []
+            for key, score_val in sub_scores.items():
+                if score_val is None:
+                    continue
+                w = weight_map.get(key)
+                score_num = round(score_val, 2) if isinstance(score_val, (int, float)) else score_val
+                contribution = None
+                if isinstance(w, (int, float)) and isinstance(score_num, (int, float)):
+                    contribution = round(score_num * w, 2)
+                dimensions.append({
+                    'key': key,
+                    'name': name_map.get(key, key),
+                    'score': score_num,
+                    'weight': w if isinstance(w, (int, float)) else None,
+                    'contribution': contribution,
+                })
             return {
                 'success': True,
                 'data': {
                     'symbol': symbol,
                     'score_date': doc.get('score_date'),
                     'category': category,
-                    'details': details_payload
+                    'details': details_payload,
+                    'dimensions': dimensions,
                 },
                 'message': '获取综合得分拆解成功'
             }
@@ -1677,7 +1737,8 @@ async def get_single_score_detail(
                 'symbol': symbol,
                 'score_date': doc.get('score_date'),
                 'category': category,
-                'details': category_details
+                'details': category_details,
+                'weights': SUBMODULE_WEIGHTS.get(category, {}),
             },
             'message': '获取评分详情成功'
         }
