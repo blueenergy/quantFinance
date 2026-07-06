@@ -2456,6 +2456,38 @@ def _position_snapshot(finance_collections: Dict[str, Any], signal: Dict[str, An
     ) or {}
 
 
+def _position_snapshots_by_symbol(
+    finance_collections: Dict[str, Any],
+    *,
+    signals: List[Dict[str, Any]],
+    user_id: str,
+) -> Dict[Tuple[str, str], Dict[str, Any]]:
+    """Load trader_positions for all risk-check signals in one query."""
+    account_ids = {
+        str(signal.get("securities_account_id") or "")
+        for signal in signals
+        if signal.get("securities_account_id")
+    }
+    symbols = {str(signal.get("symbol") or "") for signal in signals if signal.get("symbol")}
+    if not account_ids or not symbols:
+        return {}
+
+    rows = list(
+        finance_collections["trader_positions"].find(
+            {
+                "user_id": user_id,
+                "securities_account_id": {"$in": list(account_ids)},
+                "symbol": {"$in": list(symbols)},
+            }
+        ).sort("synced_at", -1)
+    )
+    out: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    for row in rows:
+        key = (str(row.get("securities_account_id") or ""), str(row.get("symbol") or ""))
+        out.setdefault(key, row)
+    return out
+
+
 def _daily_live_signal_amount(finance_collections: Dict[str, Any], account: Dict[str, Any], user_id: str) -> float:
     today = _business_today_date()
     today_prefix = today.isoformat()
@@ -2597,6 +2629,11 @@ def _build_live_publish_risk_report(
     market_docs = _load_stock_guard_docs(data_collections, [signal["symbol"] for signal in signals])
     buy_symbols = [signal["symbol"] for signal in signals if signal.get("action") == "buy" and signal.get("symbol")]
     vol_features_by_symbol = _load_volatility_features_by_symbol(data_collections, buy_symbols)
+    positions_by_key = _position_snapshots_by_symbol(
+        finance_collections,
+        signals=signals,
+        user_id=user_id,
+    )
 
     cash_reserved = 0.0
     day_reserved = 0.0
@@ -2618,13 +2655,17 @@ def _build_live_publish_risk_report(
             if available_cash and cash_reserved + amount > available_cash:
                 blockers.append("insufficient_cash")
             if total_assets > 0 and max_position_pct > 0:
-                position = _position_snapshot(finance_collections, signal, user_id)
+                position = positions_by_key.get(
+                    (str(signal.get("securities_account_id") or ""), str(signal.get("symbol") or ""))
+                ) or {}
                 current_market_value = _numeric(position.get("market_value"))
                 if (current_market_value + amount) / total_assets * 100 > max_position_pct:
                     blockers.append("max_position_pct_exceeded")
             cash_reserved += amount
         elif signal.get("action") == "sell":
-            position = _position_snapshot(finance_collections, signal, user_id)
+            position = positions_by_key.get(
+                (str(signal.get("securities_account_id") or ""), str(signal.get("symbol") or ""))
+            ) or {}
             available_qty = int(position.get("available_qty") or position.get("can_use_volume") or position.get("qty") or 0)
             if int(signal.get("size", 0) or 0) > available_qty:
                 blockers.append("insufficient_available_position")

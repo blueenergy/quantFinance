@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import time
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
@@ -23,6 +24,8 @@ from services.portfolio_lineage_live_bundle import (
 )
 from services.portfolio_lineage_state import lineage_key
 from services.trade_ledger import group_executions_by_order
+
+log = logging.getLogger(__name__)
 
 
 def ensure_live_snapshot_indexes(
@@ -426,6 +429,168 @@ def list_live_lineage_keys(finance_collections: Dict[str, Any]) -> List[Dict[str
         for row in rows
         if row.get("_id", {}).get("user_id") and row.get("_id", {}).get("plan_id")
     ]
+
+
+def _position_qty(row: Dict[str, Any]) -> int:
+    for field in ("shares", "qty", "quantity", "volume", "current_volume", "total_volume"):
+        if row.get(field) is not None:
+            return int(_numeric(row.get(field)))
+    return 0
+
+
+def _positions_by_symbol_key(rows: List[Dict[str, Any]]) -> Dict[str, int]:
+    out: Dict[str, int] = {}
+    for row in rows:
+        key = _symbol_key(row.get("symbol"))
+        if not key:
+            continue
+        out[key] = out.get(key, 0) + max(0, _position_qty(row))
+    return out
+
+
+def _diff_position_maps(
+    *,
+    ledger: Dict[str, int],
+    broker: Dict[str, int],
+) -> List[Dict[str, Any]]:
+    diffs: List[Dict[str, Any]] = []
+    for key in sorted({*ledger, *broker}):
+        ledger_shares = int(ledger.get(key) or 0)
+        broker_shares = int(broker.get(key) or 0)
+        if ledger_shares == broker_shares:
+            continue
+        diffs.append(
+            {
+                "symbol_key": key,
+                "ledger_shares": ledger_shares,
+                "broker_shares": broker_shares,
+                "diff": broker_shares - ledger_shares,
+            }
+        )
+    return diffs
+
+
+def reconcile_live_snapshots_with_broker_positions(
+    trading_collections: Dict[str, Any],
+    finance_collections: Dict[str, Any],
+    *,
+    user_id: Optional[str] = None,
+    rebuild_on_diff: bool = True,
+) -> Dict[str, Any]:
+    """Compare materialized account positions with broker-synced positions.
+
+    If a snapshot is stale, rebuilding from executions often resolves the drift.
+    If a mismatch remains after rebuild, it is likely a real broker-side/manual
+    trade that needs operator attention; the job records those residual diffs.
+    """
+
+    snapshots = trading_collections.get("portfolio_live_snapshots")
+    trader_positions = finance_collections.get("trader_positions")
+    if snapshots is None or trader_positions is None:
+        return {"checked": 0, "rebuilt": 0, "resolved": 0, "mismatched": 0, "skipped": 0, "diffs": []}
+
+    query: Dict[str, Any] = {}
+    if user_id:
+        query["user_id"] = user_id
+
+    checked = 0
+    rebuilt = 0
+    resolved = 0
+    mismatched = 0
+    skipped = 0
+    residual_diffs: List[Dict[str, Any]] = []
+
+    # Materialize before iterating: the loop rebuilds snapshots (an upsert on
+    # this same collection), and mutating a live cursor's collection can make
+    # pymongo skip or re-yield documents.
+    for snapshot in list(snapshots.find(query)):
+        uid = str(snapshot.get("user_id") or "")
+        account_id = str(snapshot.get("securities_account_id") or "")
+        if not uid or not account_id:
+            skipped += 1
+            continue
+
+        broker_rows = list(
+            trader_positions.find(
+                {"user_id": uid, "securities_account_id": account_id},
+                {
+                    "_id": 0,
+                    "symbol": 1,
+                    "qty": 1,
+                    "quantity": 1,
+                    "volume": 1,
+                    "shares": 1,
+                    "current_volume": 1,
+                    "total_volume": 1,
+                },
+            )
+        )
+        if not broker_rows:
+            skipped += 1
+            continue
+
+        checked += 1
+        ledger = _positions_by_symbol_key(snapshot.get("account_positions") or snapshot.get("positions") or [])
+        broker = _positions_by_symbol_key(broker_rows)
+        diffs = _diff_position_maps(ledger=ledger, broker=broker)
+        if not diffs:
+            continue
+
+        final_diffs = diffs
+        plan = None
+        if rebuild_on_diff:
+            plan_id = str(snapshot.get("anchor_plan_id") or "")
+            if not plan_id:
+                plan_ids = snapshot.get("lineage_plan_ids") or []
+                plan_id = str(plan_ids[0]) if plan_ids else ""
+            if plan_id:
+                plan = trading_collections["portfolio_trade_plans"].find_one({"user_id": uid, "plan_id": plan_id})
+            if plan:
+                rebuilt_doc = rebuild_live_snapshot_for_plan(trading_collections, finance_collections, plan, uid)
+                if rebuilt_doc:
+                    rebuilt += 1
+                    ledger = _positions_by_symbol_key(
+                        rebuilt_doc.get("account_positions") or rebuilt_doc.get("positions") or []
+                    )
+                    final_diffs = _diff_position_maps(ledger=ledger, broker=broker)
+                    if not final_diffs:
+                        resolved += 1
+                        continue
+
+        mismatched += 1
+        residual_diffs.append(
+            {
+                "user_id": uid,
+                "securities_account_id": account_id,
+                "anchor_plan_id": snapshot.get("anchor_plan_id"),
+                "diffs": final_diffs,
+            }
+        )
+
+    result = {
+        "checked": checked,
+        "rebuilt": rebuilt,
+        "resolved": resolved,
+        "mismatched": mismatched,
+        "skipped": skipped,
+        "diffs": residual_diffs,
+    }
+    status_coll = finance_collections.get("job_status")
+    if status_coll is not None:
+        status_coll.update_one(
+            {"_id": "portfolio_live_snapshot_reconcile"},
+            {
+                "$set": {
+                    **result,
+                    "status": "warning" if mismatched else "ok",
+                    "updated_at": datetime.utcnow(),
+                }
+            },
+            upsert=True,
+        )
+    if mismatched:
+        log.warning("Live snapshot broker reconcile found residual mismatches: %s", residual_diffs)
+    return result
 
 
 def rebuild_all_live_snapshots(

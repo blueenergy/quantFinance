@@ -389,6 +389,29 @@ def live_snapshot_intraday_task():
         _release_scheduler_job_lock(job_id)
 
 
+def live_snapshot_reconcile_task():
+    """Reconcile materialized live snapshots against broker-synced positions."""
+    from db import get_db_collections, get_trading_db_collections
+    from services.portfolio_live_snapshot import reconcile_live_snapshots_with_broker_positions
+
+    job_id = "live_snapshot_reconcile_intraday"
+    if not _acquire_scheduler_job_lock(job_id):
+        log.info("[LiveSnapshotReconcile] Another scheduler instance owns the lock, skipping.")
+        return
+    try:
+        finance_collections = get_db_collections()
+        trading_collections = get_trading_db_collections()
+        result = reconcile_live_snapshots_with_broker_positions(
+            trading_collections,
+            finance_collections,
+        )
+        log.info("[LiveSnapshotReconcile] result=%s", result)
+    except Exception as exc:
+        log.error("[LiveSnapshotReconcile] failed: %s", exc, exc_info=True)
+    finally:
+        _release_scheduler_job_lock(job_id)
+
+
 def hot_stock_poll_task(source: str):
     """热股分析任务 - 基于最新 THS / DC 热榜数据检查并提交分析。"""
     from db import get_db_collections, get_analyzer_db
@@ -448,6 +471,7 @@ TASK_MAP = {
     'strategy_lab_loop_tick': strategy_lab_loop_tick_task,
     'equity_snapshot_eod': equity_snapshot_eod_task,
     'live_snapshot_intraday': live_snapshot_intraday_task,
+    'live_snapshot_reconcile_intraday': live_snapshot_reconcile_task,
 }
 
 # Default trigger configurations
@@ -537,6 +561,14 @@ DEFAULT_SCHEDULES = {
     },
     'live_snapshot_intraday': {
         'name': "实盘组合快照盘中刷新 (每10分钟)",
+        'type': "cron",
+        'hour': '9-15',
+        'minute': '*/10',
+        'day_of_week': 'mon-fri',
+        'is_active': True,
+    },
+    'live_snapshot_reconcile_intraday': {
+        'name': "实盘组合快照券商持仓对账 (每10分钟)",
         'type': "cron",
         'hour': '9-15',
         'minute': '*/10',

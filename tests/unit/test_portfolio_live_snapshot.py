@@ -3,7 +3,12 @@
 from __future__ import annotations
 
 from services.portfolio_lineage_live import build_lineage_live_positions, build_lineage_live_trades
-from services.portfolio_live_snapshot import overlay_realtime, probe_stale, rebuild_live_snapshot
+from services.portfolio_live_snapshot import (
+    overlay_realtime,
+    probe_stale,
+    rebuild_live_snapshot,
+    reconcile_live_snapshots_with_broker_positions,
+)
 
 
 class _Collection:
@@ -229,6 +234,75 @@ def test_probe_stale_detects_newer_execution_without_updated_at():
         )
     }
     assert probe_stale(finance, snapshot) is True
+
+
+def test_reconcile_live_snapshots_rebuilds_and_resolves_stale_snapshot():
+    trading = _trading_collections()
+    finance = _finance_collections()
+    trading["portfolio_live_snapshots"].docs.append(
+        {
+            "user_id": "user-1",
+            "strategy_template_id": "stx",
+            "params_hash": "hx",
+            "anchor_plan_id": "pla",
+            "securities_account_id": "acct-1",
+            "account_positions": [],
+        }
+    )
+    finance["trader_positions"] = _Collection(
+        [
+            {
+                "user_id": "user-1",
+                "securities_account_id": "acct-1",
+                "symbol": "000001.SZ",
+                "qty": 100,
+            }
+        ]
+    )
+    finance["job_status"] = _Collection()
+
+    result = reconcile_live_snapshots_with_broker_positions(trading, finance)
+
+    assert result["checked"] == 1
+    assert result["rebuilt"] == 1
+    assert result["resolved"] == 1
+    assert result["mismatched"] == 0
+    assert finance["job_status"].docs[0]["status"] == "ok"
+
+
+def test_reconcile_live_snapshots_records_residual_broker_mismatch():
+    trading = _trading_collections()
+    finance = _finance_collections()
+    trading["portfolio_live_snapshots"].docs.append(
+        {
+            "user_id": "user-1",
+            "strategy_template_id": "stx",
+            "params_hash": "hx",
+            "anchor_plan_id": "pla",
+            "securities_account_id": "acct-1",
+            "account_positions": [{"symbol": "000001.SZ", "shares": 100}],
+        }
+    )
+    finance["trader_positions"] = _Collection(
+        [
+            {
+                "user_id": "user-1",
+                "securities_account_id": "acct-1",
+                "symbol": "000001.SZ",
+                "qty": 200,
+            }
+        ]
+    )
+    finance["job_status"] = _Collection()
+
+    result = reconcile_live_snapshots_with_broker_positions(trading, finance)
+
+    assert result["checked"] == 1
+    assert result["rebuilt"] == 1
+    assert result["resolved"] == 0
+    assert result["mismatched"] == 1
+    assert result["diffs"][0]["diffs"][0]["broker_shares"] == 200
+    assert finance["job_status"].docs[0]["status"] == "warning"
 
 
 def test_probe_stale_ignores_execution_count_when_watermark_current():

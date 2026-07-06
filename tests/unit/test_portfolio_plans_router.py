@@ -10,6 +10,86 @@ def test_allowed_universe_indices_include_csi2000():
     assert "csi2000" in portfolio_plans.ALLOWED_UNIVERSE_INDICES
 
 
+def test_live_publish_risk_report_batches_position_queries():
+    trader_positions = _CountingCollection(
+        [
+            {
+                "user_id": "user-1",
+                "securities_account_id": "acct-1",
+                "symbol": "000001.SZ",
+                "qty": 100,
+                "can_use_volume": 100,
+                "market_value": 1000,
+                "synced_at": 2,
+            },
+            {
+                "user_id": "user-1",
+                "securities_account_id": "acct-1",
+                "symbol": "000002.SZ",
+                "qty": 100,
+                "can_use_volume": 50,
+                "market_value": 1000,
+                "synced_at": 2,
+            },
+        ]
+    )
+    finance = {
+        "trader_accounts": _Collection(
+            [
+                {
+                    "user_id": "user-1",
+                    "securities_account_id": "acct-1",
+                    "available_cash": 100000,
+                    "total_assets": 100000,
+                    "synced_at": 2,
+                }
+            ]
+        ),
+        "trade_signals": _Collection(),
+        "trader_positions": trader_positions,
+    }
+    data = {
+        "stock_info": _Collection(),
+        "volume_price_realtime_latest": _Collection(),
+        "volume_price": _Collection(),
+    }
+
+    report = portfolio_plans._build_live_publish_risk_report(
+        finance_collections=finance,
+        data_collections=data,
+        account={
+            "_id": "acct-1",
+            "broker": "miniQMT",
+            "account_id": "ACC",
+            "live_trading_enabled": True,
+            "risk_limits": {"max_position_pct": 10},
+        },
+        signals=[
+            {
+                "order_id": "buy-1",
+                "symbol": "000001.SZ",
+                "action": "buy",
+                "size": 100,
+                "price": 10,
+                "securities_account_id": "acct-1",
+            },
+            {
+                "order_id": "sell-1",
+                "symbol": "000002.SZ",
+                "action": "sell",
+                "size": 100,
+                "price": 10,
+                "securities_account_id": "acct-1",
+            },
+        ],
+        user_id="user-1",
+    )
+
+    assert trader_positions.find_count == 1
+    assert report["blocked_count"] == 1
+    assert report["items"][1]["blockers"] == ["insufficient_available_position"]
+
+
 def _sort_key(value):
     """Type-stable sort key so the fake can order mixed/missing values without
     raising on cross-type comparisons (mirrors a real Mongo multi-key sort)."""
@@ -151,6 +231,16 @@ class _Collection:
 class _FailingFindCollection(_Collection):
     def find(self, query=None, projection=None):
         raise AssertionError("trade_executions should not be queried by plan detail")
+
+
+class _CountingCollection(_Collection):
+    def __init__(self, docs=None):
+        super().__init__(docs)
+        self.find_count = 0
+
+    def find(self, query=None, projection=None):
+        self.find_count += 1
+        return super().find(query, projection)
 
 
 def _collections():
