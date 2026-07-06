@@ -90,6 +90,60 @@ def test_live_publish_risk_report_batches_position_queries():
     assert report["items"][1]["blockers"] == ["insufficient_available_position"]
 
 
+def test_load_volatility_features_batches_queries_and_keeps_recent_window(monkeypatch):
+    from stock_data_access.indicators import volatility
+
+    volume_price = _CountingCollection(
+        [
+            {
+                "symbol": "000001.SZ",
+                "trade_date": f"2024{i:04d}",
+                "open": 10,
+                "high": 11,
+                "low": 9,
+                "close": 10,
+            }
+            for i in range(1, 323)
+        ]
+        + [
+            {
+                "symbol": "000002.SZ",
+                "trade_date": "20240101",
+                "open": 20,
+                "high": 21,
+                "low": 19,
+                "close": 20,
+            },
+            {
+                "symbol": "000002.SZ",
+                "trade_date": "20260101",
+                "open": 20,
+                "high": 21,
+                "low": 19,
+                "close": 20,
+            },
+        ]
+    )
+    seen = {}
+
+    def fake_compute(rows):
+        seen[rows[0]["symbol"]] = [row["trade_date"] for row in rows]
+        return {"row_count": len(rows), "first_trade_date": rows[0]["trade_date"]}
+
+    monkeypatch.setattr(volatility, "compute_volatility_features", fake_compute)
+
+    features = portfolio_plans._load_volatility_features_by_symbol(
+        {"volume_price": volume_price},
+        ["000001.SZ", "000002.SZ"],
+        base_date="2025-12-31",
+    )
+
+    assert volume_price.find_count == 1
+    assert features["000001.SZ"] == {"row_count": 320, "first_trade_date": "20240003"}
+    assert seen["000001.SZ"][-1] == "20240322"
+    assert features["000002.SZ"] == {"row_count": 1, "first_trade_date": "20240101"}
+
+
 def _sort_key(value):
     """Type-stable sort key so the fake can order mixed/missing values without
     raising on cross-type comparisons (mirrors a real Mongo multi-key sort)."""

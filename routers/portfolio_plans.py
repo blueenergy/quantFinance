@@ -2537,7 +2537,9 @@ def _load_volatility_features_by_symbol(
     base_date: Optional[str] = None,
 ) -> Dict[str, Dict[str, Any]]:
     try:
-        from stock_data_access.indicators.volatility import compute_volatility_features
+        from stock_data_access.indicators.volatility import (  # pyright: ignore[reportMissingImports]
+            compute_volatility_features,
+        )
     except ImportError:
         return {}
 
@@ -2545,21 +2547,32 @@ def _load_volatility_features_by_symbol(
         return {}
     as_of = (base_date or _business_today_yyyymmdd()).replace("-", "")[:8]
     coll = data_collections["volume_price"]
+    symbol_set = {str(symbol) for symbol in symbols if symbol}
+    if not symbol_set:
+        return {}
+
+    try:
+        rows = list(
+            coll.find(
+                {"symbol": {"$in": list(symbol_set)}, "trade_date": {"$lte": as_of}},
+                {"_id": 0, "symbol": 1, "trade_date": 1, "open": 1, "high": 1, "low": 1, "close": 1},
+            ).sort([("symbol", 1), ("trade_date", 1)])
+        )
+    except Exception:
+        return {}
+
+    rows_by_symbol: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        symbol = str(row.get("symbol") or "")
+        if symbol in symbol_set:
+            rows_by_symbol[symbol].append(row)
+
     out: Dict[str, Dict[str, Any]] = {}
-    for symbol in symbols:
-        if not symbol:
-            continue
+    for symbol, symbol_rows in rows_by_symbol.items():
         try:
-            rows = list(
-                coll.find(
-                    {"symbol": symbol, "trade_date": {"$lte": as_of}},
-                    {"_id": 0, "trade_date": 1, "open": 1, "high": 1, "low": 1, "close": 1},
-                )
-                .sort("trade_date", 1)
-                .limit(320)
-            )
-            if rows:
-                out[symbol] = compute_volatility_features(rows)
+            window = sorted(symbol_rows, key=lambda row: str(row.get("trade_date") or ""))[-320:]
+            if window:
+                out[symbol] = compute_volatility_features(window)
         except Exception:
             continue
     return out
