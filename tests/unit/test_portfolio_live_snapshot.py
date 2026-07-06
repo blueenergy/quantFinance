@@ -207,6 +207,30 @@ def test_probe_stale_detects_newer_execution():
     assert probe_stale(finance, snapshot) is False
 
 
+def test_probe_stale_detects_newer_execution_without_updated_at():
+    # Regression: executions written by the trader upload historically carried
+    # no updated_at. Sorting by updated_at surfaced an arbitrary old doc, so a
+    # fresh fill (larger timestamp) was missed and holdings never refreshed.
+    snapshot = {
+        "user_id": "user-1",
+        "securities_account_id": "acct-1",
+        "watermark": {
+            "execution_count": 1,
+            "last_execution_updated_at": "",
+            "max_execution_ts": 1780000000.0,
+        },
+    }
+    finance = {
+        "trade_executions": _Collection(
+            [
+                {"user_id": "user-1", "securities_account_id": "acct-1", "timestamp": 1770000000.0},
+                {"user_id": "user-1", "securities_account_id": "acct-1", "timestamp": 1783319619.0},
+            ]
+        )
+    }
+    assert probe_stale(finance, snapshot) is True
+
+
 def test_probe_stale_ignores_execution_count_when_watermark_current():
     # Count differs from the watermark (e.g. a rare deletion) but the latest
     # execution is not newer: we intentionally skip the expensive full-account

@@ -34,6 +34,10 @@ def upsert_trader_execution(
     execution.setdefault("date", dt.strftime("%Y%m%d"))
     execution.setdefault("datetime", dt.strftime("%Y-%m-%d %H:%M:%S"))
     execution.setdefault("mode", "live")
+    # Stamp updated_at on every write so snapshot freshness detection
+    # (probe_stale) and the execution watermark have a reliable, sortable
+    # marker. Keep it aligned with the event timestamp for monotonic ordering.
+    execution["updated_at"] = dt.strftime("%Y-%m-%d %H:%M:%S")
 
     broker_order_id = execution.get("broker_order_id") or execution.get("qmt_order_id")
     execution_status = execution.get("status") or "filled"

@@ -222,28 +222,42 @@ def probe_stale(
     if executions is None:
         return False
 
-    latest = executions.find_one(
-        {"user_id": user_id, "securities_account_id": account_id},
-        {"_id": 0, "updated_at": 1, "timestamp": 1},
-        sort=[("updated_at", DESCENDING)],
+    query = {"user_id": user_id, "securities_account_id": account_id}
+
+    # Primary freshness signal: the numeric execution timestamp. The trader
+    # upload always writes it, so sorting by it reliably surfaces the newest
+    # fill. We must NOT sort by updated_at here: it is optional and historically
+    # absent on most executions, so an updated_at sort returns an arbitrary old
+    # doc and the snapshot is wrongly judged fresh (holdings never refresh).
+    latest_ts = executions.find_one(
+        query,
+        {"_id": 0, "timestamp": 1},
+        sort=[("timestamp", DESCENDING)],
     )
-    if latest is None:
+    if latest_ts is None:
         return watermark.get("execution_count", 0) > 0
 
-    latest_updated = str(latest.get("updated_at") or "")
-    stored_updated = str(watermark.get("last_execution_updated_at") or "")
-    if latest_updated and stored_updated and latest_updated > stored_updated:
-        return True
-
-    ts = latest.get("timestamp")
+    ts = latest_ts.get("timestamp")
     max_ts = float(watermark.get("max_execution_ts") or 0)
     if isinstance(ts, (int, float)) and float(ts) > max_ts:
         return True
 
-    # Any insert/update bumps updated_at/timestamp, both compared above. We
-    # deliberately skip a full-account count_documents here: it scanned the
-    # whole account on every snapshot read and only guarded against deletions,
-    # which the EOD rebuild reconciles anyway.
+    # Secondary: an in-place correction (e.g. fee/status fix) may bump
+    # updated_at without advancing timestamp. Only weigh docs that carry it.
+    latest_updated_doc = executions.find_one(
+        {**query, "updated_at": {"$exists": True, "$ne": ""}},
+        {"_id": 0, "updated_at": 1},
+        sort=[("updated_at", DESCENDING)],
+    )
+    if latest_updated_doc is not None:
+        latest_updated = str(latest_updated_doc.get("updated_at") or "")
+        stored_updated = str(watermark.get("last_execution_updated_at") or "")
+        if latest_updated and latest_updated > stored_updated:
+            return True
+
+    # Both signals compared above. We deliberately skip a full-account
+    # count_documents here: it scanned the whole account on every snapshot read
+    # and only guarded against deletions, which the EOD rebuild reconciles.
     return False
 
 
