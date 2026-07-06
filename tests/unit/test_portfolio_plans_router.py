@@ -2489,6 +2489,183 @@ def test_publish_live_signals_blocks_when_position_pct_exceeded(monkeypatch):
     assert not finance["trade_signals"].docs
 
 
+def _partial_publish_collections():
+    """Two buys: 000001 trips max_order_amount (30000 > 20000 cap), 600000 passes."""
+    collections = _collections()
+    collections["portfolio_trade_plans"].docs[0].update(
+        {"status": "approved", "params_snapshot": {"initial_capital": 1_000_000, "lot_size": 100}}
+    )
+    collections["portfolio_trade_plan_items"].docs.extend(
+        [
+            {
+                "plan_id": "plan-user-1",
+                "user_id": "user-1",
+                "symbol": "000001",
+                "action": "buy",
+                "delta_shares": 3000,
+                "target_shares": 3000,
+                "current_shares": 0,
+                "estimated_price": 10.0,
+                "rank": 1,
+            },
+            {
+                "plan_id": "plan-user-1",
+                "user_id": "user-1",
+                "symbol": "600000",
+                "action": "buy",
+                "delta_shares": 100,
+                "target_shares": 100,
+                "current_shares": 0,
+                "estimated_price": 12.0,
+                "rank": 2,
+            },
+        ]
+    )
+    return collections
+
+
+def test_publish_live_signals_all_or_nothing_blocks_whole_plan(monkeypatch):
+    collections = _partial_publish_collections()
+    finance = _finance_collections()
+    monkeypatch.setattr(portfolio_plans, "get_trading_db_collections", lambda: collections)
+    monkeypatch.setattr(portfolio_plans, "get_db_collections", lambda: finance)
+    monkeypatch.setattr(portfolio_plans, "get_data_db", _data_collections)
+
+    with pytest.raises(portfolio_plans.HTTPException) as exc:
+        asyncio.run(
+            portfolio_plans.publish_portfolio_plan_live_signals(
+                "plan-user-1",
+                portfolio_plans.PublishLiveSignalsRequest(securities_account_id="acct-1", dry_run=False),
+                current_user={"id": "user-1"},
+            )
+        )
+
+    assert exc.value.status_code == 409
+    # Default (all-or-nothing): one blocked symbol stops the whole publish.
+    assert not finance["trade_signals"].docs
+
+
+def test_publish_live_signals_partial_publishes_passing_and_skips_blocked(monkeypatch):
+    collections = _partial_publish_collections()
+    finance = _finance_collections()
+    monkeypatch.setattr(portfolio_plans, "get_trading_db_collections", lambda: collections)
+    monkeypatch.setattr(portfolio_plans, "get_db_collections", lambda: finance)
+    monkeypatch.setattr(portfolio_plans, "get_data_db", _data_collections)
+
+    response = asyncio.run(
+        portfolio_plans.publish_portfolio_plan_live_signals(
+            "plan-user-1",
+            portfolio_plans.PublishLiveSignalsRequest(
+                securities_account_id="acct-1", dry_run=False, allow_partial=True
+            ),
+            current_user={"id": "user-1"},
+        )
+    )
+
+    data = response["data"]
+    assert data["partial"] is True
+    assert data["blocked"] is False
+    assert data["inserted_count"] == 1
+    assert data["publishable_count"] == 1
+    assert [doc["symbol"] for doc in finance["trade_signals"].docs] == ["600000"]
+    skipped = {row["symbol"] for row in data["skipped_by_risk"]}
+    assert skipped == {"000001"}
+    assert "max_order_amount_exceeded" in data["skipped_by_risk"][0]["blockers"]
+    plan = collections["portfolio_trade_plans"].docs[0]
+    assert plan["live_signal_count"] == 1
+    assert plan["live_signal_inserted_count"] == 1
+
+
+def test_publish_live_signals_partial_dry_run_previews_partition(monkeypatch):
+    collections = _partial_publish_collections()
+    finance = _finance_collections()
+    monkeypatch.setattr(portfolio_plans, "get_trading_db_collections", lambda: collections)
+    monkeypatch.setattr(portfolio_plans, "get_db_collections", lambda: finance)
+    monkeypatch.setattr(portfolio_plans, "get_data_db", _data_collections)
+
+    response = asyncio.run(
+        portfolio_plans.publish_portfolio_plan_live_signals(
+            "plan-user-1",
+            portfolio_plans.PublishLiveSignalsRequest(
+                securities_account_id="acct-1", dry_run=True, allow_partial=True
+            ),
+            current_user={"id": "user-1"},
+        )
+    )
+
+    data = response["data"]
+    assert data["dry_run"] is True
+    assert data["inserted_count"] == 0
+    assert data["publishable_count"] == 1
+    assert data["blocked"] is False
+    assert {row["symbol"] for row in data["skipped_by_risk"]} == {"000001"}
+    assert not finance["trade_signals"].docs
+
+
+def test_publish_live_signals_partial_all_blocked_still_409(monkeypatch):
+    collections = _collections()
+    collections["portfolio_trade_plans"].docs[0].update(
+        {"status": "approved", "params_snapshot": {"initial_capital": 1_000_000, "lot_size": 100}}
+    )
+    collections["portfolio_trade_plan_items"].docs.append(
+        {
+            "plan_id": "plan-user-1",
+            "user_id": "user-1",
+            "symbol": "000001",
+            "action": "buy",
+            "delta_shares": 3000,
+            "target_shares": 3000,
+            "current_shares": 0,
+            "estimated_price": 10.0,
+            "rank": 1,
+        }
+    )
+    finance = _finance_collections()
+    monkeypatch.setattr(portfolio_plans, "get_trading_db_collections", lambda: collections)
+    monkeypatch.setattr(portfolio_plans, "get_db_collections", lambda: finance)
+    monkeypatch.setattr(portfolio_plans, "get_data_db", _data_collections)
+
+    with pytest.raises(portfolio_plans.HTTPException) as exc:
+        asyncio.run(
+            portfolio_plans.publish_portfolio_plan_live_signals(
+                "plan-user-1",
+                portfolio_plans.PublishLiveSignalsRequest(
+                    securities_account_id="acct-1", dry_run=False, allow_partial=True
+                ),
+                current_user={"id": "user-1"},
+            )
+        )
+
+    assert exc.value.status_code == 409
+    assert "nothing to publish" in exc.value.detail["message"]
+    assert not finance["trade_signals"].docs
+
+
+def test_publish_live_signals_partial_account_block_is_hard(monkeypatch):
+    # An account-level block (live trading disabled) applies to every signal, so
+    # partial mode cannot rescue it -- confirm must still 409.
+    collections = _partial_publish_collections()
+    finance = _finance_collections()
+    finance["securities_accounts"].docs[0]["live_trading_enabled"] = False
+    monkeypatch.setattr(portfolio_plans, "get_trading_db_collections", lambda: collections)
+    monkeypatch.setattr(portfolio_plans, "get_db_collections", lambda: finance)
+    monkeypatch.setattr(portfolio_plans, "get_data_db", _data_collections)
+
+    with pytest.raises(portfolio_plans.HTTPException) as exc:
+        asyncio.run(
+            portfolio_plans.publish_portfolio_plan_live_signals(
+                "plan-user-1",
+                portfolio_plans.PublishLiveSignalsRequest(
+                    securities_account_id="acct-1", dry_run=False, allow_partial=True
+                ),
+                current_user={"id": "user-1"},
+            )
+        )
+
+    assert exc.value.status_code == 409
+    assert not finance["trade_signals"].docs
+
+
 def _remainder_setup(monkeypatch):
     collections = _collections()
     plan = collections["portfolio_trade_plans"].docs[0]
@@ -2584,6 +2761,45 @@ def test_replan_remainder_confirm_inserts_and_is_idempotent(monkeypatch):
     assert second["data"]["actionable_count"] == 0
     remainder = second["data"]["remainder"][0]
     assert "live_signal_active" in remainder["reasons"]
+
+
+def test_replan_remainder_partial_publishes_passing_and_skips_blocked(monkeypatch):
+    collections, finance = _remainder_setup(monkeypatch)
+    collections["portfolio_trade_plans"].docs[0]["params_snapshot"] = {
+        "lot_size": 100,
+        "initial_capital": 1_000_000,
+    }
+    # A second top-up target that trips max_order_amount (3000 * 10 = 30000 > 20000).
+    collections["portfolio_trade_plan_items"].docs.append(
+        {
+            "plan_id": "plan-user-1",
+            "user_id": "user-1",
+            "symbol": "600000",
+            "name": "浦发银行",
+            "action": "buy",
+            "delta_shares": 3000,
+            "target_shares": 3000,
+            "current_shares": 0,
+            "estimated_price": 10.0,
+            "rank": 2,
+        }
+    )
+
+    request = portfolio_plans.ReplanRemainderRequest(
+        securities_account_id="acct-1", dry_run=False, allow_partial=True
+    )
+    response = asyncio.run(
+        portfolio_plans.replan_portfolio_plan_remainder("plan-user-1", request, current_user={"id": "user-1"})
+    )
+
+    data = response["data"]
+    assert data["partial"] is True
+    assert data["inserted_count"] == 1
+    assert data["publishable_count"] == 1
+    assert {row["symbol"] for row in data["skipped_by_risk"]} == {"600000"}
+    # original cancelled signal + one inserted top-up for 000001.
+    inserted_symbols = [doc["symbol"] for doc in finance["trade_signals"].docs if doc.get("source") == "plan_topup"]
+    assert inserted_symbols == ["000001"]
 
 
 def _lineage_cash_remainder_setup(monkeypatch, *, broker_available_cash=100_000, active_buy=None):

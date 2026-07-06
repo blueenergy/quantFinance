@@ -230,12 +230,19 @@ class PaperExecuteRequest(BaseModel):
 class PublishLiveSignalsRequest(BaseModel):
     securities_account_id: str
     dry_run: bool = Field(default=True)
+    # When true, publish the signals that pass risk and skip only the blocked
+    # symbols instead of failing the whole plan. Account-level and plan-capital
+    # blockers still hard-block (nothing can go out). Defaults to all-or-nothing.
+    allow_partial: bool = Field(default=False)
 
 
 class ReplanRemainderRequest(BaseModel):
     securities_account_id: str
     dry_run: bool = Field(default=True)
     reason: str = Field(default="")
+    # See PublishLiveSignalsRequest.allow_partial. Cash blockers still hard-block
+    # here because an unreliable plan-cash baseline can over-budget the top-up.
+    allow_partial: bool = Field(default=False)
 
 
 class BulkRejectPlanItemsRequest(BaseModel):
@@ -2672,6 +2679,114 @@ def _build_live_publish_risk_report(
         "items": items,
         "blocked_count": sum(1 for item in items if item["blockers"]),
     }
+
+
+# Blockers intrinsic to a single symbol: the order can never publish in its
+# current form (no price, halted/ST/limit-up, extreme volatility, single-order
+# caps, or an unsellable position). Dropping such a signal only frees budget for
+# the rest, so partial publish can batch-remove all of them safely.
+_SYMBOL_INTRINSIC_BLOCKERS = frozenset(
+    {
+        "missing_price",
+        "st_stock",
+        "suspended",
+        "limit_up",
+        "extreme_volatility",
+        "extreme_atr_volatility",
+        "abnormal_intraday_range",
+        "max_order_amount_exceeded",
+        "max_position_pct_exceeded",
+        "insufficient_available_position",
+    }
+)
+
+# Cumulative budget blockers: whether a signal trips these depends on the other
+# signals in the batch (running cash / daily-amount totals). They must be
+# resolved by dropping the single lowest-priority offender and recomputing, not
+# by batch-removing every flagged signal, so higher-ranked orders keep their
+# claim on the shared budget.
+_BUDGET_BLOCKERS = frozenset({"insufficient_cash", "max_daily_amount_exceeded"})
+
+# Account-level blockers apply to every signal (live trading disabled or no
+# broker binding). Partial publish is meaningless here — nothing can go out — so
+# callers hard-block instead of silently publishing nothing.
+_ACCOUNT_LEVEL_BLOCKERS = frozenset({"live_trading_disabled", "account_binding_missing"})
+
+
+def _risk_report_has_account_level_block(risk_report: Dict[str, Any]) -> bool:
+    return any(
+        set(item.get("blockers") or []) & _ACCOUNT_LEVEL_BLOCKERS
+        for item in risk_report.get("items", [])
+    )
+
+
+def _partition_publishable_live_signals(
+    *,
+    finance_collections: Dict[str, Any],
+    data_collections: Dict[str, Any],
+    account: Dict[str, Any],
+    signals: List[Dict[str, Any]],
+    user_id: str,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any]]:
+    """Split *signals* into a publishable subset and a skipped list.
+
+    Symbol-intrinsic blockers (see ``_SYMBOL_INTRINSIC_BLOCKERS``) are removed in
+    a batch because freeing their budget can only clear other blockers. The
+    remaining cumulative budget blockers are resolved by dropping the single
+    lowest-priority offender (last in rank order) and recomputing, so a lone
+    expensive tail order yields to the rest of the book instead of over-skipping
+    everything the running cash total happened to flag.
+
+    Returns ``(publishable_signals, skipped_report_items, display_risk_report)``
+    where ``display_risk_report`` merges the surviving (passing) items with the
+    skipped (blocked) items in the original signal order, so a preview table can
+    show exactly what will publish vs be skipped.
+    """
+    order_index = {signal.get("order_id"): idx for idx, signal in enumerate(signals)}
+    survivors = list(signals)
+    skipped_items: List[Dict[str, Any]] = []
+
+    def _build(current: List[Dict[str, Any]]) -> Dict[str, Any]:
+        return _build_live_publish_risk_report(
+            finance_collections=finance_collections,
+            data_collections=data_collections,
+            account=account,
+            signals=current,
+            user_id=user_id,
+        )
+
+    guard = len(signals) * 2 + 5
+    survivor_report = _build(survivors)
+    while guard > 0:
+        guard -= 1
+        blocked = [item for item in survivor_report["items"] if item.get("blockers")]
+        if not blocked:
+            break
+        intrinsic = [
+            item for item in blocked if set(item.get("blockers") or []) & _SYMBOL_INTRINSIC_BLOCKERS
+        ]
+        if intrinsic:
+            dropped = intrinsic
+        else:
+            # Only cumulative budget blockers remain: drop the lowest-priority
+            # offender so the recompute can clear the rest of the book.
+            dropped = [blocked[-1]]
+        drop_ids = {item.get("order_id") for item in dropped}
+        skipped_items.extend(dropped)
+        survivors = [s for s in survivors if s.get("order_id") not in drop_ids]
+        if not survivors:
+            survivor_report = _build([])
+            break
+        survivor_report = _build(survivors)
+
+    display_items = list(survivor_report["items"]) + skipped_items
+    display_items.sort(key=lambda item: order_index.get(item.get("order_id"), len(signals)))
+    display_report = {
+        **survivor_report,
+        "items": display_items,
+        "blocked_count": len(skipped_items),
+    }
+    return survivors, skipped_items, display_report
 
 
 @router.get("/strategies")
@@ -7231,12 +7346,18 @@ async def publish_portfolio_plan_live_signals(
     reprice_summary["account_equity"] = account_equity
     reprice_summary["account_available_cash"] = account_available_cash
     reprice_summary["capital_basis"] = plan_capital.get("capital_basis")
-    if reprice_summary.get("blockers") and not request.dry_run:
+    reprice_blocker_set = set(reprice_summary.get("blockers") or [])
+    # Capital-baseline blockers make every size unreliable, so they hard-block
+    # even under allow_partial. ``missing_price`` is per-symbol: under
+    # allow_partial let it flow to the risk stage so only those symbols are
+    # skipped, not the whole plan.
+    hard_reprice_blockers = reprice_blocker_set & {"missing_plan_equity", "missing_plan_cash"}
+    block_on_reprice = bool(hard_reprice_blockers) if request.allow_partial else bool(reprice_blocker_set)
+    if block_on_reprice and not request.dry_run:
         message = "publish repricing blocked"
-        blocker_set = set(reprice_summary.get("blockers") or [])
-        if blocker_set == {"missing_price"}:
+        if reprice_blocker_set == {"missing_price"}:
             message = "publish repricing blocked: missing usable prices"
-        elif blocker_set.intersection({"missing_plan_equity", "missing_plan_cash"}):
+        elif hard_reprice_blockers:
             message = "publish repricing blocked: missing plan capital baseline"
         raise HTTPException(
             status_code=409,
@@ -7269,10 +7390,14 @@ async def publish_portfolio_plan_live_signals(
                         "new_signals": [],
                         "existing_signals": [],
                         "skipped_items": skipped_items,
+                        "skipped_by_risk": [],
                         "risk_report": {"items": [], "blocked_count": len(reprice_summary.get("blockers") or [])},
                         "reprice_summary": reprice_summary,
                         "inserted_count": 0,
                         "existing_count": 0,
+                        "publishable_count": 0,
+                        "allow_partial": request.allow_partial,
+                        "partial": False,
                         "blocked": bool(reprice_summary.get("blockers")),
                     }
                 ),
@@ -7296,15 +7421,59 @@ async def publish_portfolio_plan_live_signals(
         user_id=user_id,
     )
     risk_blocked = [item for item in risk_report["items"] if item["blockers"]]
-    if risk_blocked and not request.dry_run:
-        raise HTTPException(status_code=409, detail=_jsonable({"message": "live signal risk check failed", "risk_report": risk_report}))
-    # The response-level ``blocked`` flag must reflect every reason a confirm
-    # would 409 (risk items AND reprice/capital blockers), so a dry-run preview
-    # never shows "ok" for a publish that would actually fail.
-    response_blocked = bool(risk_blocked) or bool(reprice_summary.get("blockers"))
+    account_level_blocked = _risk_report_has_account_level_block(risk_report)
+    # publish_new_signals is the subset actually written. Under all-or-nothing it
+    # is either the full new_signals set or (on confirm) we 409 before writing.
+    publish_new_signals = new_signals
+    skipped_by_risk: List[Dict[str, Any]] = []
+
+    if risk_blocked:
+        if not request.allow_partial or account_level_blocked:
+            # All-or-nothing: any risk blocker (or an account-level block that no
+            # per-symbol skip could clear) fails the entire publish.
+            if not request.dry_run:
+                raise HTTPException(
+                    status_code=409,
+                    detail=_jsonable({"message": "live signal risk check failed", "risk_report": risk_report}),
+                )
+            publish_new_signals = []
+        else:
+            # Partial: publish the passing signals, skip only the blocked symbols.
+            publish_new_signals, skipped_by_risk, risk_report = _partition_publishable_live_signals(
+                finance_collections=finance_collections,
+                data_collections=data_collections,
+                account=account,
+                signals=new_signals,
+                user_id=user_id,
+            )
+            if not publish_new_signals and not request.dry_run:
+                raise HTTPException(
+                    status_code=409,
+                    detail=_jsonable(
+                        {
+                            "message": "all live signals were blocked; nothing to publish",
+                            "risk_report": risk_report,
+                            "skipped_by_risk": skipped_by_risk,
+                        }
+                    ),
+                )
+
+    partial = bool(skipped_by_risk) and bool(publish_new_signals)
+    # ``blocked`` means a confirm would publish nothing. Under all-or-nothing it
+    # is any risk/reprice blocker; under allow_partial only a fully-empty publish
+    # (or a hard account/capital block) counts, so a dry-run preview never shows
+    # "ok" for a publish that would actually fail.
+    if request.allow_partial:
+        response_blocked = (
+            bool(hard_reprice_blockers)
+            or account_level_blocked
+            or (bool(risk_blocked) and not publish_new_signals)
+        )
+    else:
+        response_blocked = bool(risk_blocked) or bool(reprice_summary.get("blockers"))
 
     inserted_count = 0
-    if not request.dry_run and new_signals:
+    if not request.dry_run and publish_new_signals:
         _persist_repriced_plan_items(
             trading_collections,
             plan_id=plan_id,
@@ -7329,8 +7498,8 @@ async def publish_portfolio_plan_live_signals(
                 "stale_price_symbols": reprice_summary.get("stale_price_symbols"),
             },
         )
-        finance_collections["trade_signals"].insert_many(new_signals)
-        inserted_count = len(new_signals)
+        finance_collections["trade_signals"].insert_many(publish_new_signals)
+        inserted_count = len(publish_new_signals)
         mark_lineage_live(
             trading_collections.get("portfolio_lineage_controls"),
             user_id=user_id,
@@ -7343,7 +7512,7 @@ async def publish_portfolio_plan_live_signals(
             {
                 "$set": {
                     "live_signals_published_at": now,
-                    "live_signal_count": len(signals),
+                    "live_signal_count": inserted_count + len(existing_signals),
                     "live_signal_inserted_count": inserted_count,
                     "live_signal_status_summary": {"pending": inserted_count, **summarize_signal_statuses(existing_signals)},
                 }
@@ -7353,10 +7522,25 @@ async def publish_portfolio_plan_live_signals(
             # Publishing live signals does NOT mean the orders filled. Only apply the
             # forward-looking exclusion here; pausing the lineage (which would stop
             # daily maintenance of a real book) must wait until fills are confirmed.
+            # For a partial publish, symbols we skipped were NOT traded, so keep
+            # them at their current book shares rather than their (unpublished)
+            # target, otherwise the lineage would wrongly treat them as acted.
+            # skipped_by_risk is empty for a full publish, so this reduces to the
+            # original all-target behavior.
+            skipped_symbol_keys = {_symbol_key(s.get("symbol")) for s in skipped_by_risk}
+            final_positions = [
+                {
+                    "symbol": item.get("symbol"),
+                    "shares": _int_value(item.get("current_shares"))
+                    if _symbol_key(item.get("symbol")) in skipped_symbol_keys
+                    else _int_value(item.get("target_shares")),
+                }
+                for item in items
+            ]
             _apply_manual_lineage_effects_native(
                 trading_collections,
                 plan,
-                final_positions=[{"symbol": item.get("symbol"), "shares": _int_value(item.get("target_shares"))} for item in items],
+                final_positions=final_positions,
                 acted_by=user_id,
                 pause_on_empty=False,
             )
@@ -7375,12 +7559,17 @@ async def publish_portfolio_plan_live_signals(
                 "dry_run": request.dry_run,
                 "signals": signals,
                 "new_signals": new_signals,
+                "publishable_signals": publish_new_signals,
                 "existing_signals": existing_signals,
                 "skipped_items": skipped_items,
+                "skipped_by_risk": skipped_by_risk,
                 "risk_report": risk_report,
                 "reprice_summary": reprice_summary,
                 "inserted_count": inserted_count,
                 "existing_count": len(existing_signals),
+                "publishable_count": len(publish_new_signals),
+                "allow_partial": request.allow_partial,
+                "partial": partial,
                 "blocked": response_blocked,
             }
         ),
@@ -7508,35 +7697,65 @@ async def replan_portfolio_plan_remainder(
         user_id=user_id,
     )
     blocked = [item for item in risk_report["items"] if item["blockers"]]
-    response_blocked = bool(blocked) or bool(cash_blockers)
-    if response_blocked and not request.dry_run:
-        # cash_blockers (e.g. missing_frozen_price) mean plan_available_cash may be
-        # overestimated, so confirming could over-budget the top-up. Block confirm
-        # consistently with the dry-run preview rather than relying on the shared
-        # broker-account cash check, which cannot bound this plan's own budget.
-        message = "remainder risk check failed" if blocked else "remainder cash check failed"
-        raise HTTPException(
-            status_code=409,
-            detail=_jsonable(
-                {
-                    "message": message,
-                    "risk_report": risk_report,
-                    "cash_blockers": cash_blockers,
-                }
-            ),
+    account_level_blocked = _risk_report_has_account_level_block(risk_report)
+    publish_signals = signals
+    skipped_by_risk: List[Dict[str, Any]] = []
+
+    # cash_blockers (e.g. missing_frozen_price) mean plan_available_cash may be
+    # overestimated, so confirming could over-budget the top-up. These always
+    # hard-block (even under allow_partial) because the budget itself is
+    # unreliable; account-level blocks likewise can't be cleared by a skip.
+    if cash_blockers or account_level_blocked or (blocked and not request.allow_partial):
+        response_blocked = True
+        if not request.dry_run:
+            message = "remainder cash check failed" if cash_blockers else "remainder risk check failed"
+            raise HTTPException(
+                status_code=409,
+                detail=_jsonable(
+                    {
+                        "message": message,
+                        "risk_report": risk_report,
+                        "cash_blockers": cash_blockers,
+                    }
+                ),
+            )
+    elif blocked:
+        # Partial: publish the passing top-up signals, skip the blocked symbols.
+        publish_signals, skipped_by_risk, risk_report = _partition_publishable_live_signals(
+            finance_collections=finance_collections,
+            data_collections=data_collections,
+            account=account,
+            signals=signals,
+            user_id=user_id,
         )
+        response_blocked = not publish_signals
+        if not publish_signals and not request.dry_run:
+            raise HTTPException(
+                status_code=409,
+                detail=_jsonable(
+                    {
+                        "message": "all remainder signals were blocked; nothing to publish",
+                        "risk_report": risk_report,
+                        "skipped_by_risk": skipped_by_risk,
+                    }
+                ),
+            )
+    else:
+        response_blocked = False
+
+    partial = bool(skipped_by_risk) and bool(publish_signals)
 
     inserted_count = 0
-    if not request.dry_run and signals:
-        finance_collections["trade_signals"].insert_many(signals)
-        inserted_count = len(signals)
+    if not request.dry_run and publish_signals:
+        finance_collections["trade_signals"].insert_many(publish_signals)
+        inserted_count = len(publish_signals)
         _append_remainder_audit(
             trading_collections,
             plan_id=plan_id,
             user_id=user_id,
             reviewer=str(current_user.get("username") or current_user.get("id") or ""),
             reason=request.reason,
-            signals=signals,
+            signals=publish_signals,
         )
 
     return {
@@ -7557,8 +7776,13 @@ async def replan_portfolio_plan_remainder(
                 "remainder": [spec.to_public() for spec in specs],
                 "actionable_count": sum(1 for spec in specs if spec.actionable),
                 "signals": signals,
+                "publishable_signals": publish_signals,
+                "skipped_by_risk": skipped_by_risk,
                 "risk_report": risk_report,
                 "inserted_count": inserted_count,
+                "publishable_count": len(publish_signals),
+                "allow_partial": request.allow_partial,
+                "partial": partial,
                 "blocked": response_blocked,
             }
         ),
