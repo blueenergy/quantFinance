@@ -13,17 +13,77 @@ from fastapi import APIRouter, Depends, Query, HTTPException, Body
 from pydantic import BaseModel, Field
 from typing import List, Optional, Dict, Any
 from datetime import datetime
+import logging
+import threading
 import time
 from auth import get_current_active_user
-from db import get_db_collections, get_data_db
+from db import get_db_collections, get_data_db, get_trading_db_collections
 from utils.stock_utils import serialize_doc
 from utils.time_display import add_display_time_fields
 from bson import ObjectId
 from services.live_equity import list_account_equity
 from services.trader_execution_upload import upsert_trader_execution
+from services.portfolio_live_snapshot import rebuild_live_snapshot_for_plan
 from services import trader_signal_reprice as signal_reprice
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
+
+_TERMINAL_EXECUTION_STATUSES = frozenset(
+    {
+        "filled",
+        "executed",
+        "rejected",
+        "cancelled",
+        "canceled",
+        "partial_cancelled",
+        "failed",
+    }
+)
+
+
+def _schedule_live_snapshot_rebuild_for_execution(
+    *,
+    user_id: str,
+    order_id: str,
+    execution_status: str,
+    signals_coll: Any,
+) -> None:
+    """Rebuild portfolio live snapshot after a terminal execution upsert."""
+    if execution_status not in _TERMINAL_EXECUTION_STATUSES:
+        return
+
+    signal = signals_coll.find_one({"order_id": order_id, "user_id": user_id})
+    if not signal:
+        return
+    plan_id = signal.get("plan_id")
+    if not plan_id:
+        return
+
+    def _run() -> None:
+        try:
+            trading_collections = get_trading_db_collections()
+            finance_collections = get_db_collections()
+            plan = trading_collections["portfolio_trade_plans"].find_one(
+                {"plan_id": plan_id, "user_id": user_id}
+            )
+            if not plan:
+                return
+            rebuild_live_snapshot_for_plan(
+                trading_collections,
+                finance_collections,
+                plan,
+                user_id,
+            )
+        except Exception:
+            logger.exception(
+                "Failed to rebuild live snapshot after execution upsert: "
+                "order_id=%s plan_id=%s",
+                order_id,
+                plan_id,
+            )
+
+    threading.Thread(target=_run, daemon=True).start()
 
 
 def _require_securities_account_doc(
@@ -235,6 +295,13 @@ def create_execution(
             dict(execution),
             user_id,
             executions_coll=executions_coll,
+            signals_coll=signals_coll,
+        )
+
+        _schedule_live_snapshot_rebuild_for_execution(
+            user_id=user_id,
+            order_id=str(execution.get("order_id") or ""),
+            execution_status=str(execution.get("status") or "filled"),
             signals_coll=signals_coll,
         )
 

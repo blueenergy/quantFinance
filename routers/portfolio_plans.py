@@ -7254,7 +7254,8 @@ async def execute_portfolio_plan_paper(
 
 
 @router.post("/plans/{plan_id}/publish-live-signals")
-async def publish_portfolio_plan_live_signals(
+@_offload
+def publish_portfolio_plan_live_signals(
     plan_id: str,
     request: PublishLiveSignalsRequest,
     current_user: dict = Depends(get_current_user),
@@ -7577,7 +7578,8 @@ async def publish_portfolio_plan_live_signals(
 
 
 @router.post("/plans/{plan_id}/replan-remainder")
-async def replan_portfolio_plan_remainder(
+@_offload
+def replan_portfolio_plan_remainder(
     plan_id: str,
     request: ReplanRemainderRequest,
     current_user: dict = Depends(get_current_user),

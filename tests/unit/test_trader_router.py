@@ -58,6 +58,16 @@ class FakeCollection:
         self.inserted.extend(docs)
         self.docs.extend(docs)
         return result
+
+    def insert_one(self, doc):
+        """Insert one document."""
+        doc = dict(doc)
+        doc["_id"] = ObjectId()
+        self.inserted.append(doc)
+        self.docs.append(doc)
+        result = Mock()
+        result.inserted_id = doc["_id"]
+        return result
     
     def update_one(self, filter_query, update_doc, upsert=False):
         """Update one document."""
@@ -506,6 +516,129 @@ class TestGetPositionsEndpoint:
         data = response.json()
         assert "stock_name" in data["data"][0]
         assert data["data"][0]["stock_name"] == "浦发银行"
+
+
+class TestCreateExecutionEndpoint:
+    """Tests for POST /trader/executions snapshot rebuild scheduling."""
+
+    @pytest.fixture
+    def setup(self, monkeypatch):
+        self.executions_coll = FakeCollection()
+        self.signals_coll = FakeCollection(
+            [
+                {
+                    "_id": ObjectId(),
+                    "user_id": "user_123",
+                    "order_id": "live-plan-abc123",
+                    "plan_id": "plan-xyz",
+                    "status": "submitted",
+                }
+            ]
+        )
+        fake_collections = {
+            "trade_executions": self.executions_coll,
+            "trade_signals": self.signals_coll,
+        }
+
+        def mock_get_db_collections():
+            return fake_collections
+
+        monkeypatch.setattr(trader, "get_db_collections", mock_get_db_collections)
+        app.dependency_overrides[get_current_active_user] = lambda: {"id": "user_123"}
+
+        self.rebuild_calls = []
+
+        def mock_rebuild(trading_collections, finance_collections, plan, user_id):
+            self.rebuild_calls.append(
+                {
+                    "plan_id": plan.get("plan_id"),
+                    "user_id": user_id,
+                }
+            )
+
+        monkeypatch.setattr(trader, "rebuild_live_snapshot_for_plan", mock_rebuild)
+
+        def mock_get_trading_db_collections():
+            return {
+                "portfolio_trade_plans": FakeCollection(
+                    [
+                        {
+                            "_id": ObjectId(),
+                            "plan_id": "plan-xyz",
+                            "user_id": "user_123",
+                            "status": "approved",
+                        }
+                    ]
+                )
+            }
+
+        monkeypatch.setattr(trader, "get_trading_db_collections", mock_get_trading_db_collections)
+
+        yield
+
+        app.dependency_overrides = {}
+
+    def test_create_execution_schedules_snapshot_rebuild_for_terminal_status(self, setup, monkeypatch):
+        started = []
+
+        class ImmediateThread:
+            def __init__(self, target=None, daemon=None):
+                self._target = target
+
+            def start(self):
+                started.append(True)
+                if self._target:
+                    self._target()
+
+        monkeypatch.setattr(trader.threading, "Thread", ImmediateThread)
+
+        response = trader.create_execution(
+            execution={
+                "order_id": "live-plan-abc123",
+                "symbol": "600000.SH",
+                "action": "buy",
+                "size": 100,
+                "filled_size": 100,
+                "filled_price": 10.5,
+                "status": "filled",
+                "timestamp": 1_700_000_000,
+            },
+            current_user={"id": "user_123"},
+        )
+
+        assert response["success"] is True
+        assert started == [True]
+        assert self.rebuild_calls == [{"plan_id": "plan-xyz", "user_id": "user_123"}]
+
+    def test_create_execution_skips_snapshot_rebuild_for_non_terminal_status(self, setup, monkeypatch):
+        started = []
+
+        class ImmediateThread:
+            def __init__(self, target=None, daemon=None):
+                self._target = target
+
+            def start(self):
+                started.append(True)
+                if self._target:
+                    self._target()
+
+        monkeypatch.setattr(trader.threading, "Thread", ImmediateThread)
+
+        response = trader.create_execution(
+            execution={
+                "order_id": "live-plan-abc123",
+                "symbol": "600000.SH",
+                "action": "buy",
+                "size": 100,
+                "status": "submitted",
+                "timestamp": 1_700_000_000,
+            },
+            current_user={"id": "user_123"},
+        )
+
+        assert response["success"] is True
+        assert started == []
+        assert self.rebuild_calls == []
 
 
 @pytest.mark.unit
