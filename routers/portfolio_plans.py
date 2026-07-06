@@ -2488,6 +2488,44 @@ def _position_snapshots_by_symbol(
     return out
 
 
+def _live_sell_sizing_basis() -> str:
+    basis = str(os.getenv("LIVE_SELL_SIZING_BASIS", "broker") or "broker").strip().lower()
+    return "lineage" if basis == "lineage" else "broker"
+
+
+def _lineage_positions_by_symbol(
+    trading_collections: Optional[Dict[str, Any]],
+    *,
+    plan: Optional[Dict[str, Any]],
+    user_id: str,
+) -> Tuple[Dict[str, int], bool]:
+    """Return this lineage's structural shares by symbol from the live snapshot."""
+
+    if not trading_collections or not plan:
+        return {}, False
+    strategy_template_id = str(plan.get("strategy_template_id") or "")
+    params_hash = str(plan.get("params_hash") or "")
+    if not strategy_template_id or not params_hash:
+        return {}, False
+    try:
+        snapshot = get_live_snapshot(
+            trading_collections,
+            user_id=user_id,
+            strategy_template_id=strategy_template_id,
+            params_hash=params_hash,
+        )
+    except Exception:  # noqa: BLE001 - fall back to broker checks on snapshot read issues.
+        return {}, False
+    if not snapshot:
+        return {}, False
+    positions: Dict[str, int] = {}
+    for row in snapshot.get("positions") or []:
+        key = _symbol_key(row.get("symbol"))
+        if key:
+            positions[key] = positions.get(key, 0) + max(0, _int_value(row.get("shares")))
+    return positions, True
+
+
 def _daily_live_signal_amount(finance_collections: Dict[str, Any], account: Dict[str, Any], user_id: str) -> float:
     today = _business_today_date()
     today_prefix = today.isoformat()
@@ -2630,6 +2668,8 @@ def _build_live_publish_risk_report(
     account: Dict[str, Any],
     signals: List[Dict[str, Any]],
     user_id: str,
+    trading_collections: Optional[Dict[str, Any]] = None,
+    plan: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     account_snapshot = _latest_account_snapshot(finance_collections, account, user_id)
     available_cash = _numeric(account_snapshot.get("available_cash") or account_snapshot.get("cash"))
@@ -2646,6 +2686,11 @@ def _build_live_publish_risk_report(
         finance_collections,
         signals=signals,
         user_id=user_id,
+    )
+    lineage_positions_by_symbol, lineage_positions_synced = (
+        _lineage_positions_by_symbol(trading_collections, plan=plan, user_id=user_id)
+        if _live_sell_sizing_basis() == "lineage"
+        else ({}, False)
     )
 
     cash_reserved = 0.0
@@ -2676,6 +2721,10 @@ def _build_live_publish_risk_report(
                     blockers.append("max_position_pct_exceeded")
             cash_reserved += amount
         elif signal.get("action") == "sell":
+            if lineage_positions_synced:
+                lineage_shares = lineage_positions_by_symbol.get(_symbol_key(signal.get("symbol")), 0)
+                if int(signal.get("size", 0) or 0) > lineage_shares:
+                    blockers.append("insufficient_lineage_position")
             position = positions_by_key.get(
                 (str(signal.get("securities_account_id") or ""), str(signal.get("symbol") or ""))
             ) or {}
@@ -2750,6 +2799,7 @@ _SYMBOL_INTRINSIC_BLOCKERS = frozenset(
         "abnormal_intraday_range",
         "max_order_amount_exceeded",
         "max_position_pct_exceeded",
+        "insufficient_lineage_position",
         "insufficient_available_position",
     }
 )
@@ -7355,11 +7405,6 @@ def publish_portfolio_plan_live_signals(
         capital_blockers.append("missing_plan_cash")
         plan_cash = 0.0
     securities_account_id = str(account.get("_id") or request.securities_account_id)
-    # NOTE (phase-1 basis seam): equity/cash are plan-book scoped, but current_shares
-    # below still come from broker account positions. They coincide when one account
-    # serves a single lineage; if the account also holds the same symbol for other
-    # plans, delta/sell-proceeds may diverge from the plan book. Switching
-    # current_shares to lineage-book positions is deferred to phase 2.
     account_positions_by_key, account_positions_synced = _account_positions_by_symbol(
         finance_collections,
         user_id=user_id,
@@ -7474,6 +7519,8 @@ def publish_portfolio_plan_live_signals(
         account=account,
         signals=new_signals,
         user_id=user_id,
+        trading_collections=trading_collections,
+        plan=plan,
     )
     risk_blocked = [item for item in risk_report["items"] if item["blockers"]]
     account_level_blocked = _risk_report_has_account_level_block(risk_report)

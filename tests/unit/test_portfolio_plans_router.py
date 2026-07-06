@@ -90,6 +90,144 @@ def test_live_publish_risk_report_batches_position_queries():
     assert report["items"][1]["blockers"] == ["insufficient_available_position"]
 
 
+def test_live_publish_risk_report_blocks_sell_above_lineage_position(monkeypatch):
+    monkeypatch.setenv("LIVE_SELL_SIZING_BASIS", "lineage")
+
+    finance = {
+        "trader_accounts": _Collection(
+            [
+                {
+                    "user_id": "user-1",
+                    "securities_account_id": "acct-1",
+                    "available_cash": 100000,
+                    "total_assets": 100000,
+                    "synced_at": 2,
+                }
+            ]
+        ),
+        "trade_signals": _Collection(),
+        "trader_positions": _Collection(
+            [
+                {
+                    "user_id": "user-1",
+                    "securities_account_id": "acct-1",
+                    "symbol": "000002.SZ",
+                    "qty": 100,
+                    "can_use_volume": 100,
+                    "synced_at": 2,
+                }
+            ]
+        ),
+    }
+    trading = {
+        "portfolio_live_snapshots": _Collection(
+            [
+                {
+                    "user_id": "user-1",
+                    "strategy_template_id": "s1",
+                    "params_hash": "hash-1",
+                    "positions": [{"symbol": "000002.SZ", "shares": 50}],
+                }
+            ]
+        )
+    }
+    data = {
+        "stock_info": _Collection(),
+        "volume_price_realtime_latest": _Collection(),
+        "volume_price": _Collection(),
+    }
+
+    report = portfolio_plans._build_live_publish_risk_report(
+        finance_collections=finance,
+        data_collections=data,
+        account={
+            "_id": "acct-1",
+            "broker": "miniQMT",
+            "account_id": "ACC",
+            "live_trading_enabled": True,
+        },
+        signals=[
+            {
+                "order_id": "sell-1",
+                "symbol": "000002.SZ",
+                "action": "sell",
+                "size": 100,
+                "price": 10,
+                "securities_account_id": "acct-1",
+            }
+        ],
+        user_id="user-1",
+        trading_collections=trading,
+        plan={"strategy_template_id": "s1", "params_hash": "hash-1"},
+    )
+
+    assert report["blocked_count"] == 1
+    assert report["items"][0]["blockers"] == ["insufficient_lineage_position"]
+
+
+def test_live_publish_risk_report_falls_back_when_lineage_snapshot_missing(monkeypatch):
+    monkeypatch.setenv("LIVE_SELL_SIZING_BASIS", "lineage")
+
+    finance = {
+        "trader_accounts": _Collection(
+            [
+                {
+                    "user_id": "user-1",
+                    "securities_account_id": "acct-1",
+                    "available_cash": 100000,
+                    "total_assets": 100000,
+                    "synced_at": 2,
+                }
+            ]
+        ),
+        "trade_signals": _Collection(),
+        "trader_positions": _Collection(
+            [
+                {
+                    "user_id": "user-1",
+                    "securities_account_id": "acct-1",
+                    "symbol": "000002.SZ",
+                    "qty": 100,
+                    "can_use_volume": 100,
+                    "synced_at": 2,
+                }
+            ]
+        ),
+    }
+    data = {
+        "stock_info": _Collection(),
+        "volume_price_realtime_latest": _Collection(),
+        "volume_price": _Collection(),
+    }
+
+    report = portfolio_plans._build_live_publish_risk_report(
+        finance_collections=finance,
+        data_collections=data,
+        account={
+            "_id": "acct-1",
+            "broker": "miniQMT",
+            "account_id": "ACC",
+            "live_trading_enabled": True,
+        },
+        signals=[
+            {
+                "order_id": "sell-1",
+                "symbol": "000002.SZ",
+                "action": "sell",
+                "size": 100,
+                "price": 10,
+                "securities_account_id": "acct-1",
+            }
+        ],
+        user_id="user-1",
+        trading_collections={"portfolio_live_snapshots": _Collection()},
+        plan={"strategy_template_id": "s1", "params_hash": "hash-1"},
+    )
+
+    assert report["blocked_count"] == 0
+    assert report["items"][0]["blockers"] == []
+
+
 def test_load_volatility_features_batches_queries_and_keeps_recent_window(monkeypatch):
     from stock_data_access.indicators import volatility
 
