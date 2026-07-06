@@ -7297,7 +7297,7 @@ async def publish_portfolio_plan_live_signals(
     )
     risk_blocked = [item for item in risk_report["items"] if item["blockers"]]
     if risk_blocked and not request.dry_run:
-        raise HTTPException(status_code=409, detail={"message": "live signal risk check failed", "risk_report": risk_report})
+        raise HTTPException(status_code=409, detail=_jsonable({"message": "live signal risk check failed", "risk_report": risk_report}))
     # The response-level ``blocked`` flag must reflect every reason a confirm
     # would 409 (risk items AND reprice/capital blockers), so a dry-run preview
     # never shows "ok" for a publish that would actually fail.
@@ -7517,11 +7517,13 @@ async def replan_portfolio_plan_remainder(
         message = "remainder risk check failed" if blocked else "remainder cash check failed"
         raise HTTPException(
             status_code=409,
-            detail={
-                "message": message,
-                "risk_report": risk_report,
-                "cash_blockers": cash_blockers,
-            },
+            detail=_jsonable(
+                {
+                    "message": message,
+                    "risk_report": risk_report,
+                    "cash_blockers": cash_blockers,
+                }
+            ),
         )
 
     inserted_count = 0
