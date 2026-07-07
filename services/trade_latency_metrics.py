@@ -8,7 +8,7 @@ instrumentation should become the next bottleneck-specific investment.
 from __future__ import annotations
 
 import math
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 SIGNAL_PROJECTION = {
@@ -73,6 +73,8 @@ def _to_epoch(value: Any) -> Optional[float]:
     if isinstance(value, (int, float)):
         return float(value)
     if isinstance(value, datetime):
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
         return value.timestamp()
     if isinstance(value, str):
         text = value.strip()
@@ -264,7 +266,7 @@ def build_trade_latency_rollup(
         execution = execution_by_order.get(oid) or {}
         snapshot = snapshot_by_lineage.get(_snapshot_key(signal)) or {}
         timestamps = {
-            "publish_at": _to_epoch(signal.get("timestamp")) or _to_epoch(signal.get("created_at")),
+            "publish_at": _to_epoch(signal.get("created_at")) or _to_epoch(signal.get("timestamp")),
             "first_seen_at": _to_epoch(signal.get("first_seen_at")),
             "submitted_at": _to_epoch(signal.get("submitted_at")),
             "executed_at": _to_epoch(signal.get("executed_at")) or _to_epoch(execution.get("timestamp")),

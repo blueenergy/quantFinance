@@ -115,6 +115,7 @@ def test_build_portfolio_plan_live_signal_uses_balanced_slippage_for_estimated_p
             "plan_id": "plan-1",
             "user_id": "user-1",
             "strategy_template_id": "st-1",
+            "params_hash": "hash-1",
         },
         item={
             "symbol": "600519.SH",
@@ -131,6 +132,36 @@ def test_build_portfolio_plan_live_signal_uses_balanced_slippage_for_estimated_p
     assert signal.max_slippage_bps == 30
     assert signal.effective_limit_price == 66.92
     assert signal.reference_price == 66.71
+    doc = signal.to_mongo()
+    assert doc["params_hash"] == "hash-1"
+    assert doc["timestamp"] == now.timestamp()
+
+
+def test_live_signal_timestamp_treats_naive_datetime_as_utc():
+    naive_utc = datetime(2026, 7, 7, 5, 50, 39, 327000)
+    signal = build_portfolio_plan_live_signal(
+        plan={
+            "plan_id": "plan-1",
+            "user_id": "user-1",
+            "strategy_template_id": "st-1",
+            "params_hash": "hash-1",
+        },
+        item={
+            "symbol": "600519.SH",
+            "delta_shares": 100,
+            "target_shares": 100,
+            "estimated_price": 66.71,
+            "rank": 1,
+        },
+        account={"_id": "acct-1", "account_id": "a1", "broker": "miniQMT"},
+        now=naive_utc,
+    )
+
+    assert signal is not None
+    doc = signal.to_mongo()
+    expected = naive_utc.replace(tzinfo=timezone.utc).timestamp()
+    assert doc["timestamp"] == expected
+    assert doc["params_hash"] == "hash-1"
 
 
 def test_build_portfolio_plan_live_signal_uses_open_auction_for_daily_close():

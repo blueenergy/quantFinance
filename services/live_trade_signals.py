@@ -108,6 +108,7 @@ class LiveTradeSignal(BaseModel):
     source: str
     plan_id: str
     strategy_template_id: str
+    params_hash: str = Field(default="")
     symbol: str
     name: str = Field(default="")
     action: str
@@ -179,7 +180,10 @@ class LiveTradeSignal(BaseModel):
 
     def to_mongo(self) -> Dict[str, Any]:
         doc = self.model_dump()
-        doc["timestamp"] = self.created_at.timestamp()
+        created_at = self.created_at
+        if created_at.tzinfo is None:
+            created_at = created_at.replace(tzinfo=timezone.utc)
+        doc["timestamp"] = created_at.timestamp()
         doc["datetime"] = self.created_at
         doc["strategy"] = self.strategy_template_id
         return doc
@@ -339,6 +343,7 @@ def build_portfolio_plan_live_signal(
         source=LIVE_SIGNAL_SOURCE_PORTFOLIO_PLAN,
         plan_id=str(plan["plan_id"]),
         strategy_template_id=str(plan["strategy_template_id"]),
+        params_hash=str(plan.get("params_hash") or ""),
         symbol=symbol,
         name=str(item.get("name") or ""),
         action=action,

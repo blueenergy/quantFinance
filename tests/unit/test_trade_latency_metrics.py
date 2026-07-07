@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 
 from services.trade_latency_metrics import build_trade_latency_rollup
 
@@ -109,7 +109,7 @@ def test_trade_latency_rollup_computes_stage_percentiles():
                     "user_id": "user-1",
                     "strategy_template_id": "stx",
                     "params_hash": "hx",
-                    "updated_at": datetime.fromtimestamp(120.0),
+                    "updated_at": datetime(1970, 1, 1, 0, 2, 0),
                     "build_ms": 8.5,
                     "watermark": {"execution_count": 1},
                     "last_rebuild_reason": "execution",
@@ -168,3 +168,30 @@ def test_trade_latency_rollup_can_omit_order_rows():
     assert result["order_count"] == 1
     assert result["orders"] == []
     assert finance["trade_signals"].last_query["order_id"] == "order-1"
+
+
+def test_trade_latency_rollup_prefers_created_at_for_publish_time():
+    created_at = datetime(2026, 7, 7, 5, 50, 39, tzinfo=timezone.utc)
+    first_seen_at = created_at.timestamp() + 2
+    finance = {
+        "trade_signals": _Collection(
+            [
+                {
+                    "user_id": "user-1",
+                    "mode": "live",
+                    "order_id": "order-1",
+                    "timestamp": created_at.timestamp() - 8 * 3600,
+                    "created_at": created_at.replace(tzinfo=None),
+                    "first_seen_at": first_seen_at,
+                }
+            ]
+        ),
+        "trade_executions": _Collection(),
+    }
+    trading = {"portfolio_live_snapshots": _Collection()}
+
+    result = build_trade_latency_rollup(finance, trading, user_id="user-1")
+
+    order = result["orders"][0]
+    assert order["timestamps"]["publish_at"] == created_at.timestamp()
+    assert order["durations_ms"]["publish_to_first_seen_ms"] == 2000.0
