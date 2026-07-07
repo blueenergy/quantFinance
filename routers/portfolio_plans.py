@@ -7398,6 +7398,7 @@ def publish_portfolio_plan_live_signals(
     request: PublishLiveSignalsRequest,
     current_user: dict = Depends(get_current_user),
 ):
+    _publish_started = time.perf_counter()
     trading_collections = get_trading_db_collections()
     finance_collections = get_db_collections()
     data_collections = get_data_db()
@@ -7632,6 +7633,8 @@ def publish_portfolio_plan_live_signals(
                 "account_available_cash": reprice_summary.get("account_available_cash"),
                 "turnover_drift_pct": reprice_summary.get("turnover_drift_pct"),
                 "stale_price_symbols": reprice_summary.get("stale_price_symbols"),
+                "signal_count": len(publish_new_signals),
+                "publish_duration_ms": round((time.perf_counter() - _publish_started) * 1000.0, 1),
             },
         )
         finance_collections["trade_signals"].insert_many(publish_new_signals)

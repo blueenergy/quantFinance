@@ -1971,6 +1971,47 @@ def test_publish_live_signals_write_is_idempotent(monkeypatch):
     assert len(finance["trade_signals"].docs) == 1
 
 
+def test_publish_live_signals_records_publish_duration_ms(monkeypatch):
+    collections = _collections()
+    collections["portfolio_trade_plans"].docs[0].update(
+        {"status": "approved", "params_snapshot": {"initial_capital": 1_000_000, "lot_size": 100}}
+    )
+    collections["portfolio_trade_plan_items"].docs.append(
+        {
+            "plan_id": "plan-user-1",
+            "user_id": "user-1",
+            "symbol": "000001",
+            "action": "buy",
+            "delta_shares": 100,
+            "target_shares": 100,
+            "estimated_price": 10.0,
+            "rank": 1,
+        }
+    )
+    finance = _finance_collections()
+    monkeypatch.setattr(portfolio_plans, "get_trading_db_collections", lambda: collections)
+    monkeypatch.setattr(portfolio_plans, "get_db_collections", lambda: finance)
+    monkeypatch.setattr(portfolio_plans, "get_data_db", _data_collections)
+
+    request = portfolio_plans.PublishLiveSignalsRequest(securities_account_id="acct-1", dry_run=False)
+    asyncio.run(
+        portfolio_plans.publish_portfolio_plan_live_signals(
+            "plan-user-1", request, current_user={"id": "user-1"}
+        )
+    )
+
+    reprice_logs = [
+        d
+        for d in collections["portfolio_plan_operation_logs"].docs
+        if d.get("operation_type") == "publish_reprice"
+    ]
+    assert len(reprice_logs) == 1
+    payload = reprice_logs[0]["payload"]
+    assert payload["signal_count"] == 1
+    assert isinstance(payload["publish_duration_ms"], (int, float))
+    assert payload["publish_duration_ms"] >= 0
+
+
 def test_publish_live_signals_rounds_protected_prices_to_tick(monkeypatch):
     collections = _collections()
     collections["portfolio_trade_plans"].docs[0]["status"] = "approved"
