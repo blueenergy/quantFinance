@@ -22,6 +22,7 @@ from utils.stock_utils import serialize_doc
 from utils.time_display import add_display_time_fields
 from bson import ObjectId
 from services.live_equity import list_account_equity
+from services.trade_latency_metrics import build_trade_latency_rollup
 from services.trader_execution_upload import upsert_trader_execution
 from services.portfolio_live_snapshot import rebuild_live_snapshot_for_plan_guarded
 from services import trader_signal_reprice as signal_reprice
@@ -908,3 +909,34 @@ def get_account_equity(
         return {"success": True, "data": [serialize_doc(row) for row in rows]}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to fetch account equity: {str(e)}")
+
+
+@router.get("/trader/metrics/latency-rollup", summary="Get live trading latency rollup")
+def get_trade_latency_rollup(
+    plan_id: Optional[str] = Query(None, description="Filter by portfolio plan ID"),
+    order_id: Optional[str] = Query(None, description="Filter by order ID"),
+    securities_account_id: Optional[str] = Query(None, description="Filter by securities account ID"),
+    since: Optional[float] = Query(None, description="Signal publish timestamp lower bound (epoch seconds)"),
+    until: Optional[float] = Query(None, description="Signal publish timestamp upper bound (epoch seconds)"),
+    limit: int = Query(500, ge=1, le=2000, description="Maximum number of signal orders to inspect"),
+    include_orders: bool = Query(True, description="Include per-order timing rows"),
+    current_user: dict = Depends(get_current_active_user),
+):
+    """Read-only latency rollup derived from persisted Mongo timestamps."""
+
+    try:
+        payload = build_trade_latency_rollup(
+            get_db_collections(),
+            get_trading_db_collections(),
+            user_id=current_user["id"],
+            plan_id=plan_id or "",
+            order_id=order_id or "",
+            securities_account_id=securities_account_id or "",
+            since=since,
+            until=until,
+            limit=limit,
+            include_orders=include_orders,
+        )
+        return {"success": True, "data": serialize_doc(payload)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to build latency rollup: {str(e)}")

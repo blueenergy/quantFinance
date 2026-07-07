@@ -709,6 +709,45 @@ class TestCreateExecutionEndpoint:
 
 
 @pytest.mark.unit
+def test_get_trade_latency_rollup_endpoint_passes_filters(monkeypatch):
+    calls = []
+
+    monkeypatch.setattr(trader, "get_db_collections", lambda: {"trade_signals": object(), "trade_executions": object()})
+    monkeypatch.setattr(trader, "get_trading_db_collections", lambda: {"portfolio_live_snapshots": object()})
+
+    def fake_rollup(finance_collections, trading_collections, **kwargs):
+        calls.append(kwargs)
+        return {"order_count": 0, "stages": {}, "orders": []}
+
+    monkeypatch.setattr(trader, "build_trade_latency_rollup", fake_rollup)
+
+    response = trader.get_trade_latency_rollup(
+        plan_id="plan-1",
+        order_id="order-1",
+        securities_account_id="acct-1",
+        since=100.0,
+        until=200.0,
+        limit=100,
+        include_orders=False,
+        current_user={"id": "user_123"},
+    )
+
+    assert response["success"] is True
+    assert calls == [
+        {
+            "user_id": "user_123",
+            "plan_id": "plan-1",
+            "order_id": "order-1",
+            "securities_account_id": "acct-1",
+            "since": 100.0,
+            "until": 200.0,
+            "limit": 100,
+            "include_orders": False,
+        }
+    ]
+
+
+@pytest.mark.unit
 def test_cleanup_positions_endpoint_integration(monkeypatch):
     """Integration test for cleanup endpoint."""
     positions_coll = FakeCollection([
