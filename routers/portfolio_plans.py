@@ -58,6 +58,7 @@ from services.portfolio_live_snapshot import (
     overlay_realtime,
     probe_stale,
     rebuild_live_snapshot_for_plan,
+    schedule_snapshot_rebuild,
 )
 from services.portfolio_lineage_paper import (
     build_lineage_paper_trades,
@@ -480,20 +481,13 @@ def _load_snapshot_with_realtime(
             trading_collections, finance_collections, plan, user_id
         )
     elif schedule_rebuild_if_stale and probe_stale(finance_collections, snapshot):
-
-        def _rebuild() -> None:
-            try:
-                rebuild_live_snapshot_for_plan(
-                    trading_collections, finance_collections, plan, user_id
-                )
-            except Exception:
-                logging.getLogger(__name__).exception(
-                    "async snapshot rebuild failed for %s/%s",
-                    strategy_template_id,
-                    params_hash[:8] if params_hash else "",
-                )
-
-        threading.Thread(target=_rebuild, daemon=True).start()
+        schedule_snapshot_rebuild(
+            trading_collections,
+            finance_collections,
+            plan,
+            user_id,
+            reason="stale_read",
+        )
 
     if not snapshot:
         return None, {}
@@ -7683,12 +7677,13 @@ def publish_portfolio_plan_live_signals(
                 acted_by=user_id,
                 pause_on_empty=False,
             )
-        threading.Thread(
-            target=lambda: rebuild_live_snapshot_for_plan(
-                trading_collections, finance_collections, plan, user_id
-            ),
-            daemon=True,
-        ).start()
+        schedule_snapshot_rebuild(
+            trading_collections,
+            finance_collections,
+            plan,
+            user_id,
+            reason="manual_lineage_apply",
+        )
 
     return {
         "success": True,

@@ -556,7 +556,7 @@ class TestCreateExecutionEndpoint:
                 }
             )
 
-        monkeypatch.setattr(trader, "rebuild_live_snapshot_for_plan", mock_rebuild)
+        monkeypatch.setattr(trader, "rebuild_live_snapshot_for_plan_guarded", mock_rebuild)
 
         def mock_get_trading_db_collections():
             return {

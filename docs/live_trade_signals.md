@@ -6,6 +6,33 @@ This document defines the minimum executable `trade_signals` contract used by:
 approved portfolio plan -> trade_signals -> quantTrader -> miniQMT -> execution/account sync
 ```
 
+## Sources of truth
+
+Every state field has exactly one authority. Publish-time risk checks and sell
+sizing must read only from the source below — no implicit third source (see
+`execution_chain_simplification.plan.md` §S5). This closes the "three sets of
+numbers" gap between UI, lineage, and the broker (risks R4/R5).
+
+| Concern | Authoritative source | Used for |
+|---------|----------------------|----------|
+| Fill quantity / price | Broker deal reports (`trade_executions`) | Terminal state, fees/taxes |
+| Sellable shares (T+1) | Broker `available_qty` | Hard cap on sell size |
+| In-plan delta / sell sizing | Lineage snapshot (`LIVE_SELL_SIZING_BASIS=lineage`) | Multi-plan shared-account sizing |
+| Plan capital budget | Plan `capital_basis` | Buy-side soft cap |
+| UI overview totals | `portfolio_live_snapshots` | Read-only materialized view, **not** a decision input |
+
+Notes:
+
+- `portfolio_live_snapshots` is a read-time materialization for the dashboard;
+  it is rebuilt asynchronously (single lease-guarded path, see
+  `services/portfolio_live_snapshot.py::schedule_snapshot_rebuild`) and must
+  never be used as a sizing or risk input.
+- Sell sizing under `LIVE_SELL_SIZING_BASIS=lineage` is derived from the lineage
+  snapshot but is still clamped by the broker `available_qty` hard cap.
+- Board-lot / STAR minimum-order normalization is applied on top of the sized
+  delta via `stock_data_access.board_lots`; it changes the *order quantity*, not
+  the authority for the underlying delta.
+
 ## Minimum Fields
 
 Executable live signals must include:

@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import logging
+import threading
 import time
+import uuid
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 from pymongo import ASCENDING, DESCENDING
+from pymongo.errors import DuplicateKeyError
 
 from services.portfolio_lineage_live import (
     _numeric,
@@ -205,6 +208,152 @@ def rebuild_live_snapshot_for_plan(
         user_id,
         anchor_plan_id=str(plan.get("plan_id") or ""),
     )
+
+
+# --- S4-B: single lease-guarded snapshot rebuild path -----------------------
+# All ad-hoc `threading.Thread(rebuild_live_snapshot_for_plan)` triggers
+# (stale read, publish, post-execution) funnel through the two helpers below so
+# concurrent rebuilds of the *same* snapshot (across threads and API workers)
+# de-duplicate via a best-effort Mongo lease on the `job_status` collection,
+# mirroring `scheduler._acquire_scheduler_job_lock`.
+
+_SNAPSHOT_REBUILD_LEASE_TTL = 120
+
+
+def _snapshot_rebuild_lock_key(plan: Dict[str, Any], user_id: str) -> str:
+    return "%s:%s:%s" % (
+        user_id,
+        str(plan.get("strategy_template_id") or ""),
+        str(plan.get("params_hash") or ""),
+    )
+
+
+def _acquire_snapshot_rebuild_lease(
+    finance_collections: Dict[str, Any],
+    lock_key: str,
+    ttl_seconds: int = _SNAPSHOT_REBUILD_LEASE_TTL,
+) -> Optional[str]:
+    """Best-effort per-snapshot lease.
+
+    Returns:
+        - an owner token (truthy str) when the lease was acquired -> run + release.
+        - ``""`` when the lease is currently held elsewhere -> skip the rebuild.
+        - ``None`` when no lease backend is available -> run without a lease.
+    """
+    coll = None
+    try:
+        coll = finance_collections.get("job_status")  # type: ignore[union-attr]
+    except Exception:
+        coll = None
+    if coll is None:
+        return None
+    now = time.time()
+    owner = f"snapshot_rebuild:{uuid.uuid4().hex}"
+    lock_id = f"snapshot_rebuild_lock:{lock_key}"
+    try:
+        result = coll.update_one(
+            {
+                "_id": lock_id,
+                "$or": [
+                    {"locked_until": {"$lte": now}},
+                    {"locked_until": {"$exists": False}},
+                ],
+            },
+            {
+                "$set": {
+                    "job_id": lock_id,
+                    "locked_by": owner,
+                    "locked_until": now + ttl_seconds,
+                    "updated_at": now,
+                },
+                "$setOnInsert": {"created_at": now},
+            },
+            upsert=True,
+        )
+    except DuplicateKeyError:
+        # Another worker won the first upsert race for this lock.
+        return ""
+    except Exception:
+        # Lease infra hiccup -> don't block the rebuild.
+        return None
+    if getattr(result, "upserted_id", None) or getattr(result, "modified_count", 0):
+        return owner
+    return ""
+
+
+def _release_snapshot_rebuild_lease(
+    finance_collections: Dict[str, Any],
+    lock_key: str,
+    owner: str,
+) -> None:
+    if not owner:
+        return
+    try:
+        coll = finance_collections.get("job_status")  # type: ignore[union-attr]
+    except Exception:
+        coll = None
+    if coll is None:
+        return
+    try:
+        coll.update_one(
+            {"_id": f"snapshot_rebuild_lock:{lock_key}", "locked_by": owner},
+            {"$set": {"locked_until": time.time(), "updated_at": time.time()}},
+        )
+    except Exception:
+        pass
+
+
+def rebuild_live_snapshot_for_plan_guarded(
+    trading_collections: Dict[str, Any],
+    finance_collections: Dict[str, Any],
+    plan: Dict[str, Any],
+    user_id: str,
+) -> Optional[Dict[str, Any]]:
+    """Rebuild guarded by a per-snapshot Mongo lease (synchronous).
+
+    Skips (returns ``None``) when another rebuild for the same snapshot is
+    already in flight.
+    """
+    lock_key = _snapshot_rebuild_lock_key(plan, user_id)
+    lease = _acquire_snapshot_rebuild_lease(finance_collections, lock_key)
+    if lease == "":
+        log.debug("snapshot rebuild already in progress for %s; skipping", lock_key)
+        return None
+    try:
+        return rebuild_live_snapshot_for_plan(
+            trading_collections, finance_collections, plan, user_id
+        )
+    finally:
+        if lease:
+            _release_snapshot_rebuild_lease(finance_collections, lock_key, lease)
+
+
+def schedule_snapshot_rebuild(
+    trading_collections: Dict[str, Any],
+    finance_collections: Dict[str, Any],
+    plan: Dict[str, Any],
+    user_id: str,
+    *,
+    reason: str = "",
+) -> threading.Thread:
+    """Fire-and-forget background rebuild funneled through the guarded path."""
+    lock_key = _snapshot_rebuild_lock_key(plan, user_id)
+
+    def _run() -> None:
+        try:
+            rebuild_live_snapshot_for_plan_guarded(
+                trading_collections, finance_collections, plan, user_id
+            )
+        except Exception:
+            log.exception(
+                "async snapshot rebuild failed for %s (reason=%s)",
+                lock_key,
+                reason or "-",
+            )
+
+    thread = threading.Thread(target=_run, daemon=True)
+    thread.start()
+    return thread
 
 
 def probe_stale(

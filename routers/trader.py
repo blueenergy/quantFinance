@@ -23,7 +23,7 @@ from utils.time_display import add_display_time_fields
 from bson import ObjectId
 from services.live_equity import list_account_equity
 from services.trader_execution_upload import upsert_trader_execution
-from services.portfolio_live_snapshot import rebuild_live_snapshot_for_plan
+from services.portfolio_live_snapshot import rebuild_live_snapshot_for_plan_guarded
 from services import trader_signal_reprice as signal_reprice
 
 router = APIRouter()
@@ -69,7 +69,7 @@ def _schedule_live_snapshot_rebuild_for_execution(
             )
             if not plan:
                 return
-            rebuild_live_snapshot_for_plan(
+            rebuild_live_snapshot_for_plan_guarded(
                 trading_collections,
                 finance_collections,
                 plan,

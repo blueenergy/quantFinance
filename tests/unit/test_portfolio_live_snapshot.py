@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import time
+
+from pymongo.errors import DuplicateKeyError
+
 from services.portfolio_lineage_live import build_lineage_live_positions, build_lineage_live_trades
 from services.portfolio_live_snapshot import (
     overlay_realtime,
@@ -336,3 +340,146 @@ def test_probe_stale_ignores_execution_count_when_watermark_current():
         )
     }
     assert probe_stale(finance, snapshot) is False
+
+
+# --- S4-B: lease-guarded snapshot rebuild -----------------------------------
+
+
+class _UpdateResult:
+    def __init__(self, upserted_id=None, modified_count=0):
+        self.upserted_id = upserted_id
+        self.modified_count = modified_count
+
+
+class _LeaseCollection:
+    """Minimal job_status fake honoring the $or/upsert lease semantics."""
+
+    def __init__(self):
+        self.docs = {}
+
+    def update_one(self, filt, update, upsert=False):
+        import time as _time
+
+        lock_id = filt["_id"]
+        existing = self.docs.get(lock_id)
+        now = _time.time()
+        # Acquire path carries a $or freshness guard; release path filters on
+        # locked_by. Honor both so the fake matches real Mongo semantics.
+        if existing is not None:
+            if "$or" in filt and existing.get("locked_until", 0) > now:
+                return _UpdateResult(upserted_id=None, modified_count=0)
+            if "locked_by" in filt and existing.get("locked_by") != filt["locked_by"]:
+                return _UpdateResult(upserted_id=None, modified_count=0)
+            doc = dict(existing)
+            doc.update(update.get("$set", {}))
+            self.docs[lock_id] = doc
+            return _UpdateResult(upserted_id=None, modified_count=1)
+        if not upsert:
+            return _UpdateResult(upserted_id=None, modified_count=0)
+        doc = {"_id": lock_id}
+        doc.update(update.get("$setOnInsert", {}))
+        doc.update(update.get("$set", {}))
+        self.docs[lock_id] = doc
+        return _UpdateResult(upserted_id=lock_id, modified_count=0)
+
+
+def _plan_stub():
+    return {
+        "plan_id": "plan-1",
+        "strategy_template_id": "tmpl-1",
+        "params_hash": "abcd1234",
+    }
+
+
+def test_guarded_rebuild_runs_and_releases_lease(monkeypatch):
+    from services import portfolio_live_snapshot as pls
+
+    calls = []
+    monkeypatch.setattr(
+        pls,
+        "rebuild_live_snapshot_for_plan",
+        lambda tc, fc, plan, uid: calls.append(plan["plan_id"]) or {"ok": True},
+    )
+    lease_coll = _LeaseCollection()
+    finance = {"job_status": lease_coll}
+
+    result = pls.rebuild_live_snapshot_for_plan_guarded({}, finance, _plan_stub(), "user-1")
+
+    assert result == {"ok": True}
+    assert calls == ["plan-1"]
+    lock_doc = next(iter(lease_coll.docs.values()))
+    assert lock_doc["locked_until"] <= time.time() + 1
+
+
+def test_guarded_rebuild_skips_when_lease_held(monkeypatch):
+    from services import portfolio_live_snapshot as pls
+
+    calls = []
+    monkeypatch.setattr(
+        pls,
+        "rebuild_live_snapshot_for_plan",
+        lambda tc, fc, plan, uid: calls.append(plan["plan_id"]) or {"ok": True},
+    )
+    lease_coll = _LeaseCollection()
+    finance = {"job_status": lease_coll}
+    lock_key = pls._snapshot_rebuild_lock_key(_plan_stub(), "user-1")
+    assert pls._acquire_snapshot_rebuild_lease(finance, lock_key, ttl_seconds=300)
+
+    result = pls.rebuild_live_snapshot_for_plan_guarded({}, finance, _plan_stub(), "user-1")
+
+    assert result is None
+    assert calls == []
+
+
+def test_guarded_rebuild_skips_duplicate_key_race(monkeypatch):
+    from services import portfolio_live_snapshot as pls
+
+    class _DuplicateKeyLeaseCollection:
+        def update_one(self, *args, **kwargs):
+            raise DuplicateKeyError("duplicate lock")
+
+    calls = []
+    monkeypatch.setattr(
+        pls,
+        "rebuild_live_snapshot_for_plan",
+        lambda tc, fc, plan, uid: calls.append(plan["plan_id"]) or {"ok": True},
+    )
+    finance = {"job_status": _DuplicateKeyLeaseCollection()}
+
+    result = pls.rebuild_live_snapshot_for_plan_guarded({}, finance, _plan_stub(), "user-1")
+
+    assert result is None
+    assert calls == []
+
+
+def test_guarded_rebuild_runs_without_lease_backend(monkeypatch):
+    from services import portfolio_live_snapshot as pls
+
+    calls = []
+    monkeypatch.setattr(
+        pls,
+        "rebuild_live_snapshot_for_plan",
+        lambda tc, fc, plan, uid: calls.append(plan["plan_id"]) or {"ok": True},
+    )
+    result = pls.rebuild_live_snapshot_for_plan_guarded({}, {}, _plan_stub(), "user-1")
+
+    assert result == {"ok": True}
+    assert calls == ["plan-1"]
+
+
+def test_schedule_snapshot_rebuild_runs_in_background(monkeypatch):
+    from services import portfolio_live_snapshot as pls
+
+    calls = []
+    monkeypatch.setattr(
+        pls,
+        "rebuild_live_snapshot_for_plan",
+        lambda tc, fc, plan, uid: calls.append(plan["plan_id"]),
+    )
+    finance = {"job_status": _LeaseCollection()}
+
+    thread = pls.schedule_snapshot_rebuild({}, finance, _plan_stub(), "user-1", reason="test")
+    thread.join(timeout=5)
+
+    assert not thread.is_alive()
+    assert calls == ["plan-1"]
