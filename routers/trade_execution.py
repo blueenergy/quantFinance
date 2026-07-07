@@ -306,6 +306,325 @@ def _signal_display_quantity(row: Dict[str, Any]) -> float:
     return 0.0
 
 
+_EXECUTION_ACTIVITY_FIELDS = (
+    "_id",
+    "symbol",
+    "side",
+    "action",
+    "status",
+    "filled_price",
+    "price",
+    "target_price",
+    "filled_size",
+    "quantity",
+    "size",
+    "strategy_name",
+    "strategy",
+    "timestamp",
+    "order_id",
+    "broker_order_id",
+    "qmt_order_id",
+    "date",
+    "total_fee",
+    "commission",
+    "worker_mode",
+    "user_id",
+)
+_SIGNAL_ACTIVITY_FIELDS = (
+    "_id",
+    "symbol",
+    "action",
+    "status",
+    "avg_price",
+    "price",
+    "order_id",
+    "broker_order_id",
+    "qmt_order_id",
+    "strategy",
+    "timestamp",
+    "updated_at",
+    "executed_at",
+    "submitted_at",
+    "created_at",
+    "mode",
+    "worker_mode",
+    "user_id",
+    "date",
+    "filled_qty",
+    "size",
+    "quantity",
+    "target_size",
+    "effective_limit_price",
+    "last_market_price",
+    "submitted_age_seconds",
+    "broker_status",
+    "broker_status_msg",
+    "last_status_checked_at",
+    "error_message",
+    "retry_count",
+)
+_EXECUTION_ACTIVITY_PROJECTION = {field: 1 for field in _EXECUTION_ACTIVITY_FIELDS}
+_SIGNAL_ACTIVITY_PROJECTION = {field: 1 for field in _SIGNAL_ACTIVITY_FIELDS}
+
+_PENDING_SIGNAL_STATUSES = {"pending", "retry_pending", "submitted", ""}
+_EXECUTED_SIGNAL_STATUSES = {"executed", "filled", "partial_filled"}
+_PENDING_EXECUTION_STATUSES = {"pending", "submitted", "partial_filled", "cancel_requested", "retry_pending"}
+
+
+def _normalize_activity_type(activity_type: Optional[str]) -> Optional[str]:
+    if activity_type is None:
+        return None
+    normalized = str(activity_type).strip().lower()
+    if normalized in ("executions", "signals"):
+        return normalized
+    raise HTTPException(
+        status_code=400,
+        detail="activity_type must be 'executions' or 'signals'",
+    )
+
+
+def _execution_activity_from_doc(exec_doc: Dict[str, Any]) -> Dict[str, Any]:
+    exec_time = add_display_time_fields(dict(exec_doc))
+    raw_status = str(exec_doc.get("status", "filled")).lower()
+    if raw_status in ("filled",):
+        status = "FILLED"
+        status_category = "executed"
+    elif raw_status in ("partial_filled",):
+        status = "PARTIAL_FILLED"
+        status_category = "executed"
+    elif raw_status in ("rejected", "failed"):
+        status = "FAILED"
+        status_category = "failed"
+    else:
+        status = raw_status.upper()
+        status_category = "executed"
+    return {
+        "_id": str(exec_doc.get("_id")),
+        "symbol": exec_doc.get("symbol"),
+        "direction": (exec_doc.get("side") or exec_doc.get("action", "")).upper(),
+        "status": status,
+        "status_category": status_category,
+        "price": exec_doc.get("filled_price", exec_doc.get("price", 0)),
+        "target_price": exec_doc.get("target_price"),
+        "filled_price": exec_doc.get("filled_price"),
+        "quantity": _display_trade_quantity(exec_doc),
+        "strategy": exec_doc.get("strategy_name", exec_doc.get("strategy", "")),
+        "timestamp": exec_doc.get("timestamp", 0),
+        "execution_time": exec_time.get("execution_time"),
+        "timestamp_iso": exec_time.get("timestamp_iso"),
+        "order_id": exec_doc.get("order_id", ""),
+        "broker_order_id": exec_doc.get("broker_order_id") or exec_doc.get("qmt_order_id"),
+        "qmt_order_id": exec_doc.get("qmt_order_id") or exec_doc.get("broker_order_id"),
+        "source": "trade_execution",
+        "date": exec_doc.get("date", ""),
+    }
+
+
+def _signal_activity_from_doc(signal_doc: Dict[str, Any]) -> Dict[str, Any]:
+    raw_status = str(signal_doc.get("status", "pending")).lower()
+    status_map = {
+        "pending": "PENDING",
+        "retry_pending": "RETRY",
+        "submitted": "SUBMITTED",
+        "executed": "FILLED",
+        "filled": "FILLED",
+        "partial_filled": "PARTIAL_FILLED",
+        "failed": "FAILED",
+        "rejected": "FAILED",
+    }
+    if raw_status in ("pending", "retry_pending", "submitted"):
+        status_category = "pending"
+    elif raw_status in _EXECUTED_SIGNAL_STATUSES:
+        status_category = "executed"
+    elif raw_status in ("failed", "rejected"):
+        status_category = "failed"
+    else:
+        status_category = "other"
+
+    activity_ts = _signal_activity_timestamp(signal_doc)
+    signal_display_doc = dict(signal_doc)
+    if activity_ts:
+        signal_display_doc["timestamp"] = activity_ts
+    signal_time = add_display_time_fields(signal_display_doc)
+    order_id = signal_doc.get("order_id", "")
+    return {
+        "_id": str(signal_doc.get("_id")),
+        "symbol": signal_doc.get("symbol"),
+        "direction": (signal_doc.get("action", "")).upper(),
+        "action": signal_doc.get("action"),
+        "status": status_map.get(raw_status, raw_status.upper()),
+        "status_category": status_category,
+        "price": signal_doc.get("avg_price", signal_doc.get("price", 0)),
+        "target_price": signal_doc.get("price"),
+        "filled_price": signal_doc.get("avg_price"),
+        "quantity": _signal_display_quantity(signal_doc),
+        "strategy": signal_doc.get("strategy", ""),
+        "timestamp": activity_ts or signal_doc.get("timestamp", 0),
+        "execution_time": signal_time.get("execution_time"),
+        "timestamp_iso": signal_time.get("timestamp_iso"),
+        "order_id": order_id,
+        "broker_order_id": signal_doc.get("broker_order_id") or signal_doc.get("qmt_order_id"),
+        "qmt_order_id": signal_doc.get("qmt_order_id") or signal_doc.get("broker_order_id"),
+        "source": "trade_signal",
+        "error_message": signal_doc.get("error_message"),
+        "retry_count": signal_doc.get("retry_count", 0),
+        "date": signal_doc.get("date", ""),
+        "effective_limit_price": signal_doc.get("effective_limit_price"),
+        "last_market_price": signal_doc.get("last_market_price"),
+        "submitted_age_seconds": signal_doc.get("submitted_age_seconds"),
+        "broker_status": signal_doc.get("broker_status"),
+        "broker_status_msg": signal_doc.get("broker_status_msg"),
+        "last_status_checked_at": signal_doc.get("last_status_checked_at"),
+        "raw_signal_status": raw_status,
+    }
+
+
+def _execution_matches_status_filter(exec_doc: Dict[str, Any], status_filter: Optional[str]) -> bool:
+    if not status_filter or status_filter == "all":
+        return True
+    raw_status = str(exec_doc.get("status", "filled")).lower()
+    if status_filter == "executed":
+        return _is_filled_execution(exec_doc)
+    if status_filter == "pending":
+        return raw_status in _PENDING_EXECUTION_STATUSES
+    return True
+
+
+def _signal_matches_status_filter(signal_doc: Dict[str, Any], status_filter: Optional[str]) -> bool:
+    if not status_filter or status_filter == "all":
+        return True
+    raw_status = str(signal_doc.get("status", "pending")).lower()
+    if status_filter == "pending":
+        return raw_status in _PENDING_SIGNAL_STATUSES
+    if status_filter == "executed":
+        return raw_status in _EXECUTED_SIGNAL_STATUSES
+    return True
+
+
+def _collect_execution_activities(
+    executions_coll: Any,
+    *,
+    user_id: Any,
+    fetch_limit: int,
+    date_query: Dict[str, Any],
+    status_filter: Optional[str],
+) -> tuple[List[Dict[str, Any]], Dict[str, Any], int, int]:
+    exec_query: Dict[str, Any] = {"worker_mode": {"$ne": "backtest"}, "user_id": user_id}
+    if date_query:
+        _apply_query_filter(exec_query, date_query)
+
+    execution_docs = list(
+        executions_coll.find(exec_query, _EXECUTION_ACTIVITY_PROJECTION)
+        .sort("timestamp", -1)
+        .limit(fetch_limit)
+    )
+    execution_source_count = len(execution_docs)
+    executions = _group_executions_by_order(execution_docs)
+    activities: List[Dict[str, Any]] = []
+    for exec_doc in executions:
+        if not _execution_matches_status_filter(exec_doc, status_filter):
+            continue
+        activities.append(_execution_activity_from_doc(exec_doc))
+    return activities, exec_query, execution_source_count, len(activities)
+
+
+def _collect_signal_activities(
+    signals_coll: Any,
+    *,
+    user_id: Any,
+    fetch_limit: int,
+    signal_date_query: Dict[str, Any],
+    status_filter: Optional[str],
+) -> tuple[List[Dict[str, Any]], Dict[str, Any], int, int]:
+    signal_query: Dict[str, Any] = {
+        "$or": [
+            {"worker_mode": "live"},
+            {"mode": "live"},
+        ],
+        "user_id": user_id,
+    }
+    if signal_date_query:
+        _apply_query_filter(signal_query, signal_date_query)
+
+    signals = list(
+        signals_coll.find(signal_query, _SIGNAL_ACTIVITY_PROJECTION)
+        .sort("timestamp", -1)
+        .limit(fetch_limit)
+    )
+    signal_source_count = len(signals)
+    activities: List[Dict[str, Any]] = []
+    for signal_doc in signals:
+        if not _signal_matches_status_filter(signal_doc, status_filter):
+            continue
+        activities.append(_signal_activity_from_doc(signal_doc))
+    return activities, signal_query, signal_source_count, len(activities)
+
+
+def _collect_legacy_merged_activities(
+    executions_coll: Any,
+    signals_coll: Any,
+    *,
+    user_id: Any,
+    fetch_limit: int,
+    date_query: Dict[str, Any],
+    signal_date_query: Dict[str, Any],
+    status_filter: Optional[str],
+) -> tuple[
+    List[Dict[str, Any]],
+    Optional[Dict[str, Any]],
+    Optional[Dict[str, Any]],
+    int,
+    int,
+    int,
+    int,
+]:
+    merged_activities: List[Dict[str, Any]] = []
+    execution_source_count = 0
+    execution_filled_count = 0
+    signal_source_count = 0
+    signal_included_count = 0
+    execution_order_ids: set = set()
+    exec_query = None
+    signal_query = None
+
+    if status_filter != "pending":
+        # Legacy compat: the pre-refactor merge always dropped unfilled orders from
+        # the execution side (via _is_filled_execution) whenever not in pending mode,
+        # regardless of status_filter. Force "executed" semantics to preserve that.
+        exec_activities, exec_query, execution_source_count, execution_filled_count = _collect_execution_activities(
+            executions_coll,
+            user_id=user_id,
+            fetch_limit=fetch_limit,
+            date_query=date_query,
+            status_filter="executed",
+        )
+        merged_activities.extend(exec_activities)
+        execution_order_ids = {row.get("order_id") for row in exec_activities if row.get("order_id")}
+
+    signal_activities, signal_query, signal_source_count, signal_included_count = _collect_signal_activities(
+        signals_coll,
+        user_id=user_id,
+        fetch_limit=fetch_limit,
+        signal_date_query=signal_date_query,
+        status_filter=status_filter,
+    )
+    for row in signal_activities:
+        order_id = row.get("order_id", "")
+        if order_id and order_id in execution_order_ids:
+            continue
+        merged_activities.append(row)
+
+    return (
+        merged_activities,
+        exec_query,
+        signal_query,
+        execution_source_count,
+        execution_filled_count,
+        signal_source_count,
+        signal_included_count,
+    )
+
+
 def _log_trade_timing(label: str, started_at: float, **parts: Any) -> None:
     elapsed = time.perf_counter() - started_at
     threshold = float(os.getenv("TRADE_API_TIMING_SECONDS", "1"))
@@ -962,9 +1281,13 @@ def get_all_trade_activities(
     days: Optional[int] = Query(None, description="最近N天"),
     all_dates: bool = Query(False, description="显式查询所有日期"),
     status_filter: Optional[str] = Query(None, description="状态筛选: executed, pending, all"),
+    activity_type: Optional[str] = Query(
+        None,
+        description="活动来源: executions 仅成交记录, signals 仅交易信号; 缺省时兼容旧版 merge",
+    ),
     current_user: dict = Depends(get_current_active_user),
 ):
-    """融合 trade_signals 和 trade_executions，提供当前用户的完整交易活动视图"""
+    """按 tab 查询交易活动; activity_type 指定单集合, status_filter=all 仅在当前 tab 内生效."""
     started_at = time.perf_counter()
     try:
         collections = get_db_collections()
@@ -985,153 +1308,56 @@ def get_all_trade_activities(
             end_date=end_date,
             all_dates=all_dates,
         )
-        
-        merged_activities = []
+
+        normalized_activity_type = _normalize_activity_type(activity_type)
         execution_source_count = 0
         execution_filled_count = 0
         signal_source_count = 0
         signal_included_count = 0
-        execution_order_ids = set()
         exec_query = None
         signal_query = None
-        
-        # 1. 获取已执行的交易记录（如果不是仅显示 pending）
-        if status_filter != "pending":
-            exec_query = {"worker_mode": {"$ne": "backtest"}, "user_id": user_id}  # 排除回测数据，按用户过滤
-            if date_query:
-                _apply_query_filter(exec_query, date_query)
-            
-            execution_docs = list(executions_coll.find(exec_query).sort("timestamp", -1).limit(fetch_limit))
-            execution_source_count = len(execution_docs)
-            executions = _group_executions_by_order(execution_docs)
-            # 排除完全未成交的订单，避免在用户视图中显示作废单
-            executions = [e for e in executions if _is_filled_execution(e)]
-            execution_filled_count = len(executions)
-            execution_order_ids = {e.get("order_id") for e in executions if e.get("order_id")}
-            
-            for exec_doc in executions:
-                exec_time = add_display_time_fields(dict(exec_doc))
-                raw_status = str(exec_doc.get("status", "filled")).lower()
-                if raw_status in ("filled",):
-                    status = "FILLED"
-                    status_category = "executed"
-                elif raw_status in ("partial_filled",):
-                    status = "PARTIAL_FILLED"
-                    status_category = "executed"
-                elif raw_status in ("rejected", "failed"):
-                    status = "FAILED"
-                    status_category = "failed"
-                else:
-                    status = raw_status.upper()
-                    status_category = "executed"
-                merged_activities.append({
-                    "_id": str(exec_doc.get("_id")),
-                    "symbol": exec_doc.get("symbol"),
-                    "direction": (exec_doc.get("side") or exec_doc.get("action", "")).upper(),
-                    "status": status,
-                    "status_category": status_category,
-                    "price": exec_doc.get("filled_price", exec_doc.get("price", 0)),
-                    "target_price": exec_doc.get("target_price"),
-                    "filled_price": exec_doc.get("filled_price"),
-                    "quantity": _display_trade_quantity(exec_doc),
-                    "strategy": exec_doc.get("strategy_name", exec_doc.get("strategy", "")),
-                    "timestamp": exec_doc.get("timestamp", 0),
-                    "execution_time": exec_time.get("execution_time"),
-                    "timestamp_iso": exec_time.get("timestamp_iso"),
-                    "order_id": exec_doc.get("order_id", ""),
-                    "broker_order_id": exec_doc.get("broker_order_id") or exec_doc.get("qmt_order_id"),
-                    "qmt_order_id": exec_doc.get("qmt_order_id") or exec_doc.get("broker_order_id"),
-                    "source": "trade_execution",
-                    "date": exec_doc.get("date", "")
-                })
-        
-        # 2. 获取交易信号。执行视图也需要信号兜底：有些实盘状态只更新 trade_signals，
-        # 对应的 trade_executions 可能尚未写入或被去重。
-        signal_query = {
-            "$or": [
-                {"worker_mode": "live"},
-                {"mode": "live"}
-            ],
-            "user_id": user_id,
-        }
-        if signal_date_query:
-            _apply_query_filter(signal_query, signal_date_query)
-        
-        pending_signal_statuses = {"pending", "retry_pending", "submitted", ""}
-        executed_signal_statuses = {"executed", "filled", "partial_filled"}
-        signals = list(signals_coll.find(signal_query).sort("timestamp", -1).limit(fetch_limit))
-        signal_source_count = len(signals)
-        
-        for signal_doc in signals:
-            order_id = signal_doc.get("order_id", "")
-            if order_id and order_id in execution_order_ids:
-                continue
-            raw_status = str(signal_doc.get("status", "pending")).lower()
-            if status_filter == "pending" and raw_status not in pending_signal_statuses:
-                continue
-            if status_filter == "executed" and raw_status not in executed_signal_statuses:
-                continue
-            status_map = {
-                "pending": "PENDING",
-                "retry_pending": "RETRY",
-                "submitted": "SUBMITTED",
-                "executed": "FILLED",
-                "filled": "FILLED",
-                "partial_filled": "PARTIAL_FILLED",
-                "failed": "FAILED",
-                "rejected": "FAILED",
-            }
-            # 粗分为待执行 vs 已执行/失败，便于前端理解
-            if raw_status in ("pending", "retry_pending", "submitted"):
-                status_category = "pending"
-            elif raw_status in executed_signal_statuses:
-                status_category = "executed"
-            elif raw_status in ("failed", "rejected"):
-                status_category = "failed"
-            else:
-                status_category = "other"
-            
-            activity_ts = _signal_activity_timestamp(signal_doc)
-            signal_display_doc = dict(signal_doc)
-            if activity_ts:
-                signal_display_doc["timestamp"] = activity_ts
-            signal_time = add_display_time_fields(signal_display_doc)
-            merged_activities.append({
-                "_id": str(signal_doc.get("_id")),
-                "symbol": signal_doc.get("symbol"),
-                "direction": (signal_doc.get("action", "")).upper(),
-                "action": signal_doc.get("action"),
-                "status": status_map.get(raw_status, raw_status.upper()),
-                "status_category": status_category,
-                "price": signal_doc.get("avg_price", signal_doc.get("price", 0)),
-                "target_price": signal_doc.get("price"),
-                "filled_price": signal_doc.get("avg_price"),
-                "quantity": _signal_display_quantity(signal_doc),
-                "strategy": signal_doc.get("strategy", ""),
-                "timestamp": activity_ts or signal_doc.get("timestamp", 0),
-                "execution_time": signal_time.get("execution_time"),
-                "timestamp_iso": signal_time.get("timestamp_iso"),
-                "order_id": order_id,
-                "broker_order_id": signal_doc.get("broker_order_id") or signal_doc.get("qmt_order_id"),
-                "qmt_order_id": signal_doc.get("qmt_order_id") or signal_doc.get("broker_order_id"),
-                "source": "trade_signal",
-                "error_message": signal_doc.get("error_message"),
-                "retry_count": signal_doc.get("retry_count", 0),
-                "date": signal_doc.get("date", ""),
-                "effective_limit_price": signal_doc.get("effective_limit_price"),
-                "last_market_price": signal_doc.get("last_market_price"),
-                "submitted_age_seconds": signal_doc.get("submitted_age_seconds"),
-                "broker_status": signal_doc.get("broker_status"),
-                "broker_status_msg": signal_doc.get("broker_status_msg"),
-                "last_status_checked_at": signal_doc.get("last_status_checked_at"),
-                "raw_signal_status": raw_status,
-            })
-            signal_included_count += 1
-        
-        # 3. 按时间倒序排序
+
+        if normalized_activity_type == "executions":
+            merged_activities, exec_query, execution_source_count, execution_filled_count = (
+                _collect_execution_activities(
+                    executions_coll,
+                    user_id=user_id,
+                    fetch_limit=fetch_limit,
+                    date_query=date_query,
+                    status_filter=status_filter,
+                )
+            )
+        elif normalized_activity_type == "signals":
+            merged_activities, signal_query, signal_source_count, signal_included_count = (
+                _collect_signal_activities(
+                    signals_coll,
+                    user_id=user_id,
+                    fetch_limit=fetch_limit,
+                    signal_date_query=signal_date_query,
+                    status_filter=status_filter,
+                )
+            )
+        else:
+            (
+                merged_activities,
+                exec_query,
+                signal_query,
+                execution_source_count,
+                execution_filled_count,
+                signal_source_count,
+                signal_included_count,
+            ) = _collect_legacy_merged_activities(
+                executions_coll,
+                signals_coll,
+                user_id=user_id,
+                fetch_limit=fetch_limit,
+                date_query=date_query,
+                signal_date_query=signal_date_query,
+                status_filter=status_filter,
+            )
+
         merged_activities.sort(key=lambda x: x.get("timestamp", 0), reverse=True)
-        
-        # 4. 分页
+
         total = len(merged_activities)
         if total == 0:
             _log_empty_trade_activity_diagnostics(
@@ -1147,16 +1373,16 @@ def get_all_trade_activities(
                 signal_included_count=signal_included_count,
             )
         merged_activities = merged_activities[skip:skip + limit]
-        
-        # 5. 添加股票名称
+
         merged_activities = enrich_trades_with_stock_names(merged_activities, stock_info_coll)
-        
+
         response = {
             "success": True,
             "data": merged_activities,
             "count": len(merged_activities),
             "total": total,
             "window_days": effective_days,
+            "activity_type": normalized_activity_type,
         }
         _log_trade_timing(
             "Trade activities",
@@ -1168,8 +1394,11 @@ def get_all_trade_activities(
             returned=len(merged_activities),
             limit=limit,
             skip=skip,
+            activity_type=normalized_activity_type or "legacy",
         )
         return response
+    except HTTPException:
+        raise
     except Exception as e:
         import traceback
         traceback.print_exc()
