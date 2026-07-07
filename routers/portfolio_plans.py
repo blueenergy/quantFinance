@@ -478,7 +478,11 @@ def _load_snapshot_with_realtime(
     )
     if snapshot is None:
         snapshot = rebuild_live_snapshot_for_plan(
-            trading_collections, finance_collections, plan, user_id
+            trading_collections,
+            finance_collections,
+            plan,
+            user_id,
+            reason="build_on_miss",
         )
     elif schedule_rebuild_if_stale and probe_stale(finance_collections, snapshot):
         schedule_snapshot_rebuild(
@@ -3649,6 +3653,7 @@ async def live_rebalance_portfolio(
     finance_collections = get_db_collections()
     data_collections = get_data_db()
     user_id = _current_user_id(current_user)
+    publish_started = time.perf_counter()
 
     plan = _require_plan(trading_collections, plan_id, current_user)
     if not request.targets:
@@ -3892,6 +3897,7 @@ async def live_rebalance_portfolio(
     if new_signals:
         finance_collections["trade_signals"].insert_many(new_signals)
         inserted_count = len(new_signals)
+    publish_duration_ms = round((time.perf_counter() - publish_started) * 1000.0, 1)
     trading_collections["portfolio_trade_plans"].update_one(
         {"plan_id": new_plan_id, "user_id": user_id},
         {
@@ -3899,12 +3905,36 @@ async def live_rebalance_portfolio(
                 "live_signals_published_at": now,
                 "live_signal_count": len(signals),
                 "live_signal_inserted_count": inserted_count,
+                "publish_duration_ms": publish_duration_ms,
                 "live_signal_status_summary": {
                     "pending": inserted_count,
                     **summarize_signal_statuses(existing_signals),
                 },
             }
         },
+    )
+    _append_plan_operation_log(
+        trading_collections,
+        plan_id=new_plan_id,
+        user_id=user_id,
+        operation_type="live_rebalance_publish",
+        status="success",
+        message="manual live rebalance signals published",
+        payload={
+            "anchor_plan_id": plan_id,
+            "manual_action": manual_action,
+            "signal_count": len(signals),
+            "inserted_count": inserted_count,
+            "existing_count": len(existing_signals),
+            "publish_duration_ms": publish_duration_ms,
+        },
+    )
+    schedule_snapshot_rebuild(
+        trading_collections,
+        finance_collections,
+        plan_doc,
+        user_id,
+        reason="live_rebalance_publish",
     )
 
     # Forward-looking exclusion only; pausing the lineage waits until the sells
@@ -3934,6 +3964,7 @@ async def live_rebalance_portfolio(
                 "risk_report": risk_report,
                 "inserted_count": inserted_count,
                 "existing_count": len(existing_signals),
+                "publish_duration_ms": publish_duration_ms,
                 "changed_symbols": changed_symbols,
                 "blocked": bool(blocked),
                 "lineage_effects": lineage_effects,
@@ -7342,6 +7373,21 @@ def get_portfolio_plan_live_summary(plan_id: str, current_user: dict = Depends(g
             "source": chart_payload.get("row_source") or "portfolio_live_equity_legacy",
         }
 
+    snapshot_meta: Dict[str, Any] = {
+        "available": bool(snapshot),
+        "updated_at": snapshot.get("updated_at") if snapshot else None,
+        "build_ms": snapshot.get("build_ms") if snapshot else None,
+        "watermark": snapshot.get("watermark") if snapshot else {},
+        "stale": None,
+        "last_rebuild_reason": snapshot.get("last_rebuild_reason") if snapshot else "",
+        "last_rebuild_trigger_order_id": snapshot.get("last_rebuild_trigger_order_id") if snapshot else "",
+    }
+    if snapshot:
+        try:
+            snapshot_meta["stale"] = bool(probe_stale(finance_collections, snapshot))
+        except Exception:
+            snapshot_meta["stale"] = None
+
     return {
         "success": True,
         "data": _jsonable(
@@ -7362,6 +7408,7 @@ def get_portfolio_plan_live_summary(plan_id: str, current_user: dict = Depends(g
                 },
                 "trades": overlay.get("trades") or [],
                 "reconcile": reconcile_payload,
+                "snapshot_meta": snapshot_meta,
             }
         ),
     }

@@ -24,6 +24,8 @@ def upsert_trader_execution(
 
     execution = dict(execution)
     execution["user_id"] = user_id
+    execution.setdefault("ingested_at", time.time())
+    execution.setdefault("ingest_source", "api")
 
     ts = execution.get("timestamp")
     if not isinstance(ts, (int, float)):

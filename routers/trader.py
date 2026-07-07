@@ -9,7 +9,7 @@ Provides endpoints for:
 This is the bridge between quantTrader (client) and quantFinance (backend).
 """
 
-from fastapi import APIRouter, Depends, Query, HTTPException, Body
+from fastapi import APIRouter, Depends, Query, HTTPException, Body, Header
 from pydantic import BaseModel, Field
 from typing import List, Optional, Dict, Any
 from datetime import datetime
@@ -74,6 +74,8 @@ def _schedule_live_snapshot_rebuild_for_execution(
                 finance_collections,
                 plan,
                 user_id,
+                reason="execution",
+                trigger_order_id=order_id,
             )
         except Exception:
             logger.exception(
@@ -173,6 +175,7 @@ def _attach_stock_names(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 def get_pending_signals(
     limit: int = Query(50, ge=1, le=200, description="Maximum number of signals"),
     include_submitted: bool = Query(False, description="Include submitted signals"),
+    x_quanttrader_worker_id: Optional[str] = Header(None, alias="X-QuantTrader-Worker-Id"),
     current_user: dict = Depends(get_current_active_user)
 ):
     """Get pending trading signals for quantTrader execution.
@@ -205,6 +208,34 @@ def get_pending_signals(
         # locally for backwards-compatible documents that may not have phase fields.
         cursor = signals_coll.find(query).sort("timestamp", 1).limit(limit)
         signals = [serialize_doc(doc) for doc in cursor]
+        first_seen_at = time.time()
+        worker_id = (
+            x_quanttrader_worker_id
+            if isinstance(x_quanttrader_worker_id, str) and x_quanttrader_worker_id
+            else f"quantTrader:{user_id}"
+        )
+        for signal in signals:
+            order_id = signal.get("order_id")
+            if not order_id or signal.get("first_seen_at") is not None:
+                continue
+            signals_coll.update_one(
+                {
+                    "order_id": order_id,
+                    "user_id": user_id,
+                    "$or": [
+                        {"first_seen_at": {"$exists": False}},
+                        {"first_seen_at": None},
+                    ],
+                },
+                {
+                    "$set": {
+                        "first_seen_at": first_seen_at,
+                        "first_seen_by": worker_id,
+                    }
+                },
+            )
+            signal["first_seen_at"] = first_seen_at
+            signal["first_seen_by"] = worker_id
         signals.sort(
             key=lambda row: (
                 0 if str(row.get("execution_phase") or row.get("action") or "").lower() == "sell" else 1,

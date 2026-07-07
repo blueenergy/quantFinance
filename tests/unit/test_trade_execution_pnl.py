@@ -249,6 +249,8 @@ def test_create_trader_execution_is_idempotent():
     assert executions.update_count == 1
     assert len(executions.docs) == 1
     assert executions.docs[0]["timestamp"] == 1001.0
+    assert executions.docs[0]["ingest_source"] == "api"
+    assert executions.docs[0]["ingested_at"] > 0
 
 
 @pytest.mark.unit

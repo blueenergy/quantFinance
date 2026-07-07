@@ -3791,6 +3791,10 @@ def test_get_portfolio_plan_live_summary_consolidates_payload(monkeypatch):
     assert payload["trades"]
     assert payload["equity"]["current_book_equity"]["initial_capital"] == 1_000_000
     assert payload["reconcile"]["applicable"] is True
+    assert payload["snapshot_meta"]["available"] is True
+    assert payload["snapshot_meta"]["stale"] is False
+    assert payload["snapshot_meta"]["watermark"]["execution_count"] == 1
+    assert payload["snapshot_meta"]["last_rebuild_reason"] == "build_on_miss"
 
 
 def test_list_portfolios_includes_live_and_paper_lineages(monkeypatch):
@@ -4837,6 +4841,12 @@ def test_live_rebalance_caps_sell_to_account_available(monkeypatch):
 def test_live_rebalance_liquidation_publishes_and_creates_manual_plan(monkeypatch):
     cols, fin, data = _live_rebalance_env()
     _patch_lineage_live_env(monkeypatch, cols, fin, data)
+    rebuild_calls = []
+
+    def _capture_rebuild(trading_collections, finance_collections, plan, user_id, *, reason="", trigger_order_id=""):
+        rebuild_calls.append({"plan_id": plan.get("plan_id"), "user_id": user_id, "reason": reason})
+
+    monkeypatch.setattr(portfolio_plans, "schedule_snapshot_rebuild", _capture_rebuild)
 
     resp = asyncio.run(
         portfolio_plans.live_rebalance_portfolio(
@@ -4865,6 +4875,21 @@ def test_live_rebalance_liquidation_publishes_and_creates_manual_plan(monkeypatc
     assert plan["status"] == "approved"
     assert plan["plan_type"] == "rebalance"
     assert plan["live_signals_published_at"]
+    assert plan["publish_duration_ms"] >= 0
+    assert data_out["publish_duration_ms"] == plan["publish_duration_ms"]
+    assert rebuild_calls == [
+        {
+            "plan_id": plan["plan_id"],
+            "user_id": "user-1",
+            "reason": "live_rebalance_publish",
+        }
+    ]
+    logs = [
+        row for row in cols["portfolio_plan_operation_logs"].docs
+        if row.get("operation_type") == "live_rebalance_publish"
+    ]
+    assert len(logs) == 1
+    assert logs[0]["payload"]["publish_duration_ms"] == plan["publish_duration_ms"]
     items = [i for i in cols["portfolio_trade_plan_items"].docs if i["plan_id"] == plan["plan_id"]]
     assert len(items) == 1
     assert items[0]["action"] == "sell"

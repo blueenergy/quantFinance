@@ -135,13 +135,23 @@ def test_rebuild_live_snapshot_writes_structural_positions_and_trades():
     finance = _finance_collections()
     plan = trading["portfolio_trade_plans"].docs[0]
 
-    doc = rebuild_live_snapshot(trading, finance, plan, "user-1", anchor_plan_id="pla")
+    doc = rebuild_live_snapshot(
+        trading,
+        finance,
+        plan,
+        "user-1",
+        anchor_plan_id="pla",
+        reason="execution",
+        trigger_order_id="oa",
+    )
 
     assert doc is not None
     assert doc["positions"][0]["symbol"] == "000001.SZ"
     assert doc["positions"][0]["shares"] == 100
     assert doc["trades"]
     assert doc["watermark"]["execution_count"] == 1
+    assert doc["last_rebuild_reason"] == "execution"
+    assert doc["last_rebuild_trigger_order_id"] == "oa"
     assert trading["portfolio_live_snapshots"].docs
 
 
@@ -398,7 +408,7 @@ def test_guarded_rebuild_runs_and_releases_lease(monkeypatch):
     monkeypatch.setattr(
         pls,
         "rebuild_live_snapshot_for_plan",
-        lambda tc, fc, plan, uid: calls.append(plan["plan_id"]) or {"ok": True},
+        lambda tc, fc, plan, uid, **kwargs: calls.append(plan["plan_id"]) or {"ok": True},
     )
     lease_coll = _LeaseCollection()
     finance = {"job_status": lease_coll}
@@ -418,7 +428,7 @@ def test_guarded_rebuild_skips_when_lease_held(monkeypatch):
     monkeypatch.setattr(
         pls,
         "rebuild_live_snapshot_for_plan",
-        lambda tc, fc, plan, uid: calls.append(plan["plan_id"]) or {"ok": True},
+        lambda tc, fc, plan, uid, **kwargs: calls.append(plan["plan_id"]) or {"ok": True},
     )
     lease_coll = _LeaseCollection()
     finance = {"job_status": lease_coll}
@@ -442,7 +452,7 @@ def test_guarded_rebuild_skips_duplicate_key_race(monkeypatch):
     monkeypatch.setattr(
         pls,
         "rebuild_live_snapshot_for_plan",
-        lambda tc, fc, plan, uid: calls.append(plan["plan_id"]) or {"ok": True},
+        lambda tc, fc, plan, uid, **kwargs: calls.append(plan["plan_id"]) or {"ok": True},
     )
     finance = {"job_status": _DuplicateKeyLeaseCollection()}
 
@@ -459,7 +469,7 @@ def test_guarded_rebuild_runs_without_lease_backend(monkeypatch):
     monkeypatch.setattr(
         pls,
         "rebuild_live_snapshot_for_plan",
-        lambda tc, fc, plan, uid: calls.append(plan["plan_id"]) or {"ok": True},
+        lambda tc, fc, plan, uid, **kwargs: calls.append(plan["plan_id"]) or {"ok": True},
     )
     result = pls.rebuild_live_snapshot_for_plan_guarded({}, {}, _plan_stub(), "user-1")
 
@@ -474,7 +484,7 @@ def test_schedule_snapshot_rebuild_runs_in_background(monkeypatch):
     monkeypatch.setattr(
         pls,
         "rebuild_live_snapshot_for_plan",
-        lambda tc, fc, plan, uid: calls.append(plan["plan_id"]),
+        lambda tc, fc, plan, uid, **kwargs: calls.append(plan["plan_id"]),
     )
     finance = {"job_status": _LeaseCollection()}
 

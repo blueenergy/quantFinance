@@ -111,13 +111,23 @@ class FakeCollection:
             return True
         
         for key, value in query.items():
+            if key == "$or":
+                if not any(self._matches(doc, branch) for branch in value):
+                    return False
+                continue
             if key == "$nin":
                 # Handle $nin operator for array fields
                 continue
-            
+
+            if isinstance(value, dict) and "$exists" in value:
+                exists = key in doc
+                if bool(value["$exists"]) != exists:
+                    return False
+                continue
+
             if key not in doc:
                 return False
-            
+
             if isinstance(value, dict):
                 if "$nin" in value:
                     # Check if doc value is NOT in the $nin list
@@ -518,6 +528,54 @@ class TestGetPositionsEndpoint:
         assert data["data"][0]["stock_name"] == "浦发银行"
 
 
+@pytest.mark.unit
+def test_get_pending_signals_stamps_first_seen(monkeypatch):
+    signals_coll = FakeCollection(
+        [
+            {
+                "_id": ObjectId(),
+                "user_id": "user_123",
+                "order_id": "order-buy",
+                "symbol": "600000.SH",
+                "action": "buy",
+                "status": "pending",
+                "is_executable": True,
+                "mode": "live",
+                "timestamp": 100.0,
+            },
+            {
+                "_id": ObjectId(),
+                "user_id": "user_123",
+                "order_id": "order-sell",
+                "symbol": "000001.SZ",
+                "action": "sell",
+                "status": "retry_pending",
+                "is_executable": True,
+                "mode": "live",
+                "timestamp": 101.0,
+                "first_seen_at": 99.0,
+                "first_seen_by": "quantTrader:old",
+            },
+        ]
+    )
+
+    monkeypatch.setattr(trader, "get_db_collections", lambda: {"trade_signals": signals_coll})
+
+    response = trader.get_pending_signals(
+        limit=50,
+        include_submitted=False,
+        x_quanttrader_worker_id="quantTrader:worker-1",
+        current_user={"id": "user_123"},
+    )
+
+    assert response["success"] is True
+    by_order = {row["order_id"]: row for row in response["data"]}
+    assert by_order["order-buy"]["first_seen_by"] == "quantTrader:worker-1"
+    assert by_order["order-buy"]["first_seen_at"] > 0
+    assert by_order["order-sell"]["first_seen_at"] == 99.0
+    assert by_order["order-sell"]["first_seen_by"] == "quantTrader:old"
+
+
 class TestCreateExecutionEndpoint:
     """Tests for POST /trader/executions snapshot rebuild scheduling."""
 
@@ -548,11 +606,13 @@ class TestCreateExecutionEndpoint:
 
         self.rebuild_calls = []
 
-        def mock_rebuild(trading_collections, finance_collections, plan, user_id):
+        def mock_rebuild(trading_collections, finance_collections, plan, user_id, **kwargs):
             self.rebuild_calls.append(
                 {
                     "plan_id": plan.get("plan_id"),
                     "user_id": user_id,
+                    "reason": kwargs.get("reason"),
+                    "trigger_order_id": kwargs.get("trigger_order_id"),
                 }
             )
 
@@ -608,7 +668,14 @@ class TestCreateExecutionEndpoint:
 
         assert response["success"] is True
         assert started == [True]
-        assert self.rebuild_calls == [{"plan_id": "plan-xyz", "user_id": "user_123"}]
+        assert self.rebuild_calls == [
+            {
+                "plan_id": "plan-xyz",
+                "user_id": "user_123",
+                "reason": "execution",
+                "trigger_order_id": "live-plan-abc123",
+            }
+        ]
 
     def test_create_execution_skips_snapshot_rebuild_for_non_terminal_status(self, setup, monkeypatch):
         started = []

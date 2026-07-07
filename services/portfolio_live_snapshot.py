@@ -128,6 +128,8 @@ def rebuild_live_snapshot(
     user_id: str,
     *,
     anchor_plan_id: Optional[str] = None,
+    reason: str = "",
+    trigger_order_id: str = "",
 ) -> Optional[Dict[str, Any]]:
     """Replay lineage executions once and upsert the structural snapshot."""
 
@@ -186,6 +188,8 @@ def rebuild_live_snapshot(
         "status": "completed",
         "updated_at": now,
         "build_ms": round((time.perf_counter() - started) * 1000, 1),
+        "last_rebuild_reason": reason or "manual",
+        "last_rebuild_trigger_order_id": trigger_order_id or "",
     }
     coll.update_one(
         lineage_key(user_id, strategy_template_id, params_hash),
@@ -200,6 +204,9 @@ def rebuild_live_snapshot_for_plan(
     finance_collections: Dict[str, Any],
     plan: Dict[str, Any],
     user_id: str,
+    *,
+    reason: str = "",
+    trigger_order_id: str = "",
 ) -> Optional[Dict[str, Any]]:
     return rebuild_live_snapshot(
         trading_collections,
@@ -207,6 +214,8 @@ def rebuild_live_snapshot_for_plan(
         plan,
         user_id,
         anchor_plan_id=str(plan.get("plan_id") or ""),
+        reason=reason,
+        trigger_order_id=trigger_order_id,
     )
 
 
@@ -308,6 +317,9 @@ def rebuild_live_snapshot_for_plan_guarded(
     finance_collections: Dict[str, Any],
     plan: Dict[str, Any],
     user_id: str,
+    *,
+    reason: str = "",
+    trigger_order_id: str = "",
 ) -> Optional[Dict[str, Any]]:
     """Rebuild guarded by a per-snapshot Mongo lease (synchronous).
 
@@ -321,7 +333,12 @@ def rebuild_live_snapshot_for_plan_guarded(
         return None
     try:
         return rebuild_live_snapshot_for_plan(
-            trading_collections, finance_collections, plan, user_id
+            trading_collections,
+            finance_collections,
+            plan,
+            user_id,
+            reason=reason,
+            trigger_order_id=trigger_order_id,
         )
     finally:
         if lease:
@@ -335,6 +352,7 @@ def schedule_snapshot_rebuild(
     user_id: str,
     *,
     reason: str = "",
+    trigger_order_id: str = "",
 ) -> threading.Thread:
     """Fire-and-forget background rebuild funneled through the guarded path."""
     lock_key = _snapshot_rebuild_lock_key(plan, user_id)
@@ -342,7 +360,12 @@ def schedule_snapshot_rebuild(
     def _run() -> None:
         try:
             rebuild_live_snapshot_for_plan_guarded(
-                trading_collections, finance_collections, plan, user_id
+                trading_collections,
+                finance_collections,
+                plan,
+                user_id,
+                reason=reason,
+                trigger_order_id=trigger_order_id,
             )
         except Exception:
             log.exception(
