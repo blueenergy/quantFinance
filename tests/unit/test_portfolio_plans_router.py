@@ -6176,6 +6176,90 @@ def test_reconcile_live_holdings_suppresses_inflight_signal(monkeypatch):
     assert {row["symbol"] for row in result["settling_diffs"]} == {"000001.SZ"}
 
 
+def test_reconcile_live_holdings_ignores_stale_snapshot_ledger(monkeypatch):
+    # Regression: a UI manual rebalance is recorded in trade_executions and the
+    # broker has already synced the new shares, but the materialized snapshot is
+    # still lagging (rebuilt asynchronously). Trusting the stale snapshot for the
+    # ledger side used to flash a false "系统账本与券商实时持仓不一致" banner. The
+    # reconcile must recompute the ledger from executions when the snapshot is
+    # stale, so a promptly recorded fill matches the broker.
+    cols, fin, data = _reconcile_shared_account_fixtures()
+    fin["trade_signals"].docs = [
+        {
+            "order_id": "oa",
+            "user_id": "user-1",
+            "mode": "live",
+            "plan_id": "plan-a",
+            "securities_account_id": "acct-1",
+            "symbol": "000001.SZ",
+            "status": "filled",
+            "created_at": 1,
+        },
+        {
+            "order_id": "ob",
+            "user_id": "user-1",
+            "mode": "live",
+            "plan_id": "plan-a",
+            "securities_account_id": "acct-1",
+            "symbol": "000001.SZ",
+            "status": "filled",
+            "created_at": 2,
+        },
+    ]
+    fin["trade_executions"].docs = [
+        {
+            "order_id": "oa",
+            "user_id": "user-1",
+            "securities_account_id": "acct-1",
+            "symbol": "000001.SZ",
+            "side": "BUY",
+            "filled_size": 100,
+            "filled_price": 10.0,
+            "timestamp": 400.0,
+        },
+        {
+            "order_id": "ob",
+            "user_id": "user-1",
+            "securities_account_id": "acct-1",
+            "symbol": "000001.SZ",
+            "side": "BUY",
+            "filled_size": 100,
+            "filled_price": 11.0,
+            "timestamp": 1000.0,
+        },
+    ]
+    fin["trader_positions"].docs = [
+        {
+            "user_id": "user-1",
+            "securities_account_id": "acct-1",
+            "symbol": "000001.SZ",
+            "volume": 200,
+            "synced_at": 1700.0,
+        },
+    ]
+    _patch_lineage_live_env(monkeypatch, cols, fin, data)
+    plan = cols["portfolio_trade_plans"].find_one({"plan_id": "plan-a"})
+
+    # Snapshot only reflects the first fill (100 shares) and its watermark is
+    # behind the second fill's timestamp, i.e. it is stale.
+    stale_snapshot = {
+        "user_id": "user-1",
+        "securities_account_id": "acct-1",
+        "account_positions": [
+            {"symbol": "000001.SZ", "shares": 100, "avg_cost": 10.0, "name": "平安银行"}
+        ],
+        "watermark": {"max_execution_ts": 500.0, "execution_count": 1},
+    }
+
+    result = portfolio_plans._reconcile_live_holdings(
+        cols, fin, data, plan, "user-1", snapshot=stale_snapshot
+    )
+
+    assert result["applicable"] is True
+    assert result["in_sync"] is True
+    assert result["diffs"] == []
+
+
 def test_force_rebalance_enqueues_rebalance_task_with_lineage_params(monkeypatch):
     cols = _collections()
     cols["portfolio_trade_plans"] = _Collection(

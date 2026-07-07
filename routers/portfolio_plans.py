@@ -3488,7 +3488,19 @@ def _reconcile_live_holdings(
     if not account_id:
         return {"applicable": False, "in_sync": True, "diffs": [], "securities_account_id": ""}
 
-    if snapshot and (snapshot.get("account_positions") or snapshot.get("positions")):
+    # The materialized snapshot's account_positions is a cache that is rebuilt
+    # asynchronously after a fill. Trusting it here would flash a false mismatch
+    # right after an in-app manual rebalance: the broker sync already reflects the
+    # new shares while the stale snapshot ledger does not, and the settling window
+    # closes once the broker sync timestamp passes the fill. Only use the snapshot
+    # fast path when it is fresh; otherwise rebuild the ledger from the
+    # authoritative trade_executions so freshly recorded fills are counted.
+    use_snapshot = bool(
+        snapshot
+        and (snapshot.get("account_positions") or snapshot.get("positions"))
+        and not probe_stale(finance_collections, snapshot)
+    )
+    if use_snapshot:
         account_symbols = sorted(
             {
                 str(row.get("symbol"))
