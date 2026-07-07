@@ -5,6 +5,8 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from stock_data_access.board_lots import is_star_market, normalize_board_target_shares
+
 PRICE_SOURCE_REALTIME = "realtime"
 PRICE_SOURCE_DAILY_CLOSE = "daily_close"
 PRICE_SOURCE_NONE = "none"
@@ -383,7 +385,19 @@ def reprice_plan_items_for_publish(
             requested_target = _round_lot_target_shares(target_weight * equity_value, float(live_price), lot)
         else:
             requested_target = int_value(item.get("target_shares"))
-        target_shares, lot_blockers = normalize_live_target_shares(current_shares, requested_target, lot)
+        if is_star_market(symbol):
+            # STAR (科创板) single orders must be >= 200 shares; the injected
+            # normalize callback only round-lots, so enforce the board rule here.
+            target_shares, lot_blockers = normalize_board_target_shares(
+                current_shares,
+                requested_target,
+                float(live_price) if live_price else None,
+                lot,
+                symbol,
+                available_cash=None,
+            )
+        else:
+            target_shares, lot_blockers = normalize_live_target_shares(current_shares, requested_target, lot)
         delta = target_shares - current_shares
         item_blockers = list(lot_blockers)
         item_warnings: List[str] = []

@@ -10,6 +10,34 @@ def test_allowed_universe_indices_include_csi2000():
     assert "csi2000" in portfolio_plans.ALLOWED_UNIVERSE_INDICES
 
 
+def test_normalize_live_target_shares_non_star_uses_legacy_lot_rounding():
+    # No symbol -> legacy behavior (round-lot delta), unchanged.
+    assert portfolio_plans._normalize_live_target_shares(0, 300, 100) == (300, [])
+    assert portfolio_plans._normalize_live_target_shares(400, 450, 100) == (
+        400,
+        ["below_lot_size"],
+    )
+
+
+def test_normalize_live_target_shares_star_enforces_200_min_order():
+    # STAR 100-share buy is bumped to 200 when cash is unknown/sufficient.
+    assert portfolio_plans._normalize_live_target_shares(
+        0, 100, 100, symbol="688627.SH", price=560.0
+    ) == (200, [])
+    # Skipped when the cash budget cannot cover a 200-share order.
+    assert portfolio_plans._normalize_live_target_shares(
+        0, 100, 100, symbol="688627.SH", price=560.0, available_cash=10_000
+    ) == (0, ["below_star_min_order"])
+    # A tiny sub-100 delta is skipped rather than inflated to a 200-share order.
+    assert portfolio_plans._normalize_live_target_shares(
+        0, 50, 100, symbol="688627.SH", price=560.0
+    ) == (0, ["below_star_min_order"])
+    # STAR sell leaving a sub-200 odd lot liquidates fully.
+    assert portfolio_plans._normalize_live_target_shares(
+        250, 100, 100, symbol="688627.SH", price=560.0
+    ) == (0, [])
+
+
 def test_live_publish_risk_report_batches_position_queries():
     trader_positions = _CountingCollection(
         [

@@ -19,6 +19,11 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from stock_data_access.board_lots import (  # pyright: ignore[reportMissingImports]
+    is_star_market,
+    normalize_board_target_shares,
+)
+
 from auth import get_current_user
 from db import db as finance_db
 from db import get_analyzer_db, get_data_db, get_db_collections, get_trading_db_collections
@@ -3133,12 +3138,29 @@ async def force_rebalance_portfolio_plan(
 LIVE_ACTION_HARD_BLOCKERS = {"live_trading_disabled", "account_binding_missing"}
 
 
-def _normalize_live_target_shares(current_shares: int, requested_target: int, lot_size: int) -> Tuple[int, List[str]]:
+def _normalize_live_target_shares(
+    current_shares: int,
+    requested_target: int,
+    lot_size: int,
+    symbol: Optional[str] = None,
+    price: Optional[float] = None,
+    available_cash: Optional[float] = None,
+) -> Tuple[int, List[str]]:
     """Snap a manual target to tradable lots; clearing to zero keeps a full exit.
 
-    Native mirror of tools.portfolio_trading.normalize_manual_target_shares so the
-    API does not import stock-scoring-system.
+    Mirrors tools.portfolio_trading for non-STAR boards. STAR market (科创板)
+    symbols delegate to the shared ``normalize_board_target_shares`` so the
+    200-share single-order minimum is honored (bump/skip/full-liquidate).
     """
+    if symbol is not None and is_star_market(symbol):
+        return normalize_board_target_shares(
+            current_shares,
+            requested_target,
+            price,
+            lot_size,
+            symbol,
+            available_cash=available_cash,
+        )
     current = max(0, int(current_shares or 0))
     requested = max(0, int(requested_target or 0))
     lot = max(1, int(lot_size or 1))
@@ -3667,7 +3689,13 @@ async def live_rebalance_portfolio(
         symbol_key = _symbol_key(symbol)
         held = current_by_key.get(symbol_key) or {}
         current_shares = _int_value(held.get("shares"))
-        target_shares, blockers = _normalize_live_target_shares(current_shares, request.targets[symbol], lot_size)
+        target_shares, blockers = _normalize_live_target_shares(
+            current_shares,
+            request.targets[symbol],
+            lot_size,
+            symbol=symbol,
+            price=_numeric(price_map.get(symbol)) or _numeric(price_map.get(symbol_key)),
+        )
         delta = target_shares - current_shares
         account_pos = account_positions_by_key.get(symbol_key) or {"current": 0, "available": 0}
         account_current_shares = account_pos["current"] if account_positions_synced else None
@@ -4288,12 +4316,18 @@ async def paper_rebalance_portfolio(
     for symbol in sorted(target_symbols):
         pos = positions.get(symbol, {})
         current_shares = _int_value(pos.get("shares"))
-        target_shares, blockers = _normalize_live_target_shares(current_shares, request.targets[symbol], lot_size)
+        price = _price_for(symbol, pos)
+        target_shares, blockers = _normalize_live_target_shares(
+            current_shares,
+            request.targets[symbol],
+            lot_size,
+            symbol=symbol,
+            price=price,
+        )
         delta = target_shares - current_shares
         if delta == 0:
             continue
         rank += 1
-        price = _price_for(symbol, pos)
         item_blockers = list(blockers)
         if not price:
             item_blockers.append("missing_price")
