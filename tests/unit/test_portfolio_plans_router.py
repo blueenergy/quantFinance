@@ -4872,6 +4872,32 @@ def test_live_rebalance_liquidation_publishes_and_creates_manual_plan(monkeypatc
     assert items[0]["delta_shares"] == -500
 
 
+def test_live_rebalance_confirm_skips_complex_risk_report(monkeypatch):
+    cols, fin, data = _live_rebalance_env()
+    _patch_lineage_live_env(monkeypatch, cols, fin, data)
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("confirm path must not run publish risk report")
+
+    monkeypatch.setattr(portfolio_plans, "_build_live_publish_risk_report", fail_if_called)
+
+    resp = asyncio.run(
+        portfolio_plans.live_rebalance_portfolio(
+            "pla",
+            portfolio_plans.LiveRebalanceRequest(
+                securities_account_id="acct-1", targets={"600000.SH": 0}, dry_run=False
+            ),
+            current_user={"id": "user-1"},
+        )
+    )
+
+    data_out = resp["data"]
+    assert data_out["dry_run"] is False
+    assert data_out["risk_report"]["skipped"] is True
+    assert data_out["risk_report"]["skip_reason"] == "manual_confirm_after_preview"
+    assert data_out["inserted_count"] == 1
+
+
 def test_external_manual_record_full_sell_clears_book_without_pausing_by_default(monkeypatch):
     cols, fin, data = _live_rebalance_env()
     _patch_lineage_live_env(monkeypatch, cols, fin, data)

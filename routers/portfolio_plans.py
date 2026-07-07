@@ -3642,6 +3642,11 @@ async def live_rebalance_portfolio(
     if not request.targets:
         raise HTTPException(status_code=400, detail="targets must include at least one symbol")
     account = _require_securities_account(finance_collections, request.securities_account_id, user_id)
+    if not _account_live_enabled(account):
+        raise HTTPException(
+            status_code=409,
+            detail="securities account is not enabled for live trading",
+        )
 
     strategy_template_id = str(plan.get("strategy_template_id") or "")
     params_hash = str(plan.get("params_hash") or "")
@@ -3817,19 +3822,27 @@ async def live_rebalance_portfolio(
             detail={"message": "no live signals could be built", "skipped_items": skipped_items},
         )
 
-    risk_report = _build_live_publish_risk_report(
-        finance_collections=finance_collections,
-        data_collections=data_collections,
-        account=account,
-        signals=signals,
-        user_id=user_id,
-    )
-    blocked = [item for item in risk_report["items"] if _live_signal_is_blocked(item)]
-    if blocked and not request.dry_run:
-        raise HTTPException(
-            status_code=409,
-            detail={"message": "live rebalance blocked by risk check", "risk_report": risk_report},
+    if request.dry_run:
+        risk_report = _build_live_publish_risk_report(
+            finance_collections=finance_collections,
+            data_collections=data_collections,
+            account=account,
+            signals=signals,
+            user_id=user_id,
         )
+        blocked = [item for item in risk_report["items"] if _live_signal_is_blocked(item)]
+    else:
+        # Manual quick actions already present this report in dry-run preview.
+        # Once a human confirms the trade, keep the hot path to hard checks above
+        # (lot normalization, sellable broker quantity, price/order build) and the
+        # signal writes below.
+        risk_report = {
+            "items": [],
+            "blocked_count": 0,
+            "skipped": True,
+            "skip_reason": "manual_confirm_after_preview",
+        }
+        blocked = []
 
     order_ids = [signal["order_id"] for signal in signals]
     existing_signals = list(
