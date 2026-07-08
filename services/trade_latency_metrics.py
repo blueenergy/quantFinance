@@ -3,6 +3,22 @@
 This intentionally derives metrics from Mongo timestamps first. It gives us a
 baseline before deciding whether Change Stream, broker callbacks, or Prometheus
 instrumentation should become the next bottleneck-specific investment.
+
+Data-quality rules (so percentiles reflect real fills, not artifacts):
+
+* Execution-derived timestamps (``executed_at``, ``ingested_at``) are only used
+  when the latest execution doc is an actual fill. Cancel / reject docs carry an
+  end-of-day timestamp that would otherwise inflate ``submitted_to_executed_ms``
+  and ``publish_to_ingested_ms`` into multi-hour garbage.
+* A snapshot only scores the order named in its ``last_rebuild_trigger_order_id``.
+  Each lineage keeps a single upserted snapshot doc, so attributing its
+  ``updated_at`` to every order in the lineage would smear one (often manual /
+  end-of-day) rebuild across unrelated fills.
+
+Known limitation: under ``mongo_direct`` ingestion the fill and the ingest share
+a single timestamp, so ``executed_to_ingested_ms`` collapses to ~0. Splitting it
+needs quantTrader to persist the broker fill time separately from the backend
+ingest time.
 """
 
 from __future__ import annotations
@@ -54,7 +70,26 @@ SNAPSHOT_PROJECTION = {
     "build_ms": 1,
     "watermark": 1,
     "last_rebuild_reason": 1,
+    "last_rebuild_trigger_order_id": 1,
 }
+
+FILL_STATUSES = {"filled", "partially_filled", "partial", "partial_filled"}
+
+
+def _execution_is_fill(execution: Dict[str, Any]) -> bool:
+    """Whether a trade_execution doc represents an actual (partial) fill.
+
+    Cancel/reject docs carry an end-of-day ``timestamp`` that must not be
+    treated as an execution time, otherwise ``submitted_to_executed_ms``
+    picks up multi-hour garbage for orders that never filled.
+    """
+
+    if str(execution.get("status") or "").lower() in FILL_STATUSES:
+        return True
+    try:
+        return int(execution.get("filled_size") or 0) > 0
+    except (TypeError, ValueError):
+        return False
 
 STAGE_DEFINITIONS: Tuple[Tuple[str, str, str], ...] = (
     ("publish_to_first_seen_ms", "publish_at", "first_seen_at"),
@@ -265,13 +300,29 @@ def build_trade_latency_rollup(
         oid = str(signal.get("order_id") or "")
         execution = execution_by_order.get(oid) or {}
         snapshot = snapshot_by_lineage.get(_snapshot_key(signal)) or {}
+        # Only trust a snapshot's timing for the order that actually triggered
+        # its rebuild. A lineage keeps a single upserted snapshot doc, so
+        # attributing its ``updated_at`` to every order would smear one (often
+        # manual / end-of-day) rebuild across unrelated fills.
+        snapshot_attributed = bool(
+            snapshot and str(snapshot.get("last_rebuild_trigger_order_id") or "") == oid
+        )
+        # Fill-gate both execution-derived timestamps: cancel / reject docs
+        # carry an end-of-day timestamp + ingested_at that would otherwise
+        # inflate submitted_to_executed_ms / publish_to_ingested_ms into
+        # multi-hour garbage for orders that never filled.
+        execution_filled = _execution_is_fill(execution)
+        executed_at = _to_epoch(signal.get("executed_at"))
+        if executed_at is None and execution_filled:
+            executed_at = _to_epoch(execution.get("timestamp"))
+        ingested_at = _to_epoch(execution.get("ingested_at")) if execution_filled else None
         timestamps = {
             "publish_at": _to_epoch(signal.get("created_at")) or _to_epoch(signal.get("timestamp")),
             "first_seen_at": _to_epoch(signal.get("first_seen_at")),
             "submitted_at": _to_epoch(signal.get("submitted_at")),
-            "executed_at": _to_epoch(signal.get("executed_at")) or _to_epoch(execution.get("timestamp")),
-            "ingested_at": _to_epoch(execution.get("ingested_at")),
-            "snapshot_updated_at": _to_epoch(snapshot.get("updated_at")),
+            "executed_at": executed_at,
+            "ingested_at": ingested_at,
+            "snapshot_updated_at": _to_epoch(snapshot.get("updated_at")) if snapshot_attributed else None,
         }
         durations: Dict[str, Optional[float]] = {}
         for name, start_key, end_key in STAGE_DEFINITIONS:
@@ -291,8 +342,9 @@ def build_trade_latency_rollup(
                 "status": signal.get("status") or execution.get("status") or "",
                 "first_seen_by": signal.get("first_seen_by") or "",
                 "ingest_source": execution.get("ingest_source") or "",
-                "snapshot_build_ms": snapshot.get("build_ms"),
-                "snapshot_rebuild_reason": snapshot.get("last_rebuild_reason") or "",
+                "snapshot_attributed": snapshot_attributed,
+                "snapshot_build_ms": snapshot.get("build_ms") if snapshot_attributed else None,
+                "snapshot_rebuild_reason": (snapshot.get("last_rebuild_reason") or "") if snapshot_attributed else "",
                 "timestamps": timestamps,
                 "durations_ms": durations,
             }

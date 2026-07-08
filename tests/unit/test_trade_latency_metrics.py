@@ -113,6 +113,7 @@ def test_trade_latency_rollup_computes_stage_percentiles():
                     "build_ms": 8.5,
                     "watermark": {"execution_count": 1},
                     "last_rebuild_reason": "execution",
+                    "last_rebuild_trigger_order_id": "order-1",
                 }
             ]
         )
@@ -195,3 +196,115 @@ def test_trade_latency_rollup_prefers_created_at_for_publish_time():
     order = result["orders"][0]
     assert order["timestamps"]["publish_at"] == created_at.timestamp()
     assert order["durations_ms"]["publish_to_first_seen_ms"] == 2000.0
+
+
+def test_rollup_ignores_cancel_execution_timestamp_for_executed_at():
+    """A cancel_requested execution's end-of-day timestamp must not be treated
+    as an execution time (would inflate submitted_to_executed_ms)."""
+
+    finance = {
+        "trade_signals": _Collection(
+            [
+                {
+                    "user_id": "user-1",
+                    "mode": "live",
+                    "order_id": "order-1",
+                    "timestamp": 100.0,
+                    "submitted_at": 103.0,
+                    "executed_at": None,
+                    "status": "cancel_requested",
+                }
+            ]
+        ),
+        "trade_executions": _Collection(
+            [
+                {
+                    "user_id": "user-1",
+                    "order_id": "order-1",
+                    "status": "cancel_requested",
+                    "timestamp": 11_000.0,
+                    "ingested_at": 11_000.0,
+                    "filled_size": 0,
+                }
+            ]
+        ),
+    }
+    trading = {"portfolio_live_snapshots": _Collection()}
+
+    result = build_trade_latency_rollup(finance, trading, user_id="user-1")
+
+    order = result["orders"][0]
+    assert order["timestamps"]["executed_at"] is None
+    assert order["timestamps"]["ingested_at"] is None
+    assert order["durations_ms"]["submitted_to_executed_ms"] is None
+    assert order["durations_ms"]["publish_to_ingested_ms"] is None
+    assert result["stages"]["submitted_to_executed_ms"]["count"] == 0
+    assert result["stages"]["publish_to_ingested_ms"]["count"] == 0
+
+
+def test_rollup_only_attributes_snapshot_to_trigger_order():
+    """The single per-lineage snapshot doc must only score the order that
+    triggered its rebuild, not every order sharing the lineage."""
+
+    finance = {
+        "trade_signals": _Collection(
+            [
+                {
+                    "user_id": "user-1",
+                    "mode": "live",
+                    "order_id": "order-early",
+                    "strategy_template_id": "stx",
+                    "params_hash": "hx",
+                    "timestamp": 100.0,
+                    "executed_at": 101.0,
+                },
+                {
+                    "user_id": "user-1",
+                    "mode": "live",
+                    "order_id": "order-trigger",
+                    "strategy_template_id": "stx",
+                    "params_hash": "hx",
+                    "timestamp": 200.0,
+                    "executed_at": 201.0,
+                },
+            ]
+        ),
+        "trade_executions": _Collection(
+            [
+                {"user_id": "user-1", "order_id": "order-early", "status": "filled",
+                 "timestamp": 101.0, "ingested_at": 101.0, "filled_size": 100},
+                {"user_id": "user-1", "order_id": "order-trigger", "status": "filled",
+                 "timestamp": 201.0, "ingested_at": 201.0, "filled_size": 100},
+            ]
+        ),
+    }
+    trading = {
+        "portfolio_live_snapshots": _Collection(
+            [
+                {
+                    "user_id": "user-1",
+                    "strategy_template_id": "stx",
+                    "params_hash": "hx",
+                    "updated_at": 205.0,
+                    "build_ms": 12.0,
+                    "last_rebuild_reason": "execution_backfill",
+                    "last_rebuild_trigger_order_id": "order-trigger",
+                }
+            ]
+        )
+    }
+
+    result = build_trade_latency_rollup(finance, trading, user_id="user-1")
+
+    early = next(o for o in result["orders"] if o["order_id"] == "order-early")
+    trigger = next(o for o in result["orders"] if o["order_id"] == "order-trigger")
+
+    assert early["snapshot_attributed"] is False
+    assert early["durations_ms"]["ingested_to_snapshot_ms"] is None
+    assert early["snapshot_build_ms"] is None
+
+    assert trigger["snapshot_attributed"] is True
+    assert trigger["durations_ms"]["ingested_to_snapshot_ms"] == 4000.0
+    assert trigger["snapshot_build_ms"] == 12.0
+    # Only the trigger order contributes a snapshot-stage sample.
+    assert result["stages"]["ingested_to_snapshot_ms"]["count"] == 1
