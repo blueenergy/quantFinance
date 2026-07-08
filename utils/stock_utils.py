@@ -1,5 +1,5 @@
 
-from datetime import datetime, date
+from datetime import datetime, date, timezone
 from bson import ObjectId
 from .symbol_utils import normalize_symbol
 
@@ -7,7 +7,11 @@ def serialize_doc(doc):
     def convert(obj):
         if isinstance(obj, ObjectId):
             return str(obj)
-        elif isinstance(obj, (datetime, date)):
+        elif isinstance(obj, datetime):
+            if obj.tzinfo is None:
+                obj = obj.replace(tzinfo=timezone.utc)
+            return obj.isoformat()
+        elif isinstance(obj, date):
             return obj.isoformat()
         elif isinstance(obj, dict):
             return {k: convert(v) for k, v in obj.items()}
