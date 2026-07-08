@@ -13,13 +13,36 @@ package namespace (e.g. ``_build_live_publish_risk_report``).
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
+import time
+import uuid
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends, HTTPException
+
+from stock_data_access.board_lots import (  # pyright: ignore[reportMissingImports]
+    is_star_market,
+    normalize_board_target_shares,
+)
+
+from auth import get_current_user
+from services.live_trade_signals import (
+    active_signal_query_for_order_ids,
+    build_portfolio_plan_live_signal,
+    summarize_signal_statuses,
+)
+from services.portfolio_plan_market import PRICE_SOURCE_DAILY_CLOSE
+from services.portfolio_record_kind import RECORD_KIND_TRADE_PLAN
 
 import routers.portfolio_plans as _pp
-from services.portfolio_plan_market import PRICE_SOURCE_DAILY_CLOSE
-from ._shared import _numeric, _symbol_key
+from . import LiveRebalanceRequest
+from ._shared import (
+    _business_today_yyyymmdd,
+    _int_value,
+    _jsonable,
+    _numeric,
+    _symbol_key,
+)
 
 
 router = APIRouter()
@@ -255,3 +278,404 @@ def _partition_publishable_live_signals(
         "blocked_count": len(skipped_items),
     }
     return survivors, skipped_items, display_report
+
+
+LIVE_ACTION_HARD_BLOCKERS = {"live_trading_disabled", "account_binding_missing"}
+
+
+def _normalize_live_target_shares(
+    current_shares: int,
+    requested_target: int,
+    lot_size: int,
+    symbol: Optional[str] = None,
+    price: Optional[float] = None,
+    available_cash: Optional[float] = None,
+) -> Tuple[int, List[str]]:
+    """Snap a manual target to tradable lots; clearing to zero keeps a full exit.
+
+    Mirrors tools.portfolio_trading for non-STAR boards. STAR market (科创板)
+    symbols delegate to the shared ``normalize_board_target_shares`` so the
+    200-share single-order minimum is honored (bump/skip/full-liquidate).
+    """
+    if symbol is not None and is_star_market(symbol):
+        return normalize_board_target_shares(
+            current_shares,
+            requested_target,
+            price,
+            lot_size,
+            symbol,
+            available_cash=available_cash,
+        )
+    current = max(0, int(current_shares or 0))
+    requested = max(0, int(requested_target or 0))
+    lot = max(1, int(lot_size or 1))
+    blockers: List[str] = []
+    if requested == current:
+        return current, blockers
+    if requested == 0:
+        return 0, blockers
+    delta = requested - current
+    if delta > 0:
+        rounded_delta = (delta // lot) * lot
+        if rounded_delta <= 0:
+            blockers.append("below_lot_size")
+            return current, blockers
+        return current + rounded_delta, blockers
+    sell_qty = (abs(delta) // lot) * lot
+    if sell_qty <= 0:
+        blockers.append("below_lot_size")
+        return current, blockers
+    return current - sell_qty, blockers
+
+
+def _live_signal_is_blocked(item: Dict[str, Any]) -> bool:
+    """Whether a discretionary live order should abort publishing.
+
+    Sells abort only on hard account-config blockers; buys abort on any blocker.
+    """
+    blockers = item.get("blockers") or []
+    if not blockers:
+        return False
+    if str(item.get("action")) == "sell":
+        return any(blocker in LIVE_ACTION_HARD_BLOCKERS for blocker in blockers)
+    return True
+
+
+@router.post("/plans/{plan_id}/live-rebalance")
+async def live_rebalance_portfolio(
+    plan_id: str,
+    request: LiveRebalanceRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    """One-click intraday LIVE position change (reduce / clear / add) for a lineage.
+
+    A discretionary, human-driven rebalance: reads the lineage's live holdings
+    (not the paper snapshot), computes per-symbol deltas from ``targets``, creates
+    a manual (origin=manual) plan for audit, and publishes buy/sell live signals
+    straight into ``trade_signals`` synchronously. The quantTrader loop (poll ~1s)
+    picks them up and submits to the broker within the session, so a discretionary
+    "trade now" no longer waits for the next-day open cron. Liquidation is just
+    every held symbol mapped to 0.
+    """
+    trading_collections = _pp.get_trading_db_collections()
+    finance_collections = _pp.get_db_collections()
+    data_collections = _pp.get_data_db()
+    user_id = _pp._current_user_id(current_user)
+    publish_started = time.perf_counter()
+
+    plan = _pp._require_plan(trading_collections, plan_id, current_user)
+    if not request.targets:
+        raise HTTPException(status_code=400, detail="targets must include at least one symbol")
+    account = _pp._require_securities_account(finance_collections, request.securities_account_id, user_id)
+    if not _pp._account_live_enabled(account):
+        raise HTTPException(
+            status_code=409,
+            detail="securities account is not enabled for live trading",
+        )
+
+    strategy_template_id = str(plan.get("strategy_template_id") or "")
+    params_hash = str(plan.get("params_hash") or "")
+    if not strategy_template_id:
+        raise HTTPException(status_code=400, detail="plan is missing strategy_template_id")
+
+    holdings = _pp._lineage_live_holdings(
+        trading_collections, finance_collections, data_collections, plan, user_id
+    )
+    current_by_key: Dict[str, Dict[str, Any]] = {}
+    for row in holdings:
+        current_by_key[_symbol_key(row.get("symbol"))] = row
+    securities_account_id = str(account.get("_id") or request.securities_account_id)
+    account_positions_by_key, account_positions_synced = _pp._account_positions_by_symbol(
+        finance_collections,
+        user_id=user_id,
+        securities_account_id=securities_account_id,
+    )
+
+    # Resolve a price for every symbol we may trade (held + newly-added targets).
+    target_symbols = {str(s) for s in request.targets.keys() if s}
+    all_symbols = sorted(target_symbols | {str(row.get("symbol")) for row in holdings})
+    price_map, _realtime_docs = _pp._load_fresh_market_prices(data_collections, all_symbols)
+
+    params_snapshot = plan.get("params_snapshot") or {}
+    lot_size = _int_value(params_snapshot.get("lot_size"), 100) or 100
+
+    now = datetime.utcnow()
+    base_date = _business_today_yyyymmdd()
+    stamp = now.strftime("%Y%m%d%H%M%S")
+    new_plan_id = f"{strategy_template_id}_{(params_hash or 'na')[:8]}_{user_id}_liverb_{stamp}{uuid.uuid4().hex[:6]}"
+
+    items: List[Dict[str, Any]] = []
+    manual_exclude_symbols: List[str] = []
+    estimated_buy = 0.0
+    estimated_sell = 0.0
+    rank = 0
+    for symbol in sorted(target_symbols):
+        symbol_key = _symbol_key(symbol)
+        held = current_by_key.get(symbol_key) or {}
+        current_shares = _int_value(held.get("shares"))
+        target_shares, blockers = _normalize_live_target_shares(
+            current_shares,
+            request.targets[symbol],
+            lot_size,
+            symbol=symbol,
+            price=_numeric(price_map.get(symbol)) or _numeric(price_map.get(symbol_key)),
+        )
+        delta = target_shares - current_shares
+        account_pos = account_positions_by_key.get(symbol_key) or {"current": 0, "available": 0}
+        account_current_shares = account_pos["current"] if account_positions_synced else None
+        account_available_shares = account_pos["available"] if account_positions_synced else None
+        if delta < 0 and account_positions_synced:
+            if account_current_shares <= 0 or account_available_shares <= 0:
+                # The broker account has synced and says this symbol is not
+                # sellable. The lineage ledger may be stale after external
+                # clean-up, so never generate a sell for shares the account
+                # does not currently hold.
+                continue
+            sell_qty = abs(delta)
+            capped_sell_qty = min(sell_qty, account_available_shares)
+            if capped_sell_qty <= 0:
+                continue
+            if capped_sell_qty < sell_qty:
+                delta = -capped_sell_qty
+                target_shares = current_shares + delta
+                blockers.append("account_position_capped")
+        if delta == 0:
+            continue
+        rank += 1
+        price = (
+            _numeric(price_map.get(symbol))
+            or _numeric(price_map.get(_symbol_key(symbol)))
+            or _numeric(held.get("last_price"))
+            or None
+        )
+        item_blockers = list(blockers)
+        if not price:
+            item_blockers.append("missing_price")
+        if delta > 0:
+            action = "buy"
+            estimated_buy += abs(delta) * float(price or 0)
+        else:
+            action = "sell"
+            estimated_sell += abs(delta) * float(price or 0)
+        if target_shares < current_shares and request.exclude_after:
+            manual_exclude_symbols.append(symbol)
+        items.append(
+            {
+                "plan_id": new_plan_id,
+                "strategy_template_id": strategy_template_id,
+                "user_id": user_id,
+                "params_hash": params_hash,
+                "base_date": base_date,
+                "execute_date": base_date,
+                "rank": rank,
+                "symbol": symbol,
+                "name": held.get("name", ""),
+                "action": action,
+                "current_shares": current_shares,
+                "target_shares": target_shares,
+                "delta_shares": delta,
+                "drift_delta_shares": delta,
+                "account_current_shares": account_current_shares,
+                "account_available_shares": account_available_shares,
+                "estimated_price": price,
+                "estimated_amount": abs(delta) * float(price or 0) if price else None,
+                "blockers": item_blockers,
+                "created_at": now,
+            }
+        )
+
+    if not items:
+        raise HTTPException(status_code=400, detail="targets produced no executable changes after lot-size normalization")
+
+    is_liquidation = all(item["action"] == "sell" and item["target_shares"] == 0 for item in items)
+    manual_action = "liquidate" if is_liquidation else "rebalance"
+
+    plan_doc = {
+        "plan_id": new_plan_id,
+        "strategy_template_id": strategy_template_id,
+        "user_id": user_id,
+        "preset_id": plan.get("preset_id"),
+        "params_hash": params_hash,
+        "params_snapshot": params_snapshot,
+        "params_override": plan.get("params_override") or {},
+        "strategy_name": plan.get("strategy_name"),
+        "base_date": base_date,
+        "execute_date": base_date,
+        "plan_type": "rebalance",
+        "record_kind": RECORD_KIND_TRADE_PLAN,
+        "origin": "manual",
+        "manual_action": manual_action,
+        "is_liquidation": is_liquidation,
+        "is_rebalance_day": True,
+        "monitor_can_trade": False,
+        "trading_enabled": True,
+        "executable": True,
+        "non_executable_reason": None,
+        "exclude_after": bool(request.exclude_after),
+        "manual_exclude_symbols": sorted(set(manual_exclude_symbols)),
+        "status": "approved",
+        "approved_by": user_id,
+        "approved_at": now,
+        "anchor_plan_id": plan_id,
+        "summary": {
+            "buy_count": sum(1 for item in items if item["action"] == "buy"),
+            "sell_count": sum(1 for item in items if item["action"] == "sell"),
+            "hold_count": 0,
+            "skip_count": 0,
+            "estimated_buy_amount": estimated_buy,
+            "estimated_sell_amount": estimated_sell,
+            "manual_action": manual_action,
+        },
+        "created_at": now,
+        "updated_at": now,
+    }
+
+    signals: List[Dict[str, Any]] = []
+    skipped_items: List[Dict[str, Any]] = []
+    for item in items:
+        try:
+            signal = build_portfolio_plan_live_signal(plan=plan_doc, item=item, account=account, now=now)
+        except Exception as exc:  # noqa: BLE001
+            skipped_items.append({"symbol": item.get("symbol"), "reason": str(exc)})
+            continue
+        if signal is not None:
+            signals.append(signal.to_mongo())
+
+    if not signals:
+        raise HTTPException(
+            status_code=409,
+            detail={"message": "no live signals could be built", "skipped_items": skipped_items},
+        )
+
+    if request.dry_run:
+        risk_report = _pp._build_live_publish_risk_report(
+            finance_collections=finance_collections,
+            data_collections=data_collections,
+            account=account,
+            signals=signals,
+            user_id=user_id,
+        )
+        blocked = [item for item in risk_report["items"] if _live_signal_is_blocked(item)]
+    else:
+        # Manual quick actions already present this report in dry-run preview.
+        # Once a human confirms the trade, keep the hot path to hard checks above
+        # (lot normalization, sellable broker quantity, price/order build) and the
+        # signal writes below.
+        risk_report = {
+            "items": [],
+            "blocked_count": 0,
+            "skipped": True,
+            "skip_reason": "manual_confirm_after_preview",
+        }
+        blocked = []
+
+    order_ids = [signal["order_id"] for signal in signals]
+    existing_signals = list(
+        finance_collections["trade_signals"].find(active_signal_query_for_order_ids(user_id, order_ids))
+    ) if order_ids else []
+    existing_order_ids = {row.get("order_id") for row in existing_signals}
+    new_signals = [signal for signal in signals if signal.get("order_id") not in existing_order_ids]
+
+    changed_symbols = sorted({item["symbol"] for item in items})
+    if request.dry_run:
+        return {
+            "success": True,
+            "data": _jsonable(
+                {
+                    "dry_run": True,
+                    "plan_id": new_plan_id,
+                    "plan": plan_doc,
+                    "items": items,
+                    "signals": signals,
+                    "new_signals": new_signals,
+                    "existing_signals": existing_signals,
+                    "skipped_items": skipped_items,
+                    "risk_report": risk_report,
+                    "manual_action": manual_action,
+                    "changed_symbols": changed_symbols,
+                    "blocked": bool(blocked),
+                }
+            ),
+        }
+
+    trading_collections["portfolio_trade_plans"].insert_one(dict(plan_doc))
+    trading_collections["portfolio_trade_plan_items"].insert_many([dict(item) for item in items])
+
+    inserted_count = 0
+    if new_signals:
+        finance_collections["trade_signals"].insert_many(new_signals)
+        inserted_count = len(new_signals)
+    publish_duration_ms = round((time.perf_counter() - publish_started) * 1000.0, 1)
+    trading_collections["portfolio_trade_plans"].update_one(
+        {"plan_id": new_plan_id, "user_id": user_id},
+        {
+            "$set": {
+                "live_signals_published_at": now,
+                "live_signal_count": len(signals),
+                "live_signal_inserted_count": inserted_count,
+                "publish_duration_ms": publish_duration_ms,
+                "live_signal_status_summary": {
+                    "pending": inserted_count,
+                    **summarize_signal_statuses(existing_signals),
+                },
+            }
+        },
+    )
+    _pp._append_plan_operation_log(
+        trading_collections,
+        plan_id=new_plan_id,
+        user_id=user_id,
+        operation_type="live_rebalance_publish",
+        status="success",
+        message="manual live rebalance signals published",
+        payload={
+            "anchor_plan_id": plan_id,
+            "manual_action": manual_action,
+            "signal_count": len(signals),
+            "inserted_count": inserted_count,
+            "existing_count": len(existing_signals),
+            "publish_duration_ms": publish_duration_ms,
+        },
+    )
+    _pp.schedule_snapshot_rebuild(
+        trading_collections,
+        finance_collections,
+        plan_doc,
+        user_id,
+        reason="live_rebalance_publish",
+    )
+
+    # Forward-looking exclusion only; pausing the lineage waits until the sells
+    # actually settle (mirrors publish-live-signals, see Error 8 in design notes).
+    final_shares_by_key = {_symbol_key(row.get("symbol")): _int_value(row.get("shares")) for row in holdings}
+    for item in items:
+        final_shares_by_key[_symbol_key(item["symbol"])] = _int_value(item["target_shares"])
+    lineage_effects = _pp._apply_manual_lineage_effects_native(
+        trading_collections,
+        plan_doc,
+        final_positions=[{"symbol": key, "shares": shares} for key, shares in final_shares_by_key.items()],
+        acted_by=user_id,
+        pause_on_empty=False,
+    )
+
+    return {
+        "success": True,
+        "data": _jsonable(
+            {
+                "dry_run": False,
+                "plan_id": new_plan_id,
+                "manual_action": manual_action,
+                "signals": signals,
+                "new_signals": new_signals,
+                "existing_signals": existing_signals,
+                "skipped_items": skipped_items,
+                "risk_report": risk_report,
+                "inserted_count": inserted_count,
+                "existing_count": len(existing_signals),
+                "publish_duration_ms": publish_duration_ms,
+                "changed_symbols": changed_symbols,
+                "blocked": bool(blocked),
+                "lineage_effects": lineage_effects,
+            }
+        ),
+    }
