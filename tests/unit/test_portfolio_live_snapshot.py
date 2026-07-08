@@ -210,6 +210,8 @@ def test_terminal_execution_backfill_rebuilds_direct_mongo_snapshot(monkeypatch)
     assert result["scanned"] == 1
     assert result["candidates"] == 1
     assert result["rebuilt"] == 1
+    assert result["last_candidate_order_ids"] == ["oa"]
+    assert result["last_rebuilt_order_ids"] == ["oa"]
     assert calls == [
         {
             "plan_id": "pla",
@@ -219,6 +221,9 @@ def test_terminal_execution_backfill_rebuilds_direct_mongo_snapshot(monkeypatch)
         }
     ]
     assert finance["job_status"].docs[0]["status"] == "ok"
+    assert finance["job_status"].docs[0]["job_type"] == "portfolio_live_snapshot"
+    assert finance["job_status"].docs[0]["date"] == "execution_backfill"
+    assert finance["job_status"].docs[0]["last_trigger_order_id"] == "oa"
 
 
 def test_terminal_execution_backfill_skips_fresh_snapshot(monkeypatch):
@@ -267,7 +272,41 @@ def test_terminal_execution_backfill_skips_fresh_snapshot(monkeypatch):
     assert result["candidates"] == 1
     assert result["rebuilt"] == 0
     assert result["skipped_fresh"] == 1
+    assert result["skipped_lease"] == 0
+    assert result["last_candidate_order_ids"] == ["oa"]
+    assert result["last_rebuilt_order_ids"] == []
     assert calls == []
+
+
+def test_terminal_execution_backfill_tracks_lease_skip(monkeypatch):
+    from services import portfolio_live_snapshot as pls
+
+    trading = _trading_collections()
+    finance = _finance_collections()
+    now = 1_800_000_000.0
+    finance["trade_executions"].docs[0].update(
+        {
+            "status": "filled",
+            "ingest_source": "mongo_direct",
+            "timestamp": now - 1,
+            "ingested_at": now - 1,
+        }
+    )
+    finance["job_status"] = _Collection()
+    monkeypatch.setattr(pls, "rebuild_live_snapshot_for_plan_guarded", lambda *args, **kwargs: None)
+
+    result = rebuild_snapshots_for_recent_terminal_executions(
+        trading,
+        finance,
+        now=now,
+        lookback_seconds=60,
+    )
+
+    assert result["scanned"] == 1
+    assert result["candidates"] == 1
+    assert result["rebuilt"] == 0
+    assert result["skipped_lease"] == 1
+    assert result["skipped_fresh"] == 0
 
 
 def test_overlay_realtime_matches_direct_position_builder():
@@ -397,6 +436,8 @@ def test_reconcile_live_snapshots_rebuilds_and_resolves_stale_snapshot():
     assert result["resolved"] == 1
     assert result["mismatched"] == 0
     assert finance["job_status"].docs[0]["status"] == "ok"
+    assert finance["job_status"].docs[0]["job_type"] == "portfolio_live_snapshot"
+    assert finance["job_status"].docs[0]["date"] == "reconcile"
 
 
 def test_reconcile_live_snapshots_records_residual_broker_mismatch():

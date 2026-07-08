@@ -411,6 +411,16 @@ def _execution_epoch(row: Dict[str, Any]) -> Optional[float]:
     return None
 
 
+def _snapshot_covers_execution(snapshot: Dict[str, Any], execution: Dict[str, Any]) -> bool:
+    """Return True when the snapshot watermark already includes execution."""
+
+    exec_ts = _execution_epoch(execution)
+    if exec_ts is None:
+        return False
+    watermark = snapshot.get("watermark") or {}
+    return float(watermark.get("max_execution_ts") or 0) >= float(exec_ts)
+
+
 def rebuild_snapshots_for_recent_terminal_executions(
     trading_collections: Dict[str, Any],
     finance_collections: Dict[str, Any],
@@ -419,7 +429,7 @@ def rebuild_snapshots_for_recent_terminal_executions(
     lookback_seconds: int = 900,
     limit: int = 200,
     now: Optional[float] = None,
-) -> Dict[str, int]:
+) -> Dict[str, Any]:
     """Backfill snapshot rebuilds for direct-Mongo terminal executions.
 
     API-mode execution uploads trigger a snapshot rebuild inline from
@@ -437,10 +447,13 @@ def rebuild_snapshots_for_recent_terminal_executions(
             "candidates": 0,
             "rebuilt": 0,
             "skipped_fresh": 0,
+            "skipped_lease": 0,
             "skipped_duplicate": 0,
             "skipped_missing_signal": 0,
             "skipped_missing_plan": 0,
             "errors": 0,
+            "last_candidate_order_ids": [],
+            "last_rebuilt_order_ids": [],
         }
 
     current = time.time() if now is None else float(now)
@@ -461,10 +474,13 @@ def rebuild_snapshots_for_recent_terminal_executions(
         "candidates": 0,
         "rebuilt": 0,
         "skipped_fresh": 0,
+        "skipped_lease": 0,
         "skipped_duplicate": 0,
         "skipped_missing_signal": 0,
         "skipped_missing_plan": 0,
         "errors": 0,
+        "last_candidate_order_ids": [],
+        "last_rebuilt_order_ids": [],
     }
 
     for execution in rows:
@@ -503,6 +519,7 @@ def rebuild_snapshots_for_recent_terminal_executions(
         candidates[key] = {"execution": execution, "plan": plan, "order_id": order_id, "user_id": uid}
 
     result["candidates"] = len(candidates)
+    result["last_candidate_order_ids"] = [str(item["order_id"]) for item in candidates.values()]
     for key, item in candidates.items():
         uid, stid, phash = key
         snapshot = get_live_snapshot(
@@ -511,7 +528,7 @@ def rebuild_snapshots_for_recent_terminal_executions(
             strategy_template_id=stid,
             params_hash=phash,
         )
-        if snapshot and not probe_stale(finance_collections, snapshot):
+        if snapshot and _snapshot_covers_execution(snapshot, item["execution"]):
             result["skipped_fresh"] += 1
             continue
         try:
@@ -525,8 +542,9 @@ def rebuild_snapshots_for_recent_terminal_executions(
             )
             if rebuilt:
                 result["rebuilt"] += 1
+                result["last_rebuilt_order_ids"].append(str(item["order_id"]))
             else:
-                result["skipped_fresh"] += 1
+                result["skipped_lease"] += 1
         except Exception:
             result["errors"] += 1
             log.exception("terminal execution snapshot backfill failed for %s", item["order_id"])
@@ -540,6 +558,15 @@ def rebuild_snapshots_for_recent_terminal_executions(
                     **result,
                     "job_type": "portfolio_live_snapshot",
                     "date": "execution_backfill",
+                    "last_trigger_order_id": (
+                        result["last_rebuilt_order_ids"][-1]
+                        if result["last_rebuilt_order_ids"]
+                        else (
+                            result["last_candidate_order_ids"][-1]
+                            if result["last_candidate_order_ids"]
+                            else ""
+                        )
+                    ),
                     "status": "error" if result["errors"] else "ok",
                     "updated_at": datetime.utcnow(),
                 }
@@ -924,6 +951,8 @@ def reconcile_live_snapshots_with_broker_positions(
             {
                 "$set": {
                     **result,
+                    "job_type": "portfolio_live_snapshot",
+                    "date": "reconcile",
                     "status": "warning" if mismatched else "ok",
                     "updated_at": datetime.utcnow(),
                 }
