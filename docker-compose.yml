@@ -406,6 +406,9 @@ services:
     environment:
       - MONGO_URI=${DOCKER_MONGO_URI:-mongodb://quant-mongodb:27017/}
       - MONGO_DB=${MONGO_DB}
+      # Required by start.portfolio.sh for future trading-calendar lookups;
+      # sibling scorer/researcher services already receive it.
+      - TUSHARE_TOKEN=${TUSHARE_TOKEN}
       - TZ=Asia/Shanghai
     extra_hosts:
       - "host.docker.internal:host-gateway"
