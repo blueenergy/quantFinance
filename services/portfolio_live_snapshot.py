@@ -6,7 +6,7 @@ import logging
 import threading
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from pymongo import ASCENDING, DESCENDING
@@ -29,6 +29,18 @@ from services.portfolio_lineage_state import lineage_key
 from services.trade_ledger import group_executions_by_order
 
 log = logging.getLogger(__name__)
+
+_TERMINAL_EXECUTION_STATUSES = frozenset(
+    {
+        "filled",
+        "executed",
+        "rejected",
+        "cancelled",
+        "canceled",
+        "partial_cancelled",
+        "failed",
+    }
+)
 
 
 def ensure_live_snapshot_indexes(
@@ -377,6 +389,160 @@ def schedule_snapshot_rebuild(
     thread = threading.Thread(target=_run, daemon=True)
     thread.start()
     return thread
+
+
+def _execution_epoch(row: Dict[str, Any]) -> Optional[float]:
+    for field in ("ingested_at", "timestamp", "updated_at"):
+        value = row.get(field)
+        if value is None or value == "":
+            continue
+        if isinstance(value, (int, float)):
+            return float(value)
+        if isinstance(value, datetime):
+            if value.tzinfo is None:
+                value = value.replace(tzinfo=timezone.utc)
+            return value.timestamp()
+        try:
+            return float(str(value))
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def rebuild_snapshots_for_recent_terminal_executions(
+    trading_collections: Dict[str, Any],
+    finance_collections: Dict[str, Any],
+    *,
+    user_id: Optional[str] = None,
+    lookback_seconds: int = 900,
+    limit: int = 200,
+    now: Optional[float] = None,
+) -> Dict[str, int]:
+    """Backfill snapshot rebuilds for direct-Mongo terminal executions.
+
+    API-mode execution uploads trigger a snapshot rebuild inline from
+    ``routers.trader``. Direct Mongo mode bypasses that route, so this scheduler
+    helper scans recent terminal executions and rebuilds any stale lineage
+    snapshot using the same guarded rebuild path.
+    """
+
+    executions = finance_collections.get("trade_executions")
+    signals = finance_collections.get("trade_signals")
+    plans = trading_collections.get("portfolio_trade_plans")
+    if executions is None or signals is None or plans is None:
+        return {
+            "scanned": 0,
+            "candidates": 0,
+            "rebuilt": 0,
+            "skipped_fresh": 0,
+            "skipped_duplicate": 0,
+            "skipped_missing_signal": 0,
+            "skipped_missing_plan": 0,
+            "errors": 0,
+        }
+
+    current = time.time() if now is None else float(now)
+    since = current - max(1, int(lookback_seconds or 900))
+    query: Dict[str, Any] = {
+        "status": {"$in": sorted(_TERMINAL_EXECUTION_STATUSES)},
+        "timestamp": {"$gte": since},
+    }
+    if user_id:
+        query["user_id"] = user_id
+
+    rows = list(
+        executions.find(query, {"_id": 0}).sort("timestamp", DESCENDING).limit(max(1, min(int(limit or 200), 1000)))
+    )
+    candidates: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+    result = {
+        "scanned": len(rows),
+        "candidates": 0,
+        "rebuilt": 0,
+        "skipped_fresh": 0,
+        "skipped_duplicate": 0,
+        "skipped_missing_signal": 0,
+        "skipped_missing_plan": 0,
+        "errors": 0,
+    }
+
+    for execution in rows:
+        order_id = str(execution.get("order_id") or "")
+        uid = str(execution.get("user_id") or "")
+        if not order_id or not uid:
+            result["skipped_missing_signal"] += 1
+            continue
+        signal = signals.find_one({"order_id": order_id, "user_id": uid}, {"_id": 0})
+        if not signal or str(signal.get("mode") or "live") != "live":
+            result["skipped_missing_signal"] += 1
+            continue
+        plan_id = str(signal.get("plan_id") or "")
+        if not plan_id:
+            result["skipped_missing_plan"] += 1
+            continue
+        plan = plans.find_one({"user_id": uid, "plan_id": plan_id}, {"_id": 0})
+        if not plan:
+            result["skipped_missing_plan"] += 1
+            continue
+        stid = str(plan.get("strategy_template_id") or "")
+        phash = str(plan.get("params_hash") or "")
+        if not stid or not phash:
+            result["skipped_missing_plan"] += 1
+            continue
+
+        key = (uid, stid, phash)
+        exec_ts = _execution_epoch(execution) or 0.0
+        existing = candidates.get(key)
+        existing_ts = _execution_epoch(existing["execution"]) if existing else None
+        if existing is not None and (existing_ts or 0.0) >= exec_ts:
+            result["skipped_duplicate"] += 1
+            continue
+        if existing is not None:
+            result["skipped_duplicate"] += 1
+        candidates[key] = {"execution": execution, "plan": plan, "order_id": order_id, "user_id": uid}
+
+    result["candidates"] = len(candidates)
+    for key, item in candidates.items():
+        uid, stid, phash = key
+        snapshot = get_live_snapshot(
+            trading_collections,
+            user_id=uid,
+            strategy_template_id=stid,
+            params_hash=phash,
+        )
+        if snapshot and not probe_stale(finance_collections, snapshot):
+            result["skipped_fresh"] += 1
+            continue
+        try:
+            rebuilt = rebuild_live_snapshot_for_plan_guarded(
+                trading_collections,
+                finance_collections,
+                item["plan"],
+                item["user_id"],
+                reason="execution_backfill",
+                trigger_order_id=item["order_id"],
+            )
+            if rebuilt:
+                result["rebuilt"] += 1
+            else:
+                result["skipped_fresh"] += 1
+        except Exception:
+            result["errors"] += 1
+            log.exception("terminal execution snapshot backfill failed for %s", item["order_id"])
+
+    status_coll = finance_collections.get("job_status")
+    if status_coll is not None:
+        status_coll.update_one(
+            {"_id": "portfolio_live_snapshot_execution_backfill"},
+            {
+                "$set": {
+                    **result,
+                    "status": "error" if result["errors"] else "ok",
+                    "updated_at": datetime.utcnow(),
+                }
+            },
+            upsert=True,
+        )
+    return result
 
 
 def probe_stale(

@@ -11,6 +11,7 @@ from services.portfolio_live_snapshot import (
     overlay_realtime,
     probe_stale,
     rebuild_live_snapshot,
+    rebuild_snapshots_for_recent_terminal_executions,
     reconcile_live_snapshots_with_broker_positions,
 )
 
@@ -31,6 +32,16 @@ class _Collection:
                     continue
                 if isinstance(value, dict) and "$in" in value:
                     if doc.get(key) not in value["$in"]:
+                        return False
+                elif isinstance(value, dict):
+                    actual = doc.get(key)
+                    if "$exists" in value and (key in doc) != bool(value["$exists"]):
+                        return False
+                    if "$ne" in value and actual == value["$ne"]:
+                        return False
+                    if "$gte" in value and (actual is None or actual < value["$gte"]):
+                        return False
+                    if "$lte" in value and (actual is None or actual > value["$lte"]):
                         return False
                 elif doc.get(key) != value:
                     return False
@@ -68,6 +79,10 @@ class _Cursor:
     def sort(self, key, direction=1):
         reverse = direction == -1
         self._rows.sort(key=lambda row: row.get(key) or 0, reverse=reverse)
+        return self
+
+    def limit(self, n):
+        self._rows = self._rows[:n]
         return self
 
     def __iter__(self):
@@ -153,6 +168,106 @@ def test_rebuild_live_snapshot_writes_structural_positions_and_trades():
     assert doc["last_rebuild_reason"] == "execution"
     assert doc["last_rebuild_trigger_order_id"] == "oa"
     assert trading["portfolio_live_snapshots"].docs
+
+
+def test_terminal_execution_backfill_rebuilds_direct_mongo_snapshot(monkeypatch):
+    from services import portfolio_live_snapshot as pls
+
+    trading = _trading_collections()
+    finance = _finance_collections()
+    now = 1_800_000_000.0
+    finance["trade_executions"].docs[0].update(
+        {
+            "status": "filled",
+            "ingest_source": "mongo_direct",
+            "timestamp": now - 1,
+            "ingested_at": now - 1,
+        }
+    )
+    finance["job_status"] = _Collection()
+    calls = []
+
+    def _fake_rebuild(trading_collections, finance_collections, plan, user_id, *, reason="", trigger_order_id=""):
+        calls.append(
+            {
+                "plan_id": plan.get("plan_id"),
+                "user_id": user_id,
+                "reason": reason,
+                "trigger_order_id": trigger_order_id,
+            }
+        )
+        return {"ok": True}
+
+    monkeypatch.setattr(pls, "rebuild_live_snapshot_for_plan_guarded", _fake_rebuild)
+
+    result = rebuild_snapshots_for_recent_terminal_executions(
+        trading,
+        finance,
+        now=now,
+        lookback_seconds=60,
+    )
+
+    assert result["scanned"] == 1
+    assert result["candidates"] == 1
+    assert result["rebuilt"] == 1
+    assert calls == [
+        {
+            "plan_id": "pla",
+            "user_id": "user-1",
+            "reason": "execution_backfill",
+            "trigger_order_id": "oa",
+        }
+    ]
+    assert finance["job_status"].docs[0]["status"] == "ok"
+
+
+def test_terminal_execution_backfill_skips_fresh_snapshot(monkeypatch):
+    from services import portfolio_live_snapshot as pls
+
+    trading = _trading_collections()
+    finance = _finance_collections()
+    now = 1_800_000_000.0
+    finance["trade_executions"].docs[0].update(
+        {
+            "status": "filled",
+            "ingest_source": "mongo_direct",
+            "timestamp": now - 1,
+            "ingested_at": now - 1,
+        }
+    )
+    trading["portfolio_live_snapshots"].docs.append(
+        {
+            "user_id": "user-1",
+            "strategy_template_id": "stx",
+            "params_hash": "hx",
+            "securities_account_id": "acct-1",
+            "watermark": {
+                "execution_count": 1,
+                "max_execution_ts": now - 1,
+                "last_execution_updated_at": "2025-01-01T10:00:00",
+            },
+        }
+    )
+    finance["job_status"] = _Collection()
+    calls = []
+    monkeypatch.setattr(
+        pls,
+        "rebuild_live_snapshot_for_plan_guarded",
+        lambda *args, **kwargs: calls.append(kwargs) or {"ok": True},
+    )
+
+    result = rebuild_snapshots_for_recent_terminal_executions(
+        trading,
+        finance,
+        now=now,
+        lookback_seconds=60,
+    )
+
+    assert result["scanned"] == 1
+    assert result["candidates"] == 1
+    assert result["rebuilt"] == 0
+    assert result["skipped_fresh"] == 1
+    assert calls == []
 
 
 def test_overlay_realtime_matches_direct_position_builder():
