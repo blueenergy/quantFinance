@@ -533,6 +533,8 @@ def test_guarded_rebuild_runs_and_releases_lease(monkeypatch):
     assert result == {"ok": True}
     assert calls == ["plan-1"]
     lock_doc = next(iter(lease_coll.docs.values()))
+    assert lock_doc["job_type"] == "snapshot_rebuild_lock"
+    assert lock_doc["date"].startswith("snapshot_rebuild_lock:")
     assert lock_doc["locked_until"] <= time.time() + 1
 
 

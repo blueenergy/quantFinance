@@ -283,6 +283,8 @@ def _acquire_snapshot_rebuild_lease(
             {
                 "$set": {
                     "job_id": lock_id,
+                    "job_type": "snapshot_rebuild_lock",
+                    "date": lock_id,
                     "locked_by": owner,
                     "locked_until": now + ttl_seconds,
                     "updated_at": now,
@@ -536,6 +538,8 @@ def rebuild_snapshots_for_recent_terminal_executions(
             {
                 "$set": {
                     **result,
+                    "job_type": "portfolio_live_snapshot",
+                    "date": "execution_backfill",
                     "status": "error" if result["errors"] else "ok",
                     "updated_at": datetime.utcnow(),
                 }

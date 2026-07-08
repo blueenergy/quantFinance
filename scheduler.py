@@ -160,6 +160,8 @@ def _acquire_scheduler_job_lock(job_id: str, ttl_seconds: int = 1800) -> bool:
             {
                 "$set": {
                     "job_id": lock_id,
+                    "job_type": "scheduler_lock",
+                    "date": lock_id,
                     "locked_by": _SCHEDULER_INSTANCE_ID,
                     "locked_until": now + ttl_seconds,
                     "updated_at": now,
