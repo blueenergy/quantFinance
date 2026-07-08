@@ -2,7 +2,7 @@
 
 > 目的：用一套清晰的概念和命名，统一“组合总览 / 组合交易计划”相关的
 > 后端字段、API 契约和前端展示，减少“想到哪做到哪”导致的歧义与 bug。
-> 适用范围：`quantFinance/routers/portfolio_plans.py` 及
+> 适用范围：`quantFinance/routers/portfolio_plans/__init__.py` 及
 > `quantFinance-dashboard` 中的组合相关页面。
 
 ---

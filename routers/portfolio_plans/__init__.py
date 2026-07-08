@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 import functools
 import logging
@@ -12,7 +12,6 @@ import os
 import threading
 import time
 import uuid
-from zoneinfo import ZoneInfo
 
 from bson import ObjectId
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -103,29 +102,26 @@ from services.portfolio_plan_market import (
     quotes_to_prices_and_realtime_docs,
     reprice_plan_items_for_publish,
 )
+from ._shared import (
+    _business_today_date,
+    _business_today_yyyymmdd,
+    _chunked,
+    _datetime_as_beijing_date,
+    _int_value,
+    _jsonable,
+    _normalize_yyyymmdd,
+    _numeric,
+    _optional_float,
+    _risk_severity_at_least,
+    _signal_filled_qty,
+    _signal_signed_filled_qty,
+    _symbol_key,
+    _symbol_query_values,
+)
 
 
 router = APIRouter(prefix="/portfolio-plans", tags=["portfolio-plans"])
 log = logging.getLogger(__name__)
-CN_TZ = ZoneInfo("Asia/Shanghai")
-
-
-def _beijing_now() -> datetime:
-    return datetime.now(CN_TZ)
-
-
-def _business_today_yyyymmdd() -> str:
-    return _beijing_now().strftime("%Y%m%d")
-
-
-def _business_today_date():
-    return _beijing_now().date()
-
-
-def _datetime_as_beijing_date(value: datetime):
-    if value.tzinfo is None:
-        value = value.replace(tzinfo=timezone.utc)
-    return value.astimezone(CN_TZ).date()
 
 
 def _offload(func):
@@ -149,7 +145,6 @@ ALLOWED_UNIVERSE_INDICES = {"hs300", "a500", "csi500", "csi1000", "csi2000", "st
 PORTFOLIO_RISK_LLM_TASK_TYPE = "portfolio_risk_llm"
 PORTFOLIO_RISK_LLM_PRIORITY = 10
 PORTFOLIO_RISK_LLM_RUNNING_STATUSES = {"pending", "processing"}
-RISK_SEVERITY_ORDER = {"none": 0, "low": 1, "medium": 2, "high": 3}
 GROWTH_CYCLE_PARAMETER_SCHEMA = {
     "universe_index": {"type": "enum", "options": sorted(ALLOWED_UNIVERSE_INDICES)},
     "index_benchmark_symbol": {"type": "string"},
@@ -362,18 +357,6 @@ class ParamPresetRequest(BaseModel):
     priority: int = Field(default=100)
     backtest_summary: Dict[str, Any] = Field(default_factory=dict)
     data_window: Dict[str, Any] = Field(default_factory=dict)
-
-
-def _jsonable(value: Any) -> Any:
-    if isinstance(value, ObjectId):
-        return str(value)
-    if isinstance(value, datetime):
-        return value.isoformat()
-    if isinstance(value, list):
-        return [_jsonable(item) for item in value]
-    if isinstance(value, dict):
-        return {key: _jsonable(item) for key, item in value.items()}
-    return value
 
 
 def _with_preset_evidence_summary(row: Dict[str, Any]) -> Dict[str, Any]:
@@ -1070,15 +1053,6 @@ def _reviewer(current_user: Dict[str, Any]) -> str:
     return str(current_user.get("username") or current_user.get("email") or current_user.get("id") or "unknown")
 
 
-def _normalize_yyyymmdd(value: Optional[str]) -> Optional[str]:
-    if not value:
-        return None
-    raw = str(value).replace("-", "").strip()
-    if len(raw) >= 8 and raw[:8].isdigit():
-        return raw[:8]
-    return None
-
-
 def _latest_available_score_watermark(stock_scores, universe_index: str) -> Dict[str, Any]:
     query: Dict[str, Any] = {"index_codes": universe_index}
     row = stock_scores.find_one(query, sort=[("score_date", -1)], projection={"_id": 0, "score_date": 1})
@@ -1095,18 +1069,6 @@ def _latest_available_score_watermark(stock_scores, universe_index: str) -> Dict
         "latest_available_score_source": "stock_scores",
         "latest_available_score_scope": source_scope,
     }
-
-
-def _optional_float(value: Any) -> Optional[float]:
-    if value is None:
-        return None
-    try:
-        number = float(value)
-    except (TypeError, ValueError):
-        return None
-    if number != number:  # NaN
-        return None
-    return number
 
 
 def _weighted_growth_cycle_score(
@@ -1477,15 +1439,6 @@ def _enrich_plan_items_with_estimated_amount(items: List[Dict[str, Any]]) -> Lis
     return enriched
 
 
-def _risk_severity(value: Any) -> str:
-    severity = str(value or "none").lower()
-    return severity if severity in RISK_SEVERITY_ORDER else "none"
-
-
-def _risk_severity_at_least(value: Any, minimum: str) -> bool:
-    return RISK_SEVERITY_ORDER[_risk_severity(value)] >= RISK_SEVERITY_ORDER[_risk_severity(minimum)]
-
-
 def _plan_item_weight(item: Dict[str, Any]) -> Optional[float]:
     for key in ("target_weight", "weight", "estimated_weight", "current_weight"):
         value = _optional_float(item.get(key))
@@ -1565,10 +1518,6 @@ def _portfolio_llm_industry_context(groups: Dict[str, List[Dict[str, Any]]]) -> 
         "total_weight": total_weight,
         "industries": rows,
     }
-
-
-def _chunked(items: List[Dict[str, Any]], size: int) -> List[List[Dict[str, Any]]]:
-    return [items[idx : idx + size] for idx in range(0, len(items), size)]
 
 
 def _portfolio_llm_task_query(
@@ -2007,48 +1956,6 @@ def _account_live_enabled(account: Dict[str, Any]) -> bool:
         or account.get("live_enabled")
         or account.get("allow_live_trading")
     )
-
-
-def _numeric(value: Any, default: float = 0.0) -> float:
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return default
-
-
-def _int_value(value: Any, default: int = 0) -> int:
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return default
-
-
-def _symbol_key(value: Any) -> str:
-    return str(value or "").split(".", 1)[0]
-
-
-def _symbol_query_values(value: Any) -> List[str]:
-    raw = str(value or "")
-    base = _symbol_key(raw)
-    values = {raw, base}
-    if base:
-        values.update({f"{base}.SH", f"{base}.SZ"})
-    return [item for item in values if item]
-
-
-def _signal_filled_qty(row: Dict[str, Any]) -> int:
-    filled = _int_value(row.get("filled_qty", row.get("filled_size", 0)))
-    if filled == 0 and str(row.get("status") or "").lower() == "filled":
-        return abs(_int_value(row.get("size")))
-    return abs(filled)
-
-
-def _signal_signed_filled_qty(row: Dict[str, Any]) -> int:
-    qty = _signal_filled_qty(row)
-    action = str(row.get("action") or row.get("side") or "").lower()
-    if action in {"sell", "s"}:
-        return -qty
-    return qty
 
 
 def _build_live_plan_item_context(
