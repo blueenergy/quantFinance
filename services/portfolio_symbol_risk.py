@@ -60,6 +60,15 @@ def get_symbol_signal_reviews(db=None) -> SymbolLlmSignalReviewAccess:
     return SymbolLlmSignalReviewAccess(db=db)
 
 
+def _dt_to_iso(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.isoformat()
+    text = str(value).strip()
+    return text or None
+
+
 def _ledger_finding_to_display(row: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "finding_key": row.get("finding_key"),
@@ -73,7 +82,9 @@ def _ledger_finding_to_display(row: Dict[str, Any]) -> Dict[str, Any]:
         "expires_as_of": row.get("expires_as_of"),
         "discovered_by": row.get("discovered_by"),
         "first_detected_as_of": row.get("first_detected_as_of"),
+        "first_detected_at": _dt_to_iso(row.get("first_detected_at")),
         "last_confirmed_as_of": row.get("last_confirmed_as_of"),
+        "last_confirmed_at": _dt_to_iso(row.get("last_confirmed_at")),
         "suggested_resolution": row.get("suggested_resolution"),
         "evidence": row.get("evidence") or [],
     }
@@ -92,7 +103,9 @@ def _opportunity_finding_to_display(row: Dict[str, Any]) -> Dict[str, Any]:
         "expires_as_of": row.get("expires_as_of"),
         "discovered_by": row.get("discovered_by"),
         "first_detected_as_of": row.get("first_detected_as_of"),
+        "first_detected_at": _dt_to_iso(row.get("first_detected_at")),
         "last_confirmed_as_of": row.get("last_confirmed_as_of"),
+        "last_confirmed_at": _dt_to_iso(row.get("last_confirmed_at")),
         "suggested_closure": row.get("suggested_closure"),
         "evidence": row.get("evidence") or [],
     }
