@@ -126,6 +126,7 @@ def get_trading_db_collections() -> Dict[str, Collection]:
         "portfolio_plan_generation_tasks": trading_db["portfolio_plan_generation_tasks"],
         "portfolio_plan_operation_logs": trading_db["portfolio_plan_operation_logs"],
         "symbol_risk_operation_logs": trading_db["symbol_risk_operation_logs"],
+        "symbol_opportunity_operation_logs": trading_db["symbol_opportunity_operation_logs"],
         "portfolio_worker_status": trading_db["portfolio_worker_status"],
         "portfolio_strategy_param_presets": trading_db["portfolio_strategy_param_presets"],
         "portfolio_research_jobs": trading_db["portfolio_research_jobs"],
@@ -153,6 +154,9 @@ def get_analyzer_db():
         "portfolio_risk_llm": analyzer_db["portfolio_risk_llm"],
         "symbol_risk_findings": analyzer_db["symbol_risk_findings"],
         "industry_risk_findings": analyzer_db["industry_risk_findings"],
+        "symbol_opportunity_findings": analyzer_db["symbol_opportunity_findings"],
+        "industry_opportunity_findings": analyzer_db["industry_opportunity_findings"],
+        "symbol_llm_signal_reviews": analyzer_db["symbol_llm_signal_reviews"],
         "market_analysis_cache": analyzer_db["market_analysis_cache"],
         # LLM interpretations of risk scan reports (written by quantAnalyzer)
         "risk_report_analysis": analyzer_db["risk_report_analysis"],

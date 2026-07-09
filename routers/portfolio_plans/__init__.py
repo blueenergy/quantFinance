@@ -74,11 +74,15 @@ _NODE_TYPE_BY_RECORD_KIND = {
 }
 from services.portfolio_risk_snapshots import capture_plan_risk_snapshot, latest_plan_risk_snapshot
 from services.portfolio_symbol_risk import (
+    attach_ledger_opportunity_to_items,
     attach_ledger_llm_to_items,
+    build_ledger_opportunity_summary,
     build_ledger_llm_summary,
     filter_items_for_llm_enqueue,
+    get_symbol_opportunity_ledger,
     get_symbol_risk_ledger,
     legacy_ledger_read_enabled,
+    opportunity_ledger_read_enabled,
 )
 from services.trade_ledger import group_executions_by_order
 # Retained as a package-level symbol: publishing.replan_portfolio_plan_remainder
@@ -1701,7 +1705,11 @@ def _enrich_plan_items_with_llm_risk(
     symbols = [str(item.get("symbol") or "") for item in items if item.get("symbol")]
     ledger = get_symbol_risk_ledger(get_analyzer_db())
     grouped = ledger.get_active_for_symbols(symbols) if symbols else {}
-    if any(rows for rows in grouped.values()):
+    opportunity_grouped: Dict[str, List[Dict[str, Any]]] = {}
+    if opportunity_ledger_read_enabled() and symbols:
+        opportunity_ledger = get_symbol_opportunity_ledger(get_analyzer_db())
+        opportunity_grouped = opportunity_ledger.get_active_for_symbols(symbols)
+    if any(rows for rows in grouped.values()) or any(rows for rows in opportunity_grouped.values()):
         industries = sorted(
             {
                 str(item.get("industry") or "").strip()
@@ -1710,12 +1718,24 @@ def _enrich_plan_items_with_llm_risk(
             }
         )
         industry_grouped = ledger.get_active_for_industries(industries) if industries else {}
-        enriched, _attached = attach_ledger_llm_to_items(items, grouped)
-        plan_summary = dict(plan.get("summary") or {})
-        plan_summary["ai_risk_llm_summary"] = build_ledger_llm_summary(
-            grouped_findings=grouped,
-            industry_grouped=industry_grouped,
+        opportunity_industry_grouped = (
+            opportunity_ledger.get_active_for_industries(industries)
+            if industries and opportunity_grouped
+            else {}
         )
+        enriched, _attached = attach_ledger_llm_to_items(items, grouped)
+        enriched, _opp_attached = attach_ledger_opportunity_to_items(enriched, opportunity_grouped)
+        plan_summary = dict(plan.get("summary") or {})
+        if any(rows for rows in grouped.values()):
+            plan_summary["ai_risk_llm_summary"] = build_ledger_llm_summary(
+                grouped_findings=grouped,
+                industry_grouped=industry_grouped,
+            )
+        if any(rows for rows in opportunity_grouped.values()):
+            plan_summary["ai_opportunity_llm_summary"] = build_ledger_opportunity_summary(
+                grouped_findings=opportunity_grouped,
+                industry_grouped=opportunity_industry_grouped,
+            )
         return {**plan, "summary": plan_summary}, enriched
 
     if not legacy_ledger_read_enabled():
@@ -1899,13 +1919,24 @@ def _enrich_bench_payload_with_llm_risk(
     symbols = [str(item.get("symbol") or "") for item in bench_items if item.get("symbol")]
     ledger = get_symbol_risk_ledger(get_analyzer_db())
     grouped = ledger.get_active_for_symbols(symbols) if symbols else {}
-    if any(rows for rows in grouped.values()):
-        enriched_bench, attached_symbol_count = attach_ledger_llm_to_items(bench_items, grouped)
-        return {
+    opportunity_grouped: Dict[str, List[Dict[str, Any]]] = {}
+    if opportunity_ledger_read_enabled() and symbols:
+        opportunity_ledger = get_symbol_opportunity_ledger(get_analyzer_db())
+        opportunity_grouped = opportunity_ledger.get_active_for_symbols(symbols)
+    if any(rows for rows in grouped.values()) or any(rows for rows in opportunity_grouped.values()):
+        enriched_bench, _attached_symbol_count = attach_ledger_llm_to_items(bench_items, grouped)
+        enriched_bench, _opp_attached = attach_ledger_opportunity_to_items(enriched_bench, opportunity_grouped)
+        enriched_payload = {
             **payload,
             "bench": enriched_bench,
-            "ai_risk_llm_summary": build_ledger_llm_summary(grouped_findings=grouped),
         }
+        if any(rows for rows in grouped.values()):
+            enriched_payload["ai_risk_llm_summary"] = build_ledger_llm_summary(grouped_findings=grouped)
+        if any(rows for rows in opportunity_grouped.values()):
+            enriched_payload["ai_opportunity_llm_summary"] = build_ledger_opportunity_summary(
+                grouped_findings=opportunity_grouped
+            )
+        return enriched_payload
 
     if not legacy_ledger_read_enabled():
         return payload

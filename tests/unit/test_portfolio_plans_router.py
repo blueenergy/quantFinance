@@ -562,6 +562,9 @@ def _analyzer_collections():
         "portfolio_risk_llm": _Collection(),
         "symbol_risk_findings": _Collection(),
         "industry_risk_findings": _Collection(),
+        "symbol_opportunity_findings": _Collection(),
+        "industry_opportunity_findings": _Collection(),
+        "symbol_llm_signal_reviews": _Collection(),
     }
 
 
@@ -938,6 +941,76 @@ def test_enqueue_portfolio_llm_risk_skips_recently_reviewed_symbols(monkeypatch)
                 "summary": "近期风险",
                 "resolution_mode": "event",
                 "last_confirmed_at": recent,
+            }
+        )
+    analysis_tasks = _Collection()
+    monkeypatch.setattr(portfolio_plans, "get_trading_db_collections", lambda: collections)
+    monkeypatch.setattr(portfolio_plans, "get_data_db", _data_collections)
+    monkeypatch.setattr(portfolio_plans, "get_analyzer_db", lambda: analyzer_collections)
+    monkeypatch.setattr(portfolio_plans, "finance_db", {"analysis_tasks": analysis_tasks})
+
+    response = asyncio.run(
+        portfolio_plans.enqueue_portfolio_plan_llm_risk(
+            plan["plan_id"],
+            portfolio_plans.PortfolioLlmRiskReviewRequest(max_symbols_per_call=5),
+            current_user={"id": "user-1"},
+        )
+    )
+
+    assert response["data"]["reused"] is False
+    symbols = {
+        item["symbol"]
+        for task in analysis_tasks.docs
+        for item in task["params"]["items"]
+    }
+    assert symbols == {"300001"}
+
+
+def test_enqueue_portfolio_llm_risk_skips_recent_review_stamp_without_findings(monkeypatch):
+    collections = _collections()
+    plan = collections["portfolio_trade_plans"].docs[0]
+    collections["portfolio_trade_plan_items"].insert_many(
+        [
+            {
+                "plan_id": plan["plan_id"],
+                "user_id": "user-1",
+                "symbol": "000001",
+                "name": "平安银行",
+                "industry": "银行",
+                "action": "buy",
+                "rank": 1,
+            },
+            {
+                "plan_id": plan["plan_id"],
+                "user_id": "user-1",
+                "symbol": "600000",
+                "name": "浦发银行",
+                "industry": "银行",
+                "action": "hold",
+                "rank": 2,
+            },
+            {
+                "plan_id": plan["plan_id"],
+                "user_id": "user-1",
+                "symbol": "300001",
+                "name": "测试科技",
+                "industry": "电子",
+                "action": "buy",
+                "rank": 3,
+            },
+        ]
+    )
+    analyzer_collections = _analyzer_collections()
+    recent = datetime.utcnow()
+    for sym in ("000001", "600000"):
+        analyzer_collections["symbol_llm_signal_reviews"].insert_one(
+            {
+                "symbol": sym,
+                "industry": "银行",
+                "reviewed_at": recent,
+                "run_id": "run-recent",
+                "dimensions": ["risk", "opportunity"],
+                "result_counts": {"risk": 0, "opportunity": 0},
             }
         )
     analysis_tasks = _Collection()

@@ -1,6 +1,6 @@
 # MongoDB Collections 数据字典
 
-> **最后更新**：2026-06-12
+> **最后更新**：2026-07-09
 
 > ⚠️ **多库架构提醒**：本系统并非单库。`quantFinance/db.py` 将集合拆分到多个数据库，
 > 环境变量可覆盖默认名（见括号）：
@@ -90,6 +90,17 @@
 | `portfolio_analysis` | 持仓/自选股 AI 分析结果（按用户存储） | 15 |
 | `market_analysis_cache` | A 股市场整体分析缓存（每日） | 88 |
 | `global_analysis` | 全球市场联动 AI 分析结果 | 15 |
+| `symbol_risk_findings` | 个股级 LLM/人工风险 finding 台账（`quant_analyzer`，active/resolved 生命周期） | — |
+| `industry_risk_findings` | 行业级 LLM 风险 finding 台账（`quant_analyzer`） | — |
+| `symbol_opportunity_findings` | 个股级 LLM/人工机会 finding 台账（`quant_analyzer`，active/closed + realized/invalidated/expired 生命周期） | — |
+| `industry_opportunity_findings` | 行业级 LLM 机会 finding 台账（`quant_analyzer`） | — |
+| `symbol_llm_signal_reviews` | 个股 LLM risk+opportunity 复评时间戳；即使无 finding 也落库，用于 cooldown | — |
+
+> `portfolio_plan_risk_snapshots` 保持原集合名以兼容既有调用，但语义已扩展为
+> “决策信号快照”：批准/发布等决策点会冻结风险与机会两侧的 active findings。
+> 机会台账读取/写入默认开启（`OPPORTUNITY_LEDGER_READ_ENABLED=true`、
+> `OPPORTUNITY_LEDGER_WRITE_ENABLED=true`），便于尽早暴露机会抽取质量问题；
+> 如需回滚，可通过 env 显式设为 `false`。
 
 ---
 
