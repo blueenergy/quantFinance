@@ -380,6 +380,16 @@ class _Collection:
             return _UpdateResult(1)
         return _UpdateResult(0)
 
+    def update_many(self, query, update):
+        count = 0
+        for doc in self.docs:
+            if self._matches(doc, query):
+                doc.update(update.get("$set", {}))
+                for key in update.get("$unset", {}):
+                    doc.pop(key, None)
+                count += 1
+        return _UpdateResult(count)
+
     def replace_one(self, query, new_doc, upsert=False):
         for idx, doc in enumerate(self.docs):
             if self._matches(doc, query):
@@ -496,6 +506,7 @@ def _collections():
         "portfolio_worker_status": _Collection(),
         "portfolio_lineage_controls": _Collection(),
         "portfolio_live_snapshots": _Collection(),
+        "portfolio_plan_risk_snapshots": _Collection(),
         "portfolio_strategy_param_presets": _Collection(
             [
                 {
@@ -549,7 +560,15 @@ def _data_collections():
 def _analyzer_collections():
     return {
         "portfolio_risk_llm": _Collection(),
+        "symbol_risk_findings": _Collection(),
+        "industry_risk_findings": _Collection(),
     }
+
+
+@pytest.fixture(autouse=True)
+def _stub_analyzer_db(monkeypatch):
+    """Keep ledger/snapshot reads off live Mongo in router unit tests."""
+    monkeypatch.setattr(portfolio_plans, "get_analyzer_db", _analyzer_collections)
 
 
 def test_bulk_reject_plan_items_enqueues_single_regeneration(monkeypatch):
@@ -628,8 +647,10 @@ def test_enqueue_portfolio_llm_risk_fans_out_by_industry_and_reuses_running_run(
         ]
     )
     analysis_tasks = _Collection()
+    analyzer_collections = _analyzer_collections()
     monkeypatch.setattr(portfolio_plans, "get_trading_db_collections", lambda: collections)
     monkeypatch.setattr(portfolio_plans, "get_data_db", _data_collections)
+    monkeypatch.setattr(portfolio_plans, "get_analyzer_db", lambda: analyzer_collections)
     monkeypatch.setattr(portfolio_plans, "finance_db", {"analysis_tasks": analysis_tasks})
 
     response = asyncio.run(
@@ -682,9 +703,11 @@ def test_enqueue_portfolio_llm_risk_supports_bench_scope(monkeypatch):
         }
     )
     analysis_tasks = _Collection()
+    analyzer_collections = _analyzer_collections()
     monkeypatch.setattr(portfolio_plans, "get_trading_db_collections", lambda: collections)
     monkeypatch.setattr(portfolio_plans, "get_db_collections", lambda: collections)
     monkeypatch.setattr(portfolio_plans, "get_data_db", lambda: data_collections)
+    monkeypatch.setattr(portfolio_plans, "get_analyzer_db", lambda: analyzer_collections)
     monkeypatch.setattr(
         portfolio_plans,
         "_current_lineage_holdings",
@@ -819,6 +842,165 @@ def test_plan_detail_enriches_latest_completed_llm_risk(monkeypatch):
     assert summary["run_id"] == "run-new"
     assert summary["status"] == "completed_with_failures"
     assert summary["industries"][0]["industry"] == "银行"
+
+
+def test_plan_detail_enriches_ledger_llm_risk(monkeypatch):
+    collections = _collections()
+    plan = collections["portfolio_trade_plans"].docs[0]
+    collections["portfolio_trade_plan_items"].insert_one(
+        {
+            "plan_id": plan["plan_id"],
+            "user_id": "user-1",
+            "symbol": "000001",
+            "name": "平安银行",
+            "industry": "银行",
+            "action": "buy",
+            "rank": 1,
+        }
+    )
+    analyzer_collections = _analyzer_collections()
+    analyzer_collections["symbol_risk_findings"].insert_one(
+        {
+            "symbol": "000001",
+            "finding_key": "legal_compliance:监管问询",
+            "status": "active",
+            "category": "legal_compliance",
+            "subject": "监管问询",
+            "severity": "high",
+            "summary": "收到监管问询函",
+            "detail": "交易所下发问询",
+            "resolution_mode": "event",
+            "discovered_by": "llm",
+        }
+    )
+    monkeypatch.setattr(portfolio_plans, "get_trading_db_collections", lambda: collections)
+    monkeypatch.setattr(portfolio_plans, "get_db_collections", lambda: _finance_collections())
+    monkeypatch.setattr(portfolio_plans, "get_data_db", _data_collections)
+    monkeypatch.setattr(portfolio_plans, "get_analyzer_db", lambda: analyzer_collections)
+
+    response = asyncio.run(
+        portfolio_plans.get_portfolio_plan(plan["plan_id"], current_user={"id": "user-1"})
+    )
+
+    item = response["data"]["items"][0]
+    assert item["ai_risk"]["llm"]["source"] == "ledger"
+    assert item["ai_risk"]["llm"]["severity"] == "high"
+    assert item["ai_risk"]["llm"]["findings"][0]["finding_key"] == "legal_compliance:监管问询"
+    summary = response["data"]["plan"]["summary"]["ai_risk_llm_summary"]
+    assert summary["source"] == "ledger"
+    assert summary["symbol_count"] == 1
+
+
+def test_enqueue_portfolio_llm_risk_skips_recently_reviewed_symbols(monkeypatch):
+    collections = _collections()
+    plan = collections["portfolio_trade_plans"].docs[0]
+    collections["portfolio_trade_plan_items"].insert_many(
+        [
+            {
+                "plan_id": plan["plan_id"],
+                "user_id": "user-1",
+                "symbol": "000001",
+                "name": "平安银行",
+                "industry": "银行",
+                "action": "buy",
+                "rank": 1,
+            },
+            {
+                "plan_id": plan["plan_id"],
+                "user_id": "user-1",
+                "symbol": "600000",
+                "name": "浦发银行",
+                "industry": "银行",
+                "action": "hold",
+                "rank": 2,
+            },
+            {
+                "plan_id": plan["plan_id"],
+                "user_id": "user-1",
+                "symbol": "300001",
+                "name": "测试科技",
+                "industry": "电子",
+                "action": "buy",
+                "rank": 3,
+            },
+        ]
+    )
+    analyzer_collections = _analyzer_collections()
+    recent = datetime.utcnow()
+    for sym in ("000001", "600000"):
+        analyzer_collections["symbol_risk_findings"].insert_one(
+            {
+                "symbol": sym,
+                "finding_key": f"sentiment_incident:{sym}",
+                "status": "active",
+                "category": "sentiment_incident",
+                "severity": "medium",
+                "summary": "近期风险",
+                "resolution_mode": "event",
+                "last_confirmed_at": recent,
+            }
+        )
+    analysis_tasks = _Collection()
+    monkeypatch.setattr(portfolio_plans, "get_trading_db_collections", lambda: collections)
+    monkeypatch.setattr(portfolio_plans, "get_data_db", _data_collections)
+    monkeypatch.setattr(portfolio_plans, "get_analyzer_db", lambda: analyzer_collections)
+    monkeypatch.setattr(portfolio_plans, "finance_db", {"analysis_tasks": analysis_tasks})
+
+    response = asyncio.run(
+        portfolio_plans.enqueue_portfolio_plan_llm_risk(
+            plan["plan_id"],
+            portfolio_plans.PortfolioLlmRiskReviewRequest(max_symbols_per_call=5),
+            current_user={"id": "user-1"},
+        )
+    )
+
+    assert response["data"]["reused"] is False
+    symbols = {
+        item["symbol"]
+        for task in analysis_tasks.docs
+        for item in task["params"]["items"]
+    }
+    assert symbols == {"300001"}
+
+
+def test_review_plan_captures_risk_snapshot_on_approve(monkeypatch):
+    collections = _collections()
+    finance_collections = _finance_collections()
+    plan = collections["portfolio_trade_plans"].docs[0]
+    collections["portfolio_trade_plan_items"].insert_one(
+        {
+            "plan_id": plan["plan_id"],
+            "user_id": "user-1",
+            "symbol": "000001",
+            "action": "buy",
+            "rank": 1,
+        }
+    )
+    analyzer_collections = _analyzer_collections()
+    analyzer_collections["symbol_risk_findings"].insert_one(
+        {
+            "symbol": "000001",
+            "finding_key": "legal_compliance:问询",
+            "status": "active",
+            "category": "legal_compliance",
+            "severity": "high",
+            "summary": "监管问询",
+            "resolution_mode": "event",
+        }
+    )
+    monkeypatch.setattr(portfolio_plans, "get_trading_db_collections", lambda: collections)
+    monkeypatch.setattr(portfolio_plans, "get_db_collections", lambda: finance_collections)
+    monkeypatch.setattr(portfolio_plans, "get_analyzer_db", lambda: analyzer_collections)
+
+    response = portfolio_plans._review_plan("plan-user-1", "approved", "ok", {"id": "user-1"})
+
+    assert response["success"] is True
+    snapshots = collections["portfolio_plan_risk_snapshots"].docs
+    assert len(snapshots) == 1
+    assert snapshots[0]["decision_point"] == "approved"
+    assert snapshots[0]["items"][0]["symbol"] == "000001"
+    assert snapshots[0]["items"][0]["llm"]["severity"] == "high"
+
 
 def test_bulk_reject_plan_items_rejects_empty_symbols(monkeypatch):
     collections = _collections()

@@ -23,6 +23,7 @@ from db import db as finance_db
 from db import get_analyzer_db, get_data_db, get_db_collections, get_trading_db_collections
 from services.analysis_tasks import build_task_doc, normalize_task_status
 from utils.time_display import add_display_time_fields
+from services.execution_policy import estimate_buy_order_cash_exposure
 from services.live_trade_signals import (
     ACTIVE_SIGNAL_STATUSES,
     PLAN_PHASE_APPROVED_PUBLISHED,
@@ -71,7 +72,14 @@ _NODE_TYPE_BY_RECORD_KIND = {
     RECORD_KIND_OBSERVATION: "monitor",
     RECORD_KIND_LEDGER_EVENT: "manual",
 }
-from services.execution_policy import estimate_buy_order_cash_exposure
+from services.portfolio_risk_snapshots import capture_plan_risk_snapshot, latest_plan_risk_snapshot
+from services.portfolio_symbol_risk import (
+    attach_ledger_llm_to_items,
+    build_ledger_llm_summary,
+    filter_items_for_llm_enqueue,
+    get_symbol_risk_ledger,
+    legacy_ledger_read_enabled,
+)
 from services.trade_ledger import group_executions_by_order
 # Retained as a package-level symbol: publishing.replan_portfolio_plan_remainder
 # resolves it via _pp.resolve_market_reference_price (so tests can monkeypatch it
@@ -1689,6 +1697,30 @@ def _enrich_plan_items_with_llm_risk(
 ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
     if not items:
         return plan, items
+
+    symbols = [str(item.get("symbol") or "") for item in items if item.get("symbol")]
+    ledger = get_symbol_risk_ledger(get_analyzer_db())
+    grouped = ledger.get_active_for_symbols(symbols) if symbols else {}
+    if any(rows for rows in grouped.values()):
+        industries = sorted(
+            {
+                str(item.get("industry") or "").strip()
+                for item in items
+                if item.get("industry")
+            }
+        )
+        industry_grouped = ledger.get_active_for_industries(industries) if industries else {}
+        enriched, _attached = attach_ledger_llm_to_items(items, grouped)
+        plan_summary = dict(plan.get("summary") or {})
+        plan_summary["ai_risk_llm_summary"] = build_ledger_llm_summary(
+            grouped_findings=grouped,
+            industry_grouped=industry_grouped,
+        )
+        return {**plan, "summary": plan_summary}, enriched
+
+    if not legacy_ledger_read_enabled():
+        return plan, items
+
     plan_id = str(plan.get("plan_id") or "")
     run_id = _latest_completed_portfolio_llm_run_id(user_id=user_id, plan_id=plan_id)
     if not run_id:
@@ -1721,6 +1753,7 @@ def _enrich_plan_items_with_llm_risk(
             }
             for doc in sorted(industry_docs, key=lambda row: str(row.get("industry") or ""))
         ],
+        "source": "legacy_plan_run",
     }
     plan_summary = dict(plan.get("summary") or {})
     plan_summary["ai_risk_llm_summary"] = summary
@@ -1862,6 +1895,21 @@ def _enrich_bench_payload_with_llm_risk(
     bench_items = list(payload.get("bench") or [])
     if not bench_items:
         return payload
+
+    symbols = [str(item.get("symbol") or "") for item in bench_items if item.get("symbol")]
+    ledger = get_symbol_risk_ledger(get_analyzer_db())
+    grouped = ledger.get_active_for_symbols(symbols) if symbols else {}
+    if any(rows for rows in grouped.values()):
+        enriched_bench, attached_symbol_count = attach_ledger_llm_to_items(bench_items, grouped)
+        return {
+            **payload,
+            "bench": enriched_bench,
+            "ai_risk_llm_summary": build_ledger_llm_summary(grouped_findings=grouped),
+        }
+
+    if not legacy_ledger_read_enabled():
+        return payload
+
     plan_id = str(plan.get("plan_id") or payload.get("plan_id") or "")
     run_id = _latest_completed_portfolio_llm_run_id(
         user_id=user_id,
@@ -1910,6 +1958,7 @@ def _enrich_bench_payload_with_llm_risk(
                 }
                 for doc in sorted(industry_docs, key=lambda row: str(row.get("industry") or ""))
             ],
+            "source": "legacy_plan_run",
         },
     }
 
@@ -3630,14 +3679,20 @@ async def enqueue_portfolio_plan_llm_risk(
             plan=plan,
             items=items,
         )
-    actionable = _portfolio_llm_actionable_items(items, request)
-    if not actionable:
+    raw_actionable = _portfolio_llm_actionable_items(items, request)
+    if not raw_actionable:
         detail = (
             "no bench candidates matched LLM risk review filters"
             if request.target_scope == "bench"
             else "no buy/hold plan items matched LLM risk review filters"
         )
         raise HTTPException(status_code=400, detail=detail)
+    actionable = filter_items_for_llm_enqueue(raw_actionable, force=request.force, db=get_analyzer_db())
+    if not actionable:
+        raise HTTPException(
+            status_code=400,
+            detail="all matched symbols were reviewed recently; use force=true to re-run",
+        )
 
     groups = _portfolio_llm_industry_groups(actionable)
     industry_context = _portfolio_llm_industry_context(groups)
@@ -3912,6 +3967,7 @@ def get_portfolio_plan(plan_id: str, current_user: dict = Depends(get_current_us
             plan_id,
             " ".join(parts),
         )
+    risk_snapshot = latest_plan_risk_snapshot(collections, plan_id=plan_id, user_id=user_id)
     return {
         "success": True,
         "data": {
@@ -3922,6 +3978,7 @@ def get_portfolio_plan(plan_id: str, current_user: dict = Depends(get_current_us
             "execution_status": _jsonable(execution_status),
             "execution_mode": execution_context["execution_mode"],
             "live_execution_context": _jsonable(execution_context),
+            "risk_snapshot": _jsonable(risk_snapshot),
         },
     }
 
@@ -4223,6 +4280,23 @@ def _review_plan(plan_id: str, decision: str, comment: str, current_user: Dict[s
             message=comment or "plan rejected by reviewer",
             payload={"previous_status": status, "cancelled_signal_count": cancelled_signal_count},
         )
+    if status_flipped and decision == "approved":
+        items = list(
+            collections["portfolio_trade_plan_items"].find(
+                {"plan_id": plan_id, "user_id": user_id},
+                {"symbol": 1, "_id": 0},
+            )
+        )
+        symbols = [str(row.get("symbol") or "") for row in items if row.get("symbol")]
+        if symbols:
+            capture_plan_risk_snapshot(
+                collections,
+                plan_id=plan_id,
+                user_id=user_id,
+                decision_point="approved",
+                symbols=symbols,
+                analyzer_db=get_analyzer_db(),
+            )
     return {"success": True, "data": _jsonable(review)}
 
 

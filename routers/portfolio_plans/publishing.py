@@ -34,6 +34,7 @@ from services.live_trade_signals import (
     summarize_signal_statuses,
 )
 from services.portfolio_lineage_state import mark_lineage_live
+from services.portfolio_risk_snapshots import capture_plan_risk_snapshot
 from services.portfolio_plan_market import (
     PRICE_SOURCE_DAILY_CLOSE,
     reprice_plan_items_for_publish,
@@ -1040,6 +1041,15 @@ def publish_portfolio_plan_live_signals(
             user_id,
             reason="manual_lineage_apply",
         )
+        if symbols:
+            capture_plan_risk_snapshot(
+                trading_collections,
+                plan_id=plan_id,
+                user_id=user_id,
+                decision_point="published",
+                symbols=symbols,
+                analyzer_db=_pp.get_analyzer_db(),
+            )
 
     return {
         "success": True,
