@@ -76,11 +76,13 @@ from services.portfolio_risk_snapshots import capture_plan_risk_snapshot, latest
 from services.portfolio_symbol_risk import (
     attach_ledger_opportunity_to_items,
     attach_ledger_llm_to_items,
+    attach_signal_reviews_to_items,
     build_ledger_opportunity_summary,
     build_ledger_llm_summary,
     filter_items_for_llm_enqueue,
     get_symbol_opportunity_ledger,
     get_symbol_risk_ledger,
+    get_symbol_signal_reviews,
     legacy_ledger_read_enabled,
     opportunity_ledger_read_enabled,
 )
@@ -1803,6 +1805,8 @@ def _enrich_plan_items_with_llm_risk(
         return plan, items
 
     symbols = [str(item.get("symbol") or "") for item in items if item.get("symbol")]
+    reviews_by_symbol = get_symbol_signal_reviews(get_analyzer_db()).get_latest_reviews(symbols) if symbols else {}
+    items = attach_signal_reviews_to_items(items, reviews_by_symbol)
     ledger = get_symbol_risk_ledger(get_analyzer_db())
     grouped = ledger.get_active_for_symbols(symbols) if symbols else {}
     opportunity_grouped: Dict[str, List[Dict[str, Any]]] = {}
@@ -2017,6 +2021,8 @@ def _enrich_bench_payload_with_llm_risk(
         return payload
 
     symbols = [str(item.get("symbol") or "") for item in bench_items if item.get("symbol")]
+    reviews_by_symbol = get_symbol_signal_reviews(get_analyzer_db()).get_latest_reviews(symbols) if symbols else {}
+    bench_items = attach_signal_reviews_to_items(bench_items, reviews_by_symbol)
     ledger = get_symbol_risk_ledger(get_analyzer_db())
     grouped = ledger.get_active_for_symbols(symbols) if symbols else {}
     opportunity_grouped: Dict[str, List[Dict[str, Any]]] = {}
@@ -3859,6 +3865,7 @@ async def enqueue_portfolio_plan_llm_risk(
                     "max_symbols_per_call": request.max_symbols_per_call,
                     "prompt_version": request.prompt_version,
                     "bench_multiplier": request.bench_multiplier,
+                    "force": request.force,
                 },
             }
             task_doc = build_task_doc(

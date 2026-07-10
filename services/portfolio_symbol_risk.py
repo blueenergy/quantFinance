@@ -111,6 +111,24 @@ def _opportunity_finding_to_display(row: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _review_to_display(row: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "checked_at": _dt_to_iso(row.get("checked_at")),
+        "analyzed_at": _dt_to_iso(row.get("analyzed_at") or row.get("reviewed_at")),
+        "reviewed_at": _dt_to_iso(row.get("reviewed_at")),
+        "last_run_status": row.get("last_run_status") or ("analyzed" if row.get("reviewed_at") else None),
+        "last_skip_reason": row.get("last_skip_reason"),
+        "last_error_detail": row.get("last_error_detail"),
+        "dimensions": row.get("dimensions") or [],
+        "result_counts": row.get("result_counts") or {},
+        "evidence_count": row.get("evidence_count"),
+        "latest_evidence_at": _dt_to_iso(row.get("latest_evidence_at")),
+        "symbol_evidence_count": row.get("symbol_evidence_count"),
+        "sector_evidence_count": row.get("sector_evidence_count"),
+        "prompt_version": row.get("prompt_version"),
+    }
+
+
 def build_llm_payload_from_ledger_findings(findings: List[Dict[str, Any]]) -> Dict[str, Any]:
     """Shape active ledger findings into ``ai_risk.llm`` for the dashboard."""
     display = [_ledger_finding_to_display(row) for row in findings]
@@ -140,6 +158,21 @@ def build_opportunity_payload_from_ledger_findings(findings: List[Dict[str, Any]
         "finding_count": len(display),
         "has_suggested_closure": any(row.get("suggested_closure") for row in display),
     }
+
+
+def attach_signal_reviews_to_items(
+    items: List[Dict[str, Any]],
+    reviews_by_symbol: Dict[str, Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    enriched: List[Dict[str, Any]] = []
+    for item in items:
+        symbol = str(item.get("symbol") or "")
+        review = reviews_by_symbol.get(symbol)
+        if not review:
+            enriched.append(item)
+            continue
+        enriched.append({**item, "signal_review": _review_to_display(review)})
+    return enriched
 
 
 def attach_ledger_llm_to_items(
@@ -263,44 +296,11 @@ def filter_items_for_llm_enqueue(
     cooldown_hours: Optional[int] = None,
     db=None,
 ) -> List[Dict[str, Any]]:
-    """Return plan/bench items that should be enqueued for LLM reassessment."""
+    """Return plan/bench items to enqueue.
+
+    Fingerprint-aware skip now happens in the analyzer worker after evidence is
+    collected.  Keeping a time-only gate here would miss same-day announcements,
+    so this layer only filters invalid rows.
+    """
     actionable = [item for item in items if item.get("symbol")]
-    if force or not actionable:
-        return list(actionable)
-
-    hours = cooldown_hours
-    if hours is None:
-        hours = int(os.getenv("SYMBOL_LLM_REVIEW_COOLDOWN_HOURS", "24"))
-    symbols = [str(item.get("symbol")) for item in actionable]
-    reviews = get_symbol_signal_reviews(db).get_latest_reviews(symbols)
-    legacy_grouped = get_symbol_risk_ledger(db).get_active_for_symbols(symbols)
-    now = datetime.utcnow()
-    selected: List[Dict[str, Any]] = []
-
-    for item in actionable:
-        sym = str(item.get("symbol"))
-        review = reviews.get(sym) or {}
-        reviewed_at = _parse_utc_datetime(review.get("reviewed_at"))
-        if reviewed_at is not None:
-            if now - reviewed_at >= timedelta(hours=hours):
-                selected.append(item)
-            continue
-
-        # Migration fallback for ledgers written before review-stamps existed.
-        findings = legacy_grouped.get(sym) or []
-        if not findings:
-            selected.append(item)
-            continue
-        confirmed_times = [
-            _parse_utc_datetime(row.get("last_confirmed_at"))
-            for row in findings
-            if row.get("last_confirmed_at")
-        ]
-        confirmed_times = [dt for dt in confirmed_times if dt is not None]
-        latest = max(confirmed_times) if confirmed_times else None
-        if latest is None:
-            selected.append(item)
-            continue
-        if now - latest >= timedelta(hours=hours):
-            selected.append(item)
-    return selected
+    return list(actionable)

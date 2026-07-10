@@ -894,7 +894,7 @@ def test_plan_detail_enriches_ledger_llm_risk(monkeypatch):
     assert summary["symbol_count"] == 1
 
 
-def test_enqueue_portfolio_llm_risk_skips_recently_reviewed_symbols(monkeypatch):
+def test_enqueue_portfolio_llm_risk_includes_recent_ledger_symbols_for_worker_fingerprint(monkeypatch):
     collections = _collections()
     plan = collections["portfolio_trade_plans"].docs[0]
     collections["portfolio_trade_plan_items"].insert_many(
@@ -963,10 +963,10 @@ def test_enqueue_portfolio_llm_risk_skips_recently_reviewed_symbols(monkeypatch)
         for task in analysis_tasks.docs
         for item in task["params"]["items"]
     }
-    assert symbols == {"300001"}
+    assert symbols == {"000001", "600000", "300001"}
 
 
-def test_enqueue_portfolio_llm_risk_skips_recent_review_stamp_without_findings(monkeypatch):
+def test_enqueue_portfolio_llm_risk_includes_recent_review_stamps_for_worker_fingerprint(monkeypatch):
     collections = _collections()
     plan = collections["portfolio_trade_plans"].docs[0]
     collections["portfolio_trade_plan_items"].insert_many(
@@ -1033,7 +1033,7 @@ def test_enqueue_portfolio_llm_risk_skips_recent_review_stamp_without_findings(m
         for task in analysis_tasks.docs
         for item in task["params"]["items"]
     }
-    assert symbols == {"300001"}
+    assert symbols == {"000001", "600000", "300001"}
 
 
 def test_review_plan_captures_risk_snapshot_on_approve(monkeypatch):
