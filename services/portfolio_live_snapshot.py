@@ -637,6 +637,7 @@ def overlay_realtime(
     snapshot: Dict[str, Any],
     price_map: Dict[str, float],
     realtime_docs: Optional[Dict[str, Dict[str, Any]]] = None,
+    quote_map: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """Apply market prices to structural positions/trades for API responses."""
 
@@ -644,6 +645,7 @@ def overlay_realtime(
     total_market_value = 0.0
     total_realized_pnl = 0.0
     total_unrealized_pnl = 0.0
+    total_day_pnl = 0.0
     total_cost_basis = 0.0
     latest_update = ""
 
@@ -656,14 +658,21 @@ def overlay_realtime(
         realized = _numeric(row.get("realized_pnl"))
         total_realized_pnl += realized
 
+        quote = (quote_map or {}).get(symbol) or (quote_map or {}).get(_symbol_key(symbol)) or {}
         price = price_map.get(symbol) or price_map.get(_symbol_key(symbol)) or avg_cost
         if shares > 0 and price <= 0:
             price = avg_cost
         value = shares * price
         unrealized = (price - avg_cost) * shares if shares > 0 else 0.0
         unrealized_pct = price / avg_cost - 1 if shares > 0 and avg_cost > 0 and price > 0 else None
+        previous_close = _numeric(quote.get("previous_close"))
+        day_change = price - previous_close if shares > 0 and price > 0 and previous_close > 0 else None
+        day_pnl = day_change * shares if day_change is not None else None
+        day_change_pct = day_change / previous_close if day_change is not None and previous_close > 0 else None
         total_market_value += value
         total_unrealized_pnl += unrealized
+        if day_pnl is not None:
+            total_day_pnl += day_pnl
         if shares > 0:
             total_cost_basis += avg_cost * shares
 
@@ -688,6 +697,12 @@ def overlay_realtime(
                     "avg_cost": round(avg_cost, 4),
                     "last_price": round(price, 4) if price else 0.0,
                     "last_price_source": price_source,
+                    "price_source": quote.get("price_source") or price_source,
+                    "price_as_of": quote.get("price_as_of"),
+                    "previous_close": round(previous_close, 4) if previous_close > 0 else None,
+                    "day_change": _round_or_none(day_change, 4),
+                    "day_change_pct": _round_or_none(day_change_pct, 6),
+                    "day_pnl": _round_or_none(day_pnl, 2),
                     "market_value": round(value, 2),
                     "realized_pnl": round(realized, 2),
                     "unrealized_pnl": round(unrealized, 2),
@@ -701,6 +716,7 @@ def overlay_realtime(
         "total_market_value": round(total_market_value, 2),
         "total_realized_pnl": round(total_realized_pnl, 2),
         "total_unrealized_pnl": round(total_unrealized_pnl, 2),
+        "total_day_pnl": round(total_day_pnl, 2),
         "total_cost_basis": round(total_cost_basis, 2),
         "holding_count": holding_count,
         "position_row_count": len(positions),

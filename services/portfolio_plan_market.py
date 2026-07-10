@@ -70,12 +70,23 @@ def _quote_from_docs(
     symbol: str,
     daily_doc: Optional[Dict[str, Any]],
     realtime_doc: Optional[Dict[str, Any]],
+    day_pnl_date: Optional[str] = None,
 ) -> Dict[str, Any]:
     daily_price = _first_positive_float((daily_doc or {}).get("close"))
+    daily_pre_close = _first_positive_float(
+        (daily_doc or {}).get("pre_close"),
+        (daily_doc or {}).get("prev_close"),
+        (daily_doc or {}).get("previous_close"),
+    )
     realtime_price = _first_positive_float(
         (realtime_doc or {}).get("close"),
         (realtime_doc or {}).get("price"),
         (realtime_doc or {}).get("latest_price"),
+    )
+    realtime_pre_close = _first_positive_float(
+        (realtime_doc or {}).get("pre_close"),
+        (realtime_doc or {}).get("prev_close"),
+        (realtime_doc or {}).get("previous_close"),
     )
     daily_date = _market_doc_yyyymmdd(daily_doc)
     realtime_date = _market_doc_yyyymmdd(realtime_doc)
@@ -84,10 +95,20 @@ def _quote_from_docs(
         and realtime_price
         and (not daily_date or not realtime_date or realtime_date >= daily_date)
     )
+    # Only expose a day-P&L baseline for the requested trading date. If the
+    # newest daily bar is older than "today", yesterday's intraday P&L must not
+    # be shown as today's P&L.
+    daily_matches_day_pnl_date = bool(day_pnl_date and daily_date == day_pnl_date)
+    realtime_previous_close = (
+        (realtime_pre_close or daily_pre_close)
+        if daily_matches_day_pnl_date and realtime_date == daily_date
+        else None
+    )
     if use_realtime:
         return {
             "symbol": symbol,
             "price": realtime_price,
+            "previous_close": realtime_previous_close,
             "price_source": PRICE_SOURCE_REALTIME,
             "price_as_of": _price_as_of_from_doc(realtime_doc, source=PRICE_SOURCE_REALTIME),
             "is_stale": False,
@@ -98,6 +119,7 @@ def _quote_from_docs(
         return {
             "symbol": symbol,
             "price": daily_price,
+            "previous_close": daily_pre_close if daily_matches_day_pnl_date else None,
             "price_source": PRICE_SOURCE_DAILY_CLOSE,
             "price_as_of": _price_as_of_from_doc(daily_doc, source=PRICE_SOURCE_DAILY_CLOSE),
             "is_stale": True,
@@ -107,6 +129,7 @@ def _quote_from_docs(
     return {
         "symbol": symbol,
         "price": None,
+        "previous_close": None,
         "price_source": PRICE_SOURCE_NONE,
         "price_as_of": None,
         "is_stale": True,
@@ -115,7 +138,7 @@ def _quote_from_docs(
     }
 
 
-_DAILY_QUOTE_FIELDS = ("symbol", "trade_date", "date", "close")
+_DAILY_QUOTE_FIELDS = ("symbol", "trade_date", "date", "close", "pre_close", "prev_close", "previous_close")
 _REALTIME_QUOTE_FIELDS = (
     "symbol",
     "trade_date",
@@ -123,6 +146,9 @@ _REALTIME_QUOTE_FIELDS = (
     "close",
     "price",
     "latest_price",
+    "pre_close",
+    "prev_close",
+    "previous_close",
     "realtime_trade_time",
     "snapshot_time",
     "updated_at",
@@ -187,6 +213,8 @@ def _market_price_quotes_per_symbol(
     realtime_coll: Any,
     symbols: List[str],
     candidates_by_symbol: Dict[str, List[str]],
+    *,
+    day_pnl_date: Optional[str] = None,
 ) -> Dict[str, Dict[str, Any]]:
     """Fallback path: one daily + one realtime ``find_one`` per symbol."""
     quotes: Dict[str, Dict[str, Any]] = {}
@@ -202,7 +230,12 @@ def _market_price_quotes_per_symbol(
             sort=[("trade_date", -1)],
             projection={key: 1 for key in _REALTIME_QUOTE_FIELDS} | {"_id": 0},
         )
-        quotes[symbol] = _quote_from_docs(symbol=symbol, daily_doc=daily_doc, realtime_doc=realtime_doc)
+        quotes[symbol] = _quote_from_docs(
+            symbol=symbol,
+            daily_doc=daily_doc,
+            realtime_doc=realtime_doc,
+            day_pnl_date=day_pnl_date,
+        )
     return quotes
 
 
@@ -211,6 +244,7 @@ def market_price_quotes(
     symbols: List[str],
     *,
     symbol_query_values: Callable[[str], List[str]],
+    day_pnl_date: Optional[str] = None,
 ) -> Dict[str, Dict[str, Any]]:
     """Return per-symbol price quotes with source metadata.
 
@@ -231,7 +265,11 @@ def market_price_quotes(
     realtime_by_symbol = _latest_variant_docs(realtime_coll, all_candidates, _REALTIME_QUOTE_FIELDS)
     if daily_by_symbol is None or realtime_by_symbol is None:
         return _market_price_quotes_per_symbol(
-            daily_coll, realtime_coll, symbols, candidates_by_symbol
+            daily_coll,
+            realtime_coll,
+            symbols,
+            candidates_by_symbol,
+            day_pnl_date=day_pnl_date,
         )
 
     quotes: Dict[str, Dict[str, Any]] = {}
@@ -241,6 +279,7 @@ def market_price_quotes(
             symbol=symbol,
             daily_doc=_pick_latest_variant(daily_by_symbol, candidates),
             realtime_doc=_pick_latest_variant(realtime_by_symbol, candidates),
+            day_pnl_date=day_pnl_date,
         )
     return quotes
 

@@ -479,8 +479,9 @@ def _load_snapshot_with_realtime(
             if row.get("symbol")
         }
     )
-    prices, realtime_docs = _load_fresh_market_prices(data_collections, symbols)
-    overlay = overlay_realtime(snapshot, prices, realtime_docs=realtime_docs)
+    quotes = _market_price_quotes(data_collections, symbols, day_pnl_date=_business_today_yyyymmdd())
+    prices, realtime_docs = quotes_to_prices_and_realtime_docs(quotes)
+    overlay = overlay_realtime(snapshot, prices, realtime_docs=realtime_docs, quote_map=quotes)
     return snapshot, overlay
 
 
@@ -5748,9 +5749,19 @@ def _market_doc_yyyymmdd(doc: Optional[Dict[str, Any]]) -> str:
     return ""
 
 
-def _market_price_quotes(data_collections: Dict[str, Any], symbols: List[str]) -> Dict[str, Dict[str, Any]]:
+def _market_price_quotes(
+    data_collections: Dict[str, Any],
+    symbols: List[str],
+    *,
+    day_pnl_date: Optional[str] = None,
+) -> Dict[str, Dict[str, Any]]:
     """Per-symbol price quotes with source metadata for overlay and publish repricing."""
-    return market_price_quotes(data_collections, symbols, symbol_query_values=_symbol_query_values)
+    return market_price_quotes(
+        data_collections,
+        symbols,
+        symbol_query_values=_symbol_query_values,
+        day_pnl_date=day_pnl_date,
+    )
 
 
 def _load_fresh_market_prices(data_collections: Dict[str, Any], symbols: List[str]) -> Tuple[Dict[str, float], Dict[str, Dict[str, Any]]]:

@@ -58,12 +58,34 @@ def _symbol_query_values(symbol):
 def test_quote_prefers_realtime_when_fresher():
     quote = _quote_from_docs(
         symbol="600000",
-        daily_doc={"trade_date": "20260625", "close": 9.5},
-        realtime_doc={"trade_date": "20260627", "close": 10.2, "snapshot_time": "2026-06-27T14:58:00"},
+        daily_doc={"trade_date": "20260625", "close": 9.5, "pre_close": 9.0},
+        realtime_doc={
+            "trade_date": "20260627",
+            "close": 10.2,
+            "pre_close": 10.0,
+            "snapshot_time": "2026-06-27T14:58:00",
+        },
     )
     assert quote["price_source"] == PRICE_SOURCE_REALTIME
     assert quote["price"] == 10.2
+    assert quote["previous_close"] is None
     assert quote["is_stale"] is False
+
+
+def test_quote_exposes_previous_close_only_when_daily_bar_matches_realtime_date():
+    quote = _quote_from_docs(
+        symbol="600000",
+        daily_doc={"trade_date": "20260627", "close": 10.1, "pre_close": 9.8},
+        realtime_doc={
+            "trade_date": "20260627",
+            "close": 10.2,
+            "snapshot_time": "2026-06-27T14:58:00",
+        },
+        day_pnl_date="20260627",
+    )
+    assert quote["price_source"] == PRICE_SOURCE_REALTIME
+    assert quote["price"] == 10.2
+    assert quote["previous_close"] == 9.8
 
 
 def test_quote_falls_back_to_daily_close():

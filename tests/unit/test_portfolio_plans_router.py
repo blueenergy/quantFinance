@@ -3912,12 +3912,13 @@ def test_lineage_live_positions_falls_back_when_realtime_is_stale(monkeypatch):
         {"order_id": "oa", "user_id": "user-1", "symbol": "000001.SZ", "side": "BUY", "filled_size": 100, "filled_price": 10.0, "timestamp": 1.0},
     ]
     data["volume_price"].docs = [
-        {"symbol": "000001.SZ", "trade_date": "20250110", "close": 12.0},
+        {"symbol": "000001.SZ", "trade_date": "20250110", "close": 12.0, "pre_close": 10.0},
     ]
     data["volume_price_realtime_latest"].docs = [
         {"symbol": "000001.SZ", "trade_date": "20250109", "close": 99.0},
     ]
 
+    monkeypatch.setattr(portfolio_plans, "_business_today_yyyymmdd", lambda: "20250110")
     _patch_lineage_live_env(monkeypatch, cols, fin, data)
     resp = asyncio.run(portfolio_plans.get_lineage_live_positions("pla", current_user={"id": "user-1"}))
     pos = resp["data"]["positions"][0]
@@ -3925,6 +3926,9 @@ def test_lineage_live_positions_falls_back_when_realtime_is_stale(monkeypatch):
     assert pos["last_price"] == 12.0
     assert pos["last_price_source"] == "market"
     assert pos["unrealized_pnl_pct"] == 0.2
+    assert pos["price_source"] == "daily_close"
+    assert pos["day_pnl"] == 200.0
+    assert resp["data"]["summary"]["total_day_pnl"] == 200.0
 
 
 def test_lineage_live_equity_dedupes_date_by_updated_at(monkeypatch):
@@ -4382,6 +4386,18 @@ def test_lineage_paper_positions_uses_latest_snapshot(monkeypatch):
             ],
         },
     ]
+    data["volume_price"].docs = [
+        {"symbol": "000001.SZ", "trade_date": "20250110", "close": 11.0, "pre_close": 10.0},
+    ]
+    data["volume_price_realtime_latest"].docs = [
+        {
+            "symbol": "000001.SZ",
+            "trade_date": "20250111",
+            "close": 12.0,
+            "pre_close": 10.0,
+            "updated_at": "2025-01-11T10:00:00",
+        },
+    ]
     _patch_lineage_live_env(monkeypatch, cols, fin, data)
     resp = asyncio.run(
         portfolio_plans.get_lineage_paper_positions("paper-new", current_user={"id": "user-1"})
@@ -4389,7 +4405,13 @@ def test_lineage_paper_positions_uses_latest_snapshot(monkeypatch):
     assert resp["data"]["as_of_date"] == "20250111"
     assert resp["data"]["source_plan_id"] == "paper-old"
     assert len(resp["data"]["positions"]) == 1
-    assert resp["data"]["positions"][0]["shares"] == 100
+    pos = resp["data"]["positions"][0]
+    assert pos["shares"] == 100
+    assert pos["last_price"] == 12.0
+    assert pos["price_source"] == "realtime"
+    assert pos["day_pnl"] is None
+    assert resp["data"]["summary"]["total_market_value"] == 1200.0
+    assert resp["data"]["summary"]["total_day_pnl"] == 0.0
 
 
 def test_lineage_paper_positions_breaks_as_of_date_ties_by_updated_at(monkeypatch):

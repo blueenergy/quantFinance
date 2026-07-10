@@ -127,30 +127,52 @@ def get_lineage_paper_positions(plan_id: str, current_user: dict = Depends(get_c
     """Latest paper position snapshot across the plan's params_hash lineage."""
 
     collections = _pp.get_trading_db_collections()
+    data_collections = _pp.get_data_db()
     user_id = _pp._current_user_id(current_user)
     plan = _pp._require_plan(collections, plan_id, current_user)
     snapshot = _pp._latest_lineage_paper_snapshot(collections, plan, user_id)
+    raw_positions = snapshot.get("positions") or []
+    symbols = sorted({str(row.get("symbol")) for row in raw_positions if row.get("symbol")})
+    quotes = _pp._market_price_quotes(
+        data_collections,
+        symbols,
+        day_pnl_date=_pp._business_today_yyyymmdd(),
+    )
     positions: List[Dict[str, Any]] = []
     total_market_value = 0.0
-    for row in sorted(snapshot.get("positions") or [], key=lambda item: str(item.get("symbol") or "")):
+    total_day_pnl = 0.0
+    for row in sorted(raw_positions, key=lambda item: str(item.get("symbol") or "")):
+        symbol = str(row.get("symbol") or "")
         shares = _int_value(row.get("shares"))
         if shares <= 0:
             continue
-        market_value = _numeric(row.get("market_value"))
-        total_market_value += market_value
+        quote = quotes.get(symbol) or quotes.get(symbol.split(".", 1)[0]) or {}
         avg_cost = _numeric(row.get("cost_basis") or row.get("mark_price"))
-        last_price = _numeric(row.get("mark_price") or row.get("cost_basis"))
+        last_price = _numeric(quote.get("price"), _numeric(row.get("mark_price") or row.get("cost_basis")))
+        market_value = shares * last_price
+        total_market_value += market_value
+        previous_close = _numeric(quote.get("previous_close"))
+        day_change = last_price - previous_close if last_price > 0 and previous_close > 0 else None
+        day_pnl = day_change * shares if day_change is not None else None
+        if day_pnl is not None:
+            total_day_pnl += day_pnl
         positions.append(
             {
-                "symbol": row.get("symbol"),
+                "symbol": symbol,
                 "name": row.get("name", ""),
                 "shares": shares,
                 "avg_cost": avg_cost,
                 "last_price": last_price,
-                "market_value": market_value,
+                "price_source": quote.get("price_source") or "paper_mark",
+                "price_as_of": quote.get("price_as_of"),
+                "previous_close": previous_close if previous_close > 0 else None,
+                "day_change": round(day_change, 4) if day_change is not None else None,
+                "day_change_pct": round(day_change / previous_close, 6) if day_change is not None and previous_close > 0 else None,
+                "day_pnl": round(day_pnl, 2) if day_pnl is not None else None,
+                "market_value": round(market_value, 2),
                 "realized_pnl": 0.0,
-                "unrealized_pnl": (last_price - avg_cost) * shares if last_price and avg_cost else 0.0,
-                "unrealized_pnl_pct": last_price / avg_cost - 1 if last_price > 0 and avg_cost > 0 else None,
+                "unrealized_pnl": round((last_price - avg_cost) * shares, 2) if last_price and avg_cost else 0.0,
+                "unrealized_pnl_pct": round(last_price / avg_cost - 1, 6) if last_price > 0 and avg_cost > 0 else None,
             }
         )
     equity = _numeric(snapshot.get("equity"))
@@ -167,9 +189,10 @@ def get_lineage_paper_positions(plan_id: str, current_user: dict = Depends(get_c
                 "positions": positions,
                 "summary": {
                     "holding_count": len(positions),
-                    "total_market_value": total_market_value,
+                    "total_market_value": round(total_market_value, 2),
                     "total_realized_pnl": 0.0,
                     "total_unrealized_pnl": sum(_numeric(row.get("unrealized_pnl")) for row in positions),
+                    "total_day_pnl": round(total_day_pnl, 2),
                     "equity": equity,
                     "cash": cash,
                 },
