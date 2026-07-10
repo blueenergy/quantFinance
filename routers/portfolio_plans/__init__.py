@@ -484,9 +484,154 @@ def _load_snapshot_with_realtime(
     return snapshot, overlay
 
 
+def _lineage_execution_yyyymmdd(row: Dict[str, Any]) -> str:
+    value = row.get("created_at") or row.get("timestamp") or row.get("updated_at") or ""
+    if isinstance(value, datetime):
+        return value.strftime("%Y%m%d")
+    if isinstance(value, (int, float)):
+        seconds = float(value) / 1000 if float(value) > 1_000_000_000_000 else float(value)
+        return datetime.fromtimestamp(seconds).strftime("%Y%m%d")
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    if text.isdigit():
+        if len(text) == 8:
+            return text
+        if len(text) >= 13:
+            return datetime.fromtimestamp(float(text[:13]) / 1000).strftime("%Y%m%d")
+        if len(text) == 10:
+            return datetime.fromtimestamp(float(text)).strftime("%Y%m%d")
+    return text[:10].replace("-", "")
+
+
+def _load_lineage_close_prices_by_date(
+    data_collections: Dict[str, Any],
+    symbols: List[str],
+    start_date: str,
+    end_date: str,
+) -> Dict[str, Dict[str, float]]:
+    symbol_set = {str(symbol) for symbol in symbols if symbol}
+    symbol_set.update(symbol.split(".", 1)[0] for symbol in list(symbol_set))
+    if not symbol_set or not start_date or not end_date:
+        return {}
+
+    rows = data_collections["volume_price"].find(
+        {
+            "symbol": {"$in": sorted(symbol_set)},
+            "trade_date": {"$gte": start_date, "$lte": end_date},
+        },
+        {"_id": 0, "symbol": 1, "trade_date": 1, "close": 1},
+    )
+    prices_by_date: Dict[str, Dict[str, float]] = {}
+    for row in rows:
+        date = str(row.get("trade_date") or "")
+        symbol = str(row.get("symbol") or "")
+        price = _numeric(row.get("close"))
+        if not date or not symbol or price <= 0:
+            continue
+        prices_by_date.setdefault(date, {})[symbol] = price
+    return prices_by_date
+
+
+def _build_lineage_live_book_daily_rows(
+    trading_collections: Dict[str, Any],
+    finance_collections: Dict[str, Any],
+    data_collections: Dict[str, Any],
+    plan: Dict[str, Any],
+    user_id: str,
+    lineage_ids: List[str],
+    *,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    if not lineage_ids:
+        return []
+
+    plan_rows = list(
+        trading_collections["portfolio_trade_plans"].find(
+            {"user_id": user_id, "plan_id": {"$in": lineage_ids}},
+            {"_id": 0, "plan_id": 1, "base_date": 1},
+        )
+    )
+    first_base_date = min(
+        (
+            normalized
+            for normalized in (_normalize_yyyymmdd(row.get("base_date")) for row in plan_rows)
+            if normalized
+        ),
+        default=_normalize_yyyymmdd(plan.get("base_date")) or "",
+    )
+
+    _bundle_ids, _signals, executions = _lineage_live_signal_execution_bundle(
+        trading_collections, finance_collections, plan, user_id
+    )
+    if not executions:
+        return []
+    execution_dates = {
+        date
+        for date in (_normalize_yyyymmdd(_lineage_execution_yyyymmdd(row)) for row in executions)
+        if date
+    }
+    earliest_execution_date = min(execution_dates, default="")
+    today = datetime.now().strftime("%Y%m%d")
+    default_lower = min(
+        (date for date in (first_base_date, earliest_execution_date) if date),
+        default="",
+    )
+    lower = _normalize_yyyymmdd(start_date) or default_lower
+    upper = _normalize_yyyymmdd(end_date) or today
+    if not lower or not upper or lower > upper:
+        return []
+
+    symbols = sorted({str(row.get("symbol")) for row in executions if row.get("symbol")})
+    prices_by_date = _load_lineage_close_prices_by_date(data_collections, symbols, lower, upper)
+    market_dates = _trading_dates_between(data_collections, lower, upper)
+    date_set = {date for date in market_dates if lower <= date <= upper}
+    date_set.update(date for date in prices_by_date.keys() if lower <= date <= upper)
+    date_set.update(date for date in execution_dates if lower <= date <= upper)
+    if first_base_date and lower <= first_base_date <= upper:
+        date_set.add(first_base_date)
+    dates = sorted(date_set)
+    if not dates:
+        return []
+
+    initial_capital = _lineage_initial_capital(plan)
+    rows: List[Dict[str, Any]] = []
+    for date in dates:
+        executions_to_date = [
+            row
+            for row in executions
+            if (_normalize_yyyymmdd(_lineage_execution_yyyymmdd(row)) or "99999999") <= date
+        ]
+        grouped = group_executions_by_order(executions_to_date)
+        price_map = prices_by_date.get(date, {})
+        payload = build_lineage_live_positions(grouped, price_map, realtime_docs={})
+        summary = payload.get("summary") or {}
+        realized = _numeric(summary.get("total_realized_pnl"))
+        unrealized = _numeric(summary.get("total_unrealized_pnl"))
+        market_value = _numeric(summary.get("total_market_value"))
+        equity = initial_capital + realized + unrealized
+        rows.append(
+            {
+                "date": date,
+                "source": "lineage_live_book_daily",
+                "equity": round(equity, 2),
+                "initial_capital": initial_capital,
+                "cash": round(equity - market_value, 2),
+                "market_value": round(market_value, 2),
+                "realized_pnl": round(realized, 2),
+                "unrealized_pnl": round(unrealized, 2),
+                "execution_count": len(grouped),
+                "lineage_plan_ids": lineage_ids,
+            }
+        )
+    return rows
+
+
 def _build_lineage_live_equity_chart(
     trading_collections: Dict[str, Any],
     finance_collections: Dict[str, Any],
+    data_collections: Dict[str, Any],
     plan: Dict[str, Any],
     user_id: str,
     plan_id: str,
@@ -522,62 +667,6 @@ def _build_lineage_live_equity_chart(
             if str(row.get("securities_account_id") or "")
         }
     )
-
-    account_equity_rows: List[Dict[str, Any]] = []
-    if account_ids:
-        account_query: Dict[str, Any] = {
-            "user_id": user_id,
-            "securities_account_id": {"$in": account_ids},
-        }
-        if date_query:
-            account_query["date"] = date_query
-        raw_account_rows = list(
-            finance_collections["trader_account_equity"].find(account_query).sort("date", 1)
-        )
-        latest_by_account_date: Dict[Tuple[str, str], Dict[str, Any]] = {}
-        for row in raw_account_rows:
-            date = str(row.get("date") or "")
-            account_id = str(row.get("securities_account_id") or "")
-            if not date or not account_id:
-                continue
-            key = (date, account_id)
-            existing = latest_by_account_date.get(key)
-            if existing is None or str(row.get("updated_at") or "") >= str(existing.get("updated_at") or ""):
-                latest_by_account_date[key] = row
-
-        daily_totals: Dict[str, Dict[str, Any]] = {}
-        for (date, account_id), row in latest_by_account_date.items():
-            bucket = daily_totals.setdefault(
-                date,
-                {
-                    "date": date,
-                    "source": "trader_account_equity",
-                    "account_ids": [],
-                    "equity": 0.0,
-                    "cash": 0.0,
-                    "market_value": 0.0,
-                    "available_cash": 0.0,
-                    "updated_at": "",
-                },
-            )
-            bucket["account_ids"].append(account_id)
-            bucket["equity"] += _numeric(row.get("total_asset", row.get("total_assets")))
-            bucket["cash"] += _numeric(row.get("cash"))
-            bucket["market_value"] += _numeric(row.get("market_value"))
-            bucket["available_cash"] += _numeric(row.get("available_cash"))
-            bucket["updated_at"] = max(str(bucket.get("updated_at") or ""), str(row.get("updated_at") or ""))
-
-        account_equity_rows = [
-            {
-                **row,
-                "account_ids": sorted(set(row.get("account_ids") or [])),
-                "equity": round(_numeric(row.get("equity")), 2),
-                "cash": round(_numeric(row.get("cash")), 2),
-                "market_value": round(_numeric(row.get("market_value")), 2),
-                "available_cash": round(_numeric(row.get("available_cash")), 2),
-            }
-            for row in sorted(daily_totals.values(), key=lambda r: str(r.get("date") or ""))
-        ]
 
     query: Dict[str, Any] = {"user_id": user_id, "plan_id": {"$in": lineage_ids}}
     if date_query:
@@ -616,19 +705,29 @@ def _build_lineage_live_equity_chart(
             }
         )
 
-    if account_equity_rows:
-        rows_for_chart = account_equity_rows
-        row_source = "trader_account_equity"
+    daily_rows = _build_lineage_live_book_daily_rows(
+        trading_collections,
+        finance_collections,
+        data_collections,
+        plan,
+        user_id,
+        lineage_ids,
+        start_date=start_date,
+        end_date=end_date,
+    )
+    if daily_rows:
+        rows_for_chart = daily_rows
+        row_source = "lineage_live_book_daily"
         caveat = (
-            "净值曲线使用该组合关联证券账户的每日总资产(total_asset)，按日期聚合；"
-            "横轴为交易日/自然日快照日期，纵轴为账户整体权益。"
+            "净值曲线按当前组合血缘的一本账重建：用同血缘所有 live 成交逐日滚动持仓，"
+            "并按当日收盘价估值；横轴为交易日，纵轴为当前血缘权益，不使用券商账户整体权益。"
         )
     else:
         rows_for_chart = enriched
         row_source = "portfolio_live_equity_legacy"
         caveat = (
-            "未找到该组合关联账户的 trader_account_equity 日快照，暂回退到旧的 "
-            "portfolio_live_equity plan 级快照；建议先生成账户级每日权益快照。"
+            "当前血缘缺少可重建日线所需的成交或行情数据，暂回退到旧的 "
+            "portfolio_live_equity plan 级快照；不使用券商账户整体权益。"
         )
 
     return {

@@ -511,7 +511,7 @@ def get_lineage_live_equity(
     end_date: Optional[str] = Query(default=None),
     current_user: dict = Depends(get_current_user),
 ):
-    """Return daily account equity for the live account(s) behind this lineage."""
+    """Return daily live equity rows for the current portfolio lineage."""
 
     trading_collections = _pp.get_trading_db_collections()
     finance_collections = _pp.get_db_collections()
@@ -522,6 +522,7 @@ def get_lineage_live_equity(
     chart_payload = _pp._build_lineage_live_equity_chart(
         trading_collections,
         finance_collections,
+        data_collections,
         plan,
         user_id,
         plan_id,
@@ -575,7 +576,7 @@ def get_portfolio_plan_live_summary(plan_id: str, current_user: dict = Depends(g
     plan = _pp._require_plan(trading_collections, plan_id, current_user)
 
     chart_payload = _pp._build_lineage_live_equity_chart(
-        trading_collections, finance_collections, plan, user_id, plan_id
+        trading_collections, finance_collections, data_collections, plan, user_id, plan_id
     )
     snapshot, overlay = _pp._load_snapshot_with_realtime(
         trading_collections, finance_collections, data_collections, plan, user_id
