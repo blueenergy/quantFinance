@@ -2623,6 +2623,146 @@ def test_execute_paper_sells_before_buys_avoids_spurious_partial(monkeypatch):
     assert buy_exec["quantity"] == 500
 
 
+def test_execute_paper_falls_back_to_latest_close_when_open_missing(monkeypatch):
+    collections = _collections()
+    plan = {
+        "plan_id": "paper-fallback-close",
+        "strategy_template_id": "s1",
+        "user_id": "user-1",
+        "params_hash": "hash-1",
+        "base_date": "20250102",
+        "execute_date": "20250103",
+        "status": "approved",
+        "params_snapshot": {"initial_capital": 1_000_000, "lot_size": 100},
+    }
+    collections["portfolio_trade_plans"].docs.append(plan)
+    collections["portfolio_trade_plan_items"].docs.append(
+        {
+            "plan_id": "paper-fallback-close",
+            "user_id": "user-1",
+            "symbol": "000001",
+            "name": "平安银行",
+            "rank": 1,
+            "delta_shares": 100,
+        }
+    )
+    data = _data_collections()
+    data["volume_price"].docs.append({"symbol": "000001", "trade_date": "20250102", "open": 10.0, "close": 11.5})
+    monkeypatch.setattr(portfolio_plans, "get_db_collections", lambda: _finance_collections())
+
+    result = portfolio_plans._apply_paper_execution(
+        collections,
+        data_collections=data,
+        plan_id="paper-fallback-close",
+        user_id="user-1",
+    )
+
+    assert result["status"] == "executed_paper"
+    assert result["executions"][0]["price_source"] == "latest_close"
+    assert result["executions"][0]["price_trade_date"] == "20250102"
+    assert result["executions"][0]["price"] == 11.5
+
+
+def test_execute_paper_falls_back_to_estimated_price_when_market_missing(monkeypatch):
+    collections = _collections()
+    plan = {
+        "plan_id": "paper-fallback-estimate",
+        "strategy_template_id": "s1",
+        "user_id": "user-1",
+        "params_hash": "hash-1",
+        "base_date": "20250102",
+        "execute_date": "20250103",
+        "status": "approved",
+        "params_snapshot": {"initial_capital": 1_000_000, "lot_size": 100},
+    }
+    collections["portfolio_trade_plans"].docs.append(plan)
+    collections["portfolio_trade_plan_items"].docs.append(
+        {
+            "plan_id": "paper-fallback-estimate",
+            "user_id": "user-1",
+            "symbol": "000001",
+            "name": "平安银行",
+            "rank": 1,
+            "delta_shares": 100,
+            "estimated_price": 12.3,
+            "price_trade_date": "20250102",
+        }
+    )
+    data = _data_collections()
+    monkeypatch.setattr(portfolio_plans, "get_db_collections", lambda: _finance_collections())
+
+    result = portfolio_plans._apply_paper_execution(
+        collections,
+        data_collections=data,
+        plan_id="paper-fallback-estimate",
+        user_id="user-1",
+    )
+
+    assert result["status"] == "executed_paper"
+    assert result["executions"][0]["price_source"] == "estimated_price"
+    assert result["executions"][0]["price_trade_date"] == "20250102"
+    assert result["executions"][0]["price"] == 12.3
+
+
+def test_execute_paper_partial_when_execution_price_missing(monkeypatch):
+    collections = _collections()
+    plan = {
+        "plan_id": "paper-missing-price",
+        "strategy_template_id": "s1",
+        "user_id": "user-1",
+        "params_hash": "hash-1",
+        "base_date": "20250102",
+        "execute_date": "20250103",
+        "status": "approved",
+        "params_snapshot": {"initial_capital": 1_000_000, "lot_size": 100},
+    }
+    collections["portfolio_trade_plans"].docs.append(plan)
+    collections["portfolio_trade_plan_items"].docs.append(
+        {
+            "plan_id": "paper-missing-price",
+            "user_id": "user-1",
+            "symbol": "000001",
+            "name": "平安银行",
+            "rank": 1,
+            "delta_shares": 100,
+        }
+    )
+    data = _data_collections()
+    monkeypatch.setattr(portfolio_plans, "get_db_collections", lambda: _finance_collections())
+
+    result = portfolio_plans._apply_paper_execution(
+        collections,
+        data_collections=data,
+        plan_id="paper-missing-price",
+        user_id="user-1",
+    )
+
+    assert result["status"] == "partially_executed"
+    assert result["executions"][0]["action"] == "blocked"
+    assert result["executions"][0]["blocker"] == "missing_execution_price"
+
+
+def test_paper_execution_status_ready_without_open_price(monkeypatch):
+    collections = _collections()
+    plan = {
+        "plan_id": "plan-user-1",
+        "user_id": "user-1",
+        "status": "approved",
+        "execute_date": "20250103",
+    }
+    items = [{"symbol": "000001", "delta_shares": 100}]
+    data = _data_collections()
+    data["volume_price"].docs.append({"symbol": "000001", "trade_date": "20250102", "open": 10.0, "close": 11.0})
+
+    status = portfolio_plans._paper_execution_status(collections, data, plan, items)
+
+    assert status["backend_execution_status"] == "ready_for_background_execution"
+    assert status["open_price_ready"] is False
+    assert status["execution_price_ready"] is True
+    assert status["execution_price_fallback_count"] == 1
+    assert status["execution_price_fallback_examples"] == ["000001"]
+
+
 def test_get_portfolio_plan_lineage_equity_returns_combo_rows(monkeypatch):
     collections = _collections()
     collections["portfolio_trade_plans"].docs.extend(

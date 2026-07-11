@@ -15,7 +15,7 @@ time. This keeps unit tests that ``monkeypatch`` those names on the
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -39,6 +39,73 @@ from ._shared import (
 
 
 router = APIRouter()
+
+
+def _load_latest_close_prices_on_or_before(
+    volume_price,
+    symbols: List[str],
+    trade_date: str,
+) -> Tuple[Dict[str, float], Dict[str, str]]:
+    prices: Dict[str, float] = {}
+    price_dates: Dict[str, str] = {}
+    for symbol in symbols:
+        row = volume_price.find_one(
+            {"symbol": symbol, "trade_date": {"$lte": trade_date}},
+            sort=[("trade_date", -1)],
+            projection={"_id": 0, "symbol": 1, "trade_date": 1, "close": 1},
+        )
+        if not row:
+            continue
+        try:
+            price = float(row.get("close"))
+        except (TypeError, ValueError):
+            continue
+        if price > 0:
+            prices[symbol] = price
+            price_dates[symbol] = str(row.get("trade_date") or "")
+    return prices, price_dates
+
+
+def _paper_execution_prices(
+    volume_price,
+    symbols: List[str],
+    execute_date: str,
+    items_by_symbol: Optional[Mapping[str, Mapping[str, Any]]] = None,
+) -> Tuple[Dict[str, float], Dict[str, str], Dict[str, str]]:
+    """Paper-only execution price waterfall: open -> latest close -> estimated."""
+    unique_symbols = sorted({str(symbol) for symbol in symbols if symbol})
+    open_prices = _pp._load_prices(volume_price, unique_symbols, execute_date, "open")
+    close_prices, close_dates = _load_latest_close_prices_on_or_before(volume_price, unique_symbols, execute_date)
+    item_map = items_by_symbol or {}
+
+    prices: Dict[str, float] = {}
+    price_sources: Dict[str, str] = {}
+    price_dates: Dict[str, str] = {}
+    for symbol in unique_symbols:
+        if symbol in open_prices:
+            prices[symbol] = open_prices[symbol]
+            price_sources[symbol] = "open"
+            price_dates[symbol] = execute_date
+            continue
+        if symbol in close_prices:
+            prices[symbol] = close_prices[symbol]
+            price_sources[symbol] = "latest_close"
+            price_dates[symbol] = close_dates.get(symbol, "")
+            continue
+        item = item_map.get(symbol) or {}
+        try:
+            estimated_price = float(item.get("estimated_price"))
+        except (TypeError, ValueError):
+            estimated_price = 0.0
+        if estimated_price > 0:
+            prices[symbol] = estimated_price
+            price_sources[symbol] = "estimated_price"
+            price_dates[symbol] = str(item.get("price_trade_date") or "")
+    return prices, price_sources, price_dates
+
+
+def _items_by_symbol(items: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    return {str(item["symbol"]): item for item in items if item.get("symbol")}
 
 
 @router.post("/plans/{plan_id}/paper-rebalance")
@@ -413,6 +480,7 @@ def _apply_paper_execution(collections: Dict[str, Any], data_collections: Dict[s
     if user_id:
         item_query["user_id"] = user_id
     items = list(collections["portfolio_trade_plan_items"].find(item_query).sort("rank", 1))
+    items_map = _items_by_symbol(items)
     symbols = [item.get("symbol") for item in items if item.get("symbol")]
     execution_symbols = sorted(
         {
@@ -421,18 +489,18 @@ def _apply_paper_execution(collections: Dict[str, Any], data_collections: Dict[s
             if item.get("symbol") and int(item.get("delta_shares", 0) or 0) != 0
         }
     )
-    open_prices = _pp._load_prices(data_collections["volume_price"], symbols, execute_date, "open")
-    missing_open_prices = [symbol for symbol in execution_symbols if symbol not in open_prices]
-    if missing_open_prices:
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                f"开盘价未就绪：execute_date={execute_date}, "
-                f"missing_count={len(missing_open_prices)}, "
-                f"examples={', '.join(missing_open_prices[:10])}"
-            ),
-        )
+    prices, price_sources, price_trade_dates = _paper_execution_prices(
+        data_collections["volume_price"],
+        execution_symbols,
+        execute_date,
+        items_map,
+    )
     close_prices = _pp._load_prices(data_collections["volume_price"], symbols, execute_date, "close")
+    latest_close_prices, _ = _load_latest_close_prices_on_or_before(
+        data_collections["volume_price"],
+        list({symbol for symbol in symbols if symbol not in close_prices}),
+        execute_date,
+    )
     now = datetime.utcnow()
     executions = []
     partial = False
@@ -450,16 +518,22 @@ def _apply_paper_execution(collections: Dict[str, Any], data_collections: Dict[s
         delta = int(item.get("delta_shares", 0) or 0)
         if not symbol or delta == 0:
             continue
-        price = open_prices.get(symbol)
+        price = prices.get(symbol)
         if not price:
-            raise HTTPException(status_code=409, detail=f"开盘价未就绪：{symbol} {execute_date}")
+            executions.append(_execution_doc(plan, item, "blocked", 0, None, 0.0, "missing_execution_price", now))
+            partial = True
+            continue
         current = positions.get(symbol, {"symbol": symbol, "name": item.get("name", ""), "industry": item.get("industry", ""), "shares": 0, "cost_basis": 0.0})
+        price_meta = {
+            "price_source": price_sources.get(symbol),
+            "price_trade_date": price_trade_dates.get(symbol),
+        }
         if delta < 0:
             quantity = min(abs(delta), int(current.get("shares", 0) or 0))
             amount = quantity * price
             cash += amount
             current["shares"] = int(current.get("shares", 0) or 0) - quantity
-            executions.append(_execution_doc(plan, item, "sell", quantity, price, amount, None, now))
+            executions.append(_execution_doc(plan, item, "sell", quantity, price, amount, None, now, **price_meta))
         else:
             quantity = delta
             amount = quantity * price
@@ -469,7 +543,7 @@ def _apply_paper_execution(collections: Dict[str, Any], data_collections: Dict[s
                 amount = quantity * price
                 partial = True
             if quantity <= 0:
-                executions.append(_execution_doc(plan, item, "blocked", 0, price, 0.0, "insufficient_cash", now))
+                executions.append(_execution_doc(plan, item, "blocked", 0, price, 0.0, "insufficient_cash", now, **price_meta))
                 partial = True
                 continue
             cash -= amount
@@ -477,7 +551,7 @@ def _apply_paper_execution(collections: Dict[str, Any], data_collections: Dict[s
             old_cost = float(current.get("cost_basis", 0) or 0)
             current["cost_basis"] = ((old_shares * old_cost) + amount) / (old_shares + quantity) if old_shares + quantity else price
             current["shares"] = old_shares + quantity
-            executions.append(_execution_doc(plan, item, "buy", quantity, price, amount, None, now))
+            executions.append(_execution_doc(plan, item, "buy", quantity, price, amount, None, now, **price_meta))
         if int(current.get("shares", 0) or 0) > 0:
             positions[symbol] = current
         elif symbol in positions:
@@ -486,7 +560,12 @@ def _apply_paper_execution(collections: Dict[str, Any], data_collections: Dict[s
     position_rows = []
     market_value = 0.0
     for symbol, pos in sorted(positions.items()):
-        mark_price = close_prices.get(symbol) or open_prices.get(symbol) or float(pos.get("cost_basis", 0) or 0)
+        mark_price = (
+            close_prices.get(symbol)
+            or latest_close_prices.get(symbol)
+            or prices.get(symbol)
+            or float(pos.get("cost_basis", 0) or 0)
+        )
         value = int(pos.get("shares", 0) or 0) * mark_price
         market_value += value
         position_rows.append({**pos, "mark_price": mark_price, "market_value": value})
@@ -563,8 +642,11 @@ def _paper_execution_status(collections: Dict[str, Any], data_collections: Dict[
     effective_execute_date = execute_date or None
     plan_status = str(plan.get("status") or "")
 
-    missing_symbols: List[str] = []
+    missing_open_symbols: List[str] = []
+    missing_execution_symbols: List[str] = []
+    fallback_symbols: List[str] = []
     missing_execute_date = plan_status == "approved" and not bool(execute_date)
+    execution_price_ready = False
     if plan_status == "approved" and execute_date:
         execution_symbols = sorted(
             {
@@ -573,8 +655,22 @@ def _paper_execution_status(collections: Dict[str, Any], data_collections: Dict[
                 if item.get("symbol") and int(item.get("delta_shares", 0) or 0) != 0
             }
         )
+        items_map = _items_by_symbol(items)
         open_prices = _pp._load_prices(data_collections["volume_price"], execution_symbols, effective_execute_date, "open") if execution_symbols else {}
-        missing_symbols = [symbol for symbol in execution_symbols if symbol not in open_prices]
+        missing_open_symbols = [symbol for symbol in execution_symbols if symbol not in open_prices]
+        prices, price_sources, _ = _paper_execution_prices(
+            data_collections["volume_price"],
+            execution_symbols,
+            str(effective_execute_date).replace("-", ""),
+            items_map,
+        ) if execution_symbols else ({}, {}, {})
+        missing_execution_symbols = [symbol for symbol in execution_symbols if symbol not in prices]
+        fallback_symbols = [
+            symbol
+            for symbol in execution_symbols
+            if symbol in prices and price_sources.get(symbol) in {"latest_close", "estimated_price"}
+        ]
+        execution_price_ready = bool(execution_symbols) and not missing_execution_symbols
 
     should_load_executions = plan_status in {"approved", "executed_paper", "partially_executed"} or bool(plan.get("paper_executed_at"))
     latest_execution = None
@@ -589,7 +685,7 @@ def _paper_execution_status(collections: Dict[str, Any], data_collections: Dict[
     if missing_execute_date:
         backend_status = "missing_execute_date"
     elif plan_status == "approved":
-        backend_status = "waiting_for_open_prices" if missing_symbols else "ready_for_background_execution"
+        backend_status = "ready_for_background_execution"
     elif plan_status in {"executed_paper", "partially_executed"}:
         backend_status = plan_status
     else:
@@ -599,17 +695,34 @@ def _paper_execution_status(collections: Dict[str, Any], data_collections: Dict[
         "execute_date": execute_date,
         "effective_execute_date": effective_execute_date,
         "uses_runtime_execute_date": False,
-        "open_price_ready": bool(execute_date) and not missing_symbols,
+        "open_price_ready": bool(execute_date) and not missing_open_symbols,
+        "execution_price_ready": execution_price_ready,
+        "execution_price_fallback_count": len(fallback_symbols),
+        "execution_price_fallback_examples": fallback_symbols[:10],
         "missing_execute_date": missing_execute_date,
-        "missing_open_price_count": len(missing_symbols),
-        "missing_open_price_examples": missing_symbols[:10],
+        "missing_open_price_count": len(missing_open_symbols),
+        "missing_open_price_examples": missing_open_symbols[:10],
+        "missing_execution_price_count": len(missing_execution_symbols),
+        "missing_execution_price_examples": missing_execution_symbols[:10],
         "backend_execution_status": backend_status,
         "execution_count": execution_count,
         "latest_execution_result": latest_execution,
     }
 
 
-def _execution_doc(plan: Dict[str, Any], item: Dict[str, Any], action: str, quantity: int, price: Optional[float], amount: float, blocker: Optional[str], now: datetime) -> Dict[str, Any]:
+def _execution_doc(
+    plan: Dict[str, Any],
+    item: Dict[str, Any],
+    action: str,
+    quantity: int,
+    price: Optional[float],
+    amount: float,
+    blocker: Optional[str],
+    now: datetime,
+    *,
+    price_source: Optional[str] = None,
+    price_trade_date: Optional[str] = None,
+) -> Dict[str, Any]:
     return {
         "execution_id": str(uuid.uuid4()),
         "plan_id": plan["plan_id"],
@@ -622,6 +735,8 @@ def _execution_doc(plan: Dict[str, Any], item: Dict[str, Any], action: str, quan
         "price": price,
         "amount": amount,
         "blocker": blocker,
+        "price_source": price_source,
+        "price_trade_date": price_trade_date,
         "execute_date": plan.get("execute_date"),
         "created_at": now,
     }
