@@ -5,6 +5,7 @@ import os
 import re
 import sys
 import time
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -15,6 +16,7 @@ from auth import get_current_active_user
 from db import get_analyzer_db, get_data_db, get_db_collections
 from routers.stock import _json_safe, _symbol_candidates
 from services.analysis_history import build_user_analysis_history_payload
+from services.analysis_tasks import build_task_doc
 from services.portfolio_symbol_risk import build_workbench_swot_section
 from services.valuation import VALUATION_SOURCE, build_stock_valuation
 try:
@@ -1912,4 +1914,105 @@ def get_stock_workbench_signals(
     return {
         "success": True,
         "data": _json_safe(payload),
+    }
+
+
+@router.post("/{symbol}/workbench/signals/collect")
+def collect_stock_workbench_signals(
+    symbol: str,
+    current_user: Dict[str, Any] = Depends(get_current_active_user),
+):
+    """Enqueue one-symbol evidence collection and O/T ledger analysis."""
+    collections = get_db_collections()
+    analysis_tasks = collections.get("analysis_tasks")
+    if analysis_tasks is None:
+        raise HTTPException(status_code=503, detail="analysis task queue unavailable")
+
+    stock = _stock_identity(symbol)
+    canonical = str(stock.get("symbol") or symbol).strip().upper()
+    user_id = str(current_user.get("id") or current_user.get("username") or "")
+    existing = analysis_tasks.find_one(
+        {
+            "type": "portfolio_risk_llm",
+            "user_id": user_id,
+            "params.target_scope": "workbench",
+            "params.items.symbol": canonical,
+            "status": {"$in": ["pending", "processing"]},
+        },
+        sort=[("created_at", -1)],
+    )
+    if existing:
+        return {
+            "success": True,
+            "data": {
+                "task_id": str(existing.get("_id") or ""),
+                "status": existing.get("status") or "pending",
+                "reused": True,
+            },
+        }
+
+    industry = str(stock.get("industry") or "未分类").strip() or "未分类"
+    run_id = str(uuid.uuid4())
+    as_of = datetime.utcnow().strftime("%Y%m%d")
+    params = {
+        "plan_id": f"workbench:{canonical}",
+        "run_id": run_id,
+        "target_scope": "workbench",
+        "base_date": as_of,
+        "score_date": as_of,
+        "industry": industry,
+        "chunk_index": 0,
+        "chunk_count": 1,
+        "emit_industry_scope": False,
+        "items": [
+            {
+                "symbol": canonical,
+                "name": stock.get("name") or canonical,
+                "industry": industry,
+                "action": "research",
+                "weight": None,
+                "score_value": None,
+                "rules_risk": None,
+            }
+        ],
+        "industry_context": {
+            "total_weight": 0.0,
+            "industries": [
+                {
+                    "industry": industry,
+                    "symbol_count": 1,
+                    "weight": 0.0,
+                    "symbols": [canonical],
+                }
+            ],
+        },
+        "options": {
+            "taxonomy_level": "sw1",
+            "prompt_version": "v1",
+            "force": False,
+        },
+    }
+    task = build_task_doc(
+        current_user=current_user,
+        task_type="portfolio_risk_llm",
+        priority=10,
+        symbol=canonical,
+        stock_name=stock.get("name"),
+        params=params,
+        source="stock_workbench_swot",
+        extra_fields={
+            "operation_type": "workbench_llm_risk_review",
+            "idempotency_key": f"workbench:{canonical}:{run_id}",
+        },
+    )
+    result = analysis_tasks.insert_one(task)
+    task_id = str(getattr(result, "inserted_id", "") or "")
+    return {
+        "success": True,
+        "data": {
+            "task_id": task_id,
+            "run_id": run_id,
+            "status": "pending",
+            "reused": False,
+        },
     }

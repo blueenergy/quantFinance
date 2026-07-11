@@ -17,6 +17,7 @@ from routers.stock_workbench import (
     _trading_section,
     _valuation_section,
     _valuation_status,
+    collect_stock_workbench_signals,
     get_stock_workbench,
     get_stock_workbench_signals,
 )
@@ -1456,3 +1457,74 @@ def test_get_stock_workbench_signals_returns_swot_payload(monkeypatch):
     assert response["data"]["swot"]["opportunity"]["findings"][0]["summary"] == "业绩超预期"
     assert response["data"]["swot"]["threat"]["findings"][0]["severity"] == "high"
     assert response["data"]["data_status"]["found"] is True
+
+
+def test_collect_stock_workbench_signals_enqueues_single_symbol_task(monkeypatch):
+    class _InsertResult:
+        inserted_id = "task-1"
+
+    class _Tasks:
+        def __init__(self):
+            self.inserted = []
+
+        def find_one(self, query, sort=None):
+            return None
+
+        def insert_one(self, doc):
+            self.inserted.append(doc)
+            return _InsertResult()
+
+    tasks = _Tasks()
+    monkeypatch.setattr(
+        "routers.stock_workbench.get_db_collections",
+        lambda: {"analysis_tasks": tasks},
+    )
+    monkeypatch.setattr(
+        "routers.stock_workbench._stock_identity",
+        lambda symbol: {
+            "symbol": "000001.SZ",
+            "name": "平安银行",
+            "industry": "银行",
+        },
+    )
+
+    response = collect_stock_workbench_signals(
+        "000001",
+        current_user={"id": "u1", "username": "tester"},
+    )
+
+    assert response["data"]["task_id"] == "task-1"
+    assert response["data"]["status"] == "pending"
+    assert response["data"]["reused"] is False
+    task = tasks.inserted[0]
+    assert task["type"] == "portfolio_risk_llm"
+    assert task["source"] == "stock_workbench_swot"
+    assert task["params"]["target_scope"] == "workbench"
+    assert task["params"]["emit_industry_scope"] is False
+    assert task["params"]["items"][0]["symbol"] == "000001.SZ"
+
+
+def test_collect_stock_workbench_signals_reuses_running_task(monkeypatch):
+    class _Tasks:
+        def find_one(self, query, sort=None):
+            return {"_id": "task-running", "status": "processing"}
+
+    monkeypatch.setattr(
+        "routers.stock_workbench.get_db_collections",
+        lambda: {"analysis_tasks": _Tasks()},
+    )
+    monkeypatch.setattr(
+        "routers.stock_workbench._stock_identity",
+        lambda symbol: {"symbol": "600519.SH", "name": "贵州茅台", "industry": "食品饮料"},
+    )
+
+    response = collect_stock_workbench_signals(
+        "600519.SH",
+        current_user={"id": "u1"},
+    )
+
+    assert response["data"] == {
+        "task_id": "task-running",
+        "status": "processing",
+        "reused": True,
+    }
