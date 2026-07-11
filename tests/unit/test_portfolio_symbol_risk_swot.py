@@ -10,6 +10,10 @@ class _Ledger:
         self.calls.append(list(symbols))
         return {symbol: list(self.grouped.get(symbol, [])) for symbol in symbols}
 
+    def get_active_for_industries(self, industries):
+        self.calls.append(list(industries))
+        return {industry: list(self.grouped.get(industry, [])) for industry in industries}
+
 
 class _Reviews:
     def __init__(self, reviews):
@@ -114,3 +118,52 @@ def test_build_workbench_swot_section_empty_when_no_ledger_rows(monkeypatch):
     assert payload["swot"]["threat"]["severity"] == "none"
     assert payload["swot"]["opportunity"]["strength"] == "none"
     assert payload["swot"]["strength"]["status"] == "planned"
+
+
+def test_build_workbench_swot_section_includes_industry_references(monkeypatch):
+    risk_ledger = _Ledger(
+        {
+            "玻璃": [
+                {
+                    "finding_key": "industry-risk-1",
+                    "severity": "low",
+                    "summary": "原材料价格波动",
+                }
+            ]
+        }
+    )
+    opportunity_ledger = _Ledger(
+        {
+            "玻璃": [
+                {
+                    "finding_key": "industry-opp-1",
+                    "strength": "low",
+                    "summary": "玻纤行业景气修复",
+                }
+            ]
+        }
+    )
+    monkeypatch.setattr(
+        "services.portfolio_symbol_risk.get_symbol_risk_ledger",
+        lambda db=None: risk_ledger,
+    )
+    monkeypatch.setattr(
+        "services.portfolio_symbol_risk.get_symbol_opportunity_ledger",
+        lambda db=None: opportunity_ledger,
+    )
+    monkeypatch.setattr(
+        "services.portfolio_symbol_risk.get_symbol_signal_reviews",
+        lambda db=None: _Reviews({}),
+    )
+    monkeypatch.setattr(
+        "services.portfolio_symbol_risk.opportunity_ledger_read_enabled",
+        lambda: True,
+    )
+
+    payload = build_workbench_swot_section("300196.SZ", industry="玻璃")
+
+    reference = payload["industry_signal_reference"]
+    assert reference["industry"] == "玻璃"
+    assert reference["data_status"]["found"] is True
+    assert reference["opportunity"]["findings"][0]["summary"] == "玻纤行业景气修复"
+    assert reference["threat"]["findings"][0]["summary"] == "原材料价格波动"

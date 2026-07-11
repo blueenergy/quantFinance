@@ -1443,10 +1443,20 @@ def test_get_stock_workbench_signals_returns_swot_payload(monkeypatch):
             "threat_count": 1,
             "opportunity_count": 1,
         },
+        "industry_signal_reference": {
+            "industry": "银行",
+            "opportunity": {"findings": []},
+            "threat": {"findings": []},
+            "data_status": {"found": False},
+        },
     }
     monkeypatch.setattr(
+        "routers.stock_workbench._stock_identity",
+        lambda symbol: {"symbol": "000001.SZ", "industry": "银行"},
+    )
+    monkeypatch.setattr(
         "routers.stock_workbench.build_workbench_swot_section",
-        lambda symbol: payload,
+        lambda symbol, industry=None: payload,
     )
 
     response = get_stock_workbench_signals("000001.SZ", current_user={"id": "u1"})
@@ -1456,6 +1466,7 @@ def test_get_stock_workbench_signals_returns_swot_payload(monkeypatch):
     assert response["data"]["swot"]["strength"]["status"] == "planned"
     assert response["data"]["swot"]["opportunity"]["findings"][0]["summary"] == "业绩超预期"
     assert response["data"]["swot"]["threat"]["findings"][0]["severity"] == "high"
+    assert response["data"]["industry_signal_reference"]["industry"] == "银行"
     assert response["data"]["data_status"]["found"] is True
 
 

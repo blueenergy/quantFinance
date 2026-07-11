@@ -1910,7 +1910,11 @@ def get_stock_workbench_signals(
     current_user: Dict[str, Any] = Depends(get_current_active_user),
 ):
     """Canonical SWOT signals section (O/T from ledger; S/W reserved)."""
-    payload = build_workbench_swot_section(symbol)
+    stock = _stock_identity(symbol)
+    payload = build_workbench_swot_section(
+        stock.get("symbol") or symbol,
+        industry=stock.get("industry"),
+    )
     return {
         "success": True,
         "data": _json_safe(payload),

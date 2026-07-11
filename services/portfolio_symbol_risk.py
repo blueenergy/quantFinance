@@ -288,10 +288,16 @@ def _symbol_candidates_for_ledger(symbol: str) -> List[str]:
     return list(dict.fromkeys([canonical, *_symbol_candidates(symbol)]))
 
 
-def build_workbench_swot_section(symbol: str, db=None) -> Dict[str, Any]:
+def build_workbench_swot_section(
+    symbol: str,
+    db=None,
+    *,
+    industry: Optional[str] = None,
+) -> Dict[str, Any]:
     """Canonical per-symbol SWOT read model for the stock workbench."""
     candidates = _symbol_candidates_for_ledger(symbol)
     canonical = candidates[0] if candidates else str(symbol or "").strip().upper()
+    industry_name = str(industry or "").strip()
 
     risk_rows: List[Dict[str, Any]] = []
     opportunity_rows: List[Dict[str, Any]] = []
@@ -299,6 +305,7 @@ def build_workbench_swot_section(symbol: str, db=None) -> Dict[str, Any]:
     grouped_risks = risk_ledger.get_active_for_symbols(candidates)
     for cand in candidates:
         risk_rows.extend(grouped_risks.get(cand, []))
+    opp_ledger = None
     if opportunity_ledger_read_enabled():
         opp_ledger = get_symbol_opportunity_ledger(db)
         grouped_opportunities = opp_ledger.get_active_for_symbols(candidates)
@@ -307,6 +314,17 @@ def build_workbench_swot_section(symbol: str, db=None) -> Dict[str, Any]:
 
     risk_rows = _dedupe_active_findings(risk_rows)
     opportunity_rows = _dedupe_active_findings(opportunity_rows)
+
+    industry_risk_rows: List[Dict[str, Any]] = []
+    industry_opportunity_rows: List[Dict[str, Any]] = []
+    if industry_name:
+        industry_risk_rows = _dedupe_active_findings(
+            risk_ledger.get_active_for_industries([industry_name]).get(industry_name, [])
+        )
+        if opp_ledger is not None:
+            industry_opportunity_rows = _dedupe_active_findings(
+                opp_ledger.get_active_for_industries([industry_name]).get(industry_name, [])
+            )
 
     reviews = get_symbol_signal_reviews(db).get_latest_reviews(candidates)
     signal_review = None
@@ -318,6 +336,8 @@ def build_workbench_swot_section(symbol: str, db=None) -> Dict[str, Any]:
 
     threat = build_llm_payload_from_ledger_findings(risk_rows)
     opportunity = build_opportunity_payload_from_ledger_findings(opportunity_rows)
+    industry_threat = build_llm_payload_from_ledger_findings(industry_risk_rows)
+    industry_opportunity = build_opportunity_payload_from_ledger_findings(industry_opportunity_rows)
     empty_quadrant = {"status": "planned", "summary": "", "findings": []}
     found = bool(risk_rows or opportunity_rows or signal_review)
     latest_as_of = None
@@ -335,6 +355,17 @@ def build_workbench_swot_section(symbol: str, db=None) -> Dict[str, Any]:
             "weakness": dict(empty_quadrant),
             "opportunity": opportunity,
             "threat": threat,
+        },
+        "industry_signal_reference": {
+            "industry": industry_name,
+            "opportunity": industry_opportunity,
+            "threat": industry_threat,
+            "data_status": {
+                "found": bool(industry_risk_rows or industry_opportunity_rows),
+                "threat_count": len(industry_threat.get("findings") or []),
+                "opportunity_count": len(industry_opportunity.get("findings") or []),
+                "source": "quant_analyzer.industry_risk_findings + industry_opportunity_findings",
+            },
         },
         "data_status": {
             "found": found,
