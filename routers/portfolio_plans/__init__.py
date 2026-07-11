@@ -5836,6 +5836,14 @@ def _enrich_plan_items_with_overlay(
         numeric=_numeric,
         int_value=_int_value,
         symbol_key=_symbol_key,
+        score_context={
+            "score_type": params.get("score_type") or "growth_cycle_weighted",
+            "score_column": params.get("score_column"),
+            "growth_weight": params.get("growth_weight", 0.3),
+            "cycle_weight": params.get("cycle_weight", 0.7),
+            "universe_index": universe_index,
+            "top_n": top_n,
+        },
     )
 
 

@@ -1,3 +1,5 @@
+import pytest
+
 from services.portfolio_plan_market import (
     PRICE_SOURCE_DAILY_CLOSE,
     PRICE_SOURCE_NONE,
@@ -69,6 +71,7 @@ def test_quote_prefers_realtime_when_fresher():
     assert quote["price_source"] == PRICE_SOURCE_REALTIME
     assert quote["price"] == 10.2
     assert quote["previous_close"] is None
+    assert quote["daily_change_pct"] == pytest.approx(5.5555555556)
     assert quote["is_stale"] is False
 
 
@@ -139,7 +142,7 @@ def test_market_price_quotes_batches_via_aggregation():
     assert realtime.find_one_called == 0
 
 
-def test_reprice_uses_target_weight_and_equity():
+def test_reprice_preserves_plan_delta_instead_of_resizing_by_weight():
     items = [
         {
             "symbol": "600000",
@@ -183,9 +186,53 @@ def test_reprice_uses_target_weight_and_equity():
         symbol_key=lambda value: str(value),
         available_cash=500_000,
     )
-    assert repriced[0]["target_shares"] == 5000
-    assert repriced[0]["delta_shares"] == 5000
+    assert repriced[0]["target_shares"] == 100
+    assert repriced[0]["delta_shares"] == 100
     assert repriced[0]["estimated_price"] == 20.0
+    assert repriced[0]["estimated_amount"] == 2000.0
+    assert summary["blockers"] == []
+
+
+def test_reprice_keeps_unchanged_star_hold_without_min_order_blocker():
+    items = [
+        {
+            "symbol": "688629.SH",
+            "target_weight": 0.12,
+            "target_shares": 600,
+            "delta_shares": 0,
+            "current_shares": 600,
+            "estimated_price": 200.0,
+        }
+    ]
+    quotes = {
+        "688629.SH": {
+            "price": 220.0,
+            "price_source": PRICE_SOURCE_REALTIME,
+            "price_as_of": "2026-07-10T15:00:00",
+            "is_stale": False,
+        }
+    }
+
+    repriced, summary = reprice_plan_items_for_publish(
+        plan={},
+        items=items,
+        quotes=quotes,
+        equity=1_000_000,
+        lot_size=100,
+        account_positions_by_key={},
+        account_positions_synced=False,
+        normalize_live_target_shares=lambda current, requested, lot: (requested, []),
+        int_value=lambda value, default=0: int(value or default),
+        numeric=lambda value: float(value or 0),
+        symbol_key=lambda value: str(value),
+        available_cash=500_000,
+    )
+
+    assert repriced[0]["current_shares"] == 600
+    assert repriced[0]["target_shares"] == 600
+    assert repriced[0]["delta_shares"] == 0
+    assert repriced[0]["action"] == "hold"
+    assert repriced[0]["blockers"] == []
     assert summary["blockers"] == []
 
 
@@ -369,11 +416,20 @@ def test_overlay_attaches_price_and_rank_drift():
         numeric=lambda value: float(value or 0),
         int_value=lambda value, default=0: int(value or default),
         symbol_key=lambda value: str(value),
+        score_context={
+            "score_type": "growth_cycle_weighted",
+            "growth_weight": 0.3,
+            "cycle_weight": 0.7,
+            "universe_index": "csi500",
+        },
     )
     assert enriched[0]["price_drift_pct"] == 10.0
+    assert enriched[0]["daily_change_pct"] is None
     assert enriched[0]["latest_rank"] == 5
     assert enriched[0]["rank_delta"] == -2
     assert overlay["score_snapshot_stale"] is True
+    assert overlay["score_context"]["universe_index"] == "csi500"
+    assert overlay["score_context"]["growth_weight"] == 0.3
 
 
 def test_overlay_does_not_mark_dropped_when_latest_rank_unavailable():

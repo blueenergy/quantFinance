@@ -23,6 +23,16 @@ def _first_positive_float(*values: Any) -> Optional[float]:
     return None
 
 
+def _first_float(*values: Any) -> Optional[float]:
+    for value in values:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            continue
+        return number
+    return None
+
+
 def _market_doc_yyyymmdd(doc: Optional[Dict[str, Any]]) -> str:
     if not doc:
         return ""
@@ -90,6 +100,12 @@ def _quote_from_docs(
     )
     daily_date = _market_doc_yyyymmdd(daily_doc)
     realtime_date = _market_doc_yyyymmdd(realtime_doc)
+    daily_change = daily_price - daily_pre_close if daily_price is not None and daily_pre_close else None
+    daily_change_pct = (
+        daily_change / daily_pre_close * 100.0
+        if daily_change is not None and daily_pre_close
+        else _first_float((daily_doc or {}).get("pct_chg"), (daily_doc or {}).get("pct_change"))
+    )
     use_realtime = bool(
         realtime_doc
         and realtime_price
@@ -112,6 +128,8 @@ def _quote_from_docs(
             "price_source": PRICE_SOURCE_REALTIME,
             "price_as_of": _price_as_of_from_doc(realtime_doc, source=PRICE_SOURCE_REALTIME),
             "is_stale": False,
+            "daily_change": daily_change,
+            "daily_change_pct": daily_change_pct,
             "realtime_doc": realtime_doc,
             "daily_doc": daily_doc,
         }
@@ -123,6 +141,8 @@ def _quote_from_docs(
             "price_source": PRICE_SOURCE_DAILY_CLOSE,
             "price_as_of": _price_as_of_from_doc(daily_doc, source=PRICE_SOURCE_DAILY_CLOSE),
             "is_stale": True,
+            "daily_change": daily_change,
+            "daily_change_pct": daily_change_pct,
             "realtime_doc": realtime_doc,
             "daily_doc": daily_doc,
         }
@@ -133,12 +153,25 @@ def _quote_from_docs(
         "price_source": PRICE_SOURCE_NONE,
         "price_as_of": None,
         "is_stale": True,
+        "daily_change": None,
+        "daily_change_pct": None,
         "realtime_doc": realtime_doc,
         "daily_doc": daily_doc,
     }
 
 
-_DAILY_QUOTE_FIELDS = ("symbol", "trade_date", "date", "close", "pre_close", "prev_close", "previous_close")
+_DAILY_QUOTE_FIELDS = (
+    "symbol",
+    "trade_date",
+    "date",
+    "close",
+    "pre_close",
+    "prev_close",
+    "previous_close",
+    "change",
+    "pct_chg",
+    "pct_change",
+)
 _REALTIME_QUOTE_FIELDS = (
     "symbol",
     "trade_date",
@@ -298,14 +331,6 @@ def quotes_to_prices_and_realtime_docs(
     return prices, realtime_docs
 
 
-def _round_lot_target_shares(target_amount: float, price: float, lot_size: int) -> int:
-    if price <= 0 or target_amount <= 0:
-        return 0
-    lot = max(1, int(lot_size or 1))
-    shares = int(target_amount / price)
-    return (shares // lot) * lot
-
-
 def _item_action(current_shares: int, target_shares: int, delta_shares: int) -> str:
     if delta_shares > 0:
         return "buy"
@@ -346,7 +371,6 @@ def reprice_plan_items_for_publish(
         quote = quotes.get(symbol) or {}
         price_source = str(quote.get("price_source") or PRICE_SOURCE_NONE)
         live_price = quote.get("price")
-        target_weight = numeric(item.get("target_weight"))
         planned_delta = int_value(item.get("delta_shares"))
         account_pos = account_positions_by_key.get(symbol_key(symbol)) or {"current": 0, "available": 0}
         # current_shares is the plan/lineage book holding (carried on the item by
@@ -356,13 +380,14 @@ def reprice_plan_items_for_publish(
         # does not own. account positions are consulted only to cap sells to the
         # broker-available quantity (see ``account_positions_synced`` blocks below).
         current_shares = int_value(item.get("current_shares"))
+        planned_target = int_value(item.get("target_shares"))
         if live_price is None or float(live_price) <= 0:
             # A pure sell-to-zero can still be published as a market order when
-            # the latest price is unavailable. Buys / target-weight positions need
-            # a price to compute target shares and must be blocked before publish.
-            can_publish_market_sell = planned_delta < 0 and target_weight <= 0
+            # the latest price is unavailable. Other planned trades need a price
+            # for amount/cash checks and must be blocked before publish.
+            can_publish_market_sell = planned_delta < 0 and planned_target == 0
             needs_price = not can_publish_market_sell and (
-                (target_weight > 0 and equity_value > 0) or planned_delta != 0
+                planned_delta != 0 or planned_target != current_shares
             )
             if needs_price:
                 missing_price_symbols.append(symbol)
@@ -381,7 +406,7 @@ def reprice_plan_items_for_publish(
                     }
                 )
                 continue
-            target_shares = int_value(item.get("target_shares"))
+            target_shares = planned_target
             delta = target_shares - current_shares
             item_blockers: List[str] = []
             if delta < 0 and account_positions_synced:
@@ -418,12 +443,7 @@ def reprice_plan_items_for_publish(
             continue
         if price_source == PRICE_SOURCE_DAILY_CLOSE:
             stale_price_symbols.append(symbol)
-        if target_weight <= 0 and int_value(item.get("target_shares")) == 0:
-            requested_target = 0
-        elif target_weight > 0 and equity_value > 0:
-            requested_target = _round_lot_target_shares(target_weight * equity_value, float(live_price), lot)
-        else:
-            requested_target = int_value(item.get("target_shares"))
+        requested_target = planned_target
         if is_star_market(symbol):
             # STAR (科创板) single orders must be >= 200 shares; the injected
             # normalize callback only round-lots, so enforce the board rule here.
@@ -560,6 +580,7 @@ def attach_plan_item_overlay(
     numeric: Callable[[Any], float],
     int_value: Callable[[Any, int], int],
     symbol_key: Callable[[Any], str],
+    score_context: Optional[Dict[str, Any]] = None,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     rank_by_key = {symbol_key(row["symbol"]): row for row in latest_ranked}
     enriched: List[Dict[str, Any]] = []
@@ -594,6 +615,8 @@ def attach_plan_item_overlay(
                 "live_price_as_of": quote.get("price_as_of"),
                 "live_price_is_stale": bool(quote.get("is_stale")),
                 "price_drift_pct": price_drift_pct,
+                "daily_change": quote.get("daily_change"),
+                "daily_change_pct": quote.get("daily_change_pct"),
                 "live_market_value": live_market_value,
                 "plan_market_value": plan_market_value,
                 "latest_score": latest_score,
@@ -614,6 +637,7 @@ def attach_plan_item_overlay(
         "score_snapshot_stale": score_stale,
         "score_snapshot_age_days": _score_age_days(plan_score_date, latest_score_date),
         "top_n": top_n,
+        "score_context": dict(score_context or {}),
     }
     return enriched, plan_overlay
 

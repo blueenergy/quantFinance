@@ -1889,7 +1889,7 @@ def test_publish_live_signals_dry_run_builds_contract(monkeypatch):
     assert len(response["data"]["reprice_summary"]["items"]) == 2
 
 
-def test_publish_live_signals_uses_plan_equity_not_account_total_asset(monkeypatch):
+def test_publish_live_signals_preserves_generated_delta_with_plan_equity(monkeypatch):
     collections = _collections()
     collections["portfolio_trade_plans"].docs[0].update(
         {
@@ -1928,8 +1928,8 @@ def test_publish_live_signals_uses_plan_equity_not_account_total_asset(monkeypat
     assert response["data"]["reprice_summary"]["equity_used"] == 1_200_000
     assert response["data"]["reprice_summary"]["account_equity"] == 5_000_000
     row = response["data"]["reprice_summary"]["items"][0]
-    assert row["new_target_shares"] == 12_000
-    assert row["new_delta_shares"] == 12_000
+    assert row["new_target_shares"] == 100
+    assert row["new_delta_shares"] == 100
 
 
 def test_publish_live_signals_falls_back_to_initial_capital_when_plan_baseline_missing(monkeypatch):
@@ -1973,8 +1973,8 @@ def test_publish_live_signals_falls_back_to_initial_capital_when_plan_baseline_m
     assert response["data"]["reprice_summary"]["plan_equity_source"] == "params_snapshot.initial_capital"
     assert response["data"]["reprice_summary"]["plan_cash_source"] == "params_snapshot.initial_capital"
     row = response["data"]["reprice_summary"]["items"][0]
-    assert row["new_target_shares"] == 3_000
-    assert row["new_delta_shares"] == 3_000
+    assert row["new_target_shares"] == 100
+    assert row["new_delta_shares"] == 100
 
 
 def test_publish_live_signals_blocks_confirm_when_plan_capital_missing(monkeypatch):
