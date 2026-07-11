@@ -18,6 +18,7 @@ from routers.stock_workbench import (
     _valuation_section,
     _valuation_status,
     get_stock_workbench,
+    get_stock_workbench_signals,
 )
 
 
@@ -1397,3 +1398,61 @@ def test_trading_section_merges_user_context(monkeypatch):
     assert section["positions"][0]["quantity"] == 100
     assert section["recent_signals"][0]["action"] == "buy"
     assert section["data_status"]["found"] is True
+
+
+def test_workbench_main_includes_lazy_signals_section_status(monkeypatch):
+    data = {
+        "stock_info": _Collection([]),
+        "stock_basic": _Collection([]),
+        "volume_price_realtime_latest": _Collection([]),
+        "volume_price": _Collection([]),
+    }
+    monkeypatch.setattr("routers.stock_workbench.get_data_db", lambda: data)
+    monkeypatch.setattr("routers.stock_workbench.get_db_collections", lambda: {"stock_scores": _Collection([])})
+
+    response = get_stock_workbench("000001.SZ", current_user={"id": "u1"})
+
+    signals = response["data"]["data_status"]["sections"]["signals"]
+    assert signals["found"] is False
+    assert "SWOT" in signals["expected_freshness"]
+    assert "symbol_risk_findings" in signals["source"]
+
+
+def test_get_stock_workbench_signals_returns_swot_payload(monkeypatch):
+    payload = {
+        "symbol": "000001.SZ",
+        "signal_review": {"analyzed_at": "2026-07-10T12:00:00"},
+        "swot": {
+            "strength": {"status": "planned", "summary": "", "findings": []},
+            "weakness": {"status": "planned", "summary": "", "findings": []},
+            "opportunity": {
+                "strength": "medium",
+                "summary": "业绩超预期",
+                "findings": [{"finding_key": "opp-1", "strength": "medium", "summary": "业绩超预期"}],
+            },
+            "threat": {
+                "severity": "high",
+                "summary": "监管调查",
+                "findings": [{"finding_key": "risk-1", "severity": "high", "summary": "监管调查"}],
+            },
+        },
+        "data_status": {
+            "found": True,
+            "as_of": "2026-07-10T12:00:00",
+            "threat_count": 1,
+            "opportunity_count": 1,
+        },
+    }
+    monkeypatch.setattr(
+        "routers.stock_workbench.build_workbench_swot_section",
+        lambda symbol: payload,
+    )
+
+    response = get_stock_workbench_signals("000001.SZ", current_user={"id": "u1"})
+
+    assert response["success"] is True
+    assert response["data"]["symbol"] == "000001.SZ"
+    assert response["data"]["swot"]["strength"]["status"] == "planned"
+    assert response["data"]["swot"]["opportunity"]["findings"][0]["summary"] == "业绩超预期"
+    assert response["data"]["swot"]["threat"]["findings"][0]["severity"] == "high"
+    assert response["data"]["data_status"]["found"] is True

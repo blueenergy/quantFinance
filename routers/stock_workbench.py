@@ -15,6 +15,7 @@ from auth import get_current_active_user
 from db import get_analyzer_db, get_data_db, get_db_collections
 from routers.stock import _json_safe, _symbol_candidates
 from services.analysis_history import build_user_analysis_history_payload
+from services.portfolio_symbol_risk import build_workbench_swot_section
 from services.valuation import VALUATION_SOURCE, build_stock_valuation
 try:
     from stock_data_access.indicators.nineturn import enrich_nineturn_signals, latest_signal_summary
@@ -1730,6 +1731,11 @@ def get_stock_workbench(
                 expected_freshness="进入股东筹码页签后按需加载",
                 source="quant_data.stk_holdernumber/hk_hold/stk_holdertrade/share_float/repurchase",
             ),
+            "signals": _section_status(
+                found=False,
+                expected_freshness="进入 SWOT 页签后按需加载",
+                source="quant_analyzer.symbol_risk_findings + symbol_opportunity_findings",
+            ),
         },
     }
 
@@ -1893,4 +1899,17 @@ def get_stock_workbench_shareholders(
     return {
         "success": True,
         "data": _json_safe(_shareholder_section(symbol)),
+    }
+
+
+@router.get("/{symbol}/workbench/signals")
+def get_stock_workbench_signals(
+    symbol: str,
+    current_user: Dict[str, Any] = Depends(get_current_active_user),
+):
+    """Canonical SWOT signals section (O/T from ledger; S/W reserved)."""
+    payload = build_workbench_swot_section(symbol)
+    return {
+        "success": True,
+        "data": _json_safe(payload),
     }

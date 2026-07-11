@@ -12,6 +12,7 @@ from stock_data_access.symbol_risk import (
 )
 from stock_data_access.symbol_opportunity import SymbolOpportunityLedgerAccess
 from stock_data_access.symbol_signal_review import SymbolLlmSignalReviewAccess
+from utils.symbol_utils import normalize_symbol
 
 _SEVERITY_ORDER = {"none": 0, "low": 1, "medium": 2, "high": 3}
 
@@ -266,6 +267,84 @@ def symbols_with_ledger_coverage(symbols: Sequence[str], db=None) -> bool:
     ledger = get_symbol_risk_ledger(db)
     grouped = ledger.get_active_for_symbols(symbols)
     return any(grouped.get(str(sym)) for sym in symbols if sym)
+
+
+def _dedupe_active_findings(rows: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    seen = set()
+    result: List[Dict[str, Any]] = []
+    for row in rows:
+        key = str(row.get("finding_key") or row.get("summary") or "")
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        result.append(row)
+    return result
+
+
+def _symbol_candidates_for_ledger(symbol: str) -> List[str]:
+    from routers.stock import _symbol_candidates
+
+    canonical = normalize_symbol(symbol)
+    return list(dict.fromkeys([canonical, *_symbol_candidates(symbol)]))
+
+
+def build_workbench_swot_section(symbol: str, db=None) -> Dict[str, Any]:
+    """Canonical per-symbol SWOT read model for the stock workbench."""
+    candidates = _symbol_candidates_for_ledger(symbol)
+    canonical = candidates[0] if candidates else str(symbol or "").strip().upper()
+
+    risk_rows: List[Dict[str, Any]] = []
+    opportunity_rows: List[Dict[str, Any]] = []
+    risk_ledger = get_symbol_risk_ledger(db)
+    grouped_risks = risk_ledger.get_active_for_symbols(candidates)
+    for cand in candidates:
+        risk_rows.extend(grouped_risks.get(cand, []))
+    if opportunity_ledger_read_enabled():
+        opp_ledger = get_symbol_opportunity_ledger(db)
+        grouped_opportunities = opp_ledger.get_active_for_symbols(candidates)
+        for cand in candidates:
+            opportunity_rows.extend(grouped_opportunities.get(cand, []))
+
+    risk_rows = _dedupe_active_findings(risk_rows)
+    opportunity_rows = _dedupe_active_findings(opportunity_rows)
+
+    reviews = get_symbol_signal_reviews(db).get_latest_reviews(candidates)
+    signal_review = None
+    for cand in candidates:
+        row = reviews.get(cand)
+        if row:
+            signal_review = _review_to_display(row)
+            break
+
+    threat = build_llm_payload_from_ledger_findings(risk_rows)
+    opportunity = build_opportunity_payload_from_ledger_findings(opportunity_rows)
+    empty_quadrant = {"status": "planned", "summary": "", "findings": []}
+    found = bool(risk_rows or opportunity_rows or signal_review)
+    latest_as_of = None
+    for row in risk_rows + opportunity_rows:
+        for key in ("last_confirmed_at", "first_detected_at"):
+            value = row.get(key)
+            if value and (latest_as_of is None or str(value) > str(latest_as_of)):
+                latest_as_of = value
+
+    return {
+        "symbol": canonical,
+        "signal_review": signal_review,
+        "swot": {
+            "strength": dict(empty_quadrant),
+            "weakness": dict(empty_quadrant),
+            "opportunity": opportunity,
+            "threat": threat,
+        },
+        "data_status": {
+            "found": found,
+            "as_of": _dt_to_iso(latest_as_of) if latest_as_of else (signal_review or {}).get("analyzed_at"),
+            "expected_freshness": "随组合 AI 风险/机会分析更新",
+            "source": "quant_analyzer.symbol_risk_findings + symbol_opportunity_findings",
+            "threat_count": len(threat.get("findings") or []),
+            "opportunity_count": len(opportunity.get("findings") or []),
+        },
+    }
 
 
 def _parse_utc_datetime(value: Any) -> Optional[datetime]:
