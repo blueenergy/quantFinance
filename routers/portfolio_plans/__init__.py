@@ -5817,6 +5817,14 @@ def _enrich_plan_items_with_overlay(
     plan_score_date = _resolve_plan_score_date(plan, universe_index)
     watermark = _latest_available_score_watermark(finance_db["stock_scores"], universe_index)
     latest_score_date = watermark.get("latest_available_score_date")
+    plan_ranked: List[Dict[str, Any]] = []
+    if plan_score_date:
+        plan_ranked = _build_ranked_score_universe(
+            finance_db["stock_scores"],
+            str(plan_score_date),
+            universe_index,
+            params,
+        )
     latest_ranked: List[Dict[str, Any]] = []
     if latest_score_date:
         latest_ranked = _build_ranked_score_universe(
@@ -5831,6 +5839,7 @@ def _enrich_plan_items_with_overlay(
         quotes=quotes,
         plan_score_date=plan_score_date,
         latest_score_date=str(latest_score_date) if latest_score_date else None,
+        plan_ranked=plan_ranked,
         latest_ranked=latest_ranked,
         top_n=top_n,
         numeric=_numeric,

@@ -568,6 +568,43 @@ def reprice_plan_items_for_publish(
     return working_items, summary
 
 
+def _target_slot_amount(plan: Dict[str, Any], top_n: int, numeric: Callable[[Any], float]) -> Optional[float]:
+    summary = plan.get("summary") or {}
+    equity = numeric(summary.get("equity"))
+    if equity <= 0:
+        return None
+    params = dict(plan.get("params_snapshot") or {})
+    cash_buffer = numeric(params.get("cash_buffer", 0.03))
+    return equity * (1.0 - cash_buffer) / max(1, top_n)
+
+
+def _selection_exclusion_reason(
+    item: Dict[str, Any],
+    *,
+    target_slot_amount: Optional[float],
+    lot_size: int,
+    min_buy_lots: int,
+    numeric: Callable[[Any], float],
+) -> Optional[str]:
+    """Why a held symbol was not kept in the new target portfolio."""
+    if item.get("rank") is not None:
+        return None
+    if int(item.get("target_shares") or 0) > 0:
+        return None
+    blockers = list(item.get("blockers") or [])
+    if "missing_price" in blockers:
+        return "missing_price"
+    price = numeric(item.get("estimated_price"))
+    min_shares = max(1, lot_size) * max(1, min_buy_lots)
+    if (
+        target_slot_amount
+        and price > 0
+        and price * min_shares > float(target_slot_amount) + 1e-9
+    ):
+        return "over_slot_budget"
+    return "dropped_from_target_pool"
+
+
 def attach_plan_item_overlay(
     *,
     plan: Dict[str, Any],
@@ -575,6 +612,7 @@ def attach_plan_item_overlay(
     quotes: Dict[str, Dict[str, Any]],
     plan_score_date: Optional[str],
     latest_score_date: Optional[str],
+    plan_ranked: Optional[List[Dict[str, Any]]] = None,
     latest_ranked: List[Dict[str, Any]],
     top_n: int,
     numeric: Callable[[Any], float],
@@ -582,7 +620,12 @@ def attach_plan_item_overlay(
     symbol_key: Callable[[Any], str],
     score_context: Optional[Dict[str, Any]] = None,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    rank_by_key = {symbol_key(row["symbol"]): row for row in latest_ranked}
+    params = dict(plan.get("params_snapshot") or {})
+    lot_size = max(1, int_value(params.get("lot_size"), 100))
+    min_buy_lots = max(1, int_value(params.get("min_buy_lots"), 1))
+    target_slot_amount = _target_slot_amount(plan, top_n, numeric)
+    plan_rank_by_key = {symbol_key(row["symbol"]): row for row in (plan_ranked or [])}
+    latest_rank_by_key = {symbol_key(row["symbol"]): row for row in latest_ranked}
     enriched: List[Dict[str, Any]] = []
     for item in items:
         symbol = str(item.get("symbol") or "")
@@ -595,17 +638,25 @@ def attach_plan_item_overlay(
         target_shares = int_value(item.get("target_shares"))
         live_market_value = float(live_price) * target_shares if live_price and target_shares else None
         plan_market_value = plan_price * target_shares if plan_price > 0 and target_shares else None
-        latest_row = rank_by_key.get(symbol_key(symbol))
+        latest_row = latest_rank_by_key.get(symbol_key(symbol))
         latest_rank = latest_row.get("rank") if latest_row else None
         latest_score = latest_row.get("score_value") if latest_row else None
-        plan_rank = item.get("rank")
+        plan_row = plan_rank_by_key.get(symbol_key(symbol))
+        snapshot_rank = plan_row.get("rank") if plan_row else None
         rank_delta = None
-        if latest_rank is not None and plan_rank is not None:
-            rank_delta = int(plan_rank) - int(latest_rank)
+        if latest_rank is not None and snapshot_rank is not None:
+            rank_delta = int(snapshot_rank) - int(latest_rank)
         dropped_out = bool(
             latest_ranked
             and target_shares > 0
             and (latest_row is None or int(latest_row.get("rank") or 0) > max(1, top_n))
+        )
+        selection_exclusion_reason = _selection_exclusion_reason(
+            item,
+            target_slot_amount=target_slot_amount,
+            lot_size=lot_size,
+            min_buy_lots=min_buy_lots,
+            numeric=numeric,
         )
         enriched.append(
             {
@@ -621,8 +672,10 @@ def attach_plan_item_overlay(
                 "plan_market_value": plan_market_value,
                 "latest_score": latest_score,
                 "latest_rank": latest_rank,
+                "snapshot_rank": snapshot_rank,
                 "rank_delta": rank_delta,
                 "dropped_out_of_top_n": dropped_out,
+                "selection_exclusion_reason": selection_exclusion_reason,
             }
         )
 
@@ -637,6 +690,7 @@ def attach_plan_item_overlay(
         "score_snapshot_stale": score_stale,
         "score_snapshot_age_days": _score_age_days(plan_score_date, latest_score_date),
         "top_n": top_n,
+        "target_slot_amount": target_slot_amount,
         "score_context": dict(score_context or {}),
     }
     return enriched, plan_overlay

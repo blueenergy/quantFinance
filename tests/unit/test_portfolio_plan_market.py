@@ -405,12 +405,14 @@ def test_overlay_attaches_price_and_rank_drift():
         }
     }
     latest_ranked = [{"symbol": "600000", "rank": 5, "score_value": 80.0}]
+    plan_ranked = [{"symbol": "600000", "rank": 3, "score_value": 82.0}]
     enriched, overlay = attach_plan_item_overlay(
         plan={},
         items=items,
         quotes=quotes,
         plan_score_date="20260625",
         latest_score_date="20260627",
+        plan_ranked=plan_ranked,
         latest_ranked=latest_ranked,
         top_n=10,
         numeric=lambda value: float(value or 0),
@@ -426,6 +428,7 @@ def test_overlay_attaches_price_and_rank_drift():
     assert enriched[0]["price_drift_pct"] == 10.0
     assert enriched[0]["daily_change_pct"] is None
     assert enriched[0]["latest_rank"] == 5
+    assert enriched[0]["snapshot_rank"] == 3
     assert enriched[0]["rank_delta"] == -2
     assert overlay["score_snapshot_stale"] is True
     assert overlay["score_context"]["universe_index"] == "csi500"
@@ -456,3 +459,83 @@ def test_overlay_does_not_mark_dropped_when_latest_rank_unavailable():
     )
     assert enriched[0]["latest_rank"] is None
     assert enriched[0]["dropped_out_of_top_n"] is False
+
+
+def test_overlay_rank_delta_uses_universe_rank_not_portfolio_slot():
+    items = [{"symbol": "002185.SZ", "rank": 1, "target_shares": 100, "estimated_price": 25.31}]
+    quotes = {"002185.SZ": {"price": 25.5, "price_source": PRICE_SOURCE_REALTIME, "is_stale": False}}
+    plan_ranked = [{"symbol": "002185.SZ", "rank": 13, "score_value": 84.25}]
+    latest_ranked = [{"symbol": "002185.SZ", "rank": 13, "score_value": 84.25}]
+    enriched, overlay = attach_plan_item_overlay(
+        plan={},
+        items=items,
+        quotes=quotes,
+        plan_score_date="20260710",
+        latest_score_date="20260710",
+        plan_ranked=plan_ranked,
+        latest_ranked=latest_ranked,
+        top_n=20,
+        numeric=lambda value: float(value or 0),
+        int_value=lambda value, default=0: int(value or default),
+        symbol_key=lambda value: str(value).split(".")[0] if "." in str(value) else str(value),
+    )
+    assert enriched[0]["rank"] == 1
+    assert enriched[0]["snapshot_rank"] == 13
+    assert enriched[0]["latest_rank"] == 13
+    assert enriched[0]["rank_delta"] == 0
+    assert overlay["score_snapshot_stale"] is False
+
+
+def test_overlay_marks_liquidation_rows_dropped_from_target_pool():
+    items = [{"symbol": "601958.SH", "rank": None, "target_shares": 0, "current_shares": 100, "action": "sell", "estimated_price": 12.0}]
+    enriched, _overlay = attach_plan_item_overlay(
+        plan={"summary": {"equity": 100000}, "params_snapshot": {"cash_buffer": 0.03, "lot_size": 100, "min_buy_lots": 1}},
+        items=items,
+        quotes={},
+        plan_score_date="20260710",
+        latest_score_date="20260710",
+        plan_ranked=[{"symbol": "601958.SH", "rank": 73, "score_value": 74.0}],
+        latest_ranked=[{"symbol": "601958.SH", "rank": 73, "score_value": 74.0}],
+        top_n=20,
+        numeric=lambda value: float(value or 0),
+        int_value=lambda value, default=0: int(value or default),
+        symbol_key=lambda value: str(value).split(".")[0],
+    )
+    assert enriched[0]["selection_exclusion_reason"] == "dropped_from_target_pool"
+
+
+def test_overlay_marks_missing_price_liquidation():
+    items = [{"symbol": "600000", "rank": None, "target_shares": 0, "blockers": ["missing_price"], "estimated_price": None}]
+    enriched, _overlay = attach_plan_item_overlay(
+        plan={"summary": {"equity": 100000}, "params_snapshot": {"cash_buffer": 0.03}},
+        items=items,
+        quotes={},
+        plan_score_date="20260710",
+        latest_score_date="20260710",
+        plan_ranked=[],
+        latest_ranked=[],
+        top_n=10,
+        numeric=lambda value: float(value or 0),
+        int_value=lambda value, default=0: int(value or default),
+        symbol_key=lambda value: str(value),
+    )
+    assert enriched[0]["selection_exclusion_reason"] == "missing_price"
+
+
+def test_overlay_marks_over_slot_budget_liquidation():
+    items = [{"symbol": "600000", "rank": None, "target_shares": 0, "estimated_price": 500.0}]
+    enriched, overlay = attach_plan_item_overlay(
+        plan={"summary": {"equity": 100000}, "params_snapshot": {"cash_buffer": 0.03, "lot_size": 100, "min_buy_lots": 1}},
+        items=items,
+        quotes={},
+        plan_score_date="20260710",
+        latest_score_date="20260710",
+        plan_ranked=[],
+        latest_ranked=[],
+        top_n=10,
+        numeric=lambda value: float(value or 0),
+        int_value=lambda value, default=0: int(value or default),
+        symbol_key=lambda value: str(value),
+    )
+    assert overlay["target_slot_amount"] == 9700.0
+    assert enriched[0]["selection_exclusion_reason"] == "over_slot_budget"
