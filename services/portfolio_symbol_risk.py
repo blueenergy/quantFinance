@@ -17,8 +17,8 @@ _SEVERITY_ORDER = {"none": 0, "low": 1, "medium": 2, "high": 3}
 
 
 def legacy_ledger_read_enabled() -> bool:
-    """During bake, fall back to plan-scoped ``portfolio_risk_llm`` when ledger is empty."""
-    return os.getenv("SYMBOL_RISK_LEDGER_LEGACY_READ", "true").lower() in {"1", "true", "yes"}
+    """Opt-in fallback to archived plan-scoped LLM results."""
+    return os.getenv("SYMBOL_RISK_LEDGER_LEGACY_READ", "false").lower() in {"1", "true", "yes"}
 
 
 def opportunity_ledger_read_enabled() -> bool:
@@ -114,17 +114,10 @@ def _opportunity_finding_to_display(row: Dict[str, Any]) -> Dict[str, Any]:
 def _review_to_display(row: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "checked_at": _dt_to_iso(row.get("checked_at")),
-        "analyzed_at": _dt_to_iso(row.get("analyzed_at") or row.get("reviewed_at")),
-        "reviewed_at": _dt_to_iso(row.get("reviewed_at")),
-        "last_run_status": row.get("last_run_status") or ("analyzed" if row.get("reviewed_at") else None),
-        "last_skip_reason": row.get("last_skip_reason"),
-        "last_error_detail": row.get("last_error_detail"),
-        "dimensions": row.get("dimensions") or [],
-        "result_counts": row.get("result_counts") or {},
+        "analyzed_at": _dt_to_iso(row.get("analyzed_at")),
+        "last_run_status": row.get("last_run_status") or ("analyzed" if row.get("analyzed_at") else None),
         "evidence_count": row.get("evidence_count"),
         "latest_evidence_at": _dt_to_iso(row.get("latest_evidence_at")),
-        "symbol_evidence_count": row.get("symbol_evidence_count"),
-        "sector_evidence_count": row.get("sector_evidence_count"),
         "prompt_version": row.get("prompt_version"),
     }
 

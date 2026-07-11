@@ -151,7 +151,7 @@ def get_analyzer_db():
         "hot_stock_analysis": analyzer_db["hot_stock_analysis"],
         "sector_concept_analysis": analyzer_db["sector_concept_analysis"],
         "portfolio_analysis": analyzer_db["portfolio_analysis"],
-        "portfolio_risk_llm": analyzer_db["portfolio_risk_llm"],
+        "legacy_portfolio_risk_llm": analyzer_db["legacy_portfolio_risk_llm"],
         "symbol_risk_findings": analyzer_db["symbol_risk_findings"],
         "industry_risk_findings": analyzer_db["industry_risk_findings"],
         "symbol_opportunity_findings": analyzer_db["symbol_opportunity_findings"],

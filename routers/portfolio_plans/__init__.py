@@ -140,6 +140,7 @@ ALLOWED_UNIVERSE_INDICES = {"hs300", "a500", "csi500", "csi1000", "csi2000", "st
 PORTFOLIO_RISK_LLM_TASK_TYPE = "portfolio_risk_llm"
 PORTFOLIO_RISK_LLM_PRIORITY = 10
 PORTFOLIO_RISK_LLM_RUNNING_STATUSES = {"pending", "processing"}
+LEGACY_PORTFOLIO_RISK_LLM_COLLECTION = "legacy_portfolio_risk_llm"
 GROWTH_CYCLE_PARAMETER_SCHEMA = {
     "universe_index": {"type": "enum", "options": sorted(ALLOWED_UNIVERSE_INDICES)},
     "index_benchmark_symbol": {"type": "string"},
@@ -1850,7 +1851,7 @@ def _enrich_plan_items_with_llm_risk(
     if not run_id:
         return plan, items
 
-    risk_coll = get_analyzer_db()["portfolio_risk_llm"]
+    risk_coll = get_analyzer_db()[LEGACY_PORTFOLIO_RISK_LLM_COLLECTION]
     docs = list(risk_coll.find({"plan_id": plan_id, "run_id": run_id}, {"_id": 0}))
     if not docs:
         return plan, items
@@ -2057,7 +2058,7 @@ def _enrich_bench_payload_with_llm_risk(
     if not run_id:
         return payload
 
-    risk_coll = get_analyzer_db()["portfolio_risk_llm"]
+    risk_coll = get_analyzer_db()[LEGACY_PORTFOLIO_RISK_LLM_COLLECTION]
     docs = list(risk_coll.find({"plan_id": plan_id, "run_id": run_id}, {"_id": 0}))
     if not docs:
         return payload

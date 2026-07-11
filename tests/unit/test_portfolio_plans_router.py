@@ -559,7 +559,7 @@ def _data_collections():
 
 def _analyzer_collections():
     return {
-        "portfolio_risk_llm": _Collection(),
+        "legacy_portfolio_risk_llm": _Collection(),
         "symbol_risk_findings": _Collection(),
         "industry_risk_findings": _Collection(),
         "symbol_opportunity_findings": _Collection(),
@@ -743,6 +743,7 @@ def test_enqueue_portfolio_llm_risk_supports_bench_scope(monkeypatch):
 
 
 def test_plan_detail_enriches_latest_completed_llm_risk(monkeypatch):
+    monkeypatch.setenv("SYMBOL_RISK_LEDGER_LEGACY_READ", "true")
     collections = _collections()
     plan = collections["portfolio_trade_plans"].docs[0]
     collections["portfolio_trade_plan_items"].insert_one(
@@ -760,7 +761,7 @@ def test_plan_detail_enriches_latest_completed_llm_risk(monkeypatch):
     finance_collections = _finance_collections()
     data_collections = _data_collections()
     analyzer_collections = _analyzer_collections()
-    analyzer_collections["portfolio_risk_llm"].insert_many(
+    analyzer_collections["legacy_portfolio_risk_llm"].insert_many(
         [
             {
                 "plan_id": plan["plan_id"],
@@ -1006,11 +1007,10 @@ def test_enqueue_portfolio_llm_risk_includes_recent_review_stamps_for_worker_fin
         analyzer_collections["symbol_llm_signal_reviews"].insert_one(
             {
                 "symbol": sym,
-                "industry": "银行",
-                "reviewed_at": recent,
-                "run_id": "run-recent",
-                "dimensions": ["risk", "opportunity"],
-                "result_counts": {"risk": 0, "opportunity": 0},
+                "review_scope": "external_event",
+                "analyzed_at": recent,
+                "checked_at": recent,
+                "last_run_status": "analyzed",
             }
         )
     analysis_tasks = _Collection()
@@ -5775,6 +5775,7 @@ def test_get_portfolio_plan_bench_splits_starters_and_bench(monkeypatch):
 
 
 def test_get_portfolio_plan_bench_enriches_latest_bench_llm_risk(monkeypatch):
+    monkeypatch.setenv("SYMBOL_RISK_LEDGER_LEGACY_READ", "true")
     cols = _collections()
     data = _data_collections()
     stock_scores = _Collection(
@@ -5803,7 +5804,7 @@ def test_get_portfolio_plan_bench_enriches_latest_bench_llm_risk(monkeypatch):
         ]
     )
     analyzer = _analyzer_collections()
-    analyzer["portfolio_risk_llm"].insert_one(
+    analyzer["legacy_portfolio_risk_llm"].insert_one(
         {
             "plan_id": "bench-plan",
             "run_id": "bench-run",
@@ -5869,6 +5870,7 @@ def test_get_portfolio_plan_bench_enriches_latest_bench_llm_risk(monkeypatch):
 
 
 def test_get_portfolio_plan_bench_enriches_running_bench_llm_risk(monkeypatch):
+    monkeypatch.setenv("SYMBOL_RISK_LEDGER_LEGACY_READ", "true")
     cols = _collections()
     data = _data_collections()
     stock_scores = _Collection(
@@ -5897,7 +5899,7 @@ def test_get_portfolio_plan_bench_enriches_running_bench_llm_risk(monkeypatch):
         ]
     )
     analyzer = _analyzer_collections()
-    analyzer["portfolio_risk_llm"].insert_one(
+    analyzer["legacy_portfolio_risk_llm"].insert_one(
         {
             "plan_id": "bench-running-plan",
             "run_id": "bench-running-run",
