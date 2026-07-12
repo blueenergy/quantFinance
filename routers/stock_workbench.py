@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import re
@@ -9,8 +10,10 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlsplit
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel, Field
 
 from auth import get_current_active_user
 from db import get_analyzer_db, get_data_db, get_db_collections
@@ -20,12 +23,14 @@ from services.analysis_tasks import build_task_doc
 from services.portfolio_symbol_risk import build_workbench_swot_section
 from services.valuation import VALUATION_SOURCE, build_stock_valuation
 try:
+    from stock_data_access.evidence_fingerprint import normalize_url
     from stock_data_access.indicators.nineturn import enrich_nineturn_signals, latest_signal_summary
 except ModuleNotFoundError:
     _stock_data_access_src = Path(__file__).resolve().parents[1] / "data-access-lib" / "src"
     if str(_stock_data_access_src) not in sys.path:
         sys.path.insert(0, str(_stock_data_access_src))
     try:
+        from stock_data_access.evidence_fingerprint import normalize_url
         from stock_data_access.indicators.nineturn import enrich_nineturn_signals, latest_signal_summary
     except ModuleNotFoundError:
         log = logging.getLogger(__name__)
@@ -37,6 +42,9 @@ except ModuleNotFoundError:
         def latest_signal_summary(signals: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
             return None
 
+        def normalize_url(value: Any) -> str:
+            return str(value or "").strip()
+
 router = APIRouter()
 log = logging.getLogger(__name__)
 
@@ -47,6 +55,37 @@ WORKBENCH_MONTHLY_MONEY_FLOW_HISTORY_LIMIT = 1500
 WORKBENCH_WEEKLY_KLINE_LIMIT = 260
 WORKBENCH_MONTHLY_KLINE_LIMIT = 260
 WORKBENCH_PROFILE_ENABLED = os.getenv("WORKBENCH_PROFILE", "").strip().lower() in {"1", "true", "yes", "on"}
+NEWS_URL_ANALYSIS_TASK_TYPE = "news_url_risk_analysis"
+MAX_NEWS_URL_LENGTH = 2048
+
+
+class AnalyzeNewsUrlRequest(BaseModel):
+    url: str = Field(..., min_length=1, max_length=MAX_NEWS_URL_LENGTH)
+
+
+def _validate_public_http_url(raw_url: str) -> str:
+    text = str(raw_url or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="url is required")
+    if len(text) > MAX_NEWS_URL_LENGTH:
+        raise HTTPException(status_code=400, detail="url is too long")
+    try:
+        parsed = urlsplit(text)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="invalid url") from exc
+    scheme = (parsed.scheme or "").lower()
+    if scheme not in {"http", "https"}:
+        raise HTTPException(status_code=400, detail="only http/https urls are supported")
+    if not parsed.netloc:
+        raise HTTPException(status_code=400, detail="url host is required")
+    normalized = normalize_url(text)
+    if not normalized:
+        raise HTTPException(status_code=400, detail="invalid url")
+    return normalized
+
+
+def _news_url_hash(url: str) -> str:
+    return hashlib.sha256(url.encode("utf-8")).hexdigest()[:32]
 
 ENTRY_HIGH_WINDOW = 120
 ENTRY_FLOW_WINDOW = 20
@@ -2007,6 +2046,87 @@ def collect_stock_workbench_signals(
         extra_fields={
             "operation_type": "workbench_llm_risk_review",
             "idempotency_key": f"workbench:{canonical}:{run_id}",
+        },
+    )
+    result = analysis_tasks.insert_one(task)
+    task_id = str(getattr(result, "inserted_id", "") or "")
+    return {
+        "success": True,
+        "data": {
+            "task_id": task_id,
+            "run_id": run_id,
+            "status": "pending",
+            "reused": False,
+        },
+    }
+
+
+@router.post("/{symbol}/workbench/signals/analyze-url")
+def analyze_stock_workbench_news_url(
+    symbol: str,
+    request: AnalyzeNewsUrlRequest,
+    current_user: Dict[str, Any] = Depends(get_current_active_user),
+):
+    """Enqueue one news URL for safe fetch + LLM risk/opportunity assessment."""
+    collections = get_db_collections()
+    analysis_tasks = collections.get("analysis_tasks")
+    if analysis_tasks is None:
+        raise HTTPException(status_code=503, detail="analysis task queue unavailable")
+
+    normalized_url = _validate_public_http_url(request.url)
+    url_hash = _news_url_hash(normalized_url)
+    stock = _stock_identity(symbol)
+    canonical = str(stock.get("symbol") or symbol).strip().upper()
+    user_id = str(current_user.get("id") or current_user.get("username") or "")
+    industry = str(stock.get("industry") or "未分类").strip() or "未分类"
+
+    existing = analysis_tasks.find_one(
+        {
+            "type": NEWS_URL_ANALYSIS_TASK_TYPE,
+            "user_id": user_id,
+            "params.symbol": canonical,
+            "params.url_hash": url_hash,
+            "status": {"$in": ["pending", "processing"]},
+        },
+        sort=[("created_at", -1)],
+    )
+    if existing:
+        return {
+            "success": True,
+            "data": {
+                "task_id": str(existing.get("_id") or ""),
+                "status": existing.get("status") or "pending",
+                "reused": True,
+            },
+        }
+
+    run_id = str(uuid.uuid4())
+    as_of = datetime.utcnow().strftime("%Y%m%d")
+    params = {
+        "symbol": canonical,
+        "name": stock.get("name") or canonical,
+        "industry": industry,
+        "url": normalized_url,
+        "url_hash": url_hash,
+        "run_id": run_id,
+        "base_date": as_of,
+        "score_date": as_of,
+        "options": {
+            "prompt_version": "v1",
+            "force": False,
+        },
+    }
+    task = build_task_doc(
+        current_user=current_user,
+        task_type=NEWS_URL_ANALYSIS_TASK_TYPE,
+        priority=12,
+        symbol=canonical,
+        stock_name=stock.get("name"),
+        params=params,
+        source="stock_workbench_news_url",
+        extra_fields={
+            "operation_type": "workbench_news_url_analysis",
+            "idempotency_key": f"news_url:{canonical}:{url_hash}",
         },
     )
     result = analysis_tasks.insert_one(task)

@@ -17,6 +17,8 @@ from routers.stock_workbench import (
     _trading_section,
     _valuation_section,
     _valuation_status,
+    AnalyzeNewsUrlRequest,
+    analyze_stock_workbench_news_url,
     collect_stock_workbench_signals,
     get_stock_workbench,
     get_stock_workbench_signals,
@@ -1539,3 +1541,97 @@ def test_collect_stock_workbench_signals_reuses_running_task(monkeypatch):
         "status": "processing",
         "reused": True,
     }
+
+
+def test_analyze_stock_workbench_news_url_enqueues_task(monkeypatch):
+    class _InsertResult:
+        inserted_id = "news-task-1"
+
+    class _Tasks:
+        def __init__(self):
+            self.inserted = []
+
+        def find_one(self, query, sort=None):
+            return None
+
+        def insert_one(self, doc):
+            self.inserted.append(doc)
+            return _InsertResult()
+
+    tasks = _Tasks()
+    monkeypatch.setattr(
+        "routers.stock_workbench.get_db_collections",
+        lambda: {"analysis_tasks": tasks},
+    )
+    monkeypatch.setattr(
+        "routers.stock_workbench._stock_identity",
+        lambda symbol: {
+            "symbol": "000001.SZ",
+            "name": "平安银行",
+            "industry": "银行",
+        },
+    )
+
+    response = analyze_stock_workbench_news_url(
+        "000001",
+        request=AnalyzeNewsUrlRequest(url="https://finance.example.com/news/123?utm_source=x"),
+        current_user={"id": "u1", "username": "tester"},
+    )
+
+    assert response["data"]["task_id"] == "news-task-1"
+    assert response["data"]["status"] == "pending"
+    assert response["data"]["reused"] is False
+    task = tasks.inserted[0]
+    assert task["type"] == "news_url_risk_analysis"
+    assert task["source"] == "stock_workbench_news_url"
+    assert task["params"]["symbol"] == "000001.SZ"
+    assert task["params"]["url"] == "https://finance.example.com/news/123"
+    assert task["params"]["url_hash"]
+    assert task["idempotency_key"] == f"news_url:000001.SZ:{task['params']['url_hash']}"
+
+
+def test_analyze_stock_workbench_news_url_reuses_running_task(monkeypatch):
+    class _Tasks:
+        def find_one(self, query, sort=None):
+            return {"_id": "news-running", "status": "processing"}
+
+    monkeypatch.setattr(
+        "routers.stock_workbench.get_db_collections",
+        lambda: {"analysis_tasks": _Tasks()},
+    )
+    monkeypatch.setattr(
+        "routers.stock_workbench._stock_identity",
+        lambda symbol: {"symbol": "600519.SH", "name": "贵州茅台", "industry": "食品饮料"},
+    )
+
+    response = analyze_stock_workbench_news_url(
+        "600519.SH",
+        request=AnalyzeNewsUrlRequest(url="https://finance.example.com/news/abc"),
+        current_user={"id": "u1"},
+    )
+
+    assert response["data"] == {
+        "task_id": "news-running",
+        "status": "processing",
+        "reused": True,
+    }
+
+
+def test_analyze_stock_workbench_news_url_rejects_invalid_scheme(monkeypatch):
+    monkeypatch.setattr(
+        "routers.stock_workbench.get_db_collections",
+        lambda: {"analysis_tasks": object()},
+    )
+    monkeypatch.setattr(
+        "routers.stock_workbench._stock_identity",
+        lambda symbol: {"symbol": "600519.SH", "name": "贵州茅台", "industry": "食品饮料"},
+    )
+
+    with pytest.raises(Exception) as exc:
+        analyze_stock_workbench_news_url(
+            "600519.SH",
+            request=AnalyzeNewsUrlRequest(url="ftp://finance.example.com/news/abc"),
+            current_user={"id": "u1"},
+        )
+
+    assert exc.value.status_code == 400
