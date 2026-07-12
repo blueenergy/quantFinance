@@ -260,6 +260,10 @@ def summarize_task_result(task: Dict[str, Any]) -> str:
         if isinstance(summary, dict):
             risk_count = int(summary.get("risk_finding_count") or 0)
             opp_count = int(summary.get("opportunity_finding_count") or 0)
+            if summary.get("status") == "unrelated_to_tracked_risk":
+                return "该新闻与所跟踪风险无直接关联，未更新"
+            if summary.get("status") == "follow_up_updated":
+                return "已更新所跟踪风险的最新进展"
             if summary.get("status") == "no_material_impact":
                 return "未发现对该股票的实质影响"
             if risk_count or opp_count:

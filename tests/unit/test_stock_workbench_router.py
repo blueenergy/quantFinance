@@ -1587,7 +1587,54 @@ def test_analyze_stock_workbench_news_url_enqueues_task(monkeypatch):
     assert task["params"]["symbol"] == "000001.SZ"
     assert task["params"]["url"] == "https://finance.example.com/news/123"
     assert task["params"]["url_hash"]
+    assert task["params"]["target_finding_key"] is None
     assert task["idempotency_key"] == f"news_url:000001.SZ:{task['params']['url_hash']}"
+
+
+def test_analyze_stock_workbench_news_url_with_finding_key_enqueues_follow_up(monkeypatch):
+    class _InsertResult:
+        inserted_id = "news-task-fk"
+
+    class _Tasks:
+        def __init__(self):
+            self.inserted = []
+            self.queries = []
+
+        def find_one(self, query, sort=None):
+            self.queries.append(query)
+            return None
+
+        def insert_one(self, doc):
+            self.inserted.append(doc)
+            return _InsertResult()
+
+    tasks = _Tasks()
+    monkeypatch.setattr(
+        "routers.stock_workbench.get_db_collections",
+        lambda: {"analysis_tasks": tasks},
+    )
+    monkeypatch.setattr(
+        "routers.stock_workbench._stock_identity",
+        lambda symbol: {"symbol": "000001.SZ", "name": "平安银行", "industry": "银行"},
+    )
+
+    response = analyze_stock_workbench_news_url(
+        "000001",
+        request=AnalyzeNewsUrlRequest(
+            url="https://finance.example.com/news/999",
+            finding_key="legal_compliance:诉讼案件尚未开庭",
+        ),
+        current_user={"id": "u1", "username": "tester"},
+    )
+
+    assert response["data"]["task_id"] == "news-task-fk"
+    task = tasks.inserted[0]
+    assert task["params"]["target_finding_key"] == "legal_compliance:诉讼案件尚未开庭"
+    # follow-up idempotency key must differ from the plain analysis key
+    assert task["idempotency_key"] != f"news_url:000001.SZ:{task['params']['url_hash']}"
+    assert task["idempotency_key"].startswith(f"news_url:000001.SZ:{task['params']['url_hash']}:")
+    # dedup query is scoped to the same target finding key
+    assert tasks.queries[0]["params.target_finding_key"] == "legal_compliance:诉讼案件尚未开庭"
 
 
 def test_analyze_stock_workbench_news_url_reuses_running_task(monkeypatch):

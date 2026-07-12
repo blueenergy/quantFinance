@@ -57,10 +57,12 @@ WORKBENCH_MONTHLY_KLINE_LIMIT = 260
 WORKBENCH_PROFILE_ENABLED = os.getenv("WORKBENCH_PROFILE", "").strip().lower() in {"1", "true", "yes", "on"}
 NEWS_URL_ANALYSIS_TASK_TYPE = "news_url_risk_analysis"
 MAX_NEWS_URL_LENGTH = 2048
+MAX_FINDING_KEY_LENGTH = 256
 
 
 class AnalyzeNewsUrlRequest(BaseModel):
     url: str = Field(..., min_length=1, max_length=MAX_NEWS_URL_LENGTH)
+    finding_key: Optional[str] = Field(default=None, max_length=MAX_FINDING_KEY_LENGTH)
 
 
 def _validate_public_http_url(raw_url: str) -> str:
@@ -2075,6 +2077,7 @@ def analyze_stock_workbench_news_url(
 
     normalized_url = _validate_public_http_url(request.url)
     url_hash = _news_url_hash(normalized_url)
+    target_finding_key = str(request.finding_key or "").strip() or None
     stock = _stock_identity(symbol)
     canonical = str(stock.get("symbol") or symbol).strip().upper()
     user_id = str(current_user.get("id") or current_user.get("username") or "")
@@ -2086,6 +2089,7 @@ def analyze_stock_workbench_news_url(
             "user_id": user_id,
             "params.symbol": canonical,
             "params.url_hash": url_hash,
+            "params.target_finding_key": target_finding_key,
             "status": {"$in": ["pending", "processing"]},
         },
         sort=[("created_at", -1)],
@@ -2108,6 +2112,7 @@ def analyze_stock_workbench_news_url(
         "industry": industry,
         "url": normalized_url,
         "url_hash": url_hash,
+        "target_finding_key": target_finding_key,
         "run_id": run_id,
         "base_date": as_of,
         "score_date": as_of,
@@ -2116,6 +2121,9 @@ def analyze_stock_workbench_news_url(
             "force": False,
         },
     }
+    idempotency_key = f"news_url:{canonical}:{url_hash}"
+    if target_finding_key:
+        idempotency_key = f"{idempotency_key}:{_news_url_hash(target_finding_key)}"
     task = build_task_doc(
         current_user=current_user,
         task_type=NEWS_URL_ANALYSIS_TASK_TYPE,
@@ -2126,7 +2134,7 @@ def analyze_stock_workbench_news_url(
         source="stock_workbench_news_url",
         extra_fields={
             "operation_type": "workbench_news_url_analysis",
-            "idempotency_key": f"news_url:{canonical}:{url_hash}",
+            "idempotency_key": idempotency_key,
         },
     )
     result = analysis_tasks.insert_one(task)
