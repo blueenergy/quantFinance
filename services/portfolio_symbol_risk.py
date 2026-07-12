@@ -11,7 +11,9 @@ from stock_data_access.symbol_risk import (
     SymbolRiskLedgerAccess,
 )
 from stock_data_access.symbol_opportunity import SymbolOpportunityLedgerAccess
-from stock_data_access.symbol_signal_review import SymbolLlmSignalReviewAccess
+from stock_data_access.symbol_signal_review import SymbolSignalReviewAccess
+from stock_data_access.symbol_strength import SymbolStrengthLedgerAccess
+from stock_data_access.symbol_weakness import SymbolWeaknessLedgerAccess
 from utils.symbol_utils import normalize_symbol
 
 _SEVERITY_ORDER = {"none": 0, "low": 1, "medium": 2, "high": 3}
@@ -24,6 +26,10 @@ def legacy_ledger_read_enabled() -> bool:
 
 def opportunity_ledger_read_enabled() -> bool:
     return os.getenv("OPPORTUNITY_LEDGER_READ_ENABLED", "true").lower() in {"1", "true", "yes"}
+
+
+def internal_signal_enabled() -> bool:
+    return os.getenv("INTERNAL_SIGNAL_ENABLED", "true").lower() in {"1", "true", "yes"}
 
 
 def _max_severity(values: Sequence[str]) -> str:
@@ -53,12 +59,28 @@ def get_symbol_opportunity_ledger(db=None) -> SymbolOpportunityLedgerAccess:
     return SymbolOpportunityLedgerAccess(db=db)
 
 
-def get_symbol_signal_reviews(db=None) -> SymbolLlmSignalReviewAccess:
+def get_symbol_signal_reviews(db=None) -> SymbolSignalReviewAccess:
     if db is None:
         from db import get_analyzer_db
 
         db = get_analyzer_db()
-    return SymbolLlmSignalReviewAccess(db=db)
+    return SymbolSignalReviewAccess(db=db)
+
+
+def get_symbol_strength_ledger(db=None) -> SymbolStrengthLedgerAccess:
+    if db is None:
+        from db import get_analyzer_db
+
+        db = get_analyzer_db()
+    return SymbolStrengthLedgerAccess(db=db)
+
+
+def get_symbol_weakness_ledger(db=None) -> SymbolWeaknessLedgerAccess:
+    if db is None:
+        from db import get_analyzer_db
+
+        db = get_analyzer_db()
+    return SymbolWeaknessLedgerAccess(db=db)
 
 
 def _dt_to_iso(value: Any) -> Optional[str]:
@@ -120,6 +142,59 @@ def _review_to_display(row: Dict[str, Any]) -> Dict[str, Any]:
         "evidence_count": row.get("evidence_count"),
         "latest_evidence_at": _dt_to_iso(row.get("latest_evidence_at")),
         "prompt_version": row.get("prompt_version"),
+        "engine_type": row.get("engine_type"),
+        "engine_version": row.get("engine_version"),
+        "rule_config_hash": row.get("rule_config_hash"),
+        "input_completeness": row.get("input_completeness"),
+        "result_counts": row.get("result_counts") or {},
+        "dimensions_reviewed": row.get("dimensions_reviewed") or [],
+        "last_skip_reason": row.get("last_skip_reason"),
+    }
+
+
+def build_internal_payload_from_ledger_findings(
+    findings: List[Dict[str, Any]],
+    *,
+    dimension: str,
+    review: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    level_field = "strength" if dimension == "strength" else "severity"
+    display = [
+        {
+            "finding_key": row.get("finding_key"),
+            "rule_id": row.get("rule_id"),
+            "category": row.get("category"),
+            level_field: row.get(level_field),
+            "summary": row.get("summary"),
+            "detail": row.get("detail"),
+            "discovered_by": row.get("discovered_by"),
+            "engine_type": row.get("engine_type"),
+            "engine_version": row.get("engine_version"),
+            "rule_config_hash": row.get("rule_config_hash"),
+            "evidence_version": row.get("evidence_version"),
+            "first_detected_as_of": row.get("first_detected_as_of"),
+            "first_detected_at": _dt_to_iso(row.get("first_detected_at")),
+            "last_confirmed_as_of": row.get("last_confirmed_as_of"),
+            "last_confirmed_at": _dt_to_iso(row.get("last_confirmed_at")),
+            "evidence": row.get("evidence") or [],
+            "lifecycle_policy": row.get("lifecycle_policy") or {},
+        }
+        for row in findings
+    ]
+    summaries = [
+        str(row.get("summary") or "").strip()
+        for row in display
+        if row.get("summary")
+    ]
+    levels = [str(row.get(level_field) or "none") for row in display]
+    analyzed = bool(review and review.get("analyzed_at"))
+    return {
+        "status": "completed" if findings or analyzed else "not_analyzed",
+        level_field: _max_severity(levels) if display else "none",
+        "summary": "；".join(summaries[:3]) if summaries else "",
+        "findings": display,
+        "source": "ledger",
+        "finding_count": len(display),
     }
 
 
@@ -315,6 +390,17 @@ def build_workbench_swot_section(
     risk_rows = _dedupe_active_findings(risk_rows)
     opportunity_rows = _dedupe_active_findings(opportunity_rows)
 
+    strength_rows: List[Dict[str, Any]] = []
+    weakness_rows: List[Dict[str, Any]] = []
+    if internal_signal_enabled():
+        grouped_strengths = get_symbol_strength_ledger(db).get_active_for_symbols(candidates)
+        grouped_weaknesses = get_symbol_weakness_ledger(db).get_active_for_symbols(candidates)
+        for cand in candidates:
+            strength_rows.extend(grouped_strengths.get(cand, []))
+            weakness_rows.extend(grouped_weaknesses.get(cand, []))
+        strength_rows = _dedupe_active_findings(strength_rows)
+        weakness_rows = _dedupe_active_findings(weakness_rows)
+
     industry_risk_rows: List[Dict[str, Any]] = []
     industry_opportunity_rows: List[Dict[str, Any]] = []
     if industry_name:
@@ -326,22 +412,49 @@ def build_workbench_swot_section(
                 opp_ledger.get_active_for_industries([industry_name]).get(industry_name, [])
             )
 
-    reviews = get_symbol_signal_reviews(db).get_latest_reviews(candidates)
+    review_access = get_symbol_signal_reviews(db)
+    reviews = review_access.get_latest_reviews(candidates)
+    internal_reviews = review_access.get_latest_reviews(
+        candidates,
+        review_scope="internal_fundamental",
+    )
     signal_review = None
+    internal_signal_review = None
     for cand in candidates:
         row = reviews.get(cand)
         if row:
             signal_review = _review_to_display(row)
             break
+    for cand in candidates:
+        row = internal_reviews.get(cand)
+        if row:
+            internal_signal_review = _review_to_display(row)
+            break
 
     threat = build_llm_payload_from_ledger_findings(risk_rows)
     opportunity = build_opportunity_payload_from_ledger_findings(opportunity_rows)
+    strength = build_internal_payload_from_ledger_findings(
+        strength_rows,
+        dimension="strength",
+        review=internal_signal_review,
+    )
+    weakness = build_internal_payload_from_ledger_findings(
+        weakness_rows,
+        dimension="weakness",
+        review=internal_signal_review,
+    )
     industry_threat = build_llm_payload_from_ledger_findings(industry_risk_rows)
     industry_opportunity = build_opportunity_payload_from_ledger_findings(industry_opportunity_rows)
-    empty_quadrant = {"status": "planned", "summary": "", "findings": []}
-    found = bool(risk_rows or opportunity_rows or signal_review)
+    found = bool(
+        risk_rows
+        or opportunity_rows
+        or strength_rows
+        or weakness_rows
+        or signal_review
+        or internal_signal_review
+    )
     latest_as_of = None
-    for row in risk_rows + opportunity_rows:
+    for row in risk_rows + opportunity_rows + strength_rows + weakness_rows:
         for key in ("last_confirmed_at", "first_detected_at"):
             value = row.get(key)
             if value and (latest_as_of is None or str(value) > str(latest_as_of)):
@@ -350,9 +463,10 @@ def build_workbench_swot_section(
     return {
         "symbol": canonical,
         "signal_review": signal_review,
+        "internal_signal_review": internal_signal_review,
         "swot": {
-            "strength": dict(empty_quadrant),
-            "weakness": dict(empty_quadrant),
+            "strength": strength,
+            "weakness": weakness,
             "opportunity": opportunity,
             "threat": threat,
         },
@@ -369,11 +483,21 @@ def build_workbench_swot_section(
         },
         "data_status": {
             "found": found,
-            "as_of": _dt_to_iso(latest_as_of) if latest_as_of else (signal_review or {}).get("analyzed_at"),
-            "expected_freshness": "随组合 AI 风险/机会分析更新",
-            "source": "quant_analyzer.symbol_risk_findings + symbol_opportunity_findings",
+            "as_of": (
+                _dt_to_iso(latest_as_of)
+                if latest_as_of
+                else (internal_signal_review or signal_review or {}).get("analyzed_at")
+            ),
+            "expected_freshness": "O/T 随外部事件分析更新；S/W 随内部财务信号刷新",
+            "source": (
+                "quant_analyzer.symbol_risk_findings + symbol_opportunity_findings + "
+                "symbol_strength_findings + symbol_weakness_findings"
+            ),
+            "strength_count": len(strength.get("findings") or []),
+            "weakness_count": len(weakness.get("findings") or []),
             "threat_count": len(threat.get("findings") or []),
             "opportunity_count": len(opportunity.get("findings") or []),
+            "internal_signal_enabled": internal_signal_enabled(),
         },
     }
 

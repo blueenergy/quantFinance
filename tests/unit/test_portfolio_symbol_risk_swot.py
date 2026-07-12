@@ -1,3 +1,5 @@
+import pytest
+
 from services.portfolio_symbol_risk import build_workbench_swot_section
 
 
@@ -16,11 +18,33 @@ class _Ledger:
 
 
 class _Reviews:
-    def __init__(self, reviews):
+    def __init__(self, reviews, internal_reviews=None):
         self.reviews = reviews
+        self.internal_reviews = internal_reviews or {}
 
-    def get_latest_reviews(self, symbols):
-        return {symbol: self.reviews.get(symbol) for symbol in symbols if symbol in self.reviews}
+    def get_latest_reviews(self, symbols, review_scope="external_event"):
+        source = (
+            self.internal_reviews
+            if review_scope == "internal_fundamental"
+            else self.reviews
+        )
+        return {symbol: source.get(symbol) for symbol in symbols if symbol in source}
+
+
+@pytest.fixture(autouse=True)
+def _empty_internal_ledgers(monkeypatch):
+    monkeypatch.setattr(
+        "services.portfolio_symbol_risk.get_symbol_strength_ledger",
+        lambda db=None: _Ledger({}),
+    )
+    monkeypatch.setattr(
+        "services.portfolio_symbol_risk.get_symbol_weakness_ledger",
+        lambda db=None: _Ledger({}),
+    )
+    monkeypatch.setattr(
+        "services.portfolio_symbol_risk.internal_signal_enabled",
+        lambda: True,
+    )
 
 
 def test_build_workbench_swot_section_maps_ot_and_planned_sw(monkeypatch):
@@ -78,8 +102,8 @@ def test_build_workbench_swot_section_maps_ot_and_planned_sw(monkeypatch):
     payload = build_workbench_swot_section("000001")
 
     assert payload["symbol"] == "000001.SZ"
-    assert payload["swot"]["strength"]["status"] == "planned"
-    assert payload["swot"]["weakness"]["status"] == "planned"
+    assert payload["swot"]["strength"]["status"] == "not_analyzed"
+    assert payload["swot"]["weakness"]["status"] == "not_analyzed"
     assert payload["swot"]["strength"]["findings"] == []
     assert payload["swot"]["threat"]["severity"] == "high"
     assert payload["swot"]["threat"]["findings"][0]["summary"] == "监管调查"
@@ -117,7 +141,7 @@ def test_build_workbench_swot_section_empty_when_no_ledger_rows(monkeypatch):
     assert payload["data_status"]["found"] is False
     assert payload["swot"]["threat"]["severity"] == "none"
     assert payload["swot"]["opportunity"]["strength"] == "none"
-    assert payload["swot"]["strength"]["status"] == "planned"
+    assert payload["swot"]["strength"]["status"] == "not_analyzed"
 
 
 def test_build_workbench_swot_section_includes_industry_references(monkeypatch):
@@ -167,3 +191,77 @@ def test_build_workbench_swot_section_includes_industry_references(monkeypatch):
     assert reference["data_status"]["found"] is True
     assert reference["opportunity"]["findings"][0]["summary"] == "玻纤行业景气修复"
     assert reference["threat"]["findings"][0]["summary"] == "原材料价格波动"
+
+
+def test_build_workbench_swot_section_includes_strength_and_weakness(monkeypatch):
+    monkeypatch.setattr(
+        "services.portfolio_symbol_risk.get_symbol_risk_ledger",
+        lambda db=None: _Ledger({}),
+    )
+    monkeypatch.setattr(
+        "services.portfolio_symbol_risk.get_symbol_opportunity_ledger",
+        lambda db=None: _Ledger({}),
+    )
+    monkeypatch.setattr(
+        "services.portfolio_symbol_risk.get_symbol_strength_ledger",
+        lambda db=None: _Ledger(
+            {
+                "300196.SZ": [
+                    {
+                        "finding_key": "profitability.roe_high",
+                        "rule_id": "profitability.roe_high",
+                        "strength": "high",
+                        "category": "profitability",
+                        "summary": "ROE 水平较高且处于行业前列",
+                        "engine_version": "sw-mvp-v1",
+                        "rule_config_hash": "rules-hash",
+                        "last_confirmed_at": "2026-07-10T12:00:00",
+                    }
+                ]
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        "services.portfolio_symbol_risk.get_symbol_weakness_ledger",
+        lambda db=None: _Ledger(
+            {
+                "300196.SZ": [
+                    {
+                        "finding_key": "leverage.debt_elevated",
+                        "rule_id": "leverage.debt_elevated",
+                        "severity": "medium",
+                        "category": "leverage",
+                        "summary": "资产负债率较高且处于行业高位",
+                    }
+                ]
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        "services.portfolio_symbol_risk.get_symbol_signal_reviews",
+        lambda db=None: _Reviews(
+            {},
+            {
+                "300196.SZ": {
+                    "analyzed_at": "2026-07-10T12:00:00",
+                    "engine_type": "rules",
+                    "engine_version": "sw-mvp-v1",
+                    "rule_config_hash": "rules-hash",
+                    "input_completeness": "complete",
+                    "result_counts": {"strength": 1, "weakness": 1},
+                }
+            },
+        ),
+    )
+
+    payload = build_workbench_swot_section("300196.SZ")
+
+    assert payload["swot"]["strength"]["status"] == "completed"
+    assert payload["swot"]["strength"]["strength"] == "high"
+    assert payload["swot"]["strength"]["findings"][0]["rule_id"] == (
+        "profitability.roe_high"
+    )
+    assert payload["swot"]["weakness"]["severity"] == "medium"
+    assert payload["internal_signal_review"]["engine_type"] == "rules"
+    assert payload["data_status"]["strength_count"] == 1
+    assert payload["data_status"]["weakness_count"] == 1

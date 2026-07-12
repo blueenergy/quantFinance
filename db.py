@@ -155,6 +155,8 @@ def get_analyzer_db():
         "symbol_risk_findings": analyzer_db["symbol_risk_findings"],
         "industry_risk_findings": analyzer_db["industry_risk_findings"],
         "symbol_opportunity_findings": analyzer_db["symbol_opportunity_findings"],
+        "symbol_strength_findings": analyzer_db["symbol_strength_findings"],
+        "symbol_weakness_findings": analyzer_db["symbol_weakness_findings"],
         "industry_opportunity_findings": analyzer_db["industry_opportunity_findings"],
         "symbol_llm_signal_reviews": analyzer_db["symbol_llm_signal_reviews"],
         "market_analysis_cache": analyzer_db["market_analysis_cache"],

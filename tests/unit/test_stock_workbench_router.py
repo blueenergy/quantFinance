@@ -18,10 +18,12 @@ from routers.stock_workbench import (
     _valuation_section,
     _valuation_status,
     AnalyzeNewsUrlRequest,
+    RefreshInternalSignalsRequest,
     analyze_stock_workbench_news_url,
     collect_stock_workbench_signals,
     get_stock_workbench,
     get_stock_workbench_signals,
+    refresh_stock_workbench_internal_signals,
 )
 
 
@@ -1470,6 +1472,58 @@ def test_get_stock_workbench_signals_returns_swot_payload(monkeypatch):
     assert response["data"]["swot"]["threat"]["findings"][0]["severity"] == "high"
     assert response["data"]["industry_signal_reference"]["industry"] == "银行"
     assert response["data"]["data_status"]["found"] is True
+
+
+def test_refresh_stock_workbench_internal_signals_enqueues_rule_task(monkeypatch):
+    class _InsertResult:
+        inserted_id = "internal-task-1"
+
+    class _Tasks:
+        def __init__(self):
+            self.inserted = []
+
+        def find_one(self, query, sort=None):
+            return None
+
+        def insert_one(self, doc):
+            self.inserted.append(doc)
+            return _InsertResult()
+
+    tasks = _Tasks()
+    monkeypatch.setattr(
+        "routers.stock_workbench.get_db_collections",
+        lambda: {"analysis_tasks": tasks},
+    )
+    monkeypatch.setattr(
+        "routers.stock_workbench._stock_identity",
+        lambda symbol: {
+            "symbol": "300196.SZ",
+            "name": "长海股份",
+            "industry": "玻璃玻纤",
+        },
+    )
+    monkeypatch.setattr(
+        "routers.stock_workbench._latest_score",
+        lambda symbol: {"score_date": "20260710"},
+    )
+    monkeypatch.setattr(
+        "routers.stock_workbench.internal_signal_enabled",
+        lambda: True,
+    )
+
+    response = refresh_stock_workbench_internal_signals(
+        "300196",
+        request=RefreshInternalSignalsRequest(force=True),
+        current_user={"id": "u1"},
+    )
+
+    assert response["data"]["task_id"] == "internal-task-1"
+    task = tasks.inserted[0]
+    assert task["type"] == "internal_signal_refresh"
+    assert task["params"]["symbol"] == "300196.SZ"
+    assert task["params"]["score_date"] == "20260710"
+    assert task["params"]["force"] is True
+    assert task["operation_type"] == "workbench_internal_signal_refresh"
 
 
 def test_collect_stock_workbench_signals_enqueues_single_symbol_task(monkeypatch):

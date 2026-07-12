@@ -20,7 +20,10 @@ from db import get_analyzer_db, get_data_db, get_db_collections
 from routers.stock import _json_safe, _symbol_candidates
 from services.analysis_history import build_user_analysis_history_payload
 from services.analysis_tasks import build_task_doc
-from services.portfolio_symbol_risk import build_workbench_swot_section
+from services.portfolio_symbol_risk import (
+    build_workbench_swot_section,
+    internal_signal_enabled,
+)
 from services.valuation import VALUATION_SOURCE, build_stock_valuation
 try:
     from stock_data_access.evidence_fingerprint import normalize_url
@@ -63,6 +66,10 @@ MAX_FINDING_KEY_LENGTH = 256
 class AnalyzeNewsUrlRequest(BaseModel):
     url: str = Field(..., min_length=1, max_length=MAX_NEWS_URL_LENGTH)
     finding_key: Optional[str] = Field(default=None, max_length=MAX_FINDING_KEY_LENGTH)
+
+
+class RefreshInternalSignalsRequest(BaseModel):
+    force: bool = False
 
 
 def _validate_public_http_url(raw_url: str) -> str:
@@ -1959,6 +1966,77 @@ def get_stock_workbench_signals(
     return {
         "success": True,
         "data": _json_safe(payload),
+    }
+
+
+@router.post("/{symbol}/workbench/signals/refresh-internal")
+def refresh_stock_workbench_internal_signals(
+    symbol: str,
+    request: RefreshInternalSignalsRequest,
+    current_user: Dict[str, Any] = Depends(get_current_active_user),
+):
+    """Enqueue deterministic Strength/Weakness analysis for one symbol."""
+    if not internal_signal_enabled():
+        raise HTTPException(status_code=503, detail="internal signal analysis is disabled")
+    collections = get_db_collections()
+    analysis_tasks = collections.get("analysis_tasks")
+    if analysis_tasks is None:
+        raise HTTPException(status_code=503, detail="analysis task queue unavailable")
+
+    stock = _stock_identity(symbol)
+    canonical = str(stock.get("symbol") or symbol).strip().upper()
+    user_id = str(current_user.get("id") or current_user.get("username") or "")
+    existing = analysis_tasks.find_one(
+        {
+            "type": "internal_signal_refresh",
+            "user_id": user_id,
+            "params.symbol": canonical,
+            "status": {"$in": ["pending", "processing"]},
+        },
+        sort=[("created_at", -1)],
+    )
+    if existing:
+        return {
+            "success": True,
+            "data": {
+                "task_id": str(existing.get("_id") or ""),
+                "status": existing.get("status") or "pending",
+                "reused": True,
+            },
+        }
+
+    score = _latest_score(canonical) or {}
+    score_date = str(score.get("score_date") or datetime.utcnow().strftime("%Y%m%d"))
+    run_id = str(uuid.uuid4())
+    params = {
+        "symbol": canonical,
+        "score_date": score_date,
+        "run_id": run_id,
+        "force": request.force,
+        "options": {"force": request.force},
+    }
+    task = build_task_doc(
+        current_user=current_user,
+        task_type="internal_signal_refresh",
+        priority=11,
+        symbol=canonical,
+        stock_name=stock.get("name"),
+        params=params,
+        source="stock_workbench_swot",
+        extra_fields={
+            "operation_type": "workbench_internal_signal_refresh",
+            "idempotency_key": f"internal-signal:{canonical}:{run_id}",
+        },
+    )
+    result = analysis_tasks.insert_one(task)
+    return {
+        "success": True,
+        "data": {
+            "task_id": str(getattr(result, "inserted_id", "") or ""),
+            "run_id": run_id,
+            "status": "pending",
+            "reused": False,
+        },
     }
 
 
