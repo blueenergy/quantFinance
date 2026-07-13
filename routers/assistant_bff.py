@@ -356,6 +356,7 @@ async def chat_stream_hermes(
                 symbol=sym_guess if sym_guess else None,
                 page=1,
                 limit=_ANALYSIS_HISTORY_LIMIT,
+                include_full=True,
             )
             system_fragments.append(
                 _analysis_history_json_for_system_prompt(

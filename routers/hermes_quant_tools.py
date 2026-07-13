@@ -307,6 +307,7 @@ async def hermes_get_analysis_history(
         symbol=symbol,
         page=1,
         limit=limit,
+        include_full=True,
     )
     return payload
 
@@ -3634,6 +3635,7 @@ async def user_watchlist_history(
         user_id=user["id"],
         symbol=symbol,
         limit=min(limit, 50),
+        include_full=True,
     )
     payload["username"] = user.get("username")
     return payload

@@ -18,7 +18,10 @@ from services.analysis_tasks import (
     estimate_wait_seconds,
     queue_wait_seconds_to_text,
 )
-from services.analysis_history import build_user_analysis_history_payload
+from services.analysis_history import (
+    build_user_analysis_history_payload,
+    get_user_analysis_history_detail,
+)
 from db import db
 from routers.entitlements_matrix import (
     FEATURE_WATCHLIST_OPPORTUNITIES,
@@ -727,17 +730,36 @@ def _fetch_ladder_data_for_portfolio() -> Optional[Dict[str, Any]]:
 
 
 @router.get("/analysis-history")
-def get_analysis_history(symbol: Optional[str] = None, page: int = 1, limit: int = 50, current_user: dict = Depends(get_current_active_user)):
+def get_analysis_history(
+    symbol: Optional[str] = None,
+    page: int = 1,
+    limit: int = 50,
+    include_full: bool = False,
+    current_user: dict = Depends(get_current_active_user),
+):
     """
     获取当前用户指定股票的分析历史。
     如果未提供 `symbol`，将返回当前用户的所有历史（按时间倒序），支持分页（page, limit）。
+    默认仅返回列表摘要；include_full=true 时返回完整正文（供兼容调用方）。
     """
     return build_user_analysis_history_payload(
         current_user.get("id"),
         symbol=symbol,
         page=page,
         limit=limit,
+        include_full=include_full,
     )
+
+
+@router.get("/analysis-history/{history_id}", summary="获取单条分析历史详情")
+def get_analysis_history_detail(
+    history_id: str,
+    current_user: dict = Depends(get_current_active_user),
+):
+    payload = get_user_analysis_history_detail(current_user.get("id"), history_id)
+    if not payload:
+        raise HTTPException(status_code=404, detail="分析记录不存在")
+    return payload
 
 
 @router.post("/analyze/deep-analysis")

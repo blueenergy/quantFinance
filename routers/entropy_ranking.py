@@ -198,6 +198,30 @@ def _entropy_sort_key(doc: Dict[str, Any]) -> tuple:
     return (value is None, value if value is not None else 0.0, str(doc.get("symbol") or ""))
 
 
+_MISSING_ENTROPY_SENTINEL = 1e18
+
+
+def _rank_entropy_docs(coll, query: Dict[str, Any], limit: int) -> List[Dict[str, Any]]:
+    """在 MongoDB 内按熵值升序排序并截断，缺失分数排末尾。"""
+    pipeline = [
+        {"$match": query},
+        {
+            "$addFields": {
+                "_rank_entropy": {
+                    "$ifNull": [
+                        "$final_entropy_score",
+                        {"$ifNull": ["$entropy_score", _MISSING_ENTROPY_SENTINEL]},
+                    ]
+                }
+            }
+        },
+        {"$sort": {"_rank_entropy": 1, "symbol": 1}},
+        {"$limit": int(limit)},
+        {"$project": {"_id": 0, "_rank_entropy": 0}},
+    ]
+    return list(coll.aggregate(pipeline))
+
+
 @router.get("/entropy/dates")
 def get_entropy_dates(limit: int = Query(60, ge=1, le=500)):
     coll = get_db_collections()["entropy_scores"]
@@ -221,8 +245,7 @@ def get_entropy_rankings(
     query: Dict[str, Any] = {"score_date": score_date}
     if index_code:
         query["index_codes"] = index_code
-    docs = list(coll.find(query, {"_id": 0}))
-    docs = sorted(docs, key=_entropy_sort_key)[:limit]
+    docs = _rank_entropy_docs(coll, query, limit)
     info_map = _build_info_map([str(d.get("symbol") or "") for d in docs])
     rows = [_serialize_score(doc, info_map) for doc in docs]
     return {"success": True, "data": {"score_date": score_date, "rows": rows}}

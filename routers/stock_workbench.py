@@ -1101,7 +1101,9 @@ def _stock_identity(symbol: str) -> Dict[str, Any]:
 
 
 def _latest_deep_analysis(user_id: Any, symbol: str) -> Optional[Dict[str, Any]]:
-    payload = build_user_analysis_history_payload(user_id, symbol=symbol, page=1, limit=1)
+    payload = build_user_analysis_history_payload(
+        user_id, symbol=symbol, page=1, limit=1, include_full=True
+    )
     rows = payload.get("data") if isinstance(payload, dict) else None
     if isinstance(rows, list) and rows:
         return rows[0]

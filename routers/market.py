@@ -1316,24 +1316,15 @@ def _sector_distribution(rows: List[Dict[str, Any]]) -> Dict[str, int]:
 
 
 def _previous_trade_dates(volume_price, start_date: str, needed: int) -> List[str]:
-    """Return latest trading dates before start_date using trade_date index order."""
+    """Return latest trading dates before start_date (distinct on trade_date)."""
     if needed <= 0:
         return []
-    out: List[str] = []
-    seen = set()
-    cursor = volume_price.find(
+    dates = volume_price.distinct(
+        "trade_date",
         {"trade_date": {"$lt": start_date}, "close": {"$exists": True, "$ne": None}},
-        {"_id": 0, "trade_date": 1},
-    ).sort("trade_date", -1).limit(max(needed * 8000, 20000))
-    for row in cursor:
-        trade_date = str(row.get("trade_date") or "")
-        if not trade_date or trade_date in seen:
-            continue
-        seen.add(trade_date)
-        out.append(trade_date)
-        if len(out) >= needed:
-            break
-    return sorted(out)
+    )
+    valid = sorted({str(d) for d in dates if d}, reverse=True)
+    return sorted(valid[:needed])
 
 
 @router.get('/market-spectrum/sectors', summary="获取板块日线阴阳谱数据", tags=["Market"])
@@ -1372,8 +1363,10 @@ def get_market_spectrum_sectors(
     if prev_days:
         lookback_start = prev_days[0]
 
+    member_symbols = list(members.keys())
     cursor = volume_price.find(
         {
+            "symbol": {"$in": member_symbols},
             "trade_date": {"$gte": lookback_start, "$lte": end_date},
             "close": {"$exists": True, "$ne": None},
         },
@@ -1383,8 +1376,7 @@ def get_market_spectrum_sectors(
     rows_by_symbol: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
     for doc in cursor:
         symbol = str(doc.get("symbol") or "")
-        if symbol in members:
-            rows_by_symbol[symbol].append(doc)
+        rows_by_symbol[symbol].append(doc)
 
     groups: Dict[tuple, List[Dict[str, Any]]] = defaultdict(list)
     for symbol, rows in rows_by_symbol.items():

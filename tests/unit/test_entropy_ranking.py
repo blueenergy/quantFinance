@@ -53,6 +53,30 @@ class _FakeDataDb(dict):
 
 
 @pytest.mark.unit
+def test_rank_entropy_docs_missing_scores_last():
+    class _FakeColl:
+        def aggregate(self, pipeline):
+            docs = [
+                {"symbol": "AAA", "final_entropy_score": 0.2},
+                {"symbol": "BBB"},
+                {"symbol": "CCC", "entropy_score": 0.1},
+                {"symbol": "DDD", "final_entropy_score": 0.05},
+            ]
+            match = pipeline[0]["$match"]
+            rows = [d for d in docs if d.get("score_date", "20260101") == match.get("score_date", "20260101")]
+            ranked = sorted(rows, key=entropy_ranking._entropy_sort_key)
+            limit = pipeline[3]["$limit"]
+            return [{k: v for k, v in d.items()} for d in ranked[:limit]]
+
+    docs = entropy_ranking._rank_entropy_docs(
+        _FakeColl(),
+        {"score_date": "20260101"},
+        3,
+    )
+    assert [d["symbol"] for d in docs] == ["DDD", "CCC", "AAA"]
+
+
+@pytest.mark.unit
 def test_future_returns_uses_hfq_factors(monkeypatch):
     vp = _FakeVpColl(
         [
