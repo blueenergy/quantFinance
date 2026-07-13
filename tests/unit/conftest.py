@@ -16,6 +16,23 @@ import pytest
 _UNIT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
+class _EmptyInternalLedger:
+    def get_active_for_symbols(self, symbols):
+        return {symbol: [] for symbol in symbols}
+
+
+@pytest.fixture(autouse=True)
+def _mock_internal_swot_ledgers(monkeypatch):
+    monkeypatch.setattr(
+        "services.portfolio_symbol_risk.get_symbol_strength_ledger",
+        lambda db=None: _EmptyInternalLedger(),
+    )
+    monkeypatch.setattr(
+        "services.portfolio_symbol_risk.get_symbol_weakness_ledger",
+        lambda db=None: _EmptyInternalLedger(),
+    )
+
+
 def pytest_collection_modifyitems(config, items):
     for item in items:
         item_path = getattr(item, "fspath", None)

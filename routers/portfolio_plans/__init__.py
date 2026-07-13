@@ -79,6 +79,7 @@ from services.portfolio_symbol_risk import (
     attach_signal_reviews_to_items,
     build_ledger_opportunity_summary,
     build_ledger_llm_summary,
+    enrich_items_with_internal_swot,
     filter_items_for_llm_enqueue,
     get_symbol_opportunity_ledger,
     get_symbol_risk_ledger,
@@ -1808,6 +1809,7 @@ def _enrich_plan_items_with_llm_risk(
     symbols = [str(item.get("symbol") or "") for item in items if item.get("symbol")]
     reviews_by_symbol = get_symbol_signal_reviews(get_analyzer_db()).get_latest_reviews(symbols) if symbols else {}
     items = attach_signal_reviews_to_items(items, reviews_by_symbol)
+    items = enrich_items_with_internal_swot(items, db=get_analyzer_db())
     ledger = get_symbol_risk_ledger(get_analyzer_db())
     grouped = ledger.get_active_for_symbols(symbols) if symbols else {}
     opportunity_grouped: Dict[str, List[Dict[str, Any]]] = {}
@@ -2024,6 +2026,7 @@ def _enrich_bench_payload_with_llm_risk(
     symbols = [str(item.get("symbol") or "") for item in bench_items if item.get("symbol")]
     reviews_by_symbol = get_symbol_signal_reviews(get_analyzer_db()).get_latest_reviews(symbols) if symbols else {}
     bench_items = attach_signal_reviews_to_items(bench_items, reviews_by_symbol)
+    bench_items = enrich_items_with_internal_swot(bench_items, db=get_analyzer_db())
     ledger = get_symbol_risk_ledger(get_analyzer_db())
     grouped = ledger.get_active_for_symbols(symbols) if symbols else {}
     opportunity_grouped: Dict[str, List[Dict[str, Any]]] = {}

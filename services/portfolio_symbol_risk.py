@@ -178,6 +178,7 @@ def build_internal_payload_from_ledger_findings(
             "last_confirmed_at": _dt_to_iso(row.get("last_confirmed_at")),
             "evidence": row.get("evidence") or [],
             "lifecycle_policy": row.get("lifecycle_policy") or {},
+            "rule_condition": row.get("rule_condition") or {},
         }
         for row in findings
     ]
@@ -280,6 +281,68 @@ def attach_ledger_opportunity_to_items(
         enriched.append({**item, "ai_opportunity": opportunity})
         attached += 1
     return enriched, attached
+
+
+def attach_ledger_internal_swot_to_items(
+    items: List[Dict[str, Any]],
+    grouped_strength: Dict[str, List[Dict[str, Any]]],
+    grouped_weakness: Dict[str, List[Dict[str, Any]]],
+) -> Tuple[List[Dict[str, Any]], int]:
+    enriched: List[Dict[str, Any]] = []
+    attached = 0
+    for item in items:
+        symbol = str(item.get("symbol") or "")
+        strength_rows = grouped_strength.get(symbol) or []
+        weakness_rows = grouped_weakness.get(symbol) or []
+        if not strength_rows and not weakness_rows:
+            enriched.append(item)
+            continue
+        strength = build_internal_payload_from_ledger_findings(
+            strength_rows,
+            dimension="strength",
+            review=None,
+        )
+        weakness = build_internal_payload_from_ledger_findings(
+            weakness_rows,
+            dimension="weakness",
+            review=None,
+        )
+        enriched.append(
+            {
+                **item,
+                "internal_swot": {
+                    "strength": strength,
+                    "weakness": weakness,
+                },
+            }
+        )
+        attached += 1
+    return enriched, attached
+
+
+def enrich_items_with_internal_swot(
+    items: List[Dict[str, Any]],
+    db=None,
+) -> List[Dict[str, Any]]:
+    if not internal_signal_enabled() or not items:
+        return items
+    symbols = [str(item.get("symbol") or "") for item in items if item.get("symbol")]
+    if not symbols:
+        return items
+    if db is None:
+        from db import get_analyzer_db
+
+        db = get_analyzer_db()
+    grouped_strength = get_symbol_strength_ledger(db).get_active_for_symbols(symbols)
+    grouped_weakness = get_symbol_weakness_ledger(db).get_active_for_symbols(symbols)
+    if not any(grouped_strength.values()) and not any(grouped_weakness.values()):
+        return items
+    enriched, _ = attach_ledger_internal_swot_to_items(
+        items,
+        grouped_strength,
+        grouped_weakness,
+    )
+    return enriched
 
 
 def build_ledger_llm_summary(

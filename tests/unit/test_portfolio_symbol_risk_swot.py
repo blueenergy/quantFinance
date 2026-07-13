@@ -265,3 +265,47 @@ def test_build_workbench_swot_section_includes_strength_and_weakness(monkeypatch
     assert payload["internal_signal_review"]["engine_type"] == "rules"
     assert payload["data_status"]["strength_count"] == 1
     assert payload["data_status"]["weakness_count"] == 1
+
+
+def test_enrich_items_with_internal_swot_attaches_summary(monkeypatch):
+    monkeypatch.setattr(
+        "services.portfolio_symbol_risk.internal_signal_enabled",
+        lambda: True,
+    )
+
+    class _StrengthLedger:
+        def get_active_for_symbols(self, symbols):
+            return {
+                "600519.SH": [
+                    {
+                        "finding_key": "profitability.roe_high",
+                        "rule_id": "profitability.roe_high",
+                        "strength": "high",
+                        "summary": "ROE 较高",
+                    }
+                ]
+            }
+
+    class _WeaknessLedger:
+        def get_active_for_symbols(self, symbols):
+            return {"600519.SH": []}
+
+    monkeypatch.setattr(
+        "services.portfolio_symbol_risk.get_symbol_strength_ledger",
+        lambda db=None: _StrengthLedger(),
+    )
+    monkeypatch.setattr(
+        "services.portfolio_symbol_risk.get_symbol_weakness_ledger",
+        lambda db=None: _WeaknessLedger(),
+    )
+
+    from services.portfolio_symbol_risk import enrich_items_with_internal_swot
+
+    enriched = enrich_items_with_internal_swot(
+        [{"symbol": "600519.SH", "name": "茅台"}],
+        db=object(),
+    )
+
+    assert enriched[0]["internal_swot"]["strength"]["findings"][0]["finding_key"] == (
+        "profitability.roe_high"
+    )
