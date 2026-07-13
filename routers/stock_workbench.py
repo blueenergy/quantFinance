@@ -215,7 +215,9 @@ def _latest_score(symbol: str) -> Optional[Dict[str, Any]]:
     candidates = _symbol_candidates(symbol)
     return collections["stock_scores"].find_one(
         {"symbol": {"$in": candidates}},
-        sort=[("score_date", -1), ("_id", -1)],
+        # Keep the sort covered by (symbol, score_date). Adding _id here forces
+        # MongoDB to fetch and sort every score document for a cold symbol.
+        sort=[("score_date", -1)],
     )
 
 
@@ -236,7 +238,8 @@ def _score_history(symbol: str, limit: int = 60) -> List[Dict[str, Any]]:
             "cycle_score": 1,
             "composite_score": 1,
         },
-        sort=[("score_date", -1), ("_id", -1)],
+        # See _latest_score: the deployed compound index does not include _id.
+        sort=[("score_date", -1)],
         limit=limit,
     )
     return list(cursor)
@@ -250,18 +253,20 @@ def _latest_daily_quote(data: Any, candidates: List[str], trade_date: Any = None
         if trade_date:
             same_day = volume_price.find_one(
                 {**base, "trade_date": trade_date},
-                sort=[("trade_date", -1), ("_id", -1)],
+                sort=[("trade_date", -1)],
             )
             if same_day:
                 return same_day
             doc = volume_price.find_one(
                 {**base, "trade_date": {"$lt": trade_date}},
-                sort=[("trade_date", -1), ("_id", -1)],
+                sort=[("trade_date", -1)],
             )
             if doc:
                 return doc
         else:
-            doc = volume_price.find_one(base, sort=[("trade_date", -1), ("_id", -1)])
+            # volume_price is unique per symbol/trade_date. Restricting the
+            # sort to trade_date lets MongoDB stop after one index entry.
+            doc = volume_price.find_one(base, sort=[("trade_date", -1)])
             if doc:
                 return doc
     return None

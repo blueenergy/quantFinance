@@ -7,6 +7,8 @@ from routers.stock_workbench import (
     _attach_display_pct_change,
     _financials_section,
     _kline_section,
+    _latest_daily_quote,
+    _latest_score,
     _money_flow_section,
     _nineturn_section,
     _quote_section,
@@ -70,6 +72,47 @@ class _Collection:
             if value != expected:
                 return False
         return True
+
+
+class _RecordingCollection(_Collection):
+    def __init__(self, docs=None):
+        super().__init__(docs)
+        self.find_one_sorts = []
+        self.find_sorts = []
+
+    def find_one(self, query=None, projection=None, sort=None):
+        self.find_one_sorts.append(sort)
+        return super().find_one(query, projection, sort)
+
+    def find(self, query=None, projection=None, sort=None, limit=0):
+        self.find_sorts.append(sort)
+        return super().find(query, projection, sort, limit)
+
+
+def test_latest_daily_quote_uses_index_covered_sort():
+    quotes = _RecordingCollection(
+        [{"symbol": "000001.SZ", "trade_date": "20260610", "close": 10.0}]
+    )
+
+    quote = _latest_daily_quote({"volume_price": quotes}, ["000001.SZ"])
+
+    assert quote["trade_date"] == "20260610"
+    assert quotes.find_one_sorts == [[("trade_date", -1)]]
+
+
+def test_score_queries_use_index_covered_sort(monkeypatch):
+    scores = _RecordingCollection(
+        [{"symbol": "000001.SZ", "score_date": "20260610", "technical_score": 70}]
+    )
+    monkeypatch.setattr("routers.stock_workbench.get_db_collections", lambda: {"stock_scores": scores})
+
+    latest = _latest_score("000001.SZ")
+    history = _score_history("000001.SZ")
+
+    assert latest["score_date"] == "20260610"
+    assert history[0]["score_date"] == "20260610"
+    assert scores.find_one_sorts == [[("score_date", -1)]]
+    assert scores.find_sorts == [[("score_date", -1)]]
 
 
 def test_display_pct_change_uses_close_against_daily_pre_close():
