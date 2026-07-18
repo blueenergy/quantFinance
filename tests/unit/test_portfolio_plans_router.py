@@ -1386,7 +1386,8 @@ def test_generate_portfolio_plan_uses_current_user(monkeypatch):
     assert response["data"]["status"] == "pending"
     assert response["data"]["user_id"] == "user-1"
     assert response["data"]["strategy_template_id"] == "s1"
-    assert response["data"]["base_date"] == "2025-01-04"
+    # API may accept YYYY-MM-DD, but tasks must store YYYYMMDD for Mongo score_date compares.
+    assert response["data"]["base_date"] == "20250104"
     assert response["data"]["mode"] == "auto"
     assert "initial_capital_override" not in response["data"]
     assert response["data"]["preset_id"] == "preset-1"
@@ -1396,7 +1397,9 @@ def test_generate_portfolio_plan_uses_current_user(monkeypatch):
         "cash_buffer": 0.05,
         "initial_capital": 250_000,
     }
-    assert collections["portfolio_plan_generation_tasks"].docs[0]["task_id"] == response["data"]["task_id"]
+    stored_task = collections["portfolio_plan_generation_tasks"].docs[0]
+    assert stored_task["task_id"] == response["data"]["task_id"]
+    assert stored_task["base_date"] == "20250104"
 
 
 def test_generate_portfolio_plan_rejects_disabled_strategy(monkeypatch):
