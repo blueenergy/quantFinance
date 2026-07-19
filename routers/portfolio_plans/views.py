@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 
 from auth import get_current_user
 
@@ -421,6 +421,53 @@ def get_portfolio_plan_lineage_timeline(
         offset=offset,
     )
     return {"success": True, "data": _jsonable(payload)}
+
+
+@router.get("/lineages/{strategy_template_id}/{params_hash}/trailing-stop-runs")
+@_offload
+def list_lineage_trailing_stop_runs(
+    strategy_template_id: str,
+    params_hash: str,
+    limit: int = Query(default=7, ge=1, le=60),
+    triggered_only: bool = Query(default=False),
+    include_items: bool = Query(default=False),
+    current_user: dict = Depends(get_current_user),
+):
+    trading_collections = _pp.get_trading_db_collections()
+    user_id = _pp._current_user_id(current_user)
+    _pp._require_lineage_plan_access(
+        trading_collections,
+        strategy_template_id=strategy_template_id,
+        params_hash=params_hash,
+        user_id=user_id,
+    )
+    payload = _pp._list_trailing_stop_runs_payload(
+        trading_collections,
+        strategy_template_id=strategy_template_id,
+        params_hash=params_hash,
+        user_id=user_id,
+        limit=limit,
+        triggered_only=triggered_only,
+        include_items=include_items,
+    )
+    return {"success": True, "data": _jsonable(payload)}
+
+
+@router.get("/trailing-stop-runs/{run_id}")
+@_offload
+def get_trailing_stop_run(
+    run_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    trading_collections = _pp.get_trading_db_collections()
+    user_id = _pp._current_user_id(current_user)
+    run = trading_collections["portfolio_trailing_stop_runs"].find_one(
+        {"run_id": run_id, "user_id": user_id},
+        {"_id": 0},
+    )
+    if not run:
+        raise HTTPException(status_code=404, detail="trailing stop run not found")
+    return {"success": True, "data": _jsonable(run)}
 
 
 @router.get("/plans/{plan_id}/lineage-live-executions")

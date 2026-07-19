@@ -4763,6 +4763,120 @@ def _get_lineage_control_doc(
     return {"paused": False, "excluded_symbols": []}
 
 
+def _trailing_stop_run_summary(run: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not run:
+        return None
+    summary = dict(run.get("summary") or {})
+    return {
+        "run_id": run.get("run_id"),
+        "base_date": run.get("base_date"),
+        "status": run.get("status"),
+        "trailing_stop_pct": run.get("trailing_stop_pct"),
+        "summary": summary,
+        "triggered_count": int(summary.get("triggered_count") or 0),
+        "symbols_checked": int(summary.get("symbols_checked") or 0),
+        "triggered_symbols": list(run.get("triggered_symbols") or []),
+        "sell_plan_id": run.get("sell_plan_id"),
+        "verbosity": run.get("verbosity"),
+        "created_at": run.get("created_at"),
+    }
+
+
+def _latest_trailing_stop_run_summary(
+    trading_collections: Dict[str, Any],
+    *,
+    strategy_template_id: str,
+    params_hash: str,
+    user_id: str,
+) -> Optional[Dict[str, Any]]:
+    coll = trading_collections.get("portfolio_trailing_stop_runs")
+    if coll is None:
+        return None
+    run = coll.find_one(
+        {
+            "strategy_template_id": strategy_template_id,
+            "params_hash": params_hash,
+            "user_id": user_id,
+            "status": "completed",
+        },
+        {
+            "_id": 0,
+            "run_id": 1,
+            "base_date": 1,
+            "status": 1,
+            "trailing_stop_pct": 1,
+            "summary": 1,
+            "triggered_symbols": 1,
+            "sell_plan_id": 1,
+            "verbosity": 1,
+            "created_at": 1,
+        },
+        sort=[("base_date", -1), ("created_at", -1)],
+    )
+    return _trailing_stop_run_summary(run)
+
+
+def _list_trailing_stop_runs_payload(
+    trading_collections: Dict[str, Any],
+    *,
+    strategy_template_id: str,
+    params_hash: str,
+    user_id: str,
+    limit: int = 7,
+    triggered_only: bool = False,
+    include_items: bool = False,
+) -> Dict[str, Any]:
+    coll = trading_collections.get("portfolio_trailing_stop_runs")
+    if coll is None:
+        return {"runs": []}
+    query: Dict[str, Any] = {
+        "strategy_template_id": strategy_template_id,
+        "params_hash": params_hash,
+        "user_id": user_id,
+        "status": "completed",
+    }
+    if triggered_only:
+        query["triggered_symbols"] = {"$ne": []}
+    projection = {"_id": 0}
+    if not include_items:
+        projection["items"] = 0
+    rows = list(
+        coll.find(query, projection)
+        .sort([("base_date", -1), ("created_at", -1)])
+        .limit(max(1, int(limit)))
+    )
+    if include_items:
+        return {
+            "strategy_template_id": strategy_template_id,
+            "params_hash": params_hash,
+            "runs": rows,
+        }
+    return {
+        "strategy_template_id": strategy_template_id,
+        "params_hash": params_hash,
+        "runs": [_trailing_stop_run_summary(row) or row for row in rows],
+    }
+
+
+def _require_lineage_plan_access(
+    trading_collections: Dict[str, Any],
+    *,
+    strategy_template_id: str,
+    params_hash: str,
+    user_id: str,
+) -> None:
+    exists = trading_collections["portfolio_trade_plans"].find_one(
+        {
+            "strategy_template_id": strategy_template_id,
+            "params_hash": params_hash,
+            "user_id": user_id,
+        },
+        {"_id": 1},
+    )
+    if not exists:
+        raise HTTPException(status_code=404, detail="lineage not found")
+
+
 def _lineage_control_key(strategy_template_id: str, params_hash: str, user_id: Optional[str]) -> Dict[str, Any]:
     return {
         "strategy_template_id": strategy_template_id,
@@ -5638,6 +5752,12 @@ def _build_lineage_timeline_payload(
         "today_state": _plan_today_state_label(headline_plan),
         "action_required": _plan_action_required(headline_plan),
         "latest_drift_summary": latest_drift_summary,
+        "latest_trailing_stop_run": _latest_trailing_stop_run_summary(
+            trading_collections,
+            strategy_template_id=str(latest_plan.get("strategy_template_id") or ""),
+            params_hash=str(latest_plan.get("params_hash") or ""),
+            user_id=user_id,
+        ),
         "timeline": timeline,
         "timeline_pagination": {"total": total, "limit": limit, "offset": offset},
     }
@@ -5896,6 +6016,8 @@ list_portfolios = _views.list_portfolios
 get_portfolio_plan_summary = _views.get_portfolio_plan_summary
 list_live_portfolios = _views.list_live_portfolios
 get_portfolio_plan_lineage_timeline = _views.get_portfolio_plan_lineage_timeline
+list_lineage_trailing_stop_runs = _views.list_lineage_trailing_stop_runs
+get_trailing_stop_run = _views.get_trailing_stop_run
 get_lineage_live_executions = _views.get_lineage_live_executions
 get_lineage_live_positions = _views.get_lineage_live_positions
 get_lineage_live_equity = _views.get_lineage_live_equity

@@ -505,6 +505,7 @@ def _collections():
         "portfolio_plan_operation_logs": _Collection(),
         "portfolio_worker_status": _Collection(),
         "portfolio_lineage_controls": _Collection(),
+        "portfolio_trailing_stop_runs": _Collection(),
         "portfolio_live_snapshots": _Collection(),
         "portfolio_plan_risk_snapshots": _Collection(),
         "portfolio_strategy_param_presets": _Collection(
@@ -6929,3 +6930,59 @@ def test_force_rebalance_blocks_when_lineage_has_open_trade_plan(monkeypatch, op
     assert exc.value.detail["plan_id"] == "open-plan"
     assert exc.value.detail["status"] == open_status
     assert not cols["portfolio_plan_generation_tasks"].docs
+
+
+def test_trailing_stop_run_endpoints(monkeypatch):
+    cols = _collections()
+    cols["portfolio_trailing_stop_runs"] = _Collection(
+        [
+            {
+                "run_id": "run-1",
+                "strategy_template_id": "s1",
+                "params_hash": "hash-abc",
+                "user_id": "user-1",
+                "base_date": "20250107",
+                "status": "completed",
+                "trailing_stop_pct": 0.15,
+                "summary": {
+                    "symbols_checked": 3,
+                    "triggered_count": 0,
+                    "message": "已检查 3 只，无标的跌破 15% 移动止盈",
+                },
+                "triggered_symbols": [],
+                "verbosity": "verbose",
+                "items": [
+                    {"symbol": "000001", "peak_high": 10, "close": 9.8, "stop_floor": 8.5, "triggered": False},
+                ],
+            }
+        ]
+    )
+    cols["portfolio_trade_plans"].docs.append(
+        {
+            "plan_id": "plan-user-1",
+            "strategy_template_id": "s1",
+            "params_hash": "hash-abc",
+            "user_id": "user-1",
+            "base_date": "20250102",
+            "status": "executed_paper",
+        }
+    )
+    monkeypatch.setattr(portfolio_plans, "get_trading_db_collections", lambda: cols)
+
+    list_resp = asyncio.run(
+        portfolio_plans.list_lineage_trailing_stop_runs(
+            "s1",
+            "hash-abc",
+            limit=7,
+            triggered_only=False,
+            include_items=False,
+            current_user={"id": "user-1"},
+        )
+    )
+    assert list_resp["data"]["runs"][0]["run_id"] == "run-1"
+    assert list_resp["data"]["runs"][0]["summary"]["symbols_checked"] == 3
+
+    detail_resp = asyncio.run(
+        portfolio_plans.get_trailing_stop_run("run-1", current_user={"id": "user-1"})
+    )
+    assert detail_resp["data"]["items"][0]["symbol"] == "000001"
