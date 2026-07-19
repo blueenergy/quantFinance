@@ -398,24 +398,32 @@ def _candidate_strategy_config_from_row(job: Dict[str, Any], row: Dict[str, Any]
 
 def _load_full_result_rows(result: Dict[str, Any]) -> List[Dict[str, Any]]:
     preview_rows = list(result.get("rows") or [])
+    json_path = (result.get("artifact") or {}).get("json_path")
+
+    def _read_artifact_rows() -> Optional[List[Dict[str, Any]]]:
+        if not json_path:
+            return None
+        path = _resolve_artifact_path(str(json_path))
+        if path is None or not path.exists():
+            candidate = Path(str(json_path))
+            path = candidate if candidate.exists() else None
+        if path is None:
+            return None
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        artifact_rows = list(payload.get("rows") or [])
+        return artifact_rows or None
+
+    artifact_rows = _read_artifact_rows()
+    if artifact_rows and len(artifact_rows) > len(preview_rows):
+        return artifact_rows
+
     total = int(result.get("row_count_total") or len(preview_rows))
     if total <= len(preview_rows):
         return preview_rows
-    json_path = (result.get("artifact") or {}).get("json_path")
-    if not json_path:
-        return preview_rows
-    path = _resolve_artifact_path(str(json_path))
-    if path is None or not path.exists():
-        candidate = Path(str(json_path))
-        path = candidate if candidate.exists() else None
-    if path is None:
-        return preview_rows
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return preview_rows
-    full_rows = payload.get("rows") or preview_rows
-    return list(full_rows)
+    return artifact_rows or preview_rows
 
 
 def _params_hash(params: Dict[str, Any]) -> str:

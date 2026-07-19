@@ -802,6 +802,26 @@ def test_list_portfolio_research_result_rows_paginates(monkeypatch, tmp_path):
 
 
 @pytest.mark.unit
+def test_load_full_result_rows_prefers_artifact_without_row_count_total(tmp_path):
+    json_path = tmp_path / "result.json"
+    json_path.write_text(
+        json.dumps({"rows": [{"top_n": i, "risk_adjusted_score": i} for i in range(72)]}),
+        encoding="utf-8",
+    )
+    preview = [{"top_n": 0, "risk_adjusted_score": 0.53}]
+
+    rows = portfolio_research._load_full_result_rows(
+        {
+            "rows": preview,
+            "artifact": {"json_path": str(json_path)},
+        }
+    )
+
+    assert len(rows) == 72
+    assert rows[0]["top_n"] == 0
+
+
+@pytest.mark.unit
 def test_publish_portfolio_research_result_uses_selected_row(monkeypatch):
     collections = _collections()
     monkeypatch.setattr(portfolio_research, "get_trading_db_collections", lambda: collections)
