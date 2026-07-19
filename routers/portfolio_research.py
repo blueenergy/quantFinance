@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 import shutil
 from datetime import datetime
 from pathlib import Path
@@ -82,6 +83,7 @@ class PublishResearchResultRequest(BaseModel):
     name: Optional[str] = None
     create_new_version: bool = Field(default=False)
     comment: str = Field(default="")
+    selected_row: Optional[Dict[str, Any]] = None
 
 
 class RerunResearchJobRequest(BaseModel):
@@ -326,6 +328,94 @@ def _report_dir_candidates() -> List[Path]:
 
 def _preset_params_from_candidate(candidate: Dict[str, Any]) -> Dict[str, Any]:
     return {key: value for key, value in candidate.items() if key in PRESET_PARAM_KEYS}
+
+
+def _slug(value: Any) -> str:
+    text = re.sub(r"[^0-9A-Za-z]+", "_", str(value or "")).strip("_")
+    return text[:40] or "na"
+
+
+def _candidate_strategy_config_from_row(job: Dict[str, Any], row: Dict[str, Any]) -> Dict[str, Any]:
+    params = job.get("params") or {}
+    universe = str(params.get("universe_index") or job.get("universe_index") or "csi1000")
+    score_type = (
+        "growth_cycle_weighted"
+        if row.get("growth_weight") is not None and row.get("cycle_weight") is not None
+        else "score_column"
+    )
+    top_n = int(row.get("top_n") or (params.get("top_n_values") or [10])[0])
+    rebalance_days = int(row.get("rebalance_interval_days") or params.get("horizon") or 20)
+    variant = str(row.get("variant") or "top_n")
+    score_variant = str(row.get("score_variant") or params.get("score_column") or "score")
+    preset_id = "research_{universe}_{score}_{variant}_top{top_n}_{days}d_{suffix}".format(
+        universe=_slug(universe),
+        score=_slug(score_variant),
+        variant=_slug(variant),
+        top_n=top_n,
+        days=rebalance_days,
+        suffix=str(job.get("job_id") or uuid.uuid4())[:8],
+    )
+    trailing_stop_pct = row.get("trailing_stop_pct")
+    if trailing_stop_pct is not None:
+        try:
+            trailing_stop_pct = float(trailing_stop_pct)
+            if trailing_stop_pct <= 0:
+                trailing_stop_pct = None
+        except (TypeError, ValueError):
+            trailing_stop_pct = None
+    else:
+        trailing_stop_pct = params.get("trailing_stop_pct")
+    return {
+        "preset_id": preset_id,
+        "strategy_template_id": "growth_cycle_index_enhanced",
+        "name": f"{universe.upper()} {score_variant} {variant} Top{top_n} {rebalance_days}d",
+        "universe_index": universe,
+        "index_benchmark_symbol": params.get("index_benchmark_symbol") or row.get("index_benchmark_symbol") or "000852.SH",
+        "score_type": score_type,
+        "score_column": row.get("score_column") or params.get("score_column") or "composite_growth_cycle_score",
+        "growth_weight": row.get("growth_weight"),
+        "cycle_weight": row.get("cycle_weight"),
+        "top_n": top_n,
+        "rebalance_days": rebalance_days,
+        "construction_mode": row.get("construction_mode") or "top_n",
+        "max_industry_weight": row.get("max_industry_weight"),
+        "lot_size": int(params.get("lot_size") or 100),
+        "transaction_cost": float(params.get("transaction_cost") or 0.001),
+        "buy_commission_rate": params.get("buy_commission_rate"),
+        "sell_commission_rate": params.get("sell_commission_rate"),
+        "min_commission": params.get("min_commission"),
+        "stamp_tax_rate": params.get("stamp_tax_rate"),
+        "transfer_fee_rate": params.get("transfer_fee_rate"),
+        "execution_price": params.get("execution_price") or "next_open",
+        "cash_buffer": float(params.get("cash_buffer") or 0.03),
+        "initial_capital": float(params.get("initial_capital") or 1_000_000.0),
+        "trailing_stop_pct": trailing_stop_pct,
+        "candidate_pool_enabled": bool(params.get("candidate_pool_enabled", True)),
+        "status": "draft",
+        "version": 1,
+    }
+
+
+def _load_full_result_rows(result: Dict[str, Any]) -> List[Dict[str, Any]]:
+    preview_rows = list(result.get("rows") or [])
+    total = int(result.get("row_count_total") or len(preview_rows))
+    if total <= len(preview_rows):
+        return preview_rows
+    json_path = (result.get("artifact") or {}).get("json_path")
+    if not json_path:
+        return preview_rows
+    path = _resolve_artifact_path(str(json_path))
+    if path is None or not path.exists():
+        candidate = Path(str(json_path))
+        path = candidate if candidate.exists() else None
+    if path is None:
+        return preview_rows
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return preview_rows
+    full_rows = payload.get("rows") or preview_rows
+    return list(full_rows)
 
 
 def _params_hash(params: Dict[str, Any]) -> str:
@@ -705,6 +795,38 @@ async def get_portfolio_research_results(job_id: str, current_user: dict = Depen
     return {"success": True, "data": _jsonable(result)}
 
 
+@router.get("/jobs/{job_id}/results/rows")
+async def list_portfolio_research_result_rows(
+    job_id: str,
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=50, ge=1, le=500),
+    current_user: dict = Depends(get_current_user),
+):
+    collections = get_trading_db_collections()
+    user_id = _current_user_id(current_user)
+    job = collections["portfolio_research_jobs"].find_one({"job_id": job_id, "user_id": user_id})
+    if not job:
+        raise HTTPException(status_code=404, detail="research job not found")
+    result = collections["portfolio_research_results"].find_one({"job_id": job_id, "user_id": user_id})
+    if not result:
+        raise HTTPException(status_code=404, detail="research result not found")
+    rows = _load_full_result_rows(result)
+    total = len(rows)
+    start = (page - 1) * page_size
+    end = start + page_size
+    return {
+        "success": True,
+        "data": {
+            "rows": _jsonable(rows[start:end]),
+            "page": page,
+            "page_size": page_size,
+            "total": total,
+            "total_pages": max(1, (total + page_size - 1) // page_size),
+            "source": "artifact_json" if total > len(result.get("rows") or []) else "mongo_preview",
+        },
+    }
+
+
 @router.get("/jobs/{job_id}/artifact")
 async def get_portfolio_research_artifact(job_id: str, current_user: dict = Depends(get_current_user)):
     collections = get_trading_db_collections()
@@ -798,6 +920,8 @@ async def publish_portfolio_research_result(
     if not job or job.get("status") != "completed":
         raise HTTPException(status_code=400, detail="research job is not completed")
     candidate = dict(result.get("candidate_strategy_config") or {})
+    if request.selected_row:
+        candidate = _candidate_strategy_config_from_row(job, request.selected_row)
     if not candidate:
         raise HTTPException(status_code=400, detail="candidate strategy config is missing")
 
@@ -876,7 +1000,7 @@ async def publish_portfolio_research_result(
         "source": "portfolio_research",
         "research_job_id": job["job_id"],
         "research_result_id": result_id,
-        "backtest_summary": result.get("best_row"),
+        "backtest_summary": request.selected_row or result.get("best_row"),
         "data_window": {"start_date": job.get("start_date"), "end_date": job.get("end_date")},
         "data_watermark_snapshot": result.get("data_watermark"),
         "evidence": [evidence],

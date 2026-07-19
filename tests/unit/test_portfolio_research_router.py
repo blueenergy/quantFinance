@@ -1,4 +1,5 @@
 import asyncio
+import json
 from datetime import datetime
 
 import pytest
@@ -762,3 +763,82 @@ def test_resolve_combo_file_uses_manifest_relative_path(monkeypatch, tmp_path):
     )
 
     assert path == detail
+
+
+@pytest.mark.unit
+def test_list_portfolio_research_result_rows_paginates(monkeypatch, tmp_path):
+    collections = _collections()
+    monkeypatch.setattr(portfolio_research, "get_trading_db_collections", lambda: collections)
+    json_path = tmp_path / "result.json"
+    json_path.write_text(
+        json.dumps({"rows": [{"top_n": i, "risk_adjusted_score": i} for i in range(5)]}),
+        encoding="utf-8",
+    )
+    collections["portfolio_research_jobs"].insert_one({"job_id": "job-rows", "user_id": "user-1", "status": "completed"})
+    collections["portfolio_research_results"].insert_one(
+        {
+            "job_id": "job-rows",
+            "user_id": "user-1",
+            "rows": [{"top_n": 0}],
+            "row_count_total": 5,
+            "artifact": {"json_path": str(json_path)},
+        }
+    )
+
+    response = asyncio.run(
+        portfolio_research.list_portfolio_research_result_rows(
+            "job-rows",
+            page=2,
+            page_size=2,
+            current_user={"id": "user-1"},
+        )
+    )
+
+    assert response["success"] is True
+    assert response["data"]["total"] == 5
+    assert response["data"]["page"] == 2
+    assert len(response["data"]["rows"]) == 2
+    assert response["data"]["rows"][0]["top_n"] == 2
+
+
+@pytest.mark.unit
+def test_publish_portfolio_research_result_uses_selected_row(monkeypatch):
+    collections = _collections()
+    monkeypatch.setattr(portfolio_research, "get_trading_db_collections", lambda: collections)
+    collections["portfolio_research_jobs"].insert_one({"job_id": "job-1", "user_id": "user-1", "status": "completed"})
+    collections["portfolio_research_results"].insert_one(
+        {
+            "result_id": "result-1",
+            "job_id": "job-1",
+            "user_id": "user-1",
+            "candidate_strategy_config": {
+                "preset_id": "research_old",
+                "strategy_template_id": "growth_cycle_index_enhanced",
+                "top_n": 10,
+                "rebalance_days": 20,
+            },
+            "best_row": {"top_n": 10},
+        }
+    )
+
+    response = asyncio.run(
+        portfolio_research.publish_portfolio_research_result(
+            "result-1",
+            portfolio_research.PublishResearchResultRequest(
+                status="draft",
+                selected_row={
+                    "top_n": 20,
+                    "variant": "growth_cycle_topn",
+                    "score_variant": "growth_cycle_g30_c70",
+                    "rebalance_interval_days": 20,
+                    "trailing_stop_pct": 0.15,
+                    "construction_mode": "top_n",
+                },
+            ),
+            current_user={"id": "user-1", "username": "alice"},
+        )
+    )
+
+    preset = collections["portfolio_strategy_param_presets"].find_one({"preset_id": response["data"]["preset"]["preset_id"]})
+    assert preset["params"]["top_n"] == 20
+    assert preset["params"]["trailing_stop_pct"] == 0.15
