@@ -51,11 +51,21 @@ class _Collection:
                 continue
             value = self._value(doc, key)
             if isinstance(expected, dict):
-                if "$in" in expected and value not in expected["$in"]:
-                    return False
-                if any(key.startswith("$") for key in expected):
+                if "$in" in expected:
+                    if isinstance(value, list):
+                        if not any(item in expected["$in"] for item in value):
+                            return False
+                    elif value not in expected["$in"]:
+                        return False
+                    continue
+                if any(op.startswith("$") for op in expected):
                     continue
                 if value != expected:
+                    return False
+                continue
+            # Mirror MongoDB: equality against an array field means membership.
+            if isinstance(value, list) and not isinstance(expected, list):
+                if expected not in value:
                     return False
                 continue
             if value != expected:
@@ -129,6 +139,8 @@ def test_list_portfolio_research_jobs_includes_timing_and_progress_fields(monkey
     response = asyncio.run(
         portfolio_research.list_portfolio_research_jobs(
             status=None,
+            universe_index=None,
+            growth_cycle_weight=None,
             limit=50,
             current_user={"id": "user-1"},
         )
@@ -140,6 +152,91 @@ def test_list_portfolio_research_jobs_includes_timing_and_progress_fields(monkey
     assert job["heartbeat_at"] == heartbeat.isoformat()
     assert job["progress_stage"] == "loading_scores"
     assert job["progress_message"] == "loading stock scores"
+
+
+@pytest.mark.unit
+def test_list_portfolio_research_jobs_filters_by_universe_and_growth_cycle_weight(monkeypatch):
+    collections = _collections()
+    monkeypatch.setattr(portfolio_research, "get_trading_db_collections", lambda: collections)
+    monkeypatch.setattr(portfolio_research, "get_db_collections", lambda: {"stock_scores": _Collection()})
+    now = datetime(2026, 7, 5, 3, 30, 0)
+    collections["portfolio_research_jobs"].insert_one(
+        {
+            "job_id": "job-csi1000-3070",
+            "user_id": "user-1",
+            "name": "csi1000 30:70",
+            "universe_index": "csi1000",
+            "params": {"universe_index": "csi1000", "growth_cycle_weights": ["30:70", "40:60"]},
+            "status": "completed",
+            "created_at": now,
+        }
+    )
+    collections["portfolio_research_jobs"].insert_one(
+        {
+            "job_id": "job-csi500-2080",
+            "user_id": "user-1",
+            "name": "csi500 20:80",
+            "universe_index": "csi500",
+            "params": {"universe_index": "csi500", "growth_cycle_weights": ["20:80"]},
+            "status": "completed",
+            "created_at": now,
+        }
+    )
+    collections["portfolio_research_jobs"].insert_one(
+        {
+            "job_id": "job-other-user",
+            "user_id": "user-2",
+            "name": "other",
+            "universe_index": "csi1000",
+            "params": {"universe_index": "csi1000", "growth_cycle_weights": ["30:70"]},
+            "status": "completed",
+            "created_at": now,
+        }
+    )
+
+    by_universe = asyncio.run(
+        portfolio_research.list_portfolio_research_jobs(
+            status=None,
+            universe_index="csi1000",
+            growth_cycle_weight=None,
+            limit=50,
+            current_user={"id": "user-1"},
+        )
+    )
+    assert [job["job_id"] for job in by_universe["data"]] == ["job-csi1000-3070"]
+
+    by_weight = asyncio.run(
+        portfolio_research.list_portfolio_research_jobs(
+            status=None,
+            universe_index=None,
+            growth_cycle_weight="30：70",  # fullwidth colon normalized
+            limit=50,
+            current_user={"id": "user-1"},
+        )
+    )
+    assert [job["job_id"] for job in by_weight["data"]] == ["job-csi1000-3070"]
+
+    by_both = asyncio.run(
+        portfolio_research.list_portfolio_research_jobs(
+            status="completed",
+            universe_index="csi500",
+            growth_cycle_weight="20:80",
+            limit=50,
+            current_user={"id": "user-1"},
+        )
+    )
+    assert [job["job_id"] for job in by_both["data"]] == ["job-csi500-2080"]
+
+    no_match = asyncio.run(
+        portfolio_research.list_portfolio_research_jobs(
+            status=None,
+            universe_index="csi1000",
+            growth_cycle_weight="20:80",
+            limit=50,
+            current_user={"id": "user-1"},
+        )
+    )
+    assert no_match["data"] == []
 
 
 def test_publish_portfolio_research_result_creates_parameter_preset(monkeypatch):

@@ -319,6 +319,11 @@ async def create_portfolio_research_job(request: CreateResearchJobRequest, curre
 @router.get("/jobs")
 async def list_portfolio_research_jobs(
     status: Optional[str] = Query(default=None),
+    universe_index: Optional[str] = Query(default=None),
+    growth_cycle_weight: Optional[str] = Query(
+        default=None,
+        description="Filter jobs whose params.growth_cycle_weights contains this pair, e.g. 30:70",
+    ),
     limit: int = Query(default=50, ge=1, le=200),
     current_user: dict = Depends(get_current_user),
 ):
@@ -327,6 +332,17 @@ async def list_portfolio_research_jobs(
     query: Dict[str, Any] = {"user_id": user_id}
     if status:
         query["status"] = status
+    universe = (universe_index or "").strip()
+    if universe:
+        # Jobs store universe both at top-level and inside params; match either.
+        query["$or"] = [
+            {"universe_index": universe},
+            {"params.universe_index": universe},
+        ]
+    weight = _normalize_growth_cycle_weight(growth_cycle_weight)
+    if weight:
+        # Mongo equality on an array field means "array contains this element".
+        query["params.growth_cycle_weights"] = weight
     jobs = list(collections["portfolio_research_jobs"].find(query, RESEARCH_JOB_LIST_PROJECTION).sort("created_at", -1).limit(limit))
     result_ids = [job.get("result_id") for job in jobs if job.get("result_id")]
     results = {
@@ -335,6 +351,16 @@ async def list_portfolio_research_jobs(
     } if result_ids else {}
     stock_scores = get_db_collections()["stock_scores"]
     return {"success": True, "data": _jsonable([_job_summary(job, results.get(job.get("result_id")), stock_scores) for job in jobs])}
+
+
+def _normalize_growth_cycle_weight(value: Optional[str]) -> Optional[str]:
+    """Normalize ``30:70`` / ``30：70`` style weight pairs; empty → None."""
+    if value is None:
+        return None
+    text = str(value).strip().replace("：", ":")
+    if not text:
+        return None
+    return text
 
 
 @router.get("/jobs/{job_id}")
