@@ -59,6 +59,13 @@ class PublishResearchResultRequest(BaseModel):
     comment: str = Field(default="")
 
 
+class RerunResearchJobRequest(BaseModel):
+    """Optional overrides when cloning a research job with the same params."""
+
+    name: Optional[str] = None
+    force: bool = Field(default=True, description="Default true so a rerun is not skipped by cache/idempotency")
+
+
 def _jsonable(value: Any) -> Any:
     if isinstance(value, ObjectId):
         return str(value)
@@ -172,6 +179,7 @@ RESEARCH_JOB_LIST_PROJECTION = {
     "progress_stage": 1,
     "progress_message": 1,
     "data_watermark": 1,
+    "rerun_of_job_id": 1,
 }
 
 
@@ -284,6 +292,12 @@ async def create_portfolio_research_job(request: CreateResearchJobRequest, curre
     collections = get_trading_db_collections()
     _ensure_research_indexes(collections)
     user_id = _current_user_id(current_user)
+    job = _build_research_job_document(user_id, request)
+    collections["portfolio_research_jobs"].insert_one(job)
+    return {"success": True, "data": _jsonable(job)}
+
+
+def _build_research_job_document(user_id: str, request: CreateResearchJobRequest) -> Dict[str, Any]:
     start_date = _normalize_date(request.start_date)
     end_date = _normalize_date(request.end_date)
     if start_date > end_date:
@@ -296,7 +310,7 @@ async def create_portfolio_research_job(request: CreateResearchJobRequest, curre
     params["rebalance_interval_days"] = request.rebalance_interval_days or [request.horizon]
     if request.universe_index == "csi2000" and request.index_benchmark_symbol == "000852.SH":
         params["index_benchmark_symbol"] = UNIVERSE_BENCHMARK_SYMBOLS["csi2000"]
-    job = {
+    return {
         "job_id": str(uuid.uuid4()),
         "user_id": user_id,
         "name": request.name,
@@ -312,6 +326,62 @@ async def create_portfolio_research_job(request: CreateResearchJobRequest, curre
         "created_at": now,
         "updated_at": now,
     }
+
+
+def _rerun_name(base_name: Optional[str]) -> str:
+    name = str(base_name or "组合研究").strip() or "组合研究"
+    if name.endswith("(rerun)"):
+        return name
+    return f"{name} (rerun)"
+
+
+def _create_request_from_job(
+    job: Dict[str, Any],
+    *,
+    force: bool = True,
+    name: Optional[str] = None,
+) -> CreateResearchJobRequest:
+    """Rebuild a create payload from a stored job so rerun uses the same config."""
+    params = dict(job.get("params") or {})
+    if not params.get("universe_index"):
+        params["universe_index"] = job.get("universe_index")
+    if not params.get("start_date"):
+        params["start_date"] = job.get("start_date")
+    if not params.get("end_date"):
+        params["end_date"] = job.get("end_date")
+
+    field_names = set(CreateResearchJobRequest.model_fields.keys())
+    payload = {key: params[key] for key in field_names if key in params and params[key] is not None}
+    payload["name"] = _rerun_name(name or job.get("name") or params.get("name"))
+    payload["force"] = force
+    try:
+        return CreateResearchJobRequest(**payload)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"cannot rebuild research params for rerun: {exc}") from exc
+
+
+@router.post("/jobs/{job_id}/rerun")
+async def rerun_portfolio_research_job(
+    job_id: str,
+    request: Optional[RerunResearchJobRequest] = None,
+    current_user: dict = Depends(get_current_user),
+):
+    """Clone a research job into a new pending job with the same params.
+
+    Does not modify or overwrite the source job/result — creates a fresh job_id
+    so the original report remains available for comparison.
+    """
+    collections = get_trading_db_collections()
+    _ensure_research_indexes(collections)
+    user_id = _current_user_id(current_user)
+    source = collections["portfolio_research_jobs"].find_one({"job_id": job_id, "user_id": user_id})
+    if not source:
+        raise HTTPException(status_code=404, detail="research job not found")
+
+    options = request or RerunResearchJobRequest()
+    create_request = _create_request_from_job(source, force=options.force, name=options.name)
+    job = _build_research_job_document(user_id, create_request)
+    job["rerun_of_job_id"] = job_id
     collections["portfolio_research_jobs"].insert_one(job)
     return {"success": True, "data": _jsonable(job)}
 

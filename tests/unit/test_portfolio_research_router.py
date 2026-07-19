@@ -239,6 +239,96 @@ def test_list_portfolio_research_jobs_filters_by_universe_and_growth_cycle_weigh
     assert no_match["data"] == []
 
 
+@pytest.mark.unit
+def test_rerun_portfolio_research_job_clones_params_without_overwriting_source(monkeypatch):
+    collections = _collections()
+    monkeypatch.setattr(portfolio_research, "get_trading_db_collections", lambda: collections)
+    monkeypatch.setattr(portfolio_research, "get_db_collections", lambda: {"stock_scores": _Collection()})
+    source_params = {
+        "name": "csi1000 research",
+        "universe_index": "csi1000",
+        "start_date": "20250101",
+        "end_date": "20250131",
+        "score_column": "composite_growth_cycle_score",
+        "growth_cycle_weights": ["30:70", "40:60"],
+        "top_n_values": [10, 20],
+        "horizon": 20,
+        "rebalance_interval_days": [20],
+        "active_caps": [0.2, 0.3],
+        "transaction_cost": 0.001,
+        "force": False,
+    }
+    collections["portfolio_research_jobs"].insert_one(
+        {
+            "job_id": "job-source",
+            "user_id": "user-1",
+            "name": "csi1000 research",
+            "universe_index": "csi1000",
+            "start_date": "20250101",
+            "end_date": "20250131",
+            "params": source_params,
+            "status": "completed",
+            "result_id": "result-source",
+            "created_at": datetime(2026, 7, 5, 3, 30, 0),
+        }
+    )
+
+    response = asyncio.run(
+        portfolio_research.rerun_portfolio_research_job(
+            "job-source",
+            request=None,
+            current_user={"id": "user-1"},
+        )
+    )
+
+    assert response["success"] is True
+    cloned = response["data"]
+    assert cloned["job_id"] != "job-source"
+    assert cloned["status"] == "pending"
+    assert cloned["result_id"] is None
+    assert cloned["rerun_of_job_id"] == "job-source"
+    assert cloned["name"] == "csi1000 research (rerun)"
+    assert cloned["params"]["universe_index"] == "csi1000"
+    assert cloned["params"]["growth_cycle_weights"] == ["30:70", "40:60"]
+    assert cloned["params"]["top_n_values"] == [10, 20]
+    assert cloned["params"]["force"] is True
+
+    source = collections["portfolio_research_jobs"].find_one({"job_id": "job-source"})
+    assert source["status"] == "completed"
+    assert source["result_id"] == "result-source"
+    assert len(collections["portfolio_research_jobs"].docs) == 2
+
+
+@pytest.mark.unit
+def test_rerun_portfolio_research_job_rejects_other_users_job(monkeypatch):
+    collections = _collections()
+    monkeypatch.setattr(portfolio_research, "get_trading_db_collections", lambda: collections)
+    collections["portfolio_research_jobs"].insert_one(
+        {
+            "job_id": "job-source",
+            "user_id": "user-1",
+            "name": "owned",
+            "universe_index": "csi1000",
+            "params": {
+                "universe_index": "csi1000",
+                "start_date": "20250101",
+                "end_date": "20250131",
+            },
+            "status": "completed",
+        }
+    )
+
+    with pytest.raises(Exception) as exc:
+        asyncio.run(
+            portfolio_research.rerun_portfolio_research_job(
+                "job-source",
+                request=None,
+                current_user={"id": "user-2"},
+            )
+        )
+    assert getattr(exc.value, "status_code", None) == 404
+
+
 def test_publish_portfolio_research_result_creates_parameter_preset(monkeypatch):
     collections = _collections()
     monkeypatch.setattr(portfolio_research, "get_trading_db_collections", lambda: collections)
