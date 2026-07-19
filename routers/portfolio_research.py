@@ -15,7 +15,7 @@ import uuid
 from bson import ObjectId
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import FileResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from pymongo import ASCENDING, DESCENDING
 
 from auth import get_current_user
@@ -29,6 +29,13 @@ UNIVERSE_BENCHMARK_SYMBOLS = {
     "csi1000": "000852.SH",
     "csi2000": "932000.CSI",
 }
+
+
+def _blank_to_none(value: Any) -> Any:
+    """Treat HTML empty inputs as unset so clients do not trip 422 float parsing."""
+    if value == "" or value is None:
+        return None
+    return value
 
 
 class CreateResearchJobRequest(BaseModel):
@@ -54,6 +61,19 @@ class CreateResearchJobRequest(BaseModel):
     trailing_stop_pct: Optional[float] = Field(default=None, ge=0, le=1)
     trailing_stop_pcts: Optional[List[float]] = None
     force: bool = Field(default=False)
+
+    @field_validator(
+        "buy_commission_rate",
+        "sell_commission_rate",
+        "min_commission",
+        "stamp_tax_rate",
+        "transfer_fee_rate",
+        "trailing_stop_pct",
+        mode="before",
+    )
+    @classmethod
+    def _optional_float_blank(cls, value: Any) -> Any:
+        return _blank_to_none(value)
 
 
 class PublishResearchResultRequest(BaseModel):
@@ -93,6 +113,32 @@ class RerunResearchJobRequest(BaseModel):
     trailing_stop_pct: Optional[float] = Field(default=None, ge=0, le=1)
     trailing_stop_pcts: Optional[List[float]] = None
     force: bool = Field(default=True, description="Default true so a rerun is not skipped by cache/idempotency")
+
+    @field_validator(
+        "horizon",
+        "transaction_cost",
+        "buy_commission_rate",
+        "sell_commission_rate",
+        "min_commission",
+        "stamp_tax_rate",
+        "transfer_fee_rate",
+        "cash_buffer",
+        "initial_capital",
+        "trailing_stop_pct",
+        "index_benchmark_symbol",
+        mode="before",
+    )
+    @classmethod
+    def _optional_blank(cls, value: Any) -> Any:
+        return _blank_to_none(value)
+
+    @field_validator("rebalance_interval_days", "top_n_values", "active_caps", "trailing_stop_pcts", mode="before")
+    @classmethod
+    def _drop_null_list_items(cls, value: Any) -> Any:
+        """Axios JSON-encodes NaN as null; drop those items instead of 422."""
+        if not isinstance(value, list):
+            return value
+        return [item for item in value if item is not None]
 
 
 def _jsonable(value: Any) -> Any:
