@@ -470,6 +470,39 @@ def get_trailing_stop_run(
     return {"success": True, "data": _jsonable(run)}
 
 
+@router.put("/plans/{plan_id}/trailing-stop")
+@_offload
+def update_portfolio_plan_trailing_stop(
+    plan_id: str,
+    request: _pp.TrailingStopSettingRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    trading_collections = _pp.get_trading_db_collections()
+    user_id = _pp._current_user_id(current_user)
+    plan = _pp._require_plan(trading_collections, plan_id, current_user)
+    control = _pp._set_lineage_trailing_stop_native(
+        trading_collections,
+        str(plan.get("strategy_template_id") or ""),
+        str(plan.get("params_hash") or ""),
+        user_id,
+        request.trailing_stop_pct,
+        updated_by=user_id,
+    )
+    setting = _pp._trailing_stop_setting_payload(trading_collections, plan, user_id)
+    return {
+        "success": True,
+        "data": _jsonable(
+            {
+                "plan_id": plan_id,
+                "strategy_template_id": plan.get("strategy_template_id"),
+                "params_hash": plan.get("params_hash"),
+                "trailing_stop_setting": setting,
+                "lineage_control": control,
+            }
+        ),
+    }
+
+
 @router.get("/plans/{plan_id}/lineage-live-executions")
 @_offload
 def get_lineage_live_executions(plan_id: str, current_user: dict = Depends(get_current_user)):

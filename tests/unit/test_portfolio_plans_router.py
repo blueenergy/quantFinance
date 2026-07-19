@@ -6986,3 +6986,97 @@ def test_trailing_stop_run_endpoints(monkeypatch):
         portfolio_plans.get_trailing_stop_run("run-1", current_user={"id": "user-1"})
     )
     assert detail_resp["data"]["items"][0]["symbol"] == "000001"
+
+
+def test_update_trailing_stop_setting(monkeypatch):
+    cols = _collections()
+    cols["portfolio_trade_plans"].docs.append(
+        {
+            "plan_id": "plan-trailing",
+            "strategy_template_id": "s1",
+            "params_hash": "hash-abc",
+            "user_id": "user-1",
+            "base_date": "20250102",
+            "status": "executed_paper",
+            "params_snapshot": {"trailing_stop_pct": 0.1},
+        }
+    )
+    monkeypatch.setattr(portfolio_plans, "get_trading_db_collections", lambda: cols)
+
+    resp = asyncio.run(
+        portfolio_plans.update_portfolio_plan_trailing_stop(
+            "plan-trailing",
+            request=portfolio_plans.TrailingStopSettingRequest(trailing_stop_pct=0.15),
+            current_user={"id": "user-1"},
+        )
+    )
+    assert resp["data"]["trailing_stop_setting"]["enabled"] is True
+    assert resp["data"]["trailing_stop_setting"]["trailing_stop_pct"] == 0.15
+    control = cols["portfolio_lineage_controls"].find_one(
+        {"strategy_template_id": "s1", "params_hash": "hash-abc", "user_id": "user-1"}
+    )
+    assert control["trailing_stop_pct"] == 0.15
+
+    disable_resp = asyncio.run(
+        portfolio_plans.update_portfolio_plan_trailing_stop(
+            "plan-trailing",
+            request=portfolio_plans.TrailingStopSettingRequest(trailing_stop_pct=None),
+            current_user={"id": "user-1"},
+        )
+    )
+    assert disable_resp["data"]["trailing_stop_setting"]["enabled"] is False
+    control = cols["portfolio_lineage_controls"].find_one(
+        {"strategy_template_id": "s1", "params_hash": "hash-abc", "user_id": "user-1"}
+    )
+    assert control["trailing_stop_pct"] is None
+
+
+def test_lineage_timeline_includes_trailing_stop_setting(monkeypatch):
+    cols = _collections()
+    fin = _finance_collections()
+    data = _data_collections()
+    cols["portfolio_trade_plans"] = _Collection(
+        [
+            {
+                "plan_id": "plan-ts",
+                "strategy_template_id": "stx",
+                "user_id": "user-1",
+                "base_date": "20250102",
+                "status": "executed_paper",
+                "params_hash": "hx",
+                "strategy_name": "Combo",
+                "plan_type": "rebalance",
+                "record_kind": "trade_plan",
+                "is_rebalance_day": True,
+                "previous_rebalance_date": None,
+                "params_snapshot": {"rebalance_days": 20, "trailing_stop_pct": 0.1},
+                "summary": {"equity": 1_000_000},
+                "executable": True,
+            }
+        ]
+    )
+    cols["portfolio_lineage_controls"] = _Collection(
+        [
+            {
+                "strategy_template_id": "stx",
+                "params_hash": "hx",
+                "user_id": "user-1",
+                "trailing_stop_pct": 0.15,
+                "paused": False,
+                "excluded_symbols": [],
+            }
+        ]
+    )
+    _patch_lineage_live_env(monkeypatch, cols, fin, data)
+    resp = asyncio.run(
+        portfolio_plans.get_portfolio_plan_lineage_timeline(
+            "plan-ts",
+            limit=20,
+            offset=0,
+            current_user={"id": "user-1"},
+        )
+    )
+    setting = resp["data"]["trailing_stop_setting"]
+    assert setting["enabled"] is True
+    assert setting["trailing_stop_pct"] == 0.15
+    assert setting["source"] == "lineage_controls"

@@ -191,6 +191,7 @@ PLAN_PARAM_KEYS = {
 # the scorer records these values in params_snapshot, but only PLAN_PARAM_KEYS
 # participates in params_hash.
 PLAN_SNAPSHOT_PARAM_KEYS = PLAN_PARAM_KEYS | {
+    "trailing_stop_pct",
     "lot_size",
     "transaction_cost",
     "buy_commission_rate",
@@ -342,6 +343,12 @@ class PaperRebalanceRequest(BaseModel):
     targets: Dict[str, int] = Field(default_factory=dict)
     exclude_after: bool = Field(default=False)
     dry_run: bool = Field(default=False)
+
+
+class TrailingStopSettingRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    trailing_stop_pct: Optional[float] = Field(default=None, ge=0, le=1)
 
 
 class ParamPresetRequest(BaseModel):
@@ -4763,6 +4770,83 @@ def _get_lineage_control_doc(
     return {"paused": False, "excluded_symbols": []}
 
 
+def _trailing_stop_enabled(raw: Any) -> bool:
+    if raw in (None, ""):
+        return False
+    try:
+        return float(raw) > 0
+    except (TypeError, ValueError):
+        return False
+
+
+def _set_lineage_trailing_stop_native(
+    collections: Dict[str, Any],
+    strategy_template_id: str,
+    params_hash: str,
+    user_id: Optional[str],
+    trailing_stop_pct: Any,
+    *,
+    updated_by: Optional[str] = None,
+) -> Dict[str, Any]:
+    coll = collections.get("portfolio_lineage_controls")
+    key = _lineage_control_key(strategy_template_id, params_hash, user_id)
+    now = datetime.utcnow()
+    stored = None
+    if trailing_stop_pct not in (None, ""):
+        try:
+            stored = float(trailing_stop_pct)
+        except (TypeError, ValueError):
+            stored = None
+    update: Dict[str, Any] = {
+        **key,
+        "trailing_stop_pct": stored,
+        "trailing_stop_updated_at": now,
+        "updated_at": now,
+    }
+    if updated_by:
+        update["trailing_stop_updated_by"] = updated_by
+    if coll is not None:
+        coll.update_one(
+            key,
+            {"$set": update, "$setOnInsert": {"paused": False, "excluded_symbols": []}},
+            upsert=True,
+        )
+    return _get_lineage_control_doc(collections, strategy_template_id, params_hash, user_id or "")
+
+
+def _trailing_stop_setting_payload(
+    trading_collections: Dict[str, Any],
+    plan: Dict[str, Any],
+    user_id: str,
+) -> Dict[str, Any]:
+    strategy_template_id = str(plan.get("strategy_template_id") or "")
+    params_hash = str(plan.get("params_hash") or "")
+    control = _get_lineage_control_doc(trading_collections, strategy_template_id, params_hash, user_id)
+    if "trailing_stop_pct" in control:
+        raw = control.get("trailing_stop_pct")
+        return {
+            "trailing_stop_pct": raw,
+            "enabled": _trailing_stop_enabled(raw),
+            "source": "lineage_controls",
+            "updated_at": control.get("trailing_stop_updated_at"),
+        }
+    snapshot = plan.get("params_snapshot") or {}
+    if "trailing_stop_pct" in snapshot:
+        raw = snapshot.get("trailing_stop_pct")
+        return {
+            "trailing_stop_pct": raw,
+            "enabled": _trailing_stop_enabled(raw),
+            "source": "preset_fallback",
+            "updated_at": None,
+        }
+    return {
+        "trailing_stop_pct": None,
+        "enabled": False,
+        "source": "unset",
+        "updated_at": None,
+    }
+
+
 def _trailing_stop_run_summary(run: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     if not run:
         return None
@@ -5758,6 +5842,11 @@ def _build_lineage_timeline_payload(
             params_hash=str(latest_plan.get("params_hash") or ""),
             user_id=user_id,
         ),
+        "trailing_stop_setting": _trailing_stop_setting_payload(
+            trading_collections,
+            latest_plan,
+            user_id,
+        ),
         "timeline": timeline,
         "timeline_pagination": {"total": total, "limit": limit, "offset": offset},
     }
@@ -6018,6 +6107,7 @@ list_live_portfolios = _views.list_live_portfolios
 get_portfolio_plan_lineage_timeline = _views.get_portfolio_plan_lineage_timeline
 list_lineage_trailing_stop_runs = _views.list_lineage_trailing_stop_runs
 get_trailing_stop_run = _views.get_trailing_stop_run
+update_portfolio_plan_trailing_stop = _views.update_portfolio_plan_trailing_stop
 get_lineage_live_executions = _views.get_lineage_live_executions
 get_lineage_live_positions = _views.get_lineage_live_positions
 get_lineage_live_equity = _views.get_lineage_live_equity
