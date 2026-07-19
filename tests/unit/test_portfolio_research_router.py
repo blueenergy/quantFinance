@@ -350,6 +350,63 @@ def test_rerun_portfolio_research_job_rejects_other_users_job(monkeypatch):
 
 
 @pytest.mark.unit
+def test_rerun_portfolio_research_job_applies_param_overrides(monkeypatch):
+    collections = _collections()
+    monkeypatch.setattr(portfolio_research, "get_trading_db_collections", lambda: collections)
+    collections["portfolio_research_jobs"].insert_one(
+        {
+            "job_id": "job-source",
+            "user_id": "user-1",
+            "name": "csi1000 research",
+            "universe_index": "csi1000",
+            "start_date": "20250101",
+            "end_date": "20250131",
+            "params": {
+                "name": "csi1000 research",
+                "universe_index": "csi1000",
+                "start_date": "20250101",
+                "end_date": "20250131",
+                "score_column": "composite_growth_cycle_score",
+                "growth_cycle_weights": ["30:70"],
+                "top_n_values": [10, 20],
+                "horizon": 20,
+                "rebalance_interval_days": [20],
+                "active_caps": [0.2, 0.3],
+                "transaction_cost": 0.001,
+                "force": False,
+            },
+            "status": "completed",
+            "result_id": "result-source",
+        }
+    )
+
+    response = asyncio.run(
+        portfolio_research.rerun_portfolio_research_job(
+            "job-source",
+            request=portfolio_research.RerunResearchJobRequest(
+                growth_cycle_weights=["60:40", "40:60"],
+                start_date="20240101",
+                end_date="20241231",
+                name="csi1000 research tuned",
+            ),
+            current_user={"id": "user-1"},
+        )
+    )
+
+    cloned = response["data"]
+    assert cloned["rerun_of_job_id"] == "job-source"
+    assert cloned["name"] == "csi1000 research tuned (rerun)"
+    assert cloned["params"]["growth_cycle_weights"] == ["60:40", "40:60"]
+    assert cloned["params"]["start_date"] == "20240101"
+    assert cloned["params"]["end_date"] == "20241231"
+    assert cloned["params"]["universe_index"] == "csi1000"
+    assert cloned["params"]["top_n_values"] == [10, 20]
+    assert cloned["params"]["force"] is True
+    source = collections["portfolio_research_jobs"].find_one({"job_id": "job-source"})
+    assert source["params"]["growth_cycle_weights"] == ["30:70"]
+
+
+@pytest.mark.unit
 def test_delete_portfolio_research_job_cascades_and_keeps_preset(monkeypatch, tmp_path):
     collections = _collections()
     monkeypatch.setattr(portfolio_research, "get_trading_db_collections", lambda: collections)

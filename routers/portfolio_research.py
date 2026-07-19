@@ -63,9 +63,31 @@ class PublishResearchResultRequest(BaseModel):
 
 
 class RerunResearchJobRequest(BaseModel):
-    """Optional overrides when cloning a research job with the same params."""
+    """Clone a research job; optional fields override the source job params.
+
+    Unset fields keep the source values. ``force`` defaults to true so a rerun
+    is not skipped by cache/idempotency.
+    """
 
     name: Optional[str] = None
+    universe_index: Optional[str] = None
+    start_date: Optional[str] = None
+    end_date: Optional[str] = None
+    score_column: Optional[str] = None
+    growth_cycle_weights: Optional[List[str]] = None
+    top_n_values: Optional[List[int]] = None
+    horizon: Optional[int] = Field(default=None, ge=1)
+    rebalance_interval_days: Optional[List[int]] = None
+    active_caps: Optional[List[float]] = None
+    transaction_cost: Optional[float] = Field(default=None, ge=0)
+    buy_commission_rate: Optional[float] = Field(default=None, ge=0)
+    sell_commission_rate: Optional[float] = Field(default=None, ge=0)
+    min_commission: Optional[float] = Field(default=None, ge=0)
+    stamp_tax_rate: Optional[float] = Field(default=None, ge=0)
+    transfer_fee_rate: Optional[float] = Field(default=None, ge=0)
+    index_benchmark_symbol: Optional[str] = None
+    cash_buffer: Optional[float] = Field(default=None, ge=0, le=1)
+    initial_capital: Optional[float] = Field(default=None, gt=0)
     force: bool = Field(default=True, description="Default true so a rerun is not skipped by cache/idempotency")
 
 
@@ -447,10 +469,10 @@ def _rerun_name(base_name: Optional[str]) -> str:
 def _create_request_from_job(
     job: Dict[str, Any],
     *,
-    force: bool = True,
-    name: Optional[str] = None,
+    options: Optional[RerunResearchJobRequest] = None,
 ) -> CreateResearchJobRequest:
-    """Rebuild a create payload from a stored job so rerun uses the same config."""
+    """Rebuild a create payload from a stored job, applying optional overrides."""
+    options = options or RerunResearchJobRequest()
     params = dict(job.get("params") or {})
     if not params.get("universe_index"):
         params["universe_index"] = job.get("universe_index")
@@ -461,8 +483,17 @@ def _create_request_from_job(
 
     field_names = set(CreateResearchJobRequest.model_fields.keys())
     payload = {key: params[key] for key in field_names if key in params and params[key] is not None}
-    payload["name"] = _rerun_name(name or job.get("name") or params.get("name"))
-    payload["force"] = force
+
+    overrides = options.model_dump(exclude_unset=True)
+    for key, value in overrides.items():
+        if key == "force":
+            continue
+        if value is not None and key in field_names:
+            payload[key] = value
+
+    name_override = overrides.get("name") if "name" in overrides else None
+    payload["name"] = _rerun_name(name_override or job.get("name") or params.get("name"))
+    payload["force"] = options.force
     try:
         return CreateResearchJobRequest(**payload)
     except Exception as exc:
@@ -475,10 +506,10 @@ async def rerun_portfolio_research_job(
     request: Optional[RerunResearchJobRequest] = None,
     current_user: dict = Depends(get_current_user),
 ):
-    """Clone a research job into a new pending job with the same params.
+    """Clone a research job into a new pending job.
 
-    Does not modify or overwrite the source job/result — creates a fresh job_id
-    so the original report remains available for comparison.
+    Optional body fields override source params. Does not modify the source
+    job/result — creates a fresh job_id so the original report remains available.
     """
     collections = get_trading_db_collections()
     _ensure_research_indexes(collections)
@@ -488,7 +519,7 @@ async def rerun_portfolio_research_job(
         raise HTTPException(status_code=404, detail="research job not found")
 
     options = request or RerunResearchJobRequest()
-    create_request = _create_request_from_job(source, force=options.force, name=options.name)
+    create_request = _create_request_from_job(source, options=options)
     job = _build_research_job_document(user_id, create_request)
     job["rerun_of_job_id"] = job_id
     collections["portfolio_research_jobs"].insert_one(job)
