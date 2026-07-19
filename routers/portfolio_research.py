@@ -51,6 +51,7 @@ class CreateResearchJobRequest(BaseModel):
     index_benchmark_symbol: str = Field(default="000852.SH")
     cash_buffer: float = Field(default=0.03, ge=0, le=1)
     initial_capital: float = Field(default=1_000_000.0, gt=0)
+    trailing_stop_pct: Optional[float] = Field(default=None, ge=0, le=1)
     force: bool = Field(default=False)
 
 
@@ -88,6 +89,7 @@ class RerunResearchJobRequest(BaseModel):
     index_benchmark_symbol: Optional[str] = None
     cash_buffer: Optional[float] = Field(default=None, ge=0, le=1)
     initial_capital: Optional[float] = Field(default=None, gt=0)
+    trailing_stop_pct: Optional[float] = Field(default=None, ge=0, le=1)
     force: bool = Field(default=True, description="Default true so a rerun is not skipped by cache/idempotency")
 
 
@@ -256,6 +258,7 @@ PRESET_PARAM_KEYS = {
     "execution_price",
     "cash_buffer",
     "initial_capital",
+    "trailing_stop_pct",
     "candidate_pool_enabled",
 }
 
