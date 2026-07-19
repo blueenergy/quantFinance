@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
+import shutil
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -21,6 +23,7 @@ from db import get_db_collections, get_trading_db_collections
 
 
 router = APIRouter(prefix="/portfolio-research", tags=["portfolio-research"])
+logger = logging.getLogger(__name__)
 
 UNIVERSE_BENCHMARK_SYMBOLS = {
     "csi1000": "000852.SH",
@@ -287,6 +290,112 @@ def _resolve_artifact_path(html_path: str) -> Optional[Path]:
     return None
 
 
+def _resolved_report_roots() -> List[Path]:
+    """Absolute allowed roots for research artifacts (env + known mounts)."""
+    roots: List[Path] = []
+    for candidate in _report_dir_candidates():
+        try:
+            roots.append(candidate.resolve())
+        except OSError:
+            continue
+    return roots
+
+
+def _is_safe_artifact_path(path: Path) -> bool:
+    """True only for paths strictly inside an allowed report root (never the root itself)."""
+    try:
+        resolved = path.resolve()
+    except OSError:
+        return False
+    for root in _resolved_report_roots():
+        try:
+            resolved.relative_to(root)
+        except ValueError:
+            continue
+        if resolved == root:
+            return False
+        return True
+    return False
+
+
+def _resolve_existing_path(raw_path: Optional[str]) -> Optional[Path]:
+    """Resolve a recorded artifact path to an existing file or directory."""
+    if not raw_path:
+        return None
+    candidates = [Path(raw_path)]
+    path = Path(raw_path)
+    for base_dir in _report_dir_candidates():
+        candidates.append(base_dir / path.name)
+        if len(path.parts) >= 2:
+            candidates.append(base_dir / Path(*path.parts[-2:]))
+
+    seen = set()
+    for candidate in candidates:
+        key = str(candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _safe_remove_path(path: Path, *, is_dir: bool, stats: Dict[str, Any]) -> None:
+    if not _is_safe_artifact_path(path):
+        msg = f"{path}: refused (outside allowed report directories or is a report root)"
+        stats["errors"].append(msg)
+        logger.warning("refused unsafe research artifact delete: %s", path)
+        return
+    try:
+        if is_dir:
+            shutil.rmtree(path)
+        else:
+            path.unlink()
+        stats["removed"].append(str(path))
+    except OSError as exc:
+        stats["errors"].append(f"{path}: {exc}")
+        logger.warning("failed to delete research artifact %s: %s", path, exc)
+
+
+def _delete_artifact_files(artifact: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Best-effort removal of HTML/JSON/combos files. Never raises.
+
+    Only deletes paths that resolve strictly inside configured report directories.
+    """
+    stats: Dict[str, Any] = {"removed": [], "missing": [], "errors": []}
+    if not artifact:
+        return stats
+
+    for key in ("html_path", "json_path"):
+        raw = artifact.get(key)
+        if not raw:
+            continue
+        path = _resolve_existing_path(str(raw))
+        if path is None or not path.is_file():
+            stats["missing"].append(str(raw))
+            continue
+        _safe_remove_path(path, is_dir=False, stats=stats)
+
+    combos_dir_raw = artifact.get("combos_dir")
+    combos_dir = _resolve_existing_path(str(combos_dir_raw)) if combos_dir_raw else None
+    if combos_dir_raw and combos_dir is None:
+        stats["missing"].append(str(combos_dir_raw))
+    elif combos_dir is not None and combos_dir.is_dir():
+        _safe_remove_path(combos_dir, is_dir=True, stats=stats)
+    else:
+        for entry in artifact.get("combos") or []:
+            file_rel = entry.get("file")
+            if not file_rel:
+                continue
+            path = _resolve_combo_file(combos_dir_raw, file_rel)
+            if path is None:
+                stats["missing"].append(str(file_rel))
+                continue
+            _safe_remove_path(path, is_dir=False, stats=stats)
+
+    return stats
+
+
 @router.post("/jobs")
 async def create_portfolio_research_job(request: CreateResearchJobRequest, current_user: dict = Depends(get_current_user)):
     collections = get_trading_db_collections()
@@ -384,6 +493,60 @@ async def rerun_portfolio_research_job(
     job["rerun_of_job_id"] = job_id
     collections["portfolio_research_jobs"].insert_one(job)
     return {"success": True, "data": _jsonable(job)}
+
+
+@router.delete("/jobs/{job_id}")
+async def delete_portfolio_research_job(job_id: str, current_user: dict = Depends(get_current_user)):
+    """Hard-delete a research job and its result/reviews/artifacts.
+
+    Does not delete published parameter presets (they may be referenced by plans).
+    Pending/running jobs cannot be deleted while the worker may still write results.
+    """
+    collections = get_trading_db_collections()
+    user_id = _current_user_id(current_user)
+    job = collections["portfolio_research_jobs"].find_one({"job_id": job_id, "user_id": user_id})
+    if not job:
+        raise HTTPException(status_code=404, detail="research job not found")
+
+    status = str(job.get("status") or "")
+    if status in {"pending", "running"}:
+        raise HTTPException(
+            status_code=409,
+            detail=f"cannot delete research job while status is {status}",
+        )
+
+    result = collections["portfolio_research_results"].find_one({"job_id": job_id, "user_id": user_id})
+    artifact = (result or {}).get("artifact")
+    published_preset_id = (result or {}).get("published_preset_id")
+
+    # Delete durable DB records first; file cleanup is best-effort afterwards so a
+    # later Mongo failure cannot leave a visible job with its report already gone.
+    deleted_results = collections["portfolio_research_results"].delete_many({"job_id": job_id, "user_id": user_id})
+    review_query: Dict[str, Any] = {
+        "user_id": user_id,
+        "$or": [
+            {"job_id": job_id},
+            {"research_job_id": job_id},
+        ],
+    }
+    result_id = (result or {}).get("result_id")
+    if result_id:
+        review_query["$or"].append({"research_result_id": result_id})
+    deleted_reviews = collections["portfolio_research_reviews"].delete_many(review_query)
+    deleted_jobs = collections["portfolio_research_jobs"].delete_one({"job_id": job_id, "user_id": user_id})
+
+    artifact_stats = _delete_artifact_files(artifact)
+    return {
+        "success": True,
+        "data": {
+            "job_id": job_id,
+            "deleted_jobs": getattr(deleted_jobs, "deleted_count", 1 if deleted_jobs else 0),
+            "deleted_results": getattr(deleted_results, "deleted_count", 0),
+            "deleted_reviews": getattr(deleted_reviews, "deleted_count", 0),
+            "artifact_cleanup": artifact_stats,
+            "published_preset_kept": published_preset_id,
+        },
+    }
 
 
 @router.get("/jobs")

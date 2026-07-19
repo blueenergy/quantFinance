@@ -35,6 +35,26 @@ class _Collection:
     def insert_one(self, doc):
         self.docs.append(dict(doc))
 
+    def delete_one(self, query=None):
+        query = query or {}
+        for idx, doc in enumerate(self.docs):
+            if self._matches(doc, query):
+                del self.docs[idx]
+                return type("DeleteResult", (), {"deleted_count": 1})()
+        return type("DeleteResult", (), {"deleted_count": 0})()
+
+    def delete_many(self, query=None):
+        query = query or {}
+        keep = []
+        deleted = 0
+        for doc in self.docs:
+            if self._matches(doc, query):
+                deleted += 1
+            else:
+                keep.append(doc)
+        self.docs = keep
+        return type("DeleteResult", (), {"deleted_count": deleted})()
+
     def update_one(self, query, update):
         for doc in self.docs:
             if self._matches(doc, query):
@@ -327,6 +347,150 @@ def test_rerun_portfolio_research_job_rejects_other_users_job(monkeypatch):
             )
         )
     assert getattr(exc.value, "status_code", None) == 404
+
+
+@pytest.mark.unit
+def test_delete_portfolio_research_job_cascades_and_keeps_preset(monkeypatch, tmp_path):
+    collections = _collections()
+    monkeypatch.setattr(portfolio_research, "get_trading_db_collections", lambda: collections)
+    monkeypatch.setenv("PORTFOLIO_RESEARCH_REPORT_DIR", str(tmp_path))
+
+    html_path = tmp_path / "report.html"
+    json_path = tmp_path / "report.json"
+    combos_dir = tmp_path / "report_combos"
+    combos_dir.mkdir()
+    combo_file = combos_dir / "g30_c70.json"
+    html_path.write_text("<html></html>", encoding="utf-8")
+    json_path.write_text("{}", encoding="utf-8")
+    combo_file.write_text("{}", encoding="utf-8")
+
+    collections["portfolio_research_jobs"].insert_one(
+        {
+            "job_id": "job-del",
+            "user_id": "user-1",
+            "name": "to delete",
+            "status": "completed",
+            "result_id": "result-del",
+        }
+    )
+    collections["portfolio_research_results"].insert_one(
+        {
+            "result_id": "result-del",
+            "job_id": "job-del",
+            "user_id": "user-1",
+            "published_preset_id": "preset-keep",
+            "artifact": {
+                "html_path": str(html_path),
+                "json_path": str(json_path),
+                "combos_dir": str(combos_dir),
+                "combos": [{"combo_key": "g30_c70", "file": str(combo_file)}],
+            },
+        }
+    )
+    collections["portfolio_research_reviews"].insert_one(
+        {
+            "job_id": "job-del",
+            "user_id": "user-1",
+            "research_result_id": "result-del",
+            "action": "publish",
+        }
+    )
+    collections["portfolio_strategy_param_presets"].insert_one(
+        {"preset_id": "preset-keep", "user_id": "user-1", "status": "enabled"}
+    )
+
+    response = asyncio.run(
+        portfolio_research.delete_portfolio_research_job(
+            "job-del",
+            current_user={"id": "user-1"},
+        )
+    )
+
+    assert response["success"] is True
+    assert response["data"]["deleted_jobs"] == 1
+    assert response["data"]["deleted_results"] == 1
+    assert response["data"]["deleted_reviews"] == 1
+    assert response["data"]["published_preset_kept"] == "preset-keep"
+    assert collections["portfolio_research_jobs"].find_one({"job_id": "job-del"}) is None
+    assert collections["portfolio_research_results"].find_one({"result_id": "result-del"}) is None
+    assert collections["portfolio_research_reviews"].docs == []
+    assert collections["portfolio_strategy_param_presets"].find_one({"preset_id": "preset-keep"}) is not None
+    assert not html_path.exists()
+    assert not json_path.exists()
+    assert not combos_dir.exists()
+
+
+@pytest.mark.unit
+def test_delete_portfolio_research_job_rejects_running(monkeypatch):
+    collections = _collections()
+    monkeypatch.setattr(portfolio_research, "get_trading_db_collections", lambda: collections)
+    collections["portfolio_research_jobs"].insert_one(
+        {"job_id": "job-run", "user_id": "user-1", "status": "running"}
+    )
+
+    with pytest.raises(Exception) as exc:
+        asyncio.run(
+            portfolio_research.delete_portfolio_research_job(
+                "job-run",
+                current_user={"id": "user-1"},
+            )
+        )
+    assert getattr(exc.value, "status_code", None) == 409
+
+
+@pytest.mark.unit
+def test_delete_portfolio_research_job_scopes_reviews_by_user(monkeypatch):
+    collections = _collections()
+    monkeypatch.setattr(portfolio_research, "get_trading_db_collections", lambda: collections)
+    collections["portfolio_research_jobs"].insert_one(
+        {"job_id": "job-del", "user_id": "user-1", "status": "completed", "result_id": "result-del"}
+    )
+    collections["portfolio_research_results"].insert_one(
+        {"result_id": "result-del", "job_id": "job-del", "user_id": "user-1"}
+    )
+    collections["portfolio_research_reviews"].insert_one(
+        {"job_id": "job-del", "user_id": "user-1", "research_result_id": "result-del", "action": "mine"}
+    )
+    collections["portfolio_research_reviews"].insert_one(
+        {"job_id": "job-del", "user_id": "user-2", "research_result_id": "result-del", "action": "other"}
+    )
+
+    response = asyncio.run(
+        portfolio_research.delete_portfolio_research_job(
+            "job-del",
+            current_user={"id": "user-1"},
+        )
+    )
+
+    assert response["data"]["deleted_reviews"] == 1
+    remaining = collections["portfolio_research_reviews"].docs
+    assert len(remaining) == 1
+    assert remaining[0]["user_id"] == "user-2"
+
+
+@pytest.mark.unit
+def test_delete_artifact_files_refuses_outside_report_root_and_root_itself(monkeypatch, tmp_path):
+    report_root = tmp_path / "reports"
+    report_root.mkdir()
+    outside = tmp_path / "outside.html"
+    outside.write_text("x", encoding="utf-8")
+    nested = report_root / "ok.html"
+    nested.write_text("ok", encoding="utf-8")
+    monkeypatch.setenv("PORTFOLIO_RESEARCH_REPORT_DIR", str(report_root))
+
+    stats_outside = portfolio_research._delete_artifact_files({"html_path": str(outside)})
+    assert outside.exists()
+    assert stats_outside["removed"] == []
+    assert any("refused" in err for err in stats_outside["errors"])
+
+    stats_root = portfolio_research._delete_artifact_files({"combos_dir": str(report_root)})
+    assert report_root.exists()
+    assert stats_root["removed"] == []
+    assert any("refused" in err for err in stats_root["errors"])
+
+    stats_ok = portfolio_research._delete_artifact_files({"html_path": str(nested)})
+    assert not nested.exists()
+    assert str(nested.resolve()) in stats_ok["removed"] or any(str(nested) in item for item in stats_ok["removed"])
 
 
 def test_publish_portfolio_research_result_creates_parameter_preset(monkeypatch):
