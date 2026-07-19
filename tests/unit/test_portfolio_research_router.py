@@ -136,6 +136,28 @@ def test_create_portfolio_research_job(monkeypatch):
 
 
 @pytest.mark.unit
+def test_create_portfolio_research_job_accepts_trailing_stop_pcts(monkeypatch):
+    collections = _collections()
+    monkeypatch.setattr(portfolio_research, "get_trading_db_collections", lambda: collections)
+
+    response = asyncio.run(
+        portfolio_research.create_portfolio_research_job(
+            portfolio_research.CreateResearchJobRequest(
+                name="research",
+                universe_index="csi1000",
+                start_date="2025-01-01",
+                end_date="2025-01-31",
+                trailing_stop_pcts=[0.0, 0.1, 0.15, 0.2],
+            ),
+            current_user={"id": "user-1"},
+        )
+    )
+
+    assert response["success"] is True
+    assert collections["portfolio_research_jobs"].docs[0]["params"]["trailing_stop_pcts"] == [0.0, 0.1, 0.15, 0.2]
+
+
+@pytest.mark.unit
 def test_list_portfolio_research_jobs_includes_timing_and_progress_fields(monkeypatch):
     collections = _collections()
     monkeypatch.setattr(portfolio_research, "get_trading_db_collections", lambda: collections)

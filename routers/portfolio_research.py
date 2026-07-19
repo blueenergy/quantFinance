@@ -52,6 +52,7 @@ class CreateResearchJobRequest(BaseModel):
     cash_buffer: float = Field(default=0.03, ge=0, le=1)
     initial_capital: float = Field(default=1_000_000.0, gt=0)
     trailing_stop_pct: Optional[float] = Field(default=None, ge=0, le=1)
+    trailing_stop_pcts: Optional[List[float]] = None
     force: bool = Field(default=False)
 
 
@@ -90,6 +91,7 @@ class RerunResearchJobRequest(BaseModel):
     cash_buffer: Optional[float] = Field(default=None, ge=0, le=1)
     initial_capital: Optional[float] = Field(default=None, gt=0)
     trailing_stop_pct: Optional[float] = Field(default=None, ge=0, le=1)
+    trailing_stop_pcts: Optional[List[float]] = None
     force: bool = Field(default=True, description="Default true so a rerun is not skipped by cache/idempotency")
 
 
