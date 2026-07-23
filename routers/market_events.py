@@ -25,21 +25,32 @@ class EnqueueBriefsRequest(BaseModel):
     limit: int = Field(20, ge=1, le=100)
 
 
+def _dt_to_utc_iso(value: Any) -> Any:
+    """Serialize datetimes as UTC ISO-8601 with offset (naive Mongo dates are UTC)."""
+    if not hasattr(value, "isoformat"):
+        return value
+    if isinstance(value, datetime) and value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.isoformat()
+
+
 def _serialize_event(doc: Dict[str, Any]) -> Dict[str, Any]:
     out = dict(doc)
     out["id"] = str(doc.get("_id", ""))
     out.pop("_id", None)
-    et = doc.get("event_time")
-    if hasattr(et, "isoformat"):
-        out["event_time"] = et.isoformat()
+    out["event_time"] = _dt_to_utc_iso(doc.get("event_time"))
     for src in out.get("sources") or []:
-        seen = src.get("seen_at")
-        if hasattr(seen, "isoformat"):
-            src["seen_at"] = seen.isoformat()
+        if isinstance(src, dict) and "seen_at" in src:
+            src["seen_at"] = _dt_to_utc_iso(src.get("seen_at"))
     for field in ("fetched_at", "updated_at"):
-        val = out.get(field)
-        if hasattr(val, "isoformat"):
-            out[field] = val.isoformat()
+        if field in out:
+            out[field] = _dt_to_utc_iso(out.get(field))
+    brief = out.get("llm_brief")
+    if isinstance(brief, dict) and "updated_at" in brief:
+        brief["updated_at"] = _dt_to_utc_iso(brief.get("updated_at"))
+    brief_post = out.get("llm_brief_post")
+    if isinstance(brief_post, dict) and "updated_at" in brief_post:
+        brief_post["updated_at"] = _dt_to_utc_iso(brief_post.get("updated_at"))
     return out
 
 

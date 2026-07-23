@@ -108,6 +108,23 @@ def test_list_market_events_filters(monkeypatch):
     assert resp["events"][0]["title"] == "US CPI"
 
 
+def test_serialize_event_marks_naive_mongo_datetime_as_utc():
+    """PyMongo returns naive UTC; without +00:00 browsers in CST mis-parse as local."""
+    doc = {
+        "_id": "amd",
+        "title": "AMD Advancing AI大会",
+        # Correct absolute time: 2026-07-23 16:30 UTC == 2026-07-24 00:30 Beijing
+        "event_time": datetime(2026, 7, 23, 16, 30, 0),
+        "sources": [{"name": "wallstreetcn", "seen_at": datetime(2026, 7, 23, 10, 0, 0)}],
+        "fetched_at": datetime(2026, 7, 23, 10, 0, 0),
+        "updated_at": datetime(2026, 7, 23, 10, 0, 0),
+    }
+    out = me._serialize_event(doc)
+    assert out["event_time"] == "2026-07-23T16:30:00+00:00"
+    assert out["sources"][0]["seen_at"].endswith("+00:00")
+    assert out["fetched_at"].endswith("+00:00")
+
+
 def test_enqueue_briefs_requires_auth(monkeypatch):
     app = FastAPI()
     app.include_router(router, prefix="/api")
