@@ -155,10 +155,34 @@
 - [x] **2.3 `filled` 纳入状态常量（已完成）**
   - `_plan_today_state_label` 增 `filled → 已成交` 分支（external_manual 仍走更早的
     台账分支）。`filled` 不进 `_plan_action_required`，被当作终态、不再落入「未知状态」。
-- [ ] **2.4 `expired` 决断（暂缓 / 决定保留文案）**
-  - `_plan_today_state_label` 的 `计划已过期` 文案保留（前向兼容），但**暂不实现自动过期**：
-    过期需要独立策略（按 `execute_date + N` 判定、与 cadence/补单交互），属另一专项，
-    与本阶段终态收口解耦。当前没有写入方，文案为惰性分支，无副作用。
+- [x] **2.4 `expired` 收口零成交实盘计划（已完成）**
+  - 根因：手动 live 再平衡的锚点计划发布信号后，若其唯一/全部 live 订单在成交前被撤
+    （0 成交），既不会被 `_maybe_stamp_plan_executed_live` 收口（收口要求「至少一笔成交」），
+    也不会被 `supersede_stale_active_strategy_plans` 处理（后者按 `origin != manual`
+    且 `base_date <` 门禁，手动锚点被排除）。于是它永远卡在 `approved`、长期占据
+    「待处理」，UI 侧也难以定位作废。2026-07 在生产（115.190.172.95）实测命中一例：
+    `growth_cycle_index_enhanced_..._liverb_20260708021735432094`。
+  - 语义：区别于「用户主动作废」的 `cancelled`，这是「已发布、跑完但一股未成、系统自动
+    收口」，用 `expired` 更准确；`expired` 已在两仓 `TERMINAL_PLAN_STATUSES` /
+    `_plan_today_state_label`（`计划已过期`）登记，`_plan_action_required` 不视其为待处理。
+  - 判定（与 `executed_live` 对称，唯一区别在成交分叉）：`record_kind == trade_plan`、
+    `status == approved`、所有 live 信号终态（无 active 在途）、执行阶段 `PLAN_PHASE_DONE`，
+    且 **零成交** → `approved -> expired`（写 `expired_at`）。有成交仍走 `executed_live`。
+  - 双入口实现：
+    1. **读时落库**（quantFinance）：`_maybe_stamp_plan_expired_no_fill` 在
+       `_plan_execution_context` 里紧跟 `_maybe_stamp_plan_executed_live` 之后调用，
+       任何读路径经过即收口。仅止血「有人打开」的计划。
+    2. **主动扫描**（worker，stock-scoring-system）：`sweep_stale_zero_fill_plans`
+       （`portfolio/plans/supersede.py`）扫描同谱系「已发布 + approved + 全信号终态 +
+       零成交」的 trade_plan 收口为 `expired` 并写 `expire_plan` 操作日志；与 supersede
+       不同，它 **origin 无关、不按日期门禁**，只碰已全部终态且零成交的计划，绝不撞在执行
+       中的计划。在 `generate_trade_plan` 里 supersede 之后 **无条件** 调用（含每日 monitor
+       生成），所以即便没人打开详情页，卡住的计划也会在下一次生成（通常一天内）被收口。
+  - 单测：quantFinance 侧覆盖「零成交→expired / 在途不收口 / 部分成交仍 executed_live /
+    observation 不收口」；worker 侧覆盖「发布零成交→expired / 有成交跳过 / 有在途跳过 /
+    未发布跳过 / 手动 origin 被 supersede 漏掉但被 sweep 收口」的端到端用例。
+  - 未做（另立专项）：按 `execute_date + N` 的「到期未执行自动过期」仍不实现——那与
+    cadence/补单交互，属独立策略；本项只收口「已发布但零成交」这一确定性死角。
 
 ---
 

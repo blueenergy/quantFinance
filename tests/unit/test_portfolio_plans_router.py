@@ -1725,9 +1725,10 @@ def test_plan_execution_context_keeps_approved_while_signals_active():
     assert trading["portfolio_trade_plans"].find_one({"plan_id": "plan-user-1"})["status"] == "approved"
 
 
-def test_plan_execution_context_does_not_stamp_executed_live_without_fills():
+def test_plan_execution_context_expires_done_plan_without_fills():
     # All live signals terminal but zero fills (cancelled/rejected) -> the plan
-    # never executed, so it must stay approved, not flip to executed_live.
+    # never executed and never will, so it must NOT flip to executed_live and
+    # must be closed out as expired (no longer action-required forever).
     finance = _finance_collections()
     finance["trade_signals"] = _Collection(
         [
@@ -1740,6 +1741,59 @@ def test_plan_execution_context_does_not_stamp_executed_live_without_fills():
 
     assert ctx["execution_phase_state"] == "done"
     assert ctx["active_signal_count"] == 0
+    assert plan["status"] == "expired"
+    assert plan.get("expired_at") is not None
+    assert "live_executed_at" not in plan
+    plan_doc = trading["portfolio_trade_plans"].find_one({"plan_id": "plan-user-1"})
+    assert plan_doc["status"] == "expired"
+    assert plan_doc.get("expired_at") is not None
+
+
+def test_plan_execution_context_does_not_expire_while_signals_active():
+    # A published plan with an in-flight signal must stay approved; it is not
+    # expired until every signal has settled with zero fills.
+    finance = _finance_collections()
+    finance["trade_signals"] = _Collection(
+        [
+            {"plan_id": "plan-user-1", "user_id": "user-1", "mode": "live", "execution_phase": "sell", "status": "cancelled"},
+            {"plan_id": "plan-user-1", "user_id": "user-1", "mode": "live", "execution_phase": "buy", "status": "pending"},
+        ]
+    )
+    plan = {"plan_id": "plan-user-1", "user_id": "user-1", "record_kind": "trade_plan", "status": "approved"}
+    _ctx, trading = _run_execution_context(finance, plan)
+
+    assert plan["status"] == "approved"
+    assert trading["portfolio_trade_plans"].find_one({"plan_id": "plan-user-1"})["status"] == "approved"
+
+
+def test_plan_execution_context_does_not_expire_partially_filled_plan():
+    # Mixed terminal outcome with at least one fill is executed_live, never expired.
+    finance = _finance_collections()
+    finance["trade_signals"] = _Collection(
+        [
+            {"plan_id": "plan-user-1", "user_id": "user-1", "mode": "live", "execution_phase": "sell", "status": "cancelled"},
+            {"plan_id": "plan-user-1", "user_id": "user-1", "mode": "live", "execution_phase": "buy", "status": "filled", "filled_qty": 100},
+        ]
+    )
+    plan = {"plan_id": "plan-user-1", "user_id": "user-1", "record_kind": "trade_plan", "status": "approved"}
+    ctx, trading = _run_execution_context(finance, plan)
+
+    assert ctx["execution_phase_state"] == "done"
+    assert plan["status"] == "executed_live"
+    assert trading["portfolio_trade_plans"].find_one({"plan_id": "plan-user-1"})["status"] == "executed_live"
+
+
+def test_plan_execution_context_does_not_expire_observation():
+    # Only trade_plans run the lifecycle state machine; observations stay put.
+    finance = _finance_collections()
+    finance["trade_signals"] = _Collection(
+        [
+            {"plan_id": "plan-user-1", "user_id": "user-1", "mode": "live", "execution_phase": "buy", "status": "cancelled"},
+        ]
+    )
+    plan = {"plan_id": "plan-user-1", "user_id": "user-1", "record_kind": "observation", "status": "approved"}
+    _ctx, trading = _run_execution_context(finance, plan)
+
     assert plan["status"] == "approved"
     assert trading["portfolio_trade_plans"].find_one({"plan_id": "plan-user-1"})["status"] == "approved"
 

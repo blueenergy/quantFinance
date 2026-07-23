@@ -2389,6 +2389,48 @@ def _maybe_stamp_plan_executed_live(
     return True
 
 
+def _maybe_stamp_plan_expired_no_fill(
+    trading_collections: Dict[str, Any],
+    plan: Dict[str, Any],
+    user_id: str,
+    *,
+    active_signal_count: int,
+    phase_state: str,
+    has_live_fills: bool,
+) -> bool:
+    """Close out an approved live trade_plan that ran but never filled.
+
+    Mirror of ``_maybe_stamp_plan_executed_live`` for the opposite outcome: a
+    published live plan sits at ``approved`` until its signals settle. When every
+    signal is terminal (no active in-flight), the plan phase is ``done`` and
+    *zero* shares filled (all cancelled/rejected/failed), the plan never executed
+    and never will — flip ``approved -> expired`` so it stops showing up as an
+    action-required plan forever.
+
+    Only applies to ``record_kind == trade_plan``. The zero-fill requirement is
+    what distinguishes this from ``executed_live``; a plan with any fill is
+    stamped ``executed_live`` instead. Callers must run this *after*
+    ``_maybe_stamp_plan_executed_live`` so a filled plan is never expired.
+    """
+    if plan.get("record_kind") != RECORD_KIND_TRADE_PLAN:
+        return False
+    if str(plan.get("status") or "") != "approved":
+        return False
+    if active_signal_count > 0 or phase_state != PLAN_PHASE_DONE:
+        return False
+    if has_live_fills:
+        return False
+    now = datetime.utcnow()
+    plan_id = str(plan.get("plan_id") or "")
+    trading_collections["portfolio_trade_plans"].update_one(
+        {"plan_id": plan_id, "user_id": user_id, "status": "approved"},
+        {"$set": {"status": "expired", "expired_at": now}},
+    )
+    plan["status"] = "expired"
+    plan["expired_at"] = now
+    return True
+
+
 def _maybe_revert_unfilled_executed_live(
     trading_collections: Dict[str, Any],
     plan: Dict[str, Any],
@@ -2491,6 +2533,14 @@ def _plan_execution_context(finance_collections: Dict[str, Any], plan: Dict[str,
         phase_state = derive_execution_phase_state(live_signals)
         _stamp_sell_settled_at(trading_collections, plan, user_id, phase_state)
         _maybe_stamp_plan_executed_live(
+            trading_collections,
+            plan,
+            user_id,
+            active_signal_count=active_signal_count,
+            phase_state=phase_state,
+            has_live_fills=has_live_fills,
+        )
+        _maybe_stamp_plan_expired_no_fill(
             trading_collections,
             plan,
             user_id,
