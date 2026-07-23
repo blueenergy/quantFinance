@@ -8,6 +8,7 @@ MCP 暴露面按 route tag 拆分为 wukong-quant-read 与 wukong-quant-actions�
   GET  /hermes-tools/ladder/daily          — 连板天梯
   GET  /hermes-tools/ladder/narrative      — 涨停分析（LLM 叙事，盘后可用）
   GET  /hermes-tools/market/summary        — AI 大盘分析（市场总结）
+  GET  /hermes-tools/market/events-weekly  — 市场事件日历（未来两周）
   GET  /hermes-tools/market/global         — 全球市场简报
   GET  /hermes-tools/market/hot-stock       — 热股分析（THS/DC 最新）
   GET  /hermes-tools/macro/analysis          — 宏观 AI 分析（中国/美国）
@@ -376,6 +377,37 @@ async def hermes_market_summary(
         "overall_trend", "key_stocks", "market_overview",
     ]
     return {k: result[k] for k in keys if k in result}
+
+
+@router.get("/market/events-weekly", operation_id="market_events_weekly", tags=[MCP_READ_TAG])
+async def hermes_market_events_weekly(
+    min_importance: int = Query(3, ge=1, le=4),
+    _: bool = Depends(require_hermes_quant_internal_key),
+):
+    """本周/未来两周市场事件日历（宏观 + A股公司事件），供悟空「本周事件」简报。"""
+    from routers.market_events import query_market_events
+
+    payload = query_market_events(min_importance=min_importance, limit=200)
+    by_day: Dict[str, List[Dict[str, Any]]] = {}
+    for ev in payload.get("events") or []:
+        day = str(ev.get("event_time") or "")[:10]
+        by_day.setdefault(day, []).append(
+            {
+                "time": ev.get("event_time"),
+                "title": ev.get("title"),
+                "region": ev.get("region"),
+                "category": ev.get("category"),
+                "importance": ev.get("importance"),
+                "brief": (ev.get("llm_brief") or {}).get("summary"),
+            }
+        )
+    return {
+        "success": True,
+        "from": payload.get("from"),
+        "to": payload.get("to"),
+        "count": payload.get("count"),
+        "by_day": by_day,
+    }
 
 
 # ---------------------------------------------------------------------------

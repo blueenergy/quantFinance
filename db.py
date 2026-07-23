@@ -250,6 +250,7 @@ def get_data_db():
         "industry_limitup_stats": data_db["industry_limitup_stats"],
         # Cached international headlines for global analysis/data pulse
         "international_news_cache": data_db["international_news_cache"],
+        "market_events": data_db["market_events"],
         # Global quotes (yfinance sync from quant-data-engine)
         "global_market_quotes": data_db["global_market_quotes"],
         # Global market daily OHLCV history (synced by run_global_market_daily_sync)

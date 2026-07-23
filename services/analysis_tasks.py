@@ -17,6 +17,7 @@ DEFAULT_TASK_DURATION_SECONDS = {
     "backtest_batch_review": 180,
     "strategy_lab_loop_report": 240,
     "news_url_risk_analysis": 60,
+    "market_events_brief": 300,
 }
 
 
@@ -255,6 +256,9 @@ def summarize_task_result(task: Dict[str, Any]) -> str:
         if isinstance(analysis, dict):
             return str(analysis.get("summary_zh") or result.get("summary") or "X推文解读完成")[:120]
         return str(result.get("summary") or "X推文解读完成")[:120]
+    if task_type == "market_events_brief":
+        updated = int(result.get("updated") or 0)
+        return f"已更新 {updated} 条事件简评"
     if task_type == "news_url_risk_analysis":
         summary = result.get("summary")
         if isinstance(summary, dict):

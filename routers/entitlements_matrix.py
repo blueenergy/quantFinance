@@ -42,6 +42,7 @@ class ActionCell(BaseModel):
 
 # --- 主导航 Tab（顺序即模块排序）---
 _NAV_ROWS: List[Tuple[str, str, int]] = [
+    ("market-events", "📅 交易日历", 1),
     ("global-market-brief", "🌍 全球市场简报", 5),
     ("data-pulse", "🛰️ 数据脉搏", 8),
     ("market-analysis", "🤖 AI大盘分析", 9),

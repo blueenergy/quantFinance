@@ -14,8 +14,9 @@ from fastapi import APIRouter, Depends, Response
 from auth import get_current_active_user
 from routers.entitlements_matrix import get_merged_matrix_cells, user_tier_for_matrix
 
-# (tab_id, requires_vip_or_premium) — keep in sync with dashboard App.vue baseTabs
+# (tab_id, requires_vip_or_premium) — keep in sync with dashboard useNavigationShell baseTabs
 KNOWN_MAIN_TABS: List[tuple] = [
+    ("market-events", False),
     ("global-market-brief", False),
     ("data-pulse", False),
     ("market-analysis", False),
