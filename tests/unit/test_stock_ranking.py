@@ -1390,6 +1390,85 @@ def test_return_since_degrades_without_factor():
     assert out["return_since_score_pct"] == pytest.approx(10.0)
 
 
+@pytest.mark.unit
+def test_normalize_return_as_of():
+    assert stock_ranking._normalize_return_as_of(None) is None
+    assert stock_ranking._normalize_return_as_of("") is None
+    assert stock_ranking._normalize_return_as_of("2025-10-01") == "20251001"
+    assert stock_ranking._normalize_return_as_of("20251001") == "20251001"
+    assert stock_ranking._normalize_return_as_of("bad") is None
+    assert stock_ranking._normalize_return_as_of("20250230") is None
+    assert stock_ranking._normalize_return_as_of("20251001extra") is None
+
+
+@pytest.mark.unit
+def test_compute_return_since_respects_return_as_of():
+    vp = FakeVolumePriceCollection(_vp_ranking_pair())
+    # score 20250901 (close 50) → as-of 20250920 (close 100) = +100%
+    out = stock_ranking.compute_return_since_score(
+        vp, "AAA.SH", "20250901", {}, {}, return_as_of="20250920"
+    )
+    assert out["return_since_score_pct"] == pytest.approx(100.0)
+    assert out["price_base_trade_date"] == "20250901"
+    assert out["price_latest_trade_date"] == "20250920"
+    # Without as_of, end is absolute latest 20251001 (close 110) = +120%
+    out_latest = stock_ranking.compute_return_since_score(
+        vp, "AAA.SH", "20250901", {}, {}
+    )
+    assert out_latest["return_since_score_pct"] == pytest.approx(120.0)
+    assert out_latest["price_latest_trade_date"] == "20251001"
+
+
+@pytest.mark.unit
+def test_return_since_is_empty_when_cutoff_precedes_score_date():
+    vp = FakeVolumePriceCollection(_vp_ranking_pair())
+    out = stock_ranking.compute_return_since_score(
+        vp, "AAA.SH", "20250920", {}, {}, return_as_of="20250901"
+    )
+    assert out == stock_ranking.RETURN_SINCE_EMPTY
+
+
+@pytest.mark.unit
+def test_stock_rankings_return_as_of_query(monkeypatch):
+    docs = [
+        {
+            "symbol": "AAA.SH",
+            "composite_score": {"balanced": 75},
+            "cycle_score": 10,
+            "value_score": 20,
+            "fundamental_score": 30,
+            "growth_score": 5,
+            "technical_score": 7,
+            "money_flow_score": 3,
+            "score_date": "20250901",
+        },
+    ]
+    info_docs = [{"symbol": "AAA.SH", "name": "A Corp", "industry": "Tech"}]
+    fake_db = FakeDB(stock_scores_docs=docs, stock_info_docs=info_docs)
+    monkeypatch.setattr(stock_ranking, "get_db_collections", lambda: fake_db)
+    monkeypatch.setattr(
+        stock_ranking,
+        "get_data_db",
+        lambda: {"volume_price": FakeVolumePriceCollection(_vp_ranking_pair())},
+    )
+    client = TestClient(app)
+    resp = client.get("/api/stock-rankings?limit=1&return_as_of=20250920")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["return_as_of"] == "20250920"
+    assert data["data"][0]["return_since_score_pct"] == pytest.approx(100.0)
+    assert data["data"][0]["price_latest_trade_date"] == "20250920"
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("value", ["bad", "20250230", "20251001extra"])
+def test_stock_rankings_rejects_invalid_return_as_of(value):
+    client = TestClient(app)
+    resp = client.get(f"/api/stock-rankings?return_as_of={value}")
+    assert resp.status_code == 422
+    assert "return_as_of" in resp.json()["detail"]
+
+
 class _FakeAggVolumePrice:
     """Volume-price fake that supports the batched forward-window aggregation."""
 

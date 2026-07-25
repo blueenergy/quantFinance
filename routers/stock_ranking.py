@@ -481,6 +481,45 @@ def _trade_date_str(doc: Optional[dict]) -> Optional[str]:
     return s.replace("-", "")[:8] if s else None
 
 
+def _normalize_return_as_of(value: Optional[str]) -> Optional[str]:
+    """Normalize an optional cutoff to YYYYMMDD; reject malformed/calendar-invalid dates."""
+    if value is None:
+        return None
+    raw = str(value).strip()
+    if not raw:
+        return None
+    if len(raw) == 10 and raw[4] == "-" and raw[7] == "-":
+        text = raw.replace("-", "")
+    elif len(raw) == 8:
+        text = raw
+    else:
+        return None
+    if not text.isdigit():
+        return None
+    try:
+        datetime.strptime(text, "%Y%m%d")
+    except ValueError:
+        return None
+    return text
+
+
+def _validated_return_as_of(value: Optional[str]) -> Optional[str]:
+    """Validate an API cutoff instead of silently interpreting bad input as latest."""
+    normalized = _normalize_return_as_of(value)
+    if value is not None and str(value).strip() and normalized is None:
+        raise HTTPException(
+            status_code=422,
+            detail="return_as_of 必须是有效日期，格式为 YYYYMMDD 或 YYYY-MM-DD",
+        )
+    return normalized
+
+
+def _end_doc_cache_key(symbol: str, return_as_of: Optional[str]) -> str:
+    """Cache key for the end-bar used by return-since (latest or as-of)."""
+    as_of = _normalize_return_as_of(return_as_of)
+    return f"{symbol}|{as_of}" if as_of else symbol
+
+
 def _adj_dao_from_volume_price_col(volume_price_col: Any) -> AdjustedPriceDataAccess:
     return AdjustedPriceDataAccess(db=volume_price_col.database)
 
@@ -561,6 +600,11 @@ def _return_since_from_docs(
     adj_dao: Optional[AdjustedPriceDataAccess] = None,
 ) -> dict:
     out = dict(RETURN_SINCE_EMPTY)
+    end_td = _trade_date_str(latest_doc)
+    base_td = _trade_date_str(base_doc)
+    # 「至选中日」只定义正向区间。截止日早于评分基准日时不要生成反向收益。
+    if end_td and base_td and end_td < base_td:
+        return out
     pct = _hfq_return_pct(
         latest_doc,
         base_doc,
@@ -882,21 +926,27 @@ def compute_return_since_score(
     latest_by_symbol: Dict[str, Any],
     base_by_key: Dict[Tuple[str, str], Any],
     adj_dao: Optional[AdjustedPriceDataAccess] = None,
+    return_as_of: Optional[str] = None,
 ) -> dict:
     """
     Baseline: last trading day's close on or before score_date.
-    Latest: most recent close in volume_price for symbol.
+    End: most recent close in volume_price, or last close on/before ``return_as_of``.
     """
     if not symbol or not score_date or len(str(score_date).strip()) < 8:
         return dict(RETURN_SINCE_EMPTY)
     sd = str(score_date).strip()[:8]
+    as_of = _normalize_return_as_of(return_as_of)
+    end_key = _end_doc_cache_key(symbol, as_of)
 
-    if symbol not in latest_by_symbol:
-        latest_by_symbol[symbol] = volume_price_col.find_one(
-            {"symbol": symbol},
-            sort=[("trade_date", -1)],
-        )
-    latest_doc = latest_by_symbol[symbol]
+    if end_key not in latest_by_symbol:
+        if as_of:
+            latest_by_symbol[end_key] = _fetch_base_doc_single(volume_price_col, symbol, as_of)
+        else:
+            latest_by_symbol[end_key] = volume_price_col.find_one(
+                {"symbol": symbol},
+                sort=[("trade_date", -1)],
+            )
+    latest_doc = latest_by_symbol[end_key]
 
     bkey = (symbol, sd)
     if bkey not in base_by_key:
@@ -1005,19 +1055,30 @@ def _build_score_date_base_map(
     return base_map
 
 
-def enrich_rows_price_returns(rows: List[dict], volume_price_col: Any) -> None:
+def enrich_rows_price_returns(
+    rows: List[dict],
+    volume_price_col: Any,
+    *,
+    return_as_of: Optional[str] = None,
+) -> None:
     """一次性跑完三个价格涨跌 enrich pass，共享评分日基准 K 线与 adj_factor DAO。
 
     评分日基准 K（return-since 基准 / prior-3m 窗口末端 / future 基准）只取一次，
     ``AdjustedPriceDataAccess`` 也只建一次（其 factor 缓存跨三个 pass 复用），把
     三次重复的基准聚合与因子取用收敛为一次。
+
+    ``return_as_of`` 仅影响「以来涨跌」终点（默认最新日线）；前 3 月 / 后 N 日不变。
     """
     if not rows:
         return
     score_base_map = _build_score_date_base_map(rows, volume_price_col)
     adj_dao = _adj_dao_from_volume_price_col(volume_price_col)
     enrich_rows_return_since_score(
-        rows, volume_price_col, score_base_map=score_base_map, adj_dao=adj_dao
+        rows,
+        volume_price_col,
+        score_base_map=score_base_map,
+        adj_dao=adj_dao,
+        return_as_of=return_as_of,
     )
     enrich_rows_prior_3m_return(
         rows, volume_price_col, score_base_map=score_base_map, adj_dao=adj_dao
@@ -1033,16 +1094,20 @@ def enrich_rows_return_since_score(
     *,
     score_base_map: Optional[Dict[Tuple[str, str], Any]] = None,
     adj_dao: Optional[AdjustedPriceDataAccess] = None,
+    return_as_of: Optional[str] = None,
 ) -> None:
     """批量写涨跌字段：Mongo 往返约 1 + 不同 score_date 种数 + 少量回退查询。
 
     ``score_base_map``（评分日基准 K，键 ``(symbol, score_date)``）与 ``adj_dao`` 可由
     上层预取后在三个 enrich pass 间共享，避免重复拉取同一批基准 K 与重复建 DAO。
+
+    ``return_as_of``（YYYYMMDD）：以来涨跌终点取不晚于该日的最近日线；空则用最新日线。
     """
     if not rows:
         return
     if adj_dao is None:
         adj_dao = _adj_dao_from_volume_price_col(volume_price_col)
+    as_of = _normalize_return_as_of(return_as_of)
     if not hasattr(volume_price_col, "aggregate"):
         latest_by_symbol: Dict[str, Any] = {}
         base_by_key: Dict[Tuple[str, str], Any] = dict(score_base_map) if score_base_map else {}
@@ -1055,6 +1120,7 @@ def enrich_rows_return_since_score(
                     latest_by_symbol,
                     base_by_key,
                     adj_dao=adj_dao,
+                    return_as_of=as_of,
                 )
             )
         return
@@ -1067,7 +1133,10 @@ def enrich_rows_return_since_score(
             seen.add(sym)
             symbols.append(sym)
     symbols_vp = _expanded_query_symbols(symbols)
-    latest_map = _bulk_latest_by_symbol(volume_price_col, symbols_vp)
+    if as_of:
+        latest_map = _bulk_base_by_symbol_string(volume_price_col, symbols_vp, as_of)
+    else:
+        latest_map = _bulk_latest_by_symbol(volume_price_col, symbols_vp)
 
     base_map = (
         score_base_map
@@ -1337,6 +1406,10 @@ async def get_stock_rankings_by_index(
         None,
         description="YYYYMMDD；不传则取该指数最新评分日的完整截面",
     ),
+    return_as_of: Optional[str] = Query(
+        None,
+        description="以来涨跌截止日 YYYYMMDD；不传则用最新日线收盘",
+    ),
     exclude_st: bool = Query(True, description="是否排除名称含 ST 的股票"),
     offset: int = Query(0, ge=0, description="分页起点"),
     page_size: int = Query(30, ge=1, le=500, description="本页条数"),
@@ -1356,10 +1429,12 @@ async def get_stock_rankings_by_index(
         effective_strategy = (strategy or "balanced").strip() or "balanced"
         sort_key = _normalize_sort_by(sort_by)
         weighted_weights = _parse_weighted_sort_weights(weights) if sort_key == "weighted" else {}
+        as_of = _validated_return_as_of(return_as_of)
         cache_key = (
             "by-index",
             ic,
             str(date or ""),
+            str(as_of or ""),
             effective_strategy,
             sort_key,
             _weights_cache_key(weighted_weights),
@@ -1433,7 +1508,7 @@ async def get_stock_rankings_by_index(
             vp_col = get_data_db()["volume_price"]
             # Index rankings are paged; enrich only the visible page to keep
             # large constituent universes cheap while preserving table parity.
-            enrich_rows_price_returns(formatted, vp_col)
+            enrich_rows_price_returns(formatted, vp_col, return_as_of=as_of)
         except Exception as ex:
             print(f"[stock-rankings/by-index] enrich price returns failed: {ex}")
         payload = {
@@ -1443,6 +1518,7 @@ async def get_stock_rankings_by_index(
             "offset": offset,
             "page_size": page_size,
             "date": date or "",
+            "return_as_of": as_of or "",
             "index_code": ic,
             "message": "按指数 %s 获取评分成功" % ic,
         }
@@ -1466,6 +1542,10 @@ async def get_stock_rankings(
     min_score: Optional[float] = Query(None, description="最低分数过滤"),
     exclude_st: bool = Query(True, description="是否排除ST股票"),
     date: Optional[str] = Query(None, description="指定日期 YYYYMMDD,默认为最新日期"),
+    return_as_of: Optional[str] = Query(
+        None,
+        description="以来涨跌截止日 YYYYMMDD；不传则用最新日线收盘",
+    ),
     strategy: str = Query('balanced', description="指定排行榜策略，balanced/aggressive/conservative"),
     sort_by: str = Query(
         "composite",
@@ -1483,12 +1563,14 @@ async def get_stock_rankings(
         effective_strategy = (strategy or "balanced").strip() or "balanced"
         sort_key = _normalize_sort_by(sort_by)
         weighted_weights = _parse_weighted_sort_weights(weights) if sort_key == "weighted" else {}
+        as_of = _validated_return_as_of(return_as_of)
         cache_key = (
             "stock-rankings",
             int(limit),
             None if min_score is None else float(min_score),
             bool(exclude_st),
             str(date or ""),
+            str(as_of or ""),
             effective_strategy,
             sort_key,
             _weights_cache_key(weighted_weights),
@@ -1599,7 +1681,7 @@ async def get_stock_rankings(
 
         try:
             vp_col = get_data_db()["volume_price"]
-            enrich_rows_price_returns(formatted, vp_col)
+            enrich_rows_price_returns(formatted, vp_col, return_as_of=as_of)
         except Exception as ex:
             print(f"[stock-rankings] enrich price returns failed: {ex}")
 
@@ -1607,6 +1689,7 @@ async def get_stock_rankings(
             "success": True,
             "data": formatted,
             "total": len(formatted),
+            "return_as_of": as_of or "",
             "message": "获取排行榜成功"
         }
         _ranking_cache_put(cache_key, payload)
@@ -1985,6 +2068,10 @@ async def get_selected_stock_rankings(
     request: Request,
     body: SelectedStocksRequest,
     date: Optional[str] = Query(None, description="指定日期 YYYYMMDD,默认为每只股票的最新日期"),
+    return_as_of: Optional[str] = Query(
+        None,
+        description="以来涨跌截止日 YYYYMMDD；不传则用最新日线收盘",
+    ),
     strategy: Optional[str] = Query(
         None,
         description="与 /stock-rankings 一致，如 balanced/aggressive/conservative；优先于 body.strategy",
@@ -2017,6 +2104,7 @@ async def get_selected_stock_rankings(
         effective_strategy = qs or bs or "balanced"
         sort_key = _normalize_sort_by(sort_by)
         weighted_weights = _parse_weighted_sort_weights(weights) if sort_key == "weighted" else {}
+        as_of = _validated_return_as_of(return_as_of)
         # support optional multi-date per-symbol queries via body.dates
         dates = getattr(body, 'dates', None) or None
         cache_key = (
@@ -2024,6 +2112,7 @@ async def get_selected_stock_rankings(
             tuple(sorted(str(s) for s in symbols)),
             tuple(str(d) for d in dates) if dates else (),
             str(date or ""),
+            str(as_of or ""),
             effective_strategy,
             sort_key,
             _weights_cache_key(weighted_weights),
@@ -2072,7 +2161,7 @@ async def get_selected_stock_rankings(
                 for d in dates:
                     if vp_col is not None:
                         per_date_return_since[d] = compute_return_since_score(
-                            vp_col, sym, d, latest_by_symbol, base_by_key
+                            vp_col, sym, d, latest_by_symbol, base_by_key, return_as_of=as_of
                         )
                         per_date_prior_3m_return[d] = compute_prior_3m_return(
                             vp_col, sym, d, prior_end_by_key, prior_base_by_key
@@ -2167,6 +2256,7 @@ async def get_selected_stock_rankings(
                 'data': formatted_stocks,
                 'total': len(formatted_stocks),
                 'dates': dates,
+                'return_as_of': as_of or '',
                 'message': f'成功获取 {len(formatted_stocks)} 只指定股票的多日期评分'
             }
             _ranking_cache_put(cache_key, payload)
@@ -2266,7 +2356,7 @@ async def get_selected_stock_rankings(
         if _should_enrich_return_since(body, len(symbols)):
             try:
                 vp_col = get_data_db()["volume_price"]
-                enrich_rows_price_returns(page_rows, vp_col)
+                enrich_rows_price_returns(page_rows, vp_col, return_as_of=as_of)
             except Exception as ex:
                 print(f"[stock-rankings/selected] enrich price returns failed: {ex}")
         else:
@@ -2284,6 +2374,7 @@ async def get_selected_stock_rankings(
             "offset": offset if page_size is not None else 0,
             "page_size": eff_page_size,
             "date": date if date else "",
+            "return_as_of": as_of or "",
             "message": (
                 f"成功获取 {len(page_rows)} 只指定股票评分 (共 {total_all} 只；offset={offset})"
                 if page_size is not None
