@@ -157,7 +157,7 @@ services:
       timeout: 10s
       retries: 3
 
-  # 前端 Web（与 quantFinance/docker-compose.yml 一致：dashboard 仓库 + Dockerfile.fast）
+  # 前端 Web（与 quant-infrastructure/apps/docker-compose.dev.yml 一致：dashboard 仓库 + Dockerfile.fast）
   web:
     build:
       context: ../quantFinance-dashboard

@@ -1,10 +1,11 @@
-# Hermes skills (quantFinance)
+# Hermes skills (quantFinance) — deprecated
 
-Copy a skill folder (e.g. `quant-ladder/`) into your Hermes data directory:
+连板天梯等量化能力已合并到 monorepo 内的 **`wukong-skills/wukong-quant`**（MCP：`wukong-quant-read` / `wukong-quant-actions`）。
 
-- Docker (this repo): `quantFinance/hermes-data/skills/<skill-name>/`
-- Ensure the skill contains `SKILL.md` as required by [Hermes skills](https://hermes-agent.nousresearch.com/docs/user-guide/features/skills/).
+请将该 skill 目录复制到 Hermes 数据卷，例如：
 
-`quant-ladder` uses `QUANT_API_URL` and `HERMES_QUANT_INTERNAL_KEY` injected by `docker-compose.yml` on the **hermes** service. Set `HERMES_QUANT_INTERNAL_KEY` in `.env` to a long random string; the same value must be on **quant-api** and **hermes**.
+- `wukong-skills/wukong-quant/` → `hermes-data/skills/wukong-quant/`
 
-If you previously installed `quant-wukong-ladder`, remove that folder and use `quant-ladder` instead.
+旧版 **`quant-ladder`**（直调 `GET /api/hermes-tools/ladder/daily`）已移除，勿再安装。
+
+`HERMES_QUANT_INTERNAL_KEY` 仍须在 **quant-api** 与 MCP 客户端（`X-Hermes-Quant-Key`）上保持一致；详见 `wukong-skills/wukong-quant/SKILL.md` 中的 MCP 配置说明。
