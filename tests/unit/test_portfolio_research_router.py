@@ -136,6 +136,55 @@ def test_create_portfolio_research_job(monkeypatch):
     assert job["params"]["rebalance_interval_days"] == [20]
 
 
+def test_create_portfolio_research_job_accepts_generic_score_specs(monkeypatch):
+    collections = _collections()
+    monkeypatch.setattr(portfolio_research, "get_trading_db_collections", lambda: collections)
+
+    request = portfolio_research.CreateResearchJobRequest(
+        name="generic blend",
+        start_date="2025-01-01",
+        end_date="2025-01-31",
+        score_specs=[
+            {
+                "mode": "weighted",
+                "weights": {"fundamental": 0.6, "value": 0.4},
+            }
+        ],
+    )
+    response = asyncio.run(
+        portfolio_research.create_portfolio_research_job(
+            request,
+            current_user={"id": "user-1"},
+        )
+    )
+
+    assert response["success"] is True
+    job = collections["portfolio_research_jobs"].docs[0]
+    assert job["strategy_family"] == "weighted_score"
+    assert "growth_cycle_weights" not in job["params"]
+    assert job["params"]["score_specs"][0]["weights"] == {
+        "fundamental": 0.6,
+        "value": 0.4,
+    }
+
+
+def test_score_specs_validate_dimensions_and_reject_legacy_conflict():
+    with pytest.raises(ValueError, match="unsupported score dimensions"):
+        portfolio_research.CreateResearchJobRequest(
+            start_date="20250101",
+            end_date="20250131",
+            score_specs=[{"mode": "weighted", "weights": {"unknown": 1}}],
+        )
+
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        portfolio_research.CreateResearchJobRequest(
+            start_date="20250101",
+            end_date="20250131",
+            score_specs=[{"mode": "column", "column": "fundamental_score"}],
+            growth_cycle_weights=["30:70"],
+        )
+
+
 @pytest.mark.unit
 def test_create_portfolio_research_job_accepts_trailing_stop_pcts(monkeypatch):
     collections = _collections()
@@ -612,6 +661,39 @@ def test_publish_portfolio_research_result_creates_parameter_preset(monkeypatch)
     assert preset["research_job_id"] == "job-1"
     assert preset["params"]["top_n"] == 10
     assert collections["portfolio_research_reviews"].docs[0]["decision"] == "preset_published"
+
+
+def test_publish_portfolio_research_result_rejects_generic_score(monkeypatch):
+    collections = _collections()
+    monkeypatch.setattr(portfolio_research, "get_trading_db_collections", lambda: collections)
+    collections["portfolio_research_jobs"].insert_one(
+        {"job_id": "job-1", "user_id": "user-1", "status": "completed"}
+    )
+    collections["portfolio_research_results"].insert_one(
+        {
+            "result_id": "result-1",
+            "job_id": "job-1",
+            "user_id": "user-1",
+            "candidate_strategy_config": {
+                "preset_id": "generic-score",
+                "strategy_template_id": "growth_cycle_index_enhanced",
+                "score_type": "weighted_score",
+                "score_weights": {"fundamental": 0.6, "value": 0.4},
+            },
+        }
+    )
+
+    with pytest.raises(portfolio_research.HTTPException) as exc:
+        asyncio.run(
+            portfolio_research.publish_portfolio_research_result(
+                "result-1",
+                portfolio_research.PublishResearchResultRequest(status="draft"),
+                current_user={"id": "user-1"},
+            )
+        )
+
+    assert exc.value.status_code == 409
+    assert "not productized" in exc.value.detail
 
 
 def test_publish_portfolio_research_result_rejects_duplicate_preset(monkeypatch):

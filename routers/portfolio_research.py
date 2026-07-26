@@ -9,14 +9,14 @@ import re
 import shutil
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Annotated, Any, Dict, List, Literal, Optional, Union
 import os
 import uuid
 
 from bson import ObjectId
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import FileResponse
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from pymongo import ASCENDING, DESCENDING
 
 from auth import get_current_user
@@ -31,12 +31,72 @@ UNIVERSE_BENCHMARK_SYMBOLS = {
     "csi2000": "932000.CSI",
 }
 
+ATOMIC_SCORE_DIMENSIONS = {
+    "technical",
+    "fundamental",
+    "value",
+    "growth",
+    "money_flow",
+    "cycle",
+}
+ALLOWED_SCORE_COLUMNS = {
+    "composite_score",
+    "composite_balanced_score",
+    "composite_aggressive_score",
+    "composite_conservative_score",
+    "composite_defensive_score",
+    "composite_value_oriented_score",
+    "composite_trading_oriented_score",
+    "composite_growth_oriented_score",
+    "composite_cycle_oriented_score",
+    "composite_growth_cycle_score",
+    *(f"{dimension}_score" for dimension in ATOMIC_SCORE_DIMENSIONS),
+}
+
 
 def _blank_to_none(value: Any) -> Any:
     """Treat HTML empty inputs as unset so clients do not trip 422 float parsing."""
     if value == "" or value is None:
         return None
     return value
+
+
+class ColumnScoreSpec(BaseModel):
+    mode: Literal["column"]
+    column: str
+
+    @field_validator("column")
+    @classmethod
+    def _validate_column(cls, value: str) -> str:
+        column = str(value).strip()
+        if column not in ALLOWED_SCORE_COLUMNS:
+            raise ValueError(f"unsupported score column: {column}")
+        return column
+
+
+class WeightedScoreSpec(BaseModel):
+    mode: Literal["weighted"]
+    weights: Dict[str, float]
+
+    @field_validator("weights")
+    @classmethod
+    def _validate_weights(cls, value: Dict[str, float]) -> Dict[str, float]:
+        if not value:
+            raise ValueError("weights must not be empty")
+        unknown = sorted(set(value) - ATOMIC_SCORE_DIMENSIONS)
+        if unknown:
+            raise ValueError(f"unsupported score dimensions: {unknown}")
+        if any(float(weight) < 0 for weight in value.values()):
+            raise ValueError("weights must be non-negative")
+        if sum(float(weight) for weight in value.values()) <= 0:
+            raise ValueError("weights must have a positive total")
+        return {str(dimension): float(weight) for dimension, weight in value.items()}
+
+
+ScoreSpec = Annotated[
+    Union[ColumnScoreSpec, WeightedScoreSpec],
+    Field(discriminator="mode"),
+]
 
 
 class CreateResearchJobRequest(BaseModel):
@@ -46,6 +106,7 @@ class CreateResearchJobRequest(BaseModel):
     end_date: str
     score_column: str = Field(default="composite_growth_cycle_score")
     growth_cycle_weights: List[str] = Field(default_factory=lambda: ["30:70"])
+    score_specs: Optional[List[ScoreSpec]] = None
     top_n_values: List[int] = Field(default_factory=lambda: [10, 20, 50])
     horizon: int = Field(default=20, ge=1)
     rebalance_interval_days: Optional[List[int]] = None
@@ -76,6 +137,12 @@ class CreateResearchJobRequest(BaseModel):
     def _optional_float_blank(cls, value: Any) -> Any:
         return _blank_to_none(value)
 
+    @model_validator(mode="after")
+    def _validate_score_inputs(self) -> "CreateResearchJobRequest":
+        if self.score_specs and "growth_cycle_weights" in self.model_fields_set and self.growth_cycle_weights:
+            raise ValueError("score_specs and growth_cycle_weights are mutually exclusive")
+        return self
+
 
 class PublishResearchResultRequest(BaseModel):
     status: str = Field(default="draft", pattern="^(draft|enabled)$")
@@ -99,6 +166,7 @@ class RerunResearchJobRequest(BaseModel):
     end_date: Optional[str] = None
     score_column: Optional[str] = None
     growth_cycle_weights: Optional[List[str]] = None
+    score_specs: Optional[List[ScoreSpec]] = None
     top_n_values: Optional[List[int]] = None
     horizon: Optional[int] = Field(default=None, ge=1)
     rebalance_interval_days: Optional[List[int]] = None
@@ -141,6 +209,12 @@ class RerunResearchJobRequest(BaseModel):
         if not isinstance(value, list):
             return value
         return [item for item in value if item is not None]
+
+    @model_validator(mode="after")
+    def _validate_score_inputs(self) -> "RerunResearchJobRequest":
+        if self.score_specs and self.growth_cycle_weights:
+            raise ValueError("score_specs and growth_cycle_weights are mutually exclusive")
+        return self
 
 
 def _jsonable(value: Any) -> Any:
@@ -338,11 +412,23 @@ def _slug(value: Any) -> str:
 def _candidate_strategy_config_from_row(job: Dict[str, Any], row: Dict[str, Any]) -> Dict[str, Any]:
     params = job.get("params") or {}
     universe = str(params.get("universe_index") or job.get("universe_index") or "csi1000")
-    score_type = (
-        "growth_cycle_weighted"
-        if row.get("growth_weight") is not None and row.get("cycle_weight") is not None
-        else "score_column"
+    growth_weight = row.get("growth_weight")
+    cycle_weight = row.get("cycle_weight")
+    legacy_match = re.fullmatch(
+        r"growth_cycle_g(\d+)_c(\d+)",
+        str(row.get("score_variant") or ""),
     )
+    if legacy_match and growth_weight is None and cycle_weight is None:
+        total = float(int(legacy_match.group(1)) + int(legacy_match.group(2)))
+        if total > 0:
+            growth_weight = int(legacy_match.group(1)) / total
+            cycle_weight = int(legacy_match.group(2)) / total
+    if row.get("score_weights"):
+        score_type = "weighted_score"
+    elif growth_weight is not None and cycle_weight is not None:
+        score_type = "growth_cycle_weighted"
+    else:
+        score_type = "score_column"
     top_n = int(row.get("top_n") or (params.get("top_n_values") or [10])[0])
     rebalance_days = int(row.get("rebalance_interval_days") or params.get("horizon") or 20)
     variant = str(row.get("variant") or "top_n")
@@ -373,8 +459,9 @@ def _candidate_strategy_config_from_row(job: Dict[str, Any], row: Dict[str, Any]
         "index_benchmark_symbol": params.get("index_benchmark_symbol") or row.get("index_benchmark_symbol") or "000852.SH",
         "score_type": score_type,
         "score_column": row.get("score_column") or params.get("score_column") or "composite_growth_cycle_score",
-        "growth_weight": row.get("growth_weight"),
-        "cycle_weight": row.get("cycle_weight"),
+        "growth_weight": growth_weight,
+        "cycle_weight": cycle_weight,
+        "score_weights": row.get("score_weights"),
         "top_n": top_n,
         "rebalance_days": rebalance_days,
         "construction_mode": row.get("construction_mode") or "top_n",
@@ -585,6 +672,8 @@ def _build_research_job_document(user_id: str, request: CreateResearchJobRequest
 
     now = datetime.utcnow()
     params = request.model_dump()
+    if request.score_specs:
+        params.pop("growth_cycle_weights", None)
     params["start_date"] = start_date
     params["end_date"] = end_date
     params["rebalance_interval_days"] = request.rebalance_interval_days or [request.horizon]
@@ -594,7 +683,13 @@ def _build_research_job_document(user_id: str, request: CreateResearchJobRequest
         "job_id": str(uuid.uuid4()),
         "user_id": user_id,
         "name": request.name,
-        "strategy_family": "growth_cycle",
+        "strategy_family": (
+            "weighted_score"
+            if request.score_specs and any(spec.mode == "weighted" for spec in request.score_specs)
+            else "score_column"
+            if request.score_specs or not request.growth_cycle_weights
+            else "growth_cycle"
+        ),
         "universe_index": request.universe_index,
         "start_date": start_date,
         "end_date": end_date,
@@ -634,6 +729,10 @@ def _create_request_from_job(
     payload = {key: params[key] for key in field_names if key in params and params[key] is not None}
 
     overrides = options.model_dump(exclude_unset=True)
+    if overrides.get("score_specs"):
+        payload.pop("growth_cycle_weights", None)
+    if overrides.get("growth_cycle_weights"):
+        payload.pop("score_specs", None)
     for key, value in overrides.items():
         if key == "force":
             continue
@@ -932,6 +1031,21 @@ async def publish_portfolio_research_result(
         candidate = _candidate_strategy_config_from_row(job, request.selected_row)
     if not candidate:
         raise HTTPException(status_code=400, detail="candidate strategy config is missing")
+    candidate_score_type = candidate.get("score_type")
+    if candidate_score_type and candidate_score_type != "growth_cycle_weighted":
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Only growth_cycle_weighted research results can be published. "
+                "Generic score-column and weighted-score construction templates "
+                "are not productized yet."
+            ),
+        )
+    if candidate.get("score_weights"):
+        raise HTTPException(
+            status_code=409,
+            detail="Generic weighted-score research results cannot be published yet.",
+        )
 
     now = datetime.utcnow()
     strategy_template_id = str(candidate.get("strategy_template_id") or candidate.get("template_id") or "growth_cycle_index_enhanced")
