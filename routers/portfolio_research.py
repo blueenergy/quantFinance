@@ -15,12 +15,13 @@ import uuid
 
 from bson import ObjectId
 from fastapi import APIRouter, Depends, HTTPException, Query
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, Field, field_validator, model_validator
 from pymongo import ASCENDING, DESCENDING
 
 from auth import get_current_user
 from db import get_db_collections, get_trading_db_collections
+from services import portfolio_research_s3 as research_s3
 
 
 router = APIRouter(prefix="/portfolio-research", tags=["portfolio-research"])
@@ -494,14 +495,28 @@ def _load_full_result_rows(result: Dict[str, Any]) -> List[Dict[str, Any]]:
         if path is None or not path.exists():
             candidate = Path(str(json_path))
             path = candidate if candidate.exists() else None
-        if path is None:
-            return None
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return None
-        artifact_rows = list(payload.get("rows") or [])
-        return artifact_rows or None
+        if path is not None:
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                return None
+            artifact_rows = list(payload.get("rows") or [])
+            return artifact_rows or None
+        artifact_meta = result.get("artifact") or {}
+        if research_s3.artifact_uses_s3(artifact_meta):
+            try:
+                raw = research_s3.fetch_report_json_bytes(artifact_meta)
+            except research_s3.ArtifactStorageUnavailable as exc:
+                logger.warning("S3 research result unavailable: %s", exc)
+                return None
+            if raw:
+                try:
+                    payload = json.loads(raw.decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    return None
+                artifact_rows = list(payload.get("rows") or [])
+                return artifact_rows or None
+        return None
 
     artifact_rows = _read_artifact_rows()
     if artifact_rows and len(artifact_rows) > len(preview_rows):
@@ -615,7 +630,12 @@ def _safe_remove_path(path: Path, *, is_dir: bool, stats: Dict[str, Any]) -> Non
         logger.warning("failed to delete research artifact %s: %s", path, exc)
 
 
-def _delete_artifact_files(artifact: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+def _delete_artifact_files(
+    artifact: Optional[Dict[str, Any]],
+    *,
+    job_id: Optional[str] = None,
+    result_id: Optional[str] = None,
+) -> Dict[str, Any]:
     """Best-effort removal of HTML/JSON/combos files. Never raises.
 
     Only deletes paths that resolve strictly inside configured report directories.
@@ -623,6 +643,15 @@ def _delete_artifact_files(artifact: Optional[Dict[str, Any]]) -> Dict[str, Any]
     stats: Dict[str, Any] = {"removed": [], "missing": [], "errors": []}
     if not artifact:
         return stats
+
+    if research_s3.artifact_uses_s3(artifact):
+        if not job_id or not result_id:
+            stats["errors"].append("refused S3 cleanup without job_id and result_id")
+        else:
+            expected_prefix = research_s3.artifact_prefix(job_id, result_id)
+            s3_stats = research_s3.delete_artifact_prefix(artifact, expected_prefix=expected_prefix)
+            stats["removed"].extend(s3_stats.get("removed") or [])
+            stats["errors"].extend(s3_stats.get("errors") or [])
 
     for key in ("html_path", "json_path"):
         raw = artifact.get(key)
@@ -814,7 +843,7 @@ async def delete_portfolio_research_job(job_id: str, current_user: dict = Depend
     deleted_reviews = collections["portfolio_research_reviews"].delete_many(review_query)
     deleted_jobs = collections["portfolio_research_jobs"].delete_one({"job_id": job_id, "user_id": user_id})
 
-    artifact_stats = _delete_artifact_files(artifact)
+    artifact_stats = _delete_artifact_files(artifact, job_id=job_id, result_id=result_id)
     return {
         "success": True,
         "data": {
@@ -941,13 +970,21 @@ async def get_portfolio_research_artifact(job_id: str, current_user: dict = Depe
     result = collections["portfolio_research_results"].find_one({"job_id": job_id, "user_id": user_id})
     if not result:
         raise HTTPException(status_code=404, detail="research result not found")
-    html_path = (result.get("artifact") or {}).get("html_path")
+    artifact = result.get("artifact") or {}
+    html_path = artifact.get("html_path")
     if not html_path:
         raise HTTPException(status_code=404, detail="artifact not found")
     path = _resolve_artifact_path(str(html_path))
-    if path is None:
-        raise HTTPException(status_code=404, detail="artifact file not found")
-    return FileResponse(str(path), media_type="text/html")
+    if path is not None:
+        return FileResponse(str(path), media_type="text/html")
+    if research_s3.artifact_uses_s3(artifact):
+        try:
+            body = research_s3.fetch_report_html_bytes(artifact)
+        except research_s3.ArtifactStorageUnavailable as exc:
+            raise HTTPException(status_code=503, detail="artifact storage unavailable") from exc
+        if body is not None:
+            return Response(content=body, media_type="text/html")
+    raise HTTPException(status_code=404, detail="artifact file not found")
 
 
 def _resolve_combo_file(combos_dir: Optional[str], file_rel: Optional[str]) -> Optional[Path]:
@@ -1005,9 +1042,16 @@ async def get_portfolio_research_combo_detail(job_id: str, combo_key: str, curre
     if not entry:
         raise HTTPException(status_code=404, detail="combo detail not found")
     path = _resolve_combo_file(artifact.get("combos_dir"), entry.get("file"))
-    if path is None:
-        raise HTTPException(status_code=404, detail="combo detail file not found")
-    return FileResponse(str(path), media_type="application/json")
+    if path is not None:
+        return FileResponse(str(path), media_type="application/json")
+    if research_s3.artifact_uses_s3(artifact):
+        try:
+            body = research_s3.fetch_combo_bytes(artifact, combo_key, entry.get("file"))
+        except research_s3.ArtifactStorageUnavailable as exc:
+            raise HTTPException(status_code=503, detail="artifact storage unavailable") from exc
+        if body is not None:
+            return Response(content=body, media_type="application/json")
+    raise HTTPException(status_code=404, detail="combo detail file not found")
 
 
 @router.post("/results/{result_id}/publish")
