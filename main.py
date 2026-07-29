@@ -66,6 +66,7 @@ from routers.portfolio_plans import router as portfolio_plans_router
 from routers.symbol_risk import router as symbol_risk_router
 from routers.symbol_opportunity import router as symbol_opportunity_router
 from routers.portfolio_research import router as portfolio_research_router
+from routers.factor_backtest import router as factor_backtest_router
 from routers.permissions import router as permissions_router
 from routers.strategy_pool import router as strategy_pool_router
 from routers.strategy_workers import router as strategy_workers_router
@@ -187,6 +188,7 @@ app.include_router(portfolio_plans_router, prefix="/api", tags=["组合交易计
 app.include_router(symbol_risk_router, prefix="/api", tags=["个股风险台账"])
 app.include_router(symbol_opportunity_router, prefix="/api", tags=["个股机会台账"])
 app.include_router(portfolio_research_router, prefix="/api", tags=["组合研究"])
+app.include_router(factor_backtest_router, prefix="/api", tags=["因子回测"])
 # 兼容前端与后台两套历史路径：
 # - /api/permissions/...（前端在用）
 # - /api/admin/permissions/...（后台旧路径）
