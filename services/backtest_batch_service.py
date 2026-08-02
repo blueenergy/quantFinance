@@ -16,6 +16,22 @@ from services.backtest_batch_schemas import BacktestBatchCreate, BacktestCombo
 
 MAX_COMPARE_TASKS = 500
 
+LEASE_RESET_FIELDS: Dict[str, Any] = {
+    "lease_token": None,
+    "lease_expires_at": None,
+    "heartbeat_at": None,
+}
+
+
+def lease_field_defaults() -> Dict[str, Any]:
+    return {
+        "attempts": 0,
+        "heartbeat_at": None,
+        "lease_token": None,
+        "lease_expires_at": None,
+        "updated_at": None,
+    }
+
 RESULT_METRICS_PROJECTION = {"_id": 0, "task_id": 1, "metrics": 1}
 TASK_ROW_PROJECTION = {
     "_id": 0,
@@ -250,6 +266,7 @@ def build_backtest_task_doc(
         "started_at": None,
         "completed_at": None,
         "error_message": None,
+        **lease_field_defaults(),
     }
     if batch_id:
         task_doc["batch_id"] = batch_id

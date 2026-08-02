@@ -25,6 +25,7 @@ from services.backtest_batch_schemas import (
     BacktestCombo,
 )
 from services.backtest_batch_service import (
+    LEASE_RESET_FIELDS,
     build_backtest_task_doc as _build_backtest_task_doc,
     build_experiment_type_query,
     create_batch,
@@ -471,7 +472,7 @@ async def delete_backtest_batch(
             "user_id": current_user["id"],
             "status": {"$in": ["pending", "claimed", "running"]},
         },
-        {"$set": {"status": "cancelled", "completed_at": datetime.now()}},
+        {"$set": {"status": "cancelled", "completed_at": datetime.now(), **LEASE_RESET_FIELDS}},
     ).modified_count
 
     tasks = list(collections["backtest_tasks"].find({"batch_id": batch_id, "user_id": current_user["id"]}))
@@ -509,7 +510,7 @@ async def cancel_backtest_batch(
         raise HTTPException(status_code=404, detail="Backtest batch not found")
     result = collections["backtest_tasks"].update_many(
         {"batch_id": batch_id, "user_id": current_user["id"], "status": {"$in": ["pending", "claimed", "running"]}},
-        {"$set": {"status": "cancelled", "completed_at": datetime.now()}},
+        {"$set": {"status": "cancelled", "completed_at": datetime.now(), **LEASE_RESET_FIELDS}},
     )
     if result.modified_count <= 0:
         return {
@@ -535,7 +536,16 @@ async def retry_failed_backtest_batch(
         raise HTTPException(status_code=404, detail="Backtest batch not found")
     result = collections["backtest_tasks"].update_many(
         {"batch_id": batch_id, "user_id": current_user["id"], "status": {"$in": ["failed", "cancelled"]}},
-        {"$set": {"status": "pending", "worker_id": None, "started_at": None, "completed_at": None, "error_message": None}},
+        {
+            "$set": {
+                "status": "pending",
+                "worker_id": None,
+                "started_at": None,
+                "completed_at": None,
+                "error_message": None,
+                **LEASE_RESET_FIELDS,
+            }
+        },
     )
     collections["backtest_batches"].update_one({"batch_id": batch_id}, {"$set": {"status": "running", "updated_at": datetime.now()}})
     return {"message": "Failed tasks reset", "batch_id": batch_id, "reset_tasks": result.modified_count}
@@ -761,7 +771,7 @@ async def delete_backtest_task(
         # Mark as cancelled instead of deleting
         backtest_tasks_col.update_one(
             {"task_id": task_id},
-            {"$set": {"status": "cancelled"}}
+            {"$set": {"status": "cancelled", **LEASE_RESET_FIELDS}},
         )
         return {"message": "Backtest task cancelled"}
     
@@ -798,13 +808,16 @@ async def reset_backtest_task(
 
     backtest_tasks_col.update_one(
         {"task_id": task_id},
-        {"$set": {
-            "status": "pending",
-            "worker_id": None,
-            "started_at": None,
-            "completed_at": None,
-            "error_message": None,
-        }}
+        {
+            "$set": {
+                "status": "pending",
+                "worker_id": None,
+                "started_at": None,
+                "completed_at": None,
+                "error_message": None,
+                **LEASE_RESET_FIELDS,
+            }
+        },
     )
 
     # Remove stale results so rerun writes fresh ones
