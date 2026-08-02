@@ -19,6 +19,22 @@ from bson import ObjectId
 from auth import get_current_user
 from db import get_analyzer_db, get_db_collections
 from services.analysis_tasks import build_task_doc
+from services.backtest_batch_schemas import (
+    BacktestBatchCreate,
+    BacktestBatchRerunCreate,
+    BacktestCombo,
+)
+from services.backtest_batch_service import (
+    build_backtest_task_doc as _build_backtest_task_doc,
+    build_experiment_type_query,
+    create_batch,
+    is_compare_batch,
+    list_batch_result_rows,
+    lookup_symbol_name as _lookup_symbol_name,
+    normalize_symbol as _normalize_symbol,
+    refresh_batch_summary as _refresh_batch_summary,
+    serialize_batch as _serialize_batch,
+)
 
 router = APIRouter(prefix="/backtest", tags=["backtest"])
 
@@ -58,41 +74,6 @@ class BacktestTaskCreate(BaseModel):
             }
         }
     )
-
-
-class BacktestBatchCreate(BaseModel):
-    """Request model for creating a batch backtest experiment."""
-    name: Optional[str] = Field(default=None, description="Human-readable experiment name")
-    symbols: List[str] = Field(default_factory=list, description="Symbols for manual universe")
-    asset_type: str = Field(default="stock", description="Asset type for child tasks: stock or etf")
-    universe_type: str = Field(default="manual", description="manual, index, watchlist, or strategy_pool")
-    universe_value: Optional[str] = Field(default=None, description="Universe key, e.g. csi1000 or csi2000")
-    strategy_key: str = Field(..., description="Strategy key from STRATEGY_MAP")
-    preset: Optional[str] = Field(default=None, description="Optional preset name")
-    strategy_params: Dict[str, Any] = Field(default_factory=dict)
-    start_date: str = Field(..., description="Backtest start date (YYYYMMDD)")
-    end_date: str = Field(..., description="Backtest end date (YYYYMMDD)")
-    initial_cash: float = Field(default=1000000.0)
-    limit_symbols: int = Field(default=0, ge=0, description="Optional cap for testing. 0 means no limit.")
-
-    @field_validator("start_date", "end_date")
-    @classmethod
-    def validate_required_date(cls, v: str) -> str:
-        value = str(v or "").strip()
-        if not value:
-            raise ValueError("start_date/end_date are required")
-        return value.replace("-", "")
-
-
-class BacktestBatchRerunCreate(BaseModel):
-    name: Optional[str] = None
-    strategy_key: Optional[str] = None
-    preset: Optional[str] = None
-    strategy_params: Optional[Dict[str, Any]] = None
-    start_date: Optional[str] = None
-    end_date: Optional[str] = None
-    initial_cash: Optional[float] = None
-    only_statuses: List[str] = Field(default_factory=list)
 
 
 class BacktestBatchReviewCreate(BaseModel):
@@ -214,161 +195,9 @@ def _normalize_asset_type(asset_type: Optional[str]) -> str:
     return value
 
 
-def _lookup_symbol_name(collections: Dict[str, Any], symbol: Optional[str], asset_type: str) -> Optional[str]:
-    if not symbol:
-        return None
-    if asset_type == "etf":
-        etf_basic_col = collections.get("etf_basic")
-        if etf_basic_col is None:
-            return None
-        info = etf_basic_col.find_one({"ts_code": symbol})
-    else:
-        stock_info_col = collections.get("stock_info")
-        if stock_info_col is None:
-            return None
-        info = stock_info_col.find_one({"symbol": symbol})
-    if info and isinstance(info, dict):
-        name = info.get("name")
-        return name if isinstance(name, str) and name else None
-    return None
-
-
 def _new_task_id(symbol: str) -> str:
     clean_symbol = str(symbol or "symbol").replace(".", "_")
     return f"bt_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}_{clean_symbol}_{uuid.uuid4().hex[:6]}"
-
-
-def _new_batch_id() -> str:
-    return f"bb_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
-
-
-def _normalize_symbol(symbol: str, asset_type: str) -> str:
-    symbol = str(symbol or "").strip().upper()
-    if not symbol:
-        return ""
-    if "." in symbol:
-        return symbol
-    if asset_type == "etf":
-        if symbol.startswith(("15", "16")):
-            return f"{symbol}.SZ"
-        if symbol.startswith("5"):
-            return f"{symbol}.SH"
-        return symbol
-    if symbol.startswith("6"):
-        return f"{symbol}.SH"
-    if symbol.startswith(("0", "3")):
-        return f"{symbol}.SZ"
-    if symbol.startswith(("8", "4")):
-        return f"{symbol}.BJ"
-    return symbol
-
-
-def _dedupe_symbols(symbols: List[str], asset_type: str) -> List[str]:
-    out: List[str] = []
-    seen = set()
-    for raw in symbols or []:
-        sym = _normalize_symbol(raw, asset_type)
-        if not sym or sym in seen:
-            continue
-        seen.add(sym)
-        out.append(sym)
-    return out
-
-
-def _load_index_symbols(collections: Dict[str, Any], index_code: str) -> List[str]:
-    coll = collections.get("index_constituents")
-    code = str(index_code or "").strip()
-    if coll is None or not code:
-        return []
-    latest = coll.find_one(
-        {"index_code": code},
-        {"_id": 0, "weight_trade_date": 1, "update_date": 1},
-        sort=[("weight_trade_date", -1), ("update_date", -1)],
-    )
-    if not latest:
-        return []
-    query = {"index_code": code}
-    if latest.get("weight_trade_date"):
-        query["weight_trade_date"] = latest["weight_trade_date"]
-    if latest.get("update_date"):
-        query["update_date"] = latest["update_date"]
-    return _dedupe_symbols(
-        [d.get("symbol") for d in coll.find(query, {"_id": 0, "symbol": 1}).sort("symbol", 1)],
-        "stock",
-    )
-
-
-def _resolve_batch_symbols(collections: Dict[str, Any], task: BacktestBatchCreate) -> List[str]:
-    universe_type = (task.universe_type or "manual").strip().lower()
-    asset_type = _normalize_asset_type(task.asset_type)
-    if universe_type == "manual":
-        symbols = _dedupe_symbols(task.symbols, asset_type)
-    elif universe_type == "index":
-        symbols = _load_index_symbols(collections, task.universe_value or "")
-    elif universe_type == "watchlist":
-        watchlist_col = collections.get("user_watchlists")
-        doc = watchlist_col.find_one({"_id": task.universe_value}) if watchlist_col is not None and task.universe_value else None
-        symbols = _dedupe_symbols((doc or {}).get("symbols", []), asset_type)
-    elif universe_type == "strategy_pool":
-        pool_col = collections.get("strategy_stock_pool")
-        query: Dict[str, Any] = {}
-        if task.universe_value:
-            query["preset"] = task.universe_value
-        rows = list(pool_col.find(query, {"_id": 0, "symbol": 1}).sort("date", -1).limit(2000)) if pool_col is not None else []
-        symbols = _dedupe_symbols([r.get("symbol") for r in rows], asset_type)
-    else:
-        raise HTTPException(status_code=400, detail="universe_type must be manual, index, watchlist, or strategy_pool")
-    if not symbols:
-        raise HTTPException(status_code=400, detail="No symbols resolved for batch backtest")
-    return symbols
-
-
-def _build_backtest_task_doc(
-    *,
-    current_user: dict,
-    symbol: str,
-    asset_type: str,
-    strategy_key: str,
-    preset: Optional[str],
-    strategy_params: Dict[str, Any],
-    start_date: str,
-    end_date: str,
-    initial_cash: float,
-    batch_id: Optional[str] = None,
-    batch_name: Optional[str] = None,
-    batch_index: Optional[int] = None,
-) -> Dict[str, Any]:
-    task_doc = {
-        "task_id": _new_task_id(symbol),
-        "user_id": current_user["id"],
-        "symbol": symbol,
-        "asset_type": asset_type,
-        "strategy_key": strategy_key,
-        "preset": preset,
-        "strategy_params": strategy_params or {},
-        "start_date": start_date,
-        "end_date": end_date,
-        "initial_cash": initial_cash,
-        "status": "pending",
-        "worker_id": None,
-        "created_at": datetime.now(),
-        "started_at": None,
-        "completed_at": None,
-        "error_message": None,
-    }
-    if batch_id:
-        task_doc["batch_id"] = batch_id
-        task_doc["batch_name"] = batch_name
-        task_doc["batch_index"] = batch_index
-    return task_doc
-
-
-def _metric_value(metrics: Dict[str, Any], key: str) -> Optional[float]:
-    value = metrics.get(key)
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None
 
 
 def _clean_for_mongo(value: Any) -> Any:
@@ -427,89 +256,6 @@ def _clean_for_response(value: Any) -> Any:
         except Exception:
             pass
     return str(value)
-
-
-def _batch_status_from_counts(total: int, counts: Dict[str, int]) -> str:
-    if total <= 0:
-        return "failed"
-    completed = counts.get("completed", 0)
-    failed = counts.get("failed", 0)
-    cancelled = counts.get("cancelled", 0)
-    running = counts.get("pending", 0) + counts.get("claimed", 0) + counts.get("running", 0)
-    if running:
-        return "running" if completed or failed or cancelled else "pending"
-    if completed == total:
-        return "completed"
-    if completed > 0 and (failed or cancelled):
-        return "partial_failed"
-    if cancelled == total:
-        return "cancelled"
-    return "failed"
-
-
-def _summarize_batch(tasks: List[Dict[str, Any]], results_by_task: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
-    counts: Dict[str, int] = {}
-    returns: List[float] = []
-    drawdowns: List[float] = []
-    win_rates: List[float] = []
-    for task in tasks:
-        status_value = str(task.get("status") or "unknown")
-        counts[status_value] = counts.get(status_value, 0) + 1
-        result = results_by_task.get(task.get("task_id"))
-        metrics = result.get("metrics", {}) if isinstance(result, dict) else {}
-        for target, key in ((returns, "total_return"), (drawdowns, "max_drawdown"), (win_rates, "win_rate")):
-            val = _metric_value(metrics, key)
-            if val is not None:
-                target.append(val)
-
-    def avg(values: List[float]) -> Optional[float]:
-        return sum(values) / len(values) if values else None
-
-    def median(values: List[float]) -> Optional[float]:
-        if not values:
-            return None
-        ordered = sorted(values)
-        mid = len(ordered) // 2
-        if len(ordered) % 2:
-            return ordered[mid]
-        return (ordered[mid - 1] + ordered[mid]) / 2
-
-    total = len(tasks)
-    return {
-        "total": total,
-        "status_counts": counts,
-        "completed": counts.get("completed", 0),
-        "failed": counts.get("failed", 0),
-        "cancelled": counts.get("cancelled", 0),
-        "running": counts.get("pending", 0) + counts.get("claimed", 0) + counts.get("running", 0),
-        "avg_total_return": avg(returns),
-        "median_total_return": median(returns),
-        "avg_max_drawdown": avg(drawdowns),
-        "median_win_rate": median(win_rates),
-        "status": _batch_status_from_counts(total, counts),
-    }
-
-
-def _refresh_batch_summary(collections: Dict[str, Any], batch_id: str, user_id: str) -> Dict[str, Any]:
-    tasks = list(collections["backtest_tasks"].find({"batch_id": batch_id, "user_id": user_id}))
-    task_ids = [t["task_id"] for t in tasks]
-    results = list(collections["backtest_results"].find({"task_id": {"$in": task_ids}})) if task_ids else []
-    results_by_task = {r.get("task_id"): r for r in results}
-    summary = _summarize_batch(tasks, results_by_task)
-    collections["backtest_batches"].update_one(
-        {"batch_id": batch_id, "user_id": user_id},
-        {"$set": {"summary": summary, "status": summary["status"], "updated_at": datetime.now()}},
-    )
-    return summary
-
-
-def _serialize_batch(batch: Dict[str, Any], summary: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    out = {k: v for k, v in batch.items() if k != "_id"}
-    out["id"] = str(batch.get("_id")) if batch.get("_id") else None
-    if summary is not None:
-        out["summary"] = summary
-        out["status"] = summary.get("status", out.get("status"))
-    return _clean_for_response(out)
 
 
 def _is_batch_ref(value: Any) -> bool:
@@ -621,70 +367,13 @@ async def create_backtest_batch(
 ):
     """Create a batch experiment by expanding one request into child backtest tasks."""
     collections = get_db_collections()
-    backtest_batches_col = collections["backtest_batches"]
-    backtest_tasks_col = collections["backtest_tasks"]
-    asset_type = _normalize_asset_type(task.asset_type)
-    symbols = _resolve_batch_symbols(collections, task)
-    if task.limit_symbols and task.limit_symbols > 0:
-        symbols = symbols[:task.limit_symbols]
-    batch_id = _new_batch_id()
-    name = task.name or f"{task.strategy_key} batch {datetime.now().strftime('%Y-%m-%d %H:%M')}"
-    now = datetime.now()
-
-    batch_doc = {
-        "batch_id": batch_id,
-        "user_id": current_user["id"],
-        "name": name,
-        "universe_type": (task.universe_type or "manual").strip().lower(),
-        "universe_value": task.universe_value,
-        "symbols_count": len(symbols),
-        "limit_symbols": task.limit_symbols,
-        "symbols_preview": symbols[:20],
-        "asset_type": asset_type,
-        "strategy_key": task.strategy_key,
-        "preset": task.preset,
-        "strategy_params": task.strategy_params or {},
-        "start_date": task.start_date,
-        "end_date": task.end_date,
-        "initial_cash": task.initial_cash,
-        "status": "pending",
-        "summary": {"total": len(symbols), "status_counts": {"pending": len(symbols)}},
-        "created_at": now,
-        "updated_at": now,
-        "completed_at": None,
-    }
-
-    child_tasks = [
-        _build_backtest_task_doc(
-            current_user=current_user,
-            symbol=symbol,
-            asset_type=asset_type,
-            strategy_key=task.strategy_key,
-            preset=task.preset,
-            strategy_params=task.strategy_params,
-            start_date=task.start_date,
-            end_date=task.end_date,
-            initial_cash=task.initial_cash,
-            batch_id=batch_id,
-            batch_name=name,
-            batch_index=i,
-        )
-        for i, symbol in enumerate(symbols)
-    ]
-    backtest_batches_col.insert_one(batch_doc)
-    if child_tasks:
-        backtest_tasks_col.insert_many(child_tasks)
-
-    return {
-        **_serialize_batch(batch_doc),
-        "created_tasks": len(child_tasks),
-        "task_ids": [t["task_id"] for t in child_tasks],
-    }
+    return create_batch(collections, current_user, task)
 
 
 @router.get("/batches")
 async def list_backtest_batches(
     status: Optional[str] = None,
+    experiment_type: Optional[str] = None,
     limit: int = 50,
     current_user: dict = Depends(get_current_user),
 ):
@@ -692,6 +381,9 @@ async def list_backtest_batches(
     query = {"user_id": current_user["id"]}
     if status:
         query["status"] = status
+    exp_query = build_experiment_type_query(experiment_type)
+    if exp_query:
+        query = {"$and": [query, exp_query]}
     batches = list(collections["backtest_batches"].find(query).sort("created_at", -1).limit(limit))
     out = []
     for batch in batches:
@@ -728,47 +420,16 @@ async def get_backtest_batch_results(
     current_user: dict = Depends(get_current_user),
 ):
     collections = get_db_collections()
-    batch = collections["backtest_batches"].find_one({"batch_id": batch_id, "user_id": current_user["id"]})
-    if not batch:
-        raise HTTPException(status_code=404, detail="Backtest batch not found")
-    query = {"batch_id": batch_id, "user_id": current_user["id"]}
-    if status:
-        query["status"] = status
-    tasks = list(collections["backtest_tasks"].find(query).sort("batch_index", 1))
-    task_ids = [t["task_id"] for t in tasks]
-    results = list(collections["backtest_results"].find({"task_id": {"$in": task_ids}}))
-    results_by_task = {r.get("task_id"): r for r in results}
-    rows = []
-    for task in tasks:
-        result = results_by_task.get(task["task_id"]) or {}
-        metrics = result.get("metrics", {}) or {}
-        rows.append({
-            "task_id": task["task_id"],
-            "batch_id": batch_id,
-            "symbol": task.get("symbol"),
-            "asset_type": _normalize_asset_type(task.get("asset_type")),
-            "stock_name": _lookup_symbol_name(collections, task.get("symbol"), _normalize_asset_type(task.get("asset_type"))),
-            "status": task.get("status"),
-            "error_message": task.get("error_message"),
-            "strategy_key": task.get("strategy_key"),
-            "preset": task.get("preset"),
-            "metrics": metrics,
-            "total_return": metrics.get("total_return"),
-            "invested_return": metrics.get("invested_return"),
-            "invested_cash": metrics.get("invested_cash"),
-            "capital_utilization": metrics.get("capital_utilization"),
-            "max_drawdown": metrics.get("max_drawdown"),
-            "sharpe_ratio": metrics.get("sharpe_ratio"),
-            "win_rate": metrics.get("win_rate"),
-            "total_trades": metrics.get("total_trades"),
-        })
-    reverse = order.lower() != "asc"
-    present = [r for r in rows if r.get(sort_by) is not None]
-    missing = [r for r in rows if r.get(sort_by) is None]
-    present.sort(key=lambda r: r.get(sort_by), reverse=reverse)
-    rows = present + missing
-    total = len(rows)
-    return _clean_for_response({"batch_id": batch_id, "total": total, "offset": offset, "limit": limit, "rows": rows[offset:offset + limit]})
+    return list_batch_result_rows(
+        collections,
+        batch_id,
+        current_user["id"],
+        status=status,
+        sort_by=sort_by,
+        order=order,
+        limit=limit,
+        offset=offset,
+    )
 
 
 @router.delete("/batches/{batch_id}")
@@ -890,6 +551,8 @@ async def rerun_backtest_batch(
     batch = collections["backtest_batches"].find_one({"batch_id": batch_id, "user_id": current_user["id"]})
     if not batch:
         raise HTTPException(status_code=404, detail="Backtest batch not found")
+    if is_compare_batch(batch):
+        raise HTTPException(status_code=409, detail="Compare batches cannot be rerun via legacy rerun endpoint")
     query: Dict[str, Any] = {"batch_id": batch_id, "user_id": current_user["id"]}
     if payload.only_statuses:
         query["status"] = {"$in": payload.only_statuses}
@@ -912,7 +575,7 @@ async def rerun_backtest_batch(
         initial_cash=payload.initial_cash or batch.get("initial_cash", 1000000.0),
         limit_symbols=0,
     )
-    result = await create_backtest_batch(new_payload, current_user)
+    result = create_batch(collections, current_user, new_payload)
     collections["backtest_batches"].update_one(
         {"batch_id": result["batch_id"]},
         {

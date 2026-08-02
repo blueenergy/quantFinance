@@ -68,3 +68,31 @@ def test_sector_spectrum_query_limits_symbols(monkeypatch):
 
     assert "$in" in captured["query"]["symbol"]
     assert set(captured["query"]["symbol"]["$in"]) == {"600519.SH", "000001.SZ"}
+
+
+@pytest.mark.unit
+def test_market_spectrum_query_pins_ma_period_and_granularity(monkeypatch):
+    """market_spectrum allows several rows per day, keyed on
+    (trade_date, ma_period, granularity). Querying by date alone would return one
+    row per MA variant and silently duplicate every date for every consumer.
+    """
+    captured = {}
+
+    class _FakeCursor:
+        def sort(self, *_args, **_kwargs):
+            return iter([])
+
+    collection = MagicMock()
+
+    def _capture_find(query, projection):
+        captured["query"] = query
+        return _FakeCursor()
+
+    collection.find.side_effect = _capture_find
+    monkeypatch.setattr(market_router, "get_data_db", lambda: {"market_spectrum": collection})
+
+    market_router.get_market_spectrum(start_date="20050101", end_date="20260731", ma_period=5)
+
+    assert captured["query"]["ma_period"] == 5
+    assert captured["query"]["granularity"] == "daily"
+    assert captured["query"]["trade_date"] == {"$gte": "20050101", "$lte": "20260731"}

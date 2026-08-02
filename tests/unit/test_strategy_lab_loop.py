@@ -17,7 +17,7 @@ class FakeCollection:
                 return doc.copy()
         return None
 
-    def find(self, query=None):
+    def find(self, query=None, projection=None):
         class Cursor(list):
             def sort(self, *args, **kwargs):
                 return self

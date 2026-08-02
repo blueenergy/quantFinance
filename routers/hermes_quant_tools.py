@@ -45,7 +45,7 @@ from typing import Any, Dict, List, Optional
 
 from bson import ObjectId
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from auth import get_user_from_header_token, require_hermes_quant_internal_key
 from db import data_db, db, get_analyzer_db, get_db_collections
@@ -53,6 +53,13 @@ from models.analysis_task import AnalysisMode
 from routers.market import fetch_market_analysis_result
 from services.analysis_history import build_user_analysis_history_payload
 from services.analysis_tasks import build_task_doc
+from services.backtest_batch_schemas import BacktestBatchCreate, BacktestCombo
+from services.backtest_batch_service import (
+    create_batch,
+    list_all_batch_result_rows,
+    list_batch_result_rows,
+    refresh_batch_summary,
+)
 from services.ladder_daily import build_daily_ladder_payload
 
 MCP_READ_TAG = "Hermes quant read tools"
@@ -4039,4 +4046,174 @@ async def hermes_stock_screen(
         "filters_applied": [f.model_dump() for f in parsed],
         "summary": {"industries_distribution": industries_dist},
         "results": results,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Backtest sweep (strategy compare grid)
+# ---------------------------------------------------------------------------
+
+
+def _require_mcp_user_token(x_user_token: Optional[str]) -> Dict[str, Any]:
+    if not x_user_token:
+        raise HTTPException(status_code=401, detail="X-User-Token is required for backtest sweep tools")
+    user = get_user_from_header_token(x_user_token=x_user_token)
+    if user.get("id") == "hermes-system":
+        raise HTTPException(
+            status_code=401,
+            detail="Valid user token required; hermes-system fallback is not allowed for backtest tools",
+        )
+    return user
+
+
+def _build_backtest_strategies_payload(user: Dict[str, Any]) -> Dict[str, Any]:
+    collections = get_db_collections()
+    meta_col = collections.get("strategy_metadata")
+    template_col = collections.get("strategy_template")
+    strategies_out: List[Dict[str, Any]] = []
+    user_service_level = user.get("service_level", "free")
+
+    if meta_col is not None:
+        for s in meta_col.find({}, {"_id": 0}):
+            key = s.get("key")
+            if not key:
+                continue
+            item = {
+                "key": key,
+                "name": s.get("name", key),
+                "min_service_level": s.get("min_service_level", "free"),
+            }
+            user_level_index = ["free", "basic", "vip", "premium"].index(user_service_level)
+            required_level_index = ["free", "basic", "vip", "premium"].index(item["min_service_level"])
+            item["can_use"] = user_level_index >= required_level_index
+            presets: List[Dict[str, Any]] = []
+            if template_col is not None:
+                for tpl in template_col.find({"strategy": key}, {"_id": 0}):
+                    presets.append(
+                        {
+                            "preset": tpl.get("preset"),
+                            "name": tpl.get("name") or tpl.get("preset"),
+                            "description": tpl.get("description"),
+                            "is_default": tpl.get("is_default", False),
+                            "params": tpl.get("params") or {},
+                            "params_with_desc": tpl.get("params_with_desc") or {},
+                        }
+                    )
+            item["presets"] = presets
+            strategies_out.append(item)
+
+    return {"success": True, "strategies": strategies_out}
+
+
+class BacktestSweepRequest(BaseModel):
+    name: Optional[str] = None
+    symbols: List[str] = Field(default_factory=list)
+    asset_type: str = "stock"
+    universe_type: str = "manual"
+    universe_value: Optional[str] = None
+    strategy_key: str
+    preset: Optional[str] = None
+    strategy_params: Dict[str, Any] = Field(default_factory=dict)
+    start_date: str
+    end_date: str
+    initial_cash: float = 1000000.0
+    limit_symbols: int = 0
+    experiment_type: str = "compare"
+    combos: List[BacktestCombo] = Field(default_factory=list)
+
+
+@router.get("/backtest/strategies", operation_id="backtest_strategies", tags=[MCP_READ_TAG])
+async def hermes_backtest_strategies(
+    x_user_token: str = Header(..., alias="X-User-Token"),
+    _: bool = Depends(require_hermes_quant_internal_key),
+):
+    """List strategies with presets and parameter metadata for sweep planning."""
+    user = _require_mcp_user_token(x_user_token)
+    return _build_backtest_strategies_payload(user)
+
+
+@router.post("/backtest/sweep", operation_id="submit_backtest_sweep", tags=[MCP_ACTION_TAG])
+async def hermes_submit_backtest_sweep(
+    body: BacktestSweepRequest,
+    x_user_token: str = Header(..., alias="X-User-Token"),
+    _: bool = Depends(require_hermes_quant_internal_key),
+):
+    """Submit a compare-grid backtest batch and return batch_id immediately."""
+    collections = get_db_collections()
+    user = _require_mcp_user_token(x_user_token)
+    payload = BacktestBatchCreate(**body.model_dump())
+    result = create_batch(collections, user, payload)
+    return {
+        "success": True,
+        "batch_id": result.get("batch_id"),
+        "created_tasks": result.get("created_tasks"),
+        "task_ids": result.get("task_ids"),
+        "attributed_to": user.get("username"),
+    }
+
+
+@router.get("/backtest/sweep/{batch_id}", operation_id="backtest_sweep_status", tags=[MCP_ACTION_TAG])
+async def hermes_backtest_sweep_status(
+    batch_id: str,
+    x_user_token: str = Header(..., alias="X-User-Token"),
+    _: bool = Depends(require_hermes_quant_internal_key),
+):
+    """Poll compare batch progress and return all completed metric rows."""
+    collections = get_db_collections()
+    user = _require_mcp_user_token(x_user_token)
+    summary = refresh_batch_summary(collections, batch_id, user["id"])
+    rows = list_all_batch_result_rows(collections, batch_id, user["id"])
+    return {
+        "success": True,
+        "batch_id": batch_id,
+        "summary": summary,
+        "total": len(rows),
+        "rows": rows,
+        "attributed_to": user.get("username"),
+    }
+
+
+@router.post("/backtest/sweep-and-wait", operation_id="backtest_sweep_wait", tags=[MCP_ACTION_TAG])
+async def hermes_backtest_sweep_wait(
+    body: BacktestSweepRequest,
+    timeout: int = Query(180, ge=30, le=300, description="Max wait seconds; default 180"),
+    x_user_token: str = Header(..., alias="X-User-Token"),
+    _: bool = Depends(require_hermes_quant_internal_key),
+):
+    """
+    Submit a compare-grid batch and poll until completion or timeout.
+    Large grids should use submit_backtest_sweep + backtest_sweep_status instead.
+    """
+    collections = get_db_collections()
+    user = _require_mcp_user_token(x_user_token)
+    payload = BacktestBatchCreate(**body.model_dump())
+    result = create_batch(collections, user, payload)
+    batch_id = result.get("batch_id")
+
+    elapsed = 0
+    poll_interval = 10
+    summary: Dict[str, Any] = result.get("summary") or {}
+    while elapsed < timeout:
+        await asyncio.sleep(poll_interval)
+        elapsed += poll_interval
+        summary = refresh_batch_summary(collections, batch_id, user["id"])
+        if int(summary.get("running") or 0) == 0:
+            break
+
+    rows = list_all_batch_result_rows(collections, batch_id, user["id"])
+    summary = refresh_batch_summary(collections, batch_id, user["id"])
+    timed_out = int(summary.get("running") or 0) > 0
+    return {
+        "success": not timed_out,
+        "timed_out": timed_out,
+        "batch_id": batch_id,
+        "summary": summary,
+        "total": len(rows),
+        "rows": rows,
+        "attributed_to": user.get("username"),
+        "message": (
+            "Batch still running; poll backtest_sweep_status with batch_id"
+            if timed_out
+            else "Batch completed"
+        ),
     }

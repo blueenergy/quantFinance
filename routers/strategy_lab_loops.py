@@ -8,7 +8,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
 from auth import get_current_user
-from routers.backtest import BacktestBatchCreate
+from services.backtest_batch_schemas import BacktestBatchCreate
 from services import strategy_lab_loop as loop_service
 
 router = APIRouter(prefix="/loops", tags=["strategy-lab-loops"])

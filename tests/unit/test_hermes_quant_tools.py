@@ -1402,3 +1402,41 @@ def test_stock_valuation_metrics_cash_flow_missing_collection_flagged():
     assert payload["cash_flow"]["available"] is False
     cash_flow_items = [it for it in payload["data_quality"]["items"] if it["metric"] == "cash_flow"]
     assert cash_flow_items and cash_flow_items[0]["status"] == "missing_collection"
+
+
+@pytest.mark.unit
+def test_require_mcp_user_token_rejects_missing():
+    from fastapi import HTTPException
+
+    from routers.hermes_quant_tools import _require_mcp_user_token
+
+    with pytest.raises(HTTPException) as exc:
+        _require_mcp_user_token(None)
+    assert exc.value.status_code == 401
+
+
+@pytest.mark.unit
+def test_require_mcp_user_token_rejects_hermes_system():
+    from fastapi import HTTPException
+    from unittest.mock import patch
+
+    from routers.hermes_quant_tools import _require_mcp_user_token
+
+    with patch(
+        "routers.hermes_quant_tools.get_user_from_header_token",
+        return_value={"id": "hermes-system", "username": "hermes-system"},
+    ):
+        with pytest.raises(HTTPException) as exc:
+            _require_mcp_user_token("token")
+    assert exc.value.status_code == 401
+
+
+@pytest.mark.unit
+def test_require_mcp_user_token_accepts_real_user():
+    from unittest.mock import patch
+
+    from routers.hermes_quant_tools import _require_mcp_user_token
+
+    user = {"id": "user-1", "username": "alice", "service_level": "vip"}
+    with patch("routers.hermes_quant_tools.get_user_from_header_token", return_value=user):
+        assert _require_mcp_user_token("token") == user

@@ -1249,12 +1249,17 @@ def fetch_market_data() -> Optional[Dict[str, Any]]:
 @router.get('/market-spectrum', summary="获取市场阴阳谱数据", tags=["Market"])
 def get_market_spectrum(
     start_date: str = Query(..., description="开始日期,格式YYYYMMDD"),
-    end_date: str = Query(..., description="结束日期,格式YYYYMMDD")
+    end_date: str = Query(..., description="结束日期,格式YYYYMMDD"),
+    ma_period: int = Query(5, ge=2, le=30, description="均线周期,默认5")
 ):  
     data_collections = get_data_db()
     collection = data_collections['market_spectrum']
+    # Keyed on (trade_date, ma_period, granularity); without pinning the latter two
+    # a non-5 MA backfill would return duplicate rows for every trade_date.
     query = {
-        'trade_date': {'$gte': start_date, '$lte': end_date}
+        'trade_date': {'$gte': start_date, '$lte': end_date},
+        'ma_period': ma_period,
+        'granularity': 'daily'
     }
     projection = {
         '_id': 0,

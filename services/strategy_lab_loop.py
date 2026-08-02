@@ -18,15 +18,11 @@ from typing import Any, Dict, List, Optional, Tuple
 from fastapi import HTTPException
 
 from db import get_analyzer_db, get_db_collections
-from routers.backtest import (
-    BacktestBatchCreate,
-    BacktestBatchRerunCreate,
-    _build_backtest_task_doc,
-    _new_batch_id,
-    _normalize_asset_type,
-    _resolve_batch_symbols,
-    _serialize_batch,
-    _summarize_batch,
+from services.backtest_batch_schemas import BacktestBatchCreate, BacktestBatchRerunCreate
+from services.backtest_batch_service import (
+    create_batch,
+    is_compare_batch,
+    refresh_batch_summary,
 )
 from services.analysis_tasks import (
     RUNNING_STATUSES,
@@ -431,84 +427,17 @@ def evaluate_stop_rules(
     return False, ""
 
 
-def refresh_batch_summary(collections: Dict[str, Any], batch_id: str, user_id: str) -> Dict[str, Any]:
-    batch = collections["backtest_batches"].find_one({"batch_id": batch_id, "user_id": user_id})
-    if not batch:
-        raise ValueError(f"Backtest batch not found: {batch_id}")
-    tasks = list(collections["backtest_tasks"].find({"batch_id": batch_id, "user_id": user_id}))
-    task_ids = [t["task_id"] for t in tasks]
-    results = list(collections["backtest_results"].find({"task_id": {"$in": task_ids}})) if task_ids else []
-    results_by_task = {r.get("task_id"): r for r in results}
-    summary = _summarize_batch(tasks, results_by_task)
-    collections["backtest_batches"].update_one(
-        {"batch_id": batch_id},
-        {"$set": {"summary": summary, "status": summary["status"], "updated_at": datetime.now()}},
-    )
-    return summary
-
-
 def create_backtest_batch_sync(
     collections: Dict[str, Any],
     current_user: dict,
     task: BacktestBatchCreate,
 ) -> Dict[str, Any]:
-    backtest_batches_col = collections["backtest_batches"]
-    backtest_tasks_col = collections["backtest_tasks"]
-    asset_type = _normalize_asset_type(task.asset_type)
-    symbols = _resolve_batch_symbols(collections, task)
-    if task.limit_symbols and task.limit_symbols > 0:
-        symbols = symbols[: task.limit_symbols]
-    batch_id = _new_batch_id()
-    name = task.name or f"{task.strategy_key} batch {datetime.now().strftime('%Y-%m-%d %H:%M')}"
-    now = datetime.now()
-    batch_doc = {
-        "batch_id": batch_id,
-        "user_id": current_user["id"],
-        "name": name,
-        "universe_type": (task.universe_type or "manual").strip().lower(),
-        "universe_value": task.universe_value,
-        "symbols_count": len(symbols),
-        "limit_symbols": task.limit_symbols,
-        "symbols_preview": symbols[:20],
-        "asset_type": asset_type,
-        "strategy_key": task.strategy_key,
-        "preset": task.preset,
-        "strategy_params": task.strategy_params or {},
-        "start_date": task.start_date,
-        "end_date": task.end_date,
-        "initial_cash": task.initial_cash,
-        "status": "pending",
-        "summary": {"total": len(symbols), "status_counts": {"pending": len(symbols)}},
-        "created_at": now,
-        "updated_at": now,
-        "completed_at": None,
-        "loop_id": None,
-    }
-    child_tasks = [
-        _build_backtest_task_doc(
-            current_user=current_user,
-            symbol=symbol,
-            asset_type=asset_type,
-            strategy_key=task.strategy_key,
-            preset=task.preset,
-            strategy_params=task.strategy_params,
-            start_date=task.start_date,
-            end_date=task.end_date,
-            initial_cash=task.initial_cash,
-            batch_id=batch_id,
-            batch_name=name,
-            batch_index=i,
-        )
-        for i, symbol in enumerate(symbols)
-    ]
-    backtest_batches_col.insert_one(batch_doc)
-    if child_tasks:
-        backtest_tasks_col.insert_many(child_tasks)
-    return {
-        **_serialize_batch(batch_doc),
-        "created_tasks": len(child_tasks),
-        "task_ids": [t["task_id"] for t in child_tasks],
-    }
+    return create_batch(
+        collections,
+        current_user,
+        task,
+        extra_batch_fields={"loop_id": None},
+    )
 
 
 def rerun_backtest_batch_sync(
@@ -1174,6 +1103,8 @@ def create_loop(
         batch = collections["backtest_batches"].find_one({"batch_id": source_batch_id, "user_id": user_id})
         if not batch:
             raise ValueError(f"Backtest batch not found: {source_batch_id}")
+        if is_compare_batch(batch):
+            raise ValueError("Compare batches cannot be used as Loop source batches")
         active_loop = _find_active_loop_for_batch(collections, user_id, source_batch_id)
         if active_loop:
             raise ValueError(
