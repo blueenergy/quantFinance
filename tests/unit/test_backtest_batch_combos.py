@@ -158,6 +158,30 @@ def test_create_batch_rejects_duplicate_combo_key():
 
 
 @pytest.mark.unit
+def test_create_batch_rejects_window_too_short_for_strategy():
+    """The whole batch is refused up front rather than partial_failing later."""
+    collections = {
+        "backtest_batches": FakeCollection(),
+        "backtest_tasks": FakeCollection(),
+        "strategy_metadata": FakeCollection([{"key": "turtle", "min_bars": 50}]),
+    }
+    payload = BacktestBatchCreate(
+        symbols=["000001.SZ", "000002.SZ"],
+        strategy_key="turtle",
+        strategy_params={"period": 20},
+        start_date="20240101",
+        end_date="20240131",
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        create_batch(collections, {"id": "user1"}, payload)
+
+    assert exc.value.status_code == 422
+    assert collections["backtest_batches"].docs == []
+    assert collections["backtest_tasks"].docs == []
+
+
+@pytest.mark.unit
 def test_create_batch_compare_limit_enforced():
     collections = {
         "backtest_batches": FakeCollection(),

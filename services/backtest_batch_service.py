@@ -13,6 +13,7 @@ from bson import ObjectId
 from fastapi import HTTPException
 
 from services.backtest_batch_schemas import BacktestBatchCreate, BacktestCombo
+from services.backtest_precheck import validate_backtest_window
 
 MAX_COMPARE_TASKS = 500
 
@@ -464,6 +465,13 @@ def create_batch(
             raise HTTPException(status_code=422, detail=f"Duplicate combo_key in request: {key}")
         combo_keys_seen.add(key)
         combo_entries.append((combo, key))
+
+    validate_backtest_window(
+        collections,
+        [combo.strategy_key for combo, _ in combo_entries],
+        task.start_date,
+        task.end_date,
+    )
 
     total_tasks = len(symbols) * len(combo_entries)
     if task.combos is not None and total_tasks > MAX_COMPARE_TASKS:

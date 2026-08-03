@@ -36,6 +36,7 @@ from services.backtest_batch_service import (
     refresh_batch_summary as _refresh_batch_summary,
     serialize_batch as _serialize_batch,
 )
+from services.backtest_precheck import validate_backtest_window
 
 router = APIRouter(prefix="/backtest", tags=["backtest"])
 
@@ -321,7 +322,9 @@ async def create_backtest_task(
     collections = get_db_collections()
     backtest_tasks_col = collections["backtest_tasks"]
     asset_type = _normalize_asset_type(task.asset_type)
-    
+
+    validate_backtest_window(collections, [task.strategy_key], task.start_date, task.end_date)
+
     symbol = _normalize_symbol(task.symbol, asset_type)
     task_doc = _build_backtest_task_doc(
         current_user=current_user,
