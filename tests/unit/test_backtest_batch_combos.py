@@ -135,6 +135,38 @@ def test_create_batch_with_two_combos_one_symbol():
 
 
 @pytest.mark.unit
+def test_create_batch_compare_multi_symbols_cartesian():
+    collections = {
+        "backtest_batches": FakeCollection(),
+        "backtest_tasks": FakeCollection(),
+    }
+    payload = BacktestBatchCreate(
+        symbols=["000001.SZ", "510300.SH"],
+        asset_type="stock",
+        strategy_key="turtle",
+        strategy_params={"period": 20},
+        start_date="20240101",
+        end_date="20241231",
+        experiment_type="compare",
+        combos=[
+            BacktestCombo(strategy_key="turtle", preset="default", strategy_params={"period": 10}),
+            BacktestCombo(strategy_key="grid", preset=None, strategy_params={"grid_size": 0.02}),
+        ],
+    )
+    result = create_batch(collections, {"id": "user1"}, payload)
+    assert result["created_tasks"] == 4
+    tasks = collections["backtest_tasks"].docs
+    assert {t["symbol"] for t in tasks} == {"000001.SZ", "510300.SH"}
+    by_symbol = {t["symbol"]: t["asset_type"] for t in tasks}
+    assert by_symbol["000001.SZ"] == "stock"
+    assert by_symbol["510300.SH"] == "etf"
+    batch = collections["backtest_batches"].docs[0]
+    assert batch["symbols_count"] == 2
+    assert batch["combos_count"] == 2
+    assert batch["symbols_preview"] == ["000001.SZ", "510300.SH"]
+
+
+@pytest.mark.unit
 def test_create_batch_rejects_duplicate_combo_key():
     collections = {
         "backtest_batches": FakeCollection(),

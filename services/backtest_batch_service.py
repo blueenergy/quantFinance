@@ -532,12 +532,13 @@ def create_batch(
     child_tasks: List[Dict[str, Any]] = []
     batch_index = 0
     for symbol in symbols:
+        symbol_asset_type = infer_asset_type_from_symbol(symbol, asset_type)
         for combo_index, (combo, combo_key) in enumerate(combo_entries):
             child_tasks.append(
                 build_backtest_task_doc(
                     current_user=current_user,
                     symbol=symbol,
-                    asset_type=asset_type,
+                    asset_type=symbol_asset_type,
                     strategy_key=combo.strategy_key,
                     preset=combo.preset,
                     strategy_params=combo.strategy_params or {},
