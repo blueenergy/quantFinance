@@ -780,8 +780,15 @@ def test_get_backtest_result(monkeypatch, mock_user):
                 "capital_utilization": 0.85,
                 "sharpe_ratio": 1.2,
                 "max_drawdown": -0.08,
+                "max_drawdown_len": 42,
                 "win_rate": 0.6,
-                "total_trades": 10
+                "total_trades": 10,
+                "calmar_ratio": 1.87,
+                "sortino_ratio": 1.45,
+                "sqn": 2.1,
+                "ulcer_index": 0.03,
+                "benchmark_return": 0.05,
+                "excess_return": 0.10,
             },
             "trades": [
                 {
@@ -816,6 +823,13 @@ def test_get_backtest_result(monkeypatch, mock_user):
     assert data["metrics"]["invested_return"] == 0.18
     assert data["metrics"]["invested_cash"] == 850000.0
     assert data["metrics"]["capital_utilization"] == 0.85
+    assert data["metrics"]["calmar_ratio"] == 1.87
+    assert data["metrics"]["sortino_ratio"] == 1.45
+    assert data["metrics"]["sqn"] == 2.1
+    assert data["metrics"]["ulcer_index"] == 0.03
+    assert data["metrics"]["benchmark_return"] == 0.05
+    assert data["metrics"]["excess_return"] == 0.10
+    assert data["metrics"]["max_drawdown_len"] == 42
     assert len(data["trades"]) == 1
     assert len(data["equity_curve"]) == 2
     

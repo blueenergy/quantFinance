@@ -654,6 +654,12 @@ def list_batch_result_rows(
                 "sharpe_ratio": metrics.get("sharpe_ratio"),
                 "win_rate": metrics.get("win_rate"),
                 "total_trades": metrics.get("total_trades"),
+                "calmar_ratio": metrics.get("calmar_ratio"),
+                "sortino_ratio": metrics.get("sortino_ratio"),
+                "sqn": metrics.get("sqn"),
+                "ulcer_index": metrics.get("ulcer_index"),
+                "benchmark_return": metrics.get("benchmark_return"),
+                "excess_return": metrics.get("excess_return"),
             }
         )
 

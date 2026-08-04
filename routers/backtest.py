@@ -144,8 +144,15 @@ class BacktestResultMetrics(BaseModel):
     capital_utilization: Optional[float] = None
     sharpe_ratio: Optional[float] = None
     max_drawdown: Optional[float] = None
+    max_drawdown_len: Optional[float] = None
     win_rate: Optional[float] = None
     total_trades: Optional[int] = None
+    calmar_ratio: Optional[float] = None
+    sortino_ratio: Optional[float] = None
+    sqn: Optional[float] = None
+    ulcer_index: Optional[float] = None
+    benchmark_return: Optional[float] = None
+    excess_return: Optional[float] = None
 
 
 class BacktestTrade(BaseModel):
