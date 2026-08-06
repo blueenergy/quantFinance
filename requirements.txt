@@ -30,4 +30,8 @@ python-jose[cryptography]>=3.3.0  # JWT处理
 
 # MCP 服务器（暴露 quant-api 工具给 Hermes 等多智能体框架）
 fastapi-mcp==0.4.0
+# fastapi-mcp 0.4.0 只声明 mcp>=1.12.0，没有上界。mcp 2.0 把 Server.__init__
+# 的 description 改成 keyword-only，而 fastapi-mcp 仍按位置传参，重建镜像时
+# 解析到 2.x 会让 MCP 服务启动即 TypeError 崩溃循环。升级前先确认 fastapi-mcp 已适配。
+mcp>=1.12.0,<2
 boto3>=1.28.0
