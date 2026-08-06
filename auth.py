@@ -357,18 +357,23 @@ def log_admin_action(admin_user: dict, action: str, target_user_id: Optional[str
 
 def require_hermes_quant_internal_key(
     x_hermes_quant_key: Optional[str] = Header(None, alias="X-Hermes-Quant-Key"),
+    x_quant_client_key: Optional[str] = Header(None, alias="X-Quant-Client-Key"),
 ) -> bool:
-    """Shared secret for Hermes -> quant-api internal tools (no end-user JWT)."""
+    """Shared secret for Agent/MCP -> quant-api internal tools (no end-user JWT).
+
+    Accepts legacy ``X-Hermes-Quant-Key`` or neutral ``X-Quant-Client-Key``.
+    """
     expected = os.getenv("HERMES_QUANT_INTERNAL_KEY", "").strip()
     if not expected:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="HERMES_QUANT_INTERNAL_KEY is not configured",
         )
-    if not x_hermes_quant_key or x_hermes_quant_key.strip() != expected:
+    provided = (x_quant_client_key or x_hermes_quant_key or "").strip()
+    if not provided or provided != expected:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid or missing X-Hermes-Quant-Key",
+            detail="Invalid or missing X-Quant-Client-Key / X-Hermes-Quant-Key",
         )
     return True
 

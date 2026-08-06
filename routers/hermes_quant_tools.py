@@ -3789,56 +3789,21 @@ async def shenwan_pe_pb(
 # 智能选股（多条件财务筛选）
 # ---------------------------------------------------------------------------
 
-# 允许过滤的 financial_income 字段白名单（防止 LLM 幻觉字段名）
-_SCREEN_ALLOWED_FIELDS = {
-    "operate_profit",     # 营业利润
-    "revenue",            # 主营业务收入（默认营收）
-    "total_revenue",      # 营业总收入
-    "n_income",           # 净利润
-    "n_income_attr_p",    # 归母净利润
-    "total_profit",       # 利润总额
-    "oper_cost",          # 营业成本
-}
-
-_SCREEN_ALLOWED_OPS = {"gt", "gte", "lt", "lte"}
-_SCREEN_ALLOWED_METRICS = {"yoy", "abs"}
-
-
-class ScreenFilter(BaseModel):
-    field: str
-    metric_type: str  # "yoy" | "abs"
-    op: str           # "gt" | "gte" | "lt" | "lte"
-    value: float
-    base_period: Optional[str] = None  # abs 用：缺省取目标 period
-
-
-def _screen_prev_year_period(period: str) -> str:
-    """20260331 -> 20250331"""
-    return str(int(period[:4]) - 1) + period[4:]
-
-
-def _screen_compare(left: float, op: str, right: float) -> bool:
-    if op == "gt":
-        return left > right
-    if op == "gte":
-        return left >= right
-    if op == "lt":
-        return left < right
-    if op == "lte":
-        return left <= right
-    return False
+# 字段/算子白名单与筛选逻辑统一收敛到 services.screening（见 registry.py）。
 
 
 @router.get("/stock/screen", operation_id="stock_screen", tags=[MCP_READ_TAG])
 async def hermes_stock_screen(
     period: str = Query(..., description="目标报告期 YYYYMMDD，如 20260331；或 'latest' 自动取最近期"),
-    filters: str = Query(..., description="ScreenFilter 列表的 JSON 字符串"),
+    filters: str = Query(..., description="过滤条件列表的 JSON 字符串，元素形如 {field, metric_type, op, value, base_period?}"),
     report_type: int = Query(1, description="1=合并(累计，行业默认)，2=单季合并"),
     include_sw_industry: bool = Query(True, description="是否附申万 L1/L2/L3 行业"),
     exclude_st: bool = Query(True, description="排除股票名含 ST/*ST 的标的"),
-    exclude_negative_base: bool = Query(True, description="YoY 计算时若同期值<=0则跳过该股，避免扭亏假高增"),
+    exclude_negative_base: bool = Query(False, description="True 则剔除去年同期<=0的股；默认保留并用 yoy_quality 标注扭亏/减亏"),
     sort_by: str = Query("auto", description="排序字段；auto 取第一个 yoy filter；可显式指定 operate_profit_yoy 等"),
     top_n: int = Query(100, ge=1, le=500, description="最多返回条数"),
+    include_express: bool = Query(True, description="该股当期无正式财报时，回退用业绩快报"),
+    include_forecast: bool = Query(True, description="无正式财报且无快报时，回退用业绩预告（仅归母净利润）"),
     _: bool = Depends(require_hermes_quant_internal_key),
 ):
     """
@@ -3859,194 +3824,30 @@ async def hermes_stock_screen(
     - 默认 report_type=1（累计同比，行业惯例），用户说"单季"才用 2
     - 营收默认 revenue（主营业务收入），"营业总收入"才用 total_revenue
     - "超过/大于" → gt；"不低于/至少" → gte
+
+    数据来源：财报季早期正式财报尚少，缺正式财报的个股会回退到业绩快报、再回退到
+    业绩预告。每行带 data_source（formal/express/forecast），summary.sources_distribution
+    给出条数分布；引用 express/forecast 的数字时须注明是预披露值。
+
+    同比可信度：扭亏、两期均亏、低基数的个股会保留，但每个同比字段附带
+    {field}_yoy_quality（normal/turnaround/loss/low_base）与 {field}_yoy_base（去年同期金额）。
+    播报 turnaround/loss/low_base 的个股时，说「扭亏为盈」「亏损收窄」「低基数」并给出
+    两期金额，不要把百分比当成真实增速。
     """
-    import json as _json
+    from services.screening.adapters.hermes_financial import legacy_financial_screen_payload
 
-    # --- Step 1: 解析 & 校验 filters ---
-    try:
-        raw_filters = _json.loads(filters)
-        if not isinstance(raw_filters, list) or not raw_filters:
-            return {"success": False, "error": "filters 必须是非空 JSON 数组"}
-        parsed: list[ScreenFilter] = [ScreenFilter(**f) for f in raw_filters]
-    except Exception as e:
-        return {"success": False, "error": f"filters 解析失败: {e}"}
-
-    for f in parsed:
-        if f.field not in _SCREEN_ALLOWED_FIELDS:
-            return {"success": False,
-                    "error": f"不支持的 field: {f.field}",
-                    "allowed_fields": sorted(_SCREEN_ALLOWED_FIELDS)}
-        if f.metric_type not in _SCREEN_ALLOWED_METRICS:
-            return {"success": False, "error": f"不支持的 metric_type: {f.metric_type}"}
-        if f.op not in _SCREEN_ALLOWED_OPS:
-            return {"success": False, "error": f"不支持的 op: {f.op}"}
-
-    fin = data_db["financial_income"]
-
-    # --- Step 2: 处理 period=latest ---
-    target_period = period.strip()
-    if target_period.lower() == "latest":
-        latest = fin.find_one({"report_type": report_type}, sort=[("end_date", -1)])
-        if not latest:
-            return {"success": False, "error": "financial_income 无数据"}
-        target_period = latest["end_date"]
-
-    # --- Step 3: 推算所需 end_date 集合 ---
-    needed_periods = {target_period}
-    has_yoy = any(f.metric_type == "yoy" for f in parsed)
-    if has_yoy:
-        needed_periods.add(_screen_prev_year_period(target_period))
-    for f in parsed:
-        if f.metric_type == "abs" and f.base_period:
-            needed_periods.add(f.base_period)
-
-    needed_fields = {f.field for f in parsed}
-    if has_yoy:
-        # YoY 也需要这些字段
-        pass  # already in needed_fields
-
-    proj = {"_id": 0, "ts_code": 1, "end_date": 1}
-    for fld in needed_fields:
-        proj[fld] = 1
-
-    # --- Step 4: 一次批量查 financial_income，组织成 (ts_code, end_date) -> doc ---
-    cursor = fin.find(
-        {"end_date": {"$in": list(needed_periods)}, "report_type": report_type},
-        proj,
+    return legacy_financial_screen_payload(
+        period=period,
+        filters=filters,
+        report_type=report_type,
+        include_sw_industry=include_sw_industry,
+        exclude_st=exclude_st,
+        exclude_negative_base=exclude_negative_base,
+        sort_by=sort_by,
+        top_n=top_n,
+        include_express=include_express,
+        include_forecast=include_forecast,
     )
-    by_code: Dict[str, Dict[str, Dict[str, Any]]] = {}
-    for d in cursor:
-        ts = d.get("ts_code")
-        ed = d.get("end_date")
-        if not ts or not ed:
-            continue
-        by_code.setdefault(ts, {})[ed] = d
-
-    # 仅保留在目标期有数据的股票
-    candidates_in_target = [ts for ts, m in by_code.items() if target_period in m]
-    total_screened = len(candidates_in_target)
-
-    prev_period = _screen_prev_year_period(target_period) if has_yoy else None
-
-    matched: list[Dict[str, Any]] = []
-    for ts in candidates_in_target:
-        m = by_code[ts]
-        cur = m[target_period]
-        prev = m.get(prev_period) if prev_period else None
-
-        # 计算/取值并比较每个 filter
-        per_stock_metrics: Dict[str, Any] = {}
-        ok = True
-        for f in parsed:
-            cur_v = cur.get(f.field)
-            if cur_v is None:
-                ok = False
-                break
-            per_stock_metrics[f.field] = cur_v
-
-            if f.metric_type == "yoy":
-                if not prev:
-                    ok = False
-                    break
-                prev_v = prev.get(f.field)
-                if prev_v is None:
-                    ok = False
-                    break
-                if exclude_negative_base and prev_v <= 0:
-                    ok = False
-                    break
-                if prev_v == 0:
-                    ok = False
-                    break
-                yoy = (cur_v - prev_v) / abs(prev_v)
-                per_stock_metrics[f"{f.field}_yoy"] = yoy
-                if not _screen_compare(yoy, f.op, f.value):
-                    ok = False
-                    break
-            else:  # abs
-                base_p = f.base_period or target_period
-                if base_p == target_period:
-                    base_v = cur_v
-                else:
-                    base_doc = m.get(base_p)
-                    if not base_doc:
-                        ok = False
-                        break
-                    base_v = base_doc.get(f.field)
-                    if base_v is None:
-                        ok = False
-                        break
-                    per_stock_metrics[f"{f.field}@{base_p}"] = base_v
-                if not _screen_compare(base_v, f.op, f.value):
-                    ok = False
-                    break
-
-        if ok:
-            matched.append({"ts_code": ts, **per_stock_metrics})
-
-    matched_codes = [r["ts_code"] for r in matched]
-
-    # --- Step 5: 附 stock name + ST 过滤 ---
-    stock_info = data_db["stock_info"]
-    info_map = {
-        d["ts_code"]: d
-        for d in stock_info.find(
-            {"ts_code": {"$in": matched_codes}},
-            {"_id": 0, "ts_code": 1, "name": 1},
-        )
-    }
-    enriched: list[Dict[str, Any]] = []
-    for r in matched:
-        name = (info_map.get(r["ts_code"], {}) or {}).get("name", "")
-        if exclude_st and name and ("ST" in name.upper()):
-            continue
-        r["name"] = name
-        enriched.append(r)
-
-    # --- Step 6: 附申万行业 ---
-    if include_sw_industry and enriched:
-        codes = [r["ts_code"] for r in enriched]
-        sw_map = {
-            d["con_code"]: d
-            for d in data_db["sw_index_member"].find(
-                {"con_code": {"$in": codes}, "is_new": "Y", "src": "SW2021"},
-                {"_id": 0, "con_code": 1, "l1_name": 1, "l2_name": 1, "l3_name": 1,
-                 "l1_code": 1, "l2_code": 1, "l3_code": 1},
-            )
-        }
-        for r in enriched:
-            sw = sw_map.get(r["ts_code"], {}) or {}
-            r["sw_l1"] = sw.get("l1_name", "")
-            r["sw_l2"] = sw.get("l2_name", "")
-            r["sw_l3"] = sw.get("l3_name", "")
-
-    # --- Step 7: 排序 + 截断 ---
-    if sort_by == "auto":
-        first_yoy = next((f for f in parsed if f.metric_type == "yoy"), None)
-        sort_field = f"{first_yoy.field}_yoy" if first_yoy else parsed[0].field
-    else:
-        sort_field = sort_by
-    enriched.sort(key=lambda d: (d.get(sort_field) is None, -(d.get(sort_field) or 0)))
-    results = enriched[:top_n]
-
-    # --- Step 8: industries_distribution summary ---
-    industries_dist: list[Dict[str, Any]] = []
-    if include_sw_industry:
-        from collections import Counter
-        cnt = Counter(r.get("sw_l1", "") or "未知" for r in results)
-        industries_dist = [{"sw_l1": k, "count": v} for k, v in cnt.most_common()]
-
-    return {
-        "success": True,
-        "period": target_period,
-        "report_type": report_type,
-        "total_screened": total_screened,
-        "matched": len(enriched),
-        "returned": len(results),
-        "filters_applied": [f.model_dump() for f in parsed],
-        "summary": {"industries_distribution": industries_dist},
-        "results": results,
-    }
 
 
 # ---------------------------------------------------------------------------

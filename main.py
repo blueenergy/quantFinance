@@ -94,6 +94,8 @@ from routers.kline_series import router as kline_series_router
 from routers.intraday_t0 import router as intraday_t0_router
 from routers.market_insights import router as market_insights_router
 from routers.entropy_ranking import router as entropy_ranking_router
+from routers.screeners import router as screeners_router
+from routers.agent_screening_tools import router as agent_screening_tools_router
 from routers.navigation_policy import user_router as navigation_user_router
 from routers.entitlements_matrix import router as entitlements_matrix_router
 from production_config import configure_production_app
@@ -220,6 +222,8 @@ app.include_router(kline_series_router, prefix="/api", tags=["K线对比"])
 app.include_router(intraday_t0_router, prefix="/api", tags=["日内T+0"])
 app.include_router(market_insights_router, prefix="/api", tags=["火眼金睛"])
 app.include_router(entropy_ranking_router, prefix="/api", tags=["熵值因子排名"])
+app.include_router(screeners_router, prefix="/api", tags=["选股筛选"])
+app.include_router(agent_screening_tools_router, prefix="/api", tags=["Agent screening tools"])
 
 # ---------------------------------------------------------------------------
 # MCP 服务器：暴露 quant-api 工具给 Hermes 等多智能体框架
@@ -245,7 +249,7 @@ if _MCP_SERVER_ENABLED:
                 dependencies=[Depends(require_hermes_quant_internal_key)],
             ),
             # 将 MCP client headers 转发给底层路由的 Depends 校验。
-            headers=["x-hermes-quant-key", "x-user-token"],
+            headers=["x-hermes-quant-key", "x-quant-client-key", "x-user-token"],
         )
         mcp.mount_http(mount_path=mount_path)
         _mcp_instances.append(mcp)

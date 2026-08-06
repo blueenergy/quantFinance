@@ -23,7 +23,8 @@ def test_generate_internal_rejects_missing_internal_key(monkeypatch):
     )
 
     assert res.status_code == 401
-    assert res.json()["detail"] == "Invalid or missing X-Hermes-Quant-Key"
+    assert "Invalid or missing" in res.json()["detail"]
+    assert "Key" in res.json()["detail"]
 
 
 @pytest.mark.unit
