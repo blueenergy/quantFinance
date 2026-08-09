@@ -28,7 +28,8 @@ def test_resolve_execution_venue_prefers_stored_value():
     assert resolve_execution_venue({"execution_venue": "live"}, has_live_signals=False) == "live"
     assert resolve_execution_venue({"execution_venue": "paper"}, has_live_signals=True) == "paper"
     assert resolve_execution_venue(None, has_live_signals=True) == "live"
-    assert resolve_execution_venue(None, has_live_signals=False) == "paper"
+    assert resolve_execution_venue(None, has_live_signals=False) == "live"
+    assert resolve_execution_venue(None, has_live_signals=False, has_paper_activity=True) == "paper"
 
 
 def test_mark_lineage_live_upserts_execution_venue():

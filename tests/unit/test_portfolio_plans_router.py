@@ -5160,7 +5160,7 @@ def test_list_portfolios_includes_param_summary_and_paper_holdings(monkeypatch):
     )
     summary = summary_resp["data"]
     assert summary["paper_holding_count"] == 1
-    assert summary["paper_execution_mode"] == "auto_shadow"
+    assert summary["paper_execution_mode"] == "manual_review"
 
 
 def test_lineage_paper_positions_returns_latest_snapshot(monkeypatch):

@@ -5143,12 +5143,12 @@ def _resolve_paper_execution_mode(
     plan: Dict[str, Any],
     params: Optional[Dict[str, Any]] = None,
 ) -> str:
-    """Plan-level paper approval policy; paper defaults to auto_shadow."""
+    """Plan-level paper approval policy; default requires manual review."""
     params = params if params is not None else dict(plan.get("params_snapshot") or {})
     explicit = params.get("paper_execution_mode") or plan.get("paper_execution_mode")
     if explicit in ("auto_shadow", "manual_review"):
         return str(explicit)
-    return "auto_shadow"
+    return "manual_review"
 
 
 def _build_portfolio_summary_payload(
@@ -5165,8 +5165,14 @@ def _build_portfolio_summary_payload(
     has_live = _lineage_has_live_signals(
         trading_collections, finance_collections, plan, user_id
     ) or _lineage_has_live_fills(trading_collections, finance_collections, plan, user_id)
-    execution_venue = resolve_execution_venue(lineage_control, has_live_signals=has_live)
     params = dict(plan.get("params_snapshot") or {})
+    has_paper = str(plan.get("status") or "") in PAPER_ACTIVE_STATUSES
+    execution_venue = resolve_execution_venue(
+        lineage_control,
+        has_live_signals=has_live,
+        has_paper_activity=has_paper,
+        capital_basis=plan.get("capital_basis") or params.get("capital_basis"),
+    )
     paper_snapshot = _latest_lineage_paper_snapshot(trading_collections, plan, user_id)
     paper_positions = list(paper_snapshot.get("positions") or [])
     paper_holding_count = sum(1 for row in paper_positions if _int_value(row.get("shares")) > 0)
@@ -5320,7 +5326,12 @@ def _list_portfolios_payload(
                 sec_id = str(latest_signal.get("securities_account_id") or "")
 
         params = dict(latest.get("params_snapshot") or {})
-        execution_venue = resolve_execution_venue(lineage_control, has_live_signals=has_live)
+        execution_venue = resolve_execution_venue(
+            lineage_control,
+            has_live_signals=has_live,
+            has_paper_activity=has_paper,
+            capital_basis=latest.get("capital_basis") or params.get("capital_basis"),
+        )
 
         portfolios.append(
             {
@@ -5767,6 +5778,7 @@ def _build_lineage_timeline_payload(
     )
     stored_venue = lineage_control.get("execution_venue")
     has_live_signals = False
+    has_paper_activity = str(latest_plan.get("status") or "") in PAPER_ACTIVE_STATUSES
     if stored_venue not in {"live", "paper"}:
         has_live_signals = _lineage_has_live_signals(
             trading_collections, finance_collections, latest_plan, user_id
@@ -5774,6 +5786,9 @@ def _build_lineage_timeline_payload(
     execution_venue = resolve_execution_venue(
         lineage_control,
         has_live_signals=has_live_signals,
+        has_paper_activity=has_paper_activity,
+        capital_basis=latest_plan.get("capital_basis")
+        or (latest_plan.get("params_snapshot") or {}).get("capital_basis"),
     )
     live_account_id = str(lineage_control.get("securities_account_id") or "")
     if execution_venue == "live" and not live_account_id:

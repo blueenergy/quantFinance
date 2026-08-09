@@ -44,11 +44,17 @@ def resolve_execution_venue(
     lineage_control: Optional[Dict[str, Any]],
     *,
     has_live_signals: bool,
+    has_paper_activity: bool = False,
+    capital_basis: Optional[str] = None,
 ) -> str:
     stored = (lineage_control or {}).get("execution_venue")
     if stored in VALID_EXECUTION_VENUES:
         return str(stored)
-    return EXECUTION_VENUE_LIVE if has_live_signals else EXECUTION_VENUE_PAPER
+    if has_live_signals:
+        return EXECUTION_VENUE_LIVE
+    if has_paper_activity or str(capital_basis or "").strip().lower() == "rolling_paper":
+        return EXECUTION_VENUE_PAPER
+    return EXECUTION_VENUE_LIVE
 
 
 def upsert_lineage_summary(
@@ -132,9 +138,12 @@ def build_summary_from_lineage_plans(
     latest = max(all_lineage, key=lambda row: str(row.get("base_date") or ""))
     earliest = min(all_lineage, key=lambda row: str(row.get("base_date") or ""))
     params = dict(latest.get("params_snapshot") or {})
+    has_paper = any(str(row.get("status") or "") in {"executed_paper", "partially_executed"} for row in all_lineage)
     execution_venue = resolve_execution_venue(
         lineage_control,
         has_live_signals=has_live_signals,
+        has_paper_activity=has_paper,
+        capital_basis=latest.get("capital_basis") or params.get("capital_basis"),
     )
     return {
         "execution_venue": execution_venue,
