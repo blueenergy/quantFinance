@@ -109,6 +109,9 @@ class CreateResearchJobRequest(BaseModel):
     growth_cycle_weights: List[str] = Field(default_factory=lambda: ["30:70"])
     score_specs: Optional[List[ScoreSpec]] = None
     top_n_values: List[int] = Field(default_factory=lambda: [10, 20, 50])
+    selection_mode: Literal["fixed_top_n", "dynamic_score_threshold"] = Field(default="fixed_top_n")
+    threshold_lookback_days: int = Field(default=10, ge=1)
+    max_positions: int = Field(default=20, ge=1)
     horizon: int = Field(default=20, ge=1)
     rebalance_interval_days: Optional[List[int]] = None
     active_caps: List[float] = Field(default_factory=lambda: [0.2, 0.25, 0.3, 0.4])
@@ -142,6 +145,11 @@ class CreateResearchJobRequest(BaseModel):
     def _validate_score_inputs(self) -> "CreateResearchJobRequest":
         if self.score_specs and "growth_cycle_weights" in self.model_fields_set and self.growth_cycle_weights:
             raise ValueError("score_specs and growth_cycle_weights are mutually exclusive")
+        if self.selection_mode == "dynamic_score_threshold":
+            if len(self.top_n_values) != 1 or self.top_n_values[0] <= 0:
+                raise ValueError("dynamic_score_threshold requires top_n_values to contain exactly one positive integer")
+            if self.max_positions < self.top_n_values[0]:
+                raise ValueError("max_positions must be greater than or equal to the dynamic top_n value")
         return self
 
 
@@ -169,6 +177,9 @@ class RerunResearchJobRequest(BaseModel):
     growth_cycle_weights: Optional[List[str]] = None
     score_specs: Optional[List[ScoreSpec]] = None
     top_n_values: Optional[List[int]] = None
+    selection_mode: Optional[Literal["fixed_top_n", "dynamic_score_threshold"]] = None
+    threshold_lookback_days: Optional[int] = Field(default=None, ge=1)
+    max_positions: Optional[int] = Field(default=None, ge=1)
     horizon: Optional[int] = Field(default=None, ge=1)
     rebalance_interval_days: Optional[List[int]] = None
     active_caps: Optional[List[float]] = None
@@ -215,6 +226,14 @@ class RerunResearchJobRequest(BaseModel):
     def _validate_score_inputs(self) -> "RerunResearchJobRequest":
         if self.score_specs and self.growth_cycle_weights:
             raise ValueError("score_specs and growth_cycle_weights are mutually exclusive")
+        # Only what the caller actually overrode is checked here; unset fields fall
+        # back to the source job and the merged payload is revalidated by
+        # CreateResearchJobRequest.
+        if self.selection_mode == "dynamic_score_threshold":
+            if self.top_n_values is not None and (len(self.top_n_values) != 1 or self.top_n_values[0] <= 0):
+                raise ValueError("dynamic_score_threshold requires top_n_values to contain exactly one positive integer")
+            if self.max_positions is not None and self.top_n_values and self.max_positions < self.top_n_values[0]:
+                raise ValueError("max_positions must be greater than or equal to the dynamic top_n value")
         return self
 
 
@@ -370,6 +389,10 @@ PRESET_PARAM_KEYS = {
     "growth_weight",
     "cycle_weight",
     "top_n",
+    # selection_mode and its dynamic-threshold parameters are deliberately absent:
+    # live construction only supports fixed Top-N, and adding keys here would change
+    # params_hash for existing fixed presets, so republishing would fork a duplicate
+    # preset instead of appending evidence to the current one.
     "rebalance_days",
     "construction_mode",
     "max_industry_weight",
@@ -431,6 +454,15 @@ def _candidate_strategy_config_from_row(job: Dict[str, Any], row: Dict[str, Any]
     else:
         score_type = "score_column"
     top_n = int(row.get("top_n") or (params.get("top_n_values") or [10])[0])
+    selection_mode = str(row.get("selection_mode") or params.get("selection_mode") or "fixed_top_n")
+    threshold_lookback_days = int(
+        row.get("threshold_lookback_days")
+        if row.get("threshold_lookback_days") is not None
+        else params.get("threshold_lookback_days", 10)
+    )
+    max_positions = int(
+        row.get("max_positions") if row.get("max_positions") is not None else params.get("max_positions", 20)
+    )
     rebalance_days = int(row.get("rebalance_interval_days") or params.get("horizon") or 20)
     variant = str(row.get("variant") or "top_n")
     score_variant = str(row.get("score_variant") or params.get("score_column") or "score")
@@ -464,6 +496,9 @@ def _candidate_strategy_config_from_row(job: Dict[str, Any], row: Dict[str, Any]
         "cycle_weight": cycle_weight,
         "score_weights": row.get("score_weights"),
         "top_n": top_n,
+        "selection_mode": selection_mode,
+        "threshold_lookback_days": threshold_lookback_days,
+        "max_positions": max_positions,
         "rebalance_days": rebalance_days,
         "construction_mode": row.get("construction_mode") or "top_n",
         "max_industry_weight": row.get("max_industry_weight"),
@@ -1075,6 +1110,18 @@ async def publish_portfolio_research_result(
         candidate = _candidate_strategy_config_from_row(job, request.selected_row)
     if not candidate:
         raise HTTPException(status_code=400, detail="candidate strategy config is missing")
+    job_params = job.get("params") or {}
+    if (
+        (candidate.get("selection_mode") or "fixed_top_n") == "dynamic_score_threshold"
+        or job_params.get("selection_mode") == "dynamic_score_threshold"
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Dynamic score-threshold research results cannot be published because "
+                "live portfolio construction does not support dynamic_score_threshold yet."
+            ),
+        )
     candidate_score_type = candidate.get("score_type")
     if candidate_score_type and candidate_score_type != "growth_cycle_weighted":
         raise HTTPException(

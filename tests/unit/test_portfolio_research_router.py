@@ -134,6 +134,104 @@ def test_create_portfolio_research_job(monkeypatch):
     assert job["status"] == "pending"
     assert job["params"]["start_date"] == "20250101"
     assert job["params"]["rebalance_interval_days"] == [20]
+    assert job["params"]["selection_mode"] == "fixed_top_n"
+    assert job["params"]["threshold_lookback_days"] == 10
+    assert job["params"]["max_positions"] == 20
+
+
+@pytest.mark.unit
+def test_research_selection_models_defaults_and_dynamic_validation():
+    create_defaults = portfolio_research.CreateResearchJobRequest(
+        start_date="20250101",
+        end_date="20250131",
+    )
+    rerun_defaults = portfolio_research.RerunResearchJobRequest()
+
+    assert create_defaults.selection_mode == "fixed_top_n"
+    assert create_defaults.threshold_lookback_days == 10
+    assert create_defaults.max_positions == 20
+    # Rerun overrides stay unset so the source job's own values survive.
+    assert rerun_defaults.selection_mode is None
+    assert rerun_defaults.threshold_lookback_days is None
+    assert rerun_defaults.max_positions is None
+
+    dynamic_create = portfolio_research.CreateResearchJobRequest(
+        start_date="20250101",
+        end_date="20250131",
+        selection_mode="dynamic_score_threshold",
+        top_n_values=[10],
+        threshold_lookback_days=15,
+        max_positions=12,
+    )
+    dynamic_rerun = portfolio_research.RerunResearchJobRequest(
+        selection_mode="dynamic_score_threshold",
+        top_n_values=[8],
+        threshold_lookback_days=5,
+        max_positions=8,
+    )
+    assert dynamic_create.top_n_values == [10]
+    assert dynamic_rerun.top_n_values == [8]
+
+    for top_n_values, max_positions in (([10, 20], 20), ([0], 20), ([10], 9)):
+        with pytest.raises(ValueError, match="top_n_values|positive integer|max_positions"):
+            portfolio_research.CreateResearchJobRequest(
+                start_date="20250101",
+                end_date="20250131",
+                selection_mode="dynamic_score_threshold",
+                top_n_values=top_n_values,
+                max_positions=max_positions,
+            )
+
+    # Switching mode alone is allowed: top_n_values is inherited from the source job
+    # and the merged payload is revalidated as a create request.
+    assert portfolio_research.RerunResearchJobRequest(
+        selection_mode="dynamic_score_threshold"
+    ).top_n_values is None
+    with pytest.raises(ValueError, match="top_n_values"):
+        portfolio_research.RerunResearchJobRequest(
+            selection_mode="dynamic_score_threshold",
+            top_n_values=[10, 20],
+        )
+    with pytest.raises(ValueError, match="max_positions"):
+        portfolio_research.RerunResearchJobRequest(
+            selection_mode="dynamic_score_threshold",
+            top_n_values=[10],
+            max_positions=9,
+        )
+    with pytest.raises(ValueError):
+        portfolio_research.CreateResearchJobRequest(
+            start_date="20250101",
+            end_date="20250131",
+            threshold_lookback_days=0,
+        )
+    with pytest.raises(ValueError):
+        portfolio_research.RerunResearchJobRequest(max_positions=0)
+
+
+@pytest.mark.unit
+def test_create_dynamic_research_job_persists_selection_params(monkeypatch):
+    collections = _collections()
+    monkeypatch.setattr(portfolio_research, "get_trading_db_collections", lambda: collections)
+
+    response = asyncio.run(
+        portfolio_research.create_portfolio_research_job(
+            portfolio_research.CreateResearchJobRequest(
+                start_date="2025-01-01",
+                end_date="2025-01-31",
+                selection_mode="dynamic_score_threshold",
+                top_n_values=[10],
+                threshold_lookback_days=15,
+                max_positions=16,
+            ),
+            current_user={"id": "user-1"},
+        )
+    )
+
+    params = response["data"]["params"]
+    assert params["selection_mode"] == "dynamic_score_threshold"
+    assert params["top_n_values"] == [10]
+    assert params["threshold_lookback_days"] == 15
+    assert params["max_positions"] == 16
 
 
 def test_create_portfolio_research_job_accepts_generic_score_specs(monkeypatch):
@@ -383,6 +481,9 @@ def test_rerun_portfolio_research_job_clones_params_without_overwriting_source(m
     assert cloned["params"]["universe_index"] == "csi1000"
     assert cloned["params"]["growth_cycle_weights"] == ["30:70", "40:60"]
     assert cloned["params"]["top_n_values"] == [10, 20]
+    assert cloned["params"]["selection_mode"] == "fixed_top_n"
+    assert cloned["params"]["threshold_lookback_days"] == 10
+    assert cloned["params"]["max_positions"] == 20
     assert cloned["params"]["force"] is True
 
     source = collections["portfolio_research_jobs"].find_one({"job_id": "job-source"})
@@ -476,6 +577,48 @@ def test_rerun_portfolio_research_job_applies_param_overrides(monkeypatch):
     assert cloned["params"]["force"] is True
     source = collections["portfolio_research_jobs"].find_one({"job_id": "job-source"})
     assert source["params"]["growth_cycle_weights"] == ["30:70"]
+
+
+@pytest.mark.unit
+def test_rerun_portfolio_research_job_accepts_dynamic_selection(monkeypatch):
+    collections = _collections()
+    monkeypatch.setattr(portfolio_research, "get_trading_db_collections", lambda: collections)
+    collections["portfolio_research_jobs"].insert_one(
+        {
+            "job_id": "job-source",
+            "user_id": "user-1",
+            "name": "fixed research",
+            "universe_index": "csi1000",
+            "start_date": "20250101",
+            "end_date": "20250131",
+            "params": {
+                "universe_index": "csi1000",
+                "start_date": "20250101",
+                "end_date": "20250131",
+                "top_n_values": [10, 20],
+            },
+            "status": "completed",
+        }
+    )
+
+    response = asyncio.run(
+        portfolio_research.rerun_portfolio_research_job(
+            "job-source",
+            request=portfolio_research.RerunResearchJobRequest(
+                selection_mode="dynamic_score_threshold",
+                top_n_values=[8],
+                threshold_lookback_days=12,
+                max_positions=15,
+            ),
+            current_user={"id": "user-1"},
+        )
+    )
+
+    params = response["data"]["params"]
+    assert params["selection_mode"] == "dynamic_score_threshold"
+    assert params["top_n_values"] == [8]
+    assert params["threshold_lookback_days"] == 12
+    assert params["max_positions"] == 15
 
 
 @pytest.mark.unit
@@ -661,6 +804,50 @@ def test_publish_portfolio_research_result_creates_parameter_preset(monkeypatch)
     assert preset["research_job_id"] == "job-1"
     assert preset["params"]["top_n"] == 10
     assert collections["portfolio_research_reviews"].docs[0]["decision"] == "preset_published"
+
+
+def test_publish_portfolio_research_result_rejects_dynamic_selection(monkeypatch):
+    collections = _collections()
+    monkeypatch.setattr(portfolio_research, "get_trading_db_collections", lambda: collections)
+    collections["portfolio_research_jobs"].insert_one(
+        {
+            "job_id": "job-dynamic",
+            "user_id": "user-1",
+            "status": "completed",
+            "params": {
+                "selection_mode": "dynamic_score_threshold",
+                "top_n_values": [10],
+                "threshold_lookback_days": 10,
+                "max_positions": 20,
+            },
+        }
+    )
+    collections["portfolio_research_results"].insert_one(
+        {
+            "result_id": "result-dynamic",
+            "job_id": "job-dynamic",
+            "user_id": "user-1",
+            # Simulate a candidate emitted before the scoring side knows the new fields.
+            "candidate_strategy_config": {
+                "preset_id": "dynamic-research",
+                "strategy_template_id": "growth_cycle_index_enhanced",
+                "top_n": 10,
+            },
+        }
+    )
+
+    with pytest.raises(portfolio_research.HTTPException) as exc:
+        asyncio.run(
+            portfolio_research.publish_portfolio_research_result(
+                "result-dynamic",
+                portfolio_research.PublishResearchResultRequest(status="draft"),
+                current_user={"id": "user-1"},
+            )
+        )
+
+    assert exc.value.status_code == 409
+    assert "live portfolio construction" in exc.value.detail
+    assert collections["portfolio_strategy_param_presets"].docs == []
 
 
 def test_publish_portfolio_research_result_rejects_generic_score(monkeypatch):
@@ -930,6 +1117,9 @@ def test_publish_portfolio_research_result_uses_selected_row(monkeypatch):
                 status="draft",
                 selected_row={
                     "top_n": 20,
+                    "selection_mode": "fixed_top_n",
+                    "threshold_lookback_days": 15,
+                    "max_positions": 30,
                     "variant": "growth_cycle_topn",
                     "score_variant": "growth_cycle_g30_c70",
                     "rebalance_interval_days": 20,
@@ -944,3 +1134,8 @@ def test_publish_portfolio_research_result_uses_selected_row(monkeypatch):
     preset = collections["portfolio_strategy_param_presets"].find_one({"preset_id": response["data"]["preset"]["preset_id"]})
     assert preset["params"]["top_n"] == 20
     assert preset["params"]["trailing_stop_pct"] == 0.15
+    # Selection-mode keys stay out of preset params so params_hash keeps matching
+    # presets published before dynamic thresholds existed.
+    assert "selection_mode" not in preset["params"]
+    assert "threshold_lookback_days" not in preset["params"]
+    assert "max_positions" not in preset["params"]
