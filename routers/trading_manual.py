@@ -6,17 +6,60 @@ Manual trading operations API
 
 from fastapi import APIRouter, HTTPException, Depends, Query
 from typing import Dict, Any, Optional
-from datetime import datetime
+from datetime import datetime, timezone
 from bson import ObjectId
 from bson.errors import InvalidId
 from db import get_db_collections
 from auth import get_current_active_user
+from services.live_trade_signals import default_valid_until
 from utils.stock_utils import serialize_doc
 from utils.symbol_utils import normalize_symbol
 import time
 import uuid
 
 router = APIRouter()
+
+_TERMINAL_RETRY_STATUSES = frozenset({"cancelled", "canceled", "partial_cancelled"})
+_TERMINAL_RETRY_UNSET_FIELDS = {
+    "qmt_order_id": "",
+    "broker_order_id": "",
+    "cancel_requested_at": "",
+    "submitted_at": "",
+    "filled_qty": "",
+    "avg_price": "",
+    "chase_suggestion": "",
+    "broker_status": "",
+    "broker_status_msg": "",
+    "remaining_size": "",
+}
+
+
+def _parse_optional_datetime(value: Any) -> Optional[datetime]:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+    if isinstance(value, (int, float)):
+        return datetime.fromtimestamp(float(value), tz=timezone.utc)
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
+    return None
+
+
+def _retry_valid_until(signal: Dict[str, Any]) -> datetime:
+    """Fresh expiry window for a manual retry, anchored to now (or future activate_after)."""
+    now = datetime.now(timezone.utc)
+    activate_after = _parse_optional_datetime(signal.get("activate_after"))
+    if activate_after is not None and activate_after > now:
+        return default_valid_until(now, activate_after)
+    return default_valid_until(now, now)
 
 
 def _load_user_securities_account(
@@ -64,27 +107,37 @@ def manual_retry_failed_signal(
             raise HTTPException(status_code=404, detail=f"交易信号不存在: {order_id}")
         
         current_status = signal.get("status", "unknown")
-        
+
         # 检查是否为可以重试的状态
-        if current_status not in ["failed", "rejected", "retry_pending"]:
+        retryable_statuses = ["failed", "rejected", "retry_pending", "cancelled", "canceled", "partial_cancelled"]
+        if current_status not in retryable_statuses:
             raise HTTPException(
-                status_code=400, 
-                detail=f"信号状态为 {current_status}，无法重试。仅支持 failed、rejected 或 retry_pending 状态的信号。"
+                status_code=400,
+                detail=f"信号状态为 {current_status}，无法重试。仅支持 {', '.join(retryable_statuses)} 状态的信号。"
             )
-        
-        # 重置状态为 pending，重置重试次数
+
+        is_terminal_retry = current_status in _TERMINAL_RETRY_STATUSES
+
+        # 重置状态为 pending，重置重试次数；重算 valid_until 避免沿用已过期窗口
+        update_doc = {
+            "$set": {
+                "status": "pending",
+                "retry_count": 0,
+                "last_error": None,
+                "updated_at": time.time(),
+                "retried_at": time.time(),  # 记录重试时间
+                "retried_by": user_id,  # 记录重试用户
+                "valid_until": _retry_valid_until(signal),
+            }
+        }
+        # For terminal states, clear old QMT tracking fields so the trader
+        # doesn't re-claim the cancelled QMT order by order_remark.
+        if is_terminal_retry:
+            update_doc["$unset"] = dict(_TERMINAL_RETRY_UNSET_FIELDS)
+
         update_result = signals_coll.update_one(
             {"order_id": order_id, "user_id": user_id},
-            {
-                "$set": {
-                    "status": "pending",
-                    "retry_count": 0,
-                    "last_error": None,
-                    "updated_at": time.time(),
-                    "retried_at": time.time(),  # 记录重试时间
-                    "retried_by": user_id  # 记录重试用户
-                }
-            }
+            update_doc
         )
         
         if update_result.modified_count == 0:
@@ -260,7 +313,7 @@ def get_manual_signals(
 
 @router.post("/trade-signals/batch-retry", summary="批量重试失败的交易信号")
 def batch_retry_failed_signals(
-    status_filter: str = Query("failed", description="状态筛选: failed, rejected, retry_pending"),
+    status_filter: str = Query("failed", description="状态筛选: failed, rejected, retry_pending, cancelled, all_failed"),
     limit: int = Query(10, description="最大重试数量"),
     current_user: dict = Depends(get_current_active_user)
 ):
@@ -268,59 +321,67 @@ def batch_retry_failed_signals(
     try:
         collections = get_db_collections()
         signals_coll = collections["trade_signals"]
-        
+
         user_id = current_user["id"]
-        
+
         # 确定要重试的状态
         valid_statuses = {
             "failed": ["failed"],
-            "rejected": ["rejected"], 
+            "rejected": ["rejected"],
             "retry_pending": ["retry_pending"],
-            "all_failed": ["failed", "rejected", "retry_pending"]
+            "cancelled": ["cancelled", "canceled", "partial_cancelled"],
+            "all_failed": ["failed", "rejected", "retry_pending", "cancelled", "canceled", "partial_cancelled"],
         }
-        
+
         status_list = valid_statuses.get(status_filter, ["failed"])
-        
+
         # 查询符合条件的信号
         signals_to_retry = list(signals_coll.find({
             "user_id": user_id,
             "status": {"$in": status_list}
         }).sort("timestamp", -1).limit(limit))
-        
+
         if not signals_to_retry:
             return {
                 "success": True,
                 "message": f"没有找到状态为 {status_filter} 的信号",
                 "retry_count": 0
             }
-        
-        # 批量更新
-        order_ids = [signal["order_id"] for signal in signals_to_retry]
-        
-        update_result = signals_coll.update_many(
-            {
-                "user_id": user_id,
-                "order_id": {"$in": order_ids}
-            },
-            {
+
+        # 批量更新：每个信号单独 update_one（支持 $unset）
+        retried_count = 0
+        retried_order_ids = []
+        for signal_doc in signals_to_retry:
+            order_id = signal_doc["order_id"]
+            status = signal_doc.get("status", "")
+            update_doc: Dict[str, Any] = {
                 "$set": {
                     "status": "pending",
                     "retry_count": 0,
                     "last_error": None,
                     "updated_at": time.time(),
                     "retried_at": time.time(),
-                    "retried_by": user_id
+                    "retried_by": user_id,
+                    "valid_until": _retry_valid_until(signal_doc),
                 }
             }
-        )
-        
+            if status in _TERMINAL_RETRY_STATUSES:
+                update_doc["$unset"] = dict(_TERMINAL_RETRY_UNSET_FIELDS)
+            result = signals_coll.update_one(
+                {"order_id": order_id, "user_id": user_id},
+                update_doc,
+            )
+            if result.modified_count:
+                retried_count += 1
+                retried_order_ids.append(order_id)
+
         return {
             "success": True,
-            "message": f"成功重试 {update_result.modified_count} 个信号",
-            "retry_count": update_result.modified_count,
-            "order_ids": order_ids
+            "message": f"成功重试 {retried_count} 个信号",
+            "retry_count": retried_count,
+            "order_ids": retried_order_ids,
         }
-        
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"批量重试失败: {str(e)}")
 

@@ -4,6 +4,7 @@ from datetime import datetime
 import pytest
 
 from routers import portfolio_plans
+from services.live_trade_signals import DEFAULT_SIGNAL_VALID_TTL_SECONDS
 
 
 def test_allowed_universe_indices_include_csi2000():
@@ -1929,7 +1930,7 @@ def test_publish_live_signals_dry_run_builds_contract(monkeypatch):
     assert signal["valid_until"]
     activate_after = datetime.fromisoformat(signal["activate_after"])
     valid_until = datetime.fromisoformat(signal["valid_until"])
-    assert (valid_until - activate_after).total_seconds() == 600
+    assert (valid_until - activate_after).total_seconds() == DEFAULT_SIGNAL_VALID_TTL_SECONDS
     assert signal["phase_barrier"] == {"type": "plan_sells_terminal", "plan_id": "plan-user-1"}
     sell_signal = response["data"]["signals"][1]
     assert sell_signal["execution_phase"] == "sell"
