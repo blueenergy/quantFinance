@@ -305,7 +305,7 @@ class ExternalManualFill(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     symbol: str
-    action: str = Field(default="sell")
+    action: str = Field(..., description="'buy' or 'sell' — no default; must be explicit")
     filled_size: int = Field(..., gt=0)
     filled_price: float = Field(..., gt=0)
     timestamp: Optional[float] = Field(default=None)
