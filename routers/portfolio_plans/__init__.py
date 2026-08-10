@@ -2226,10 +2226,25 @@ def _build_live_plan_item_context(
             context[symbol]["live_signed_delta"] += _signal_signed_filled_qty(signal)
 
     terminal_statuses = {"filled", "cancelled", "canceled", "rejected", "failed", "partial_cancelled"}
+    excluded_target_statuses = {"cancelled", "canceled", "rejected", "failed"}
     for symbol, signals in signal_by_symbol.items():
-        target_qty = sum(_int_value(signal.get("size")) for signal in signals)
+        # Only count non-cancelled/non-failed signals for target_qty.
+        # Cancelled remainder/retry signals must not inflate the remaining gap
+        # (e.g. a filled original + a cancelled retry should show gap=0, not the
+        # retry size). When every signal is terminal and nothing filled, leave
+        # remaining_qty as None so the frontend falls back to the plan-item delta.
+        active_or_filled = [
+            s for s in signals
+            if str(s.get("status") or "").lower() not in excluded_target_statuses
+        ]
         filled_qty = context[symbol]["live_filled_qty"]
-        context[symbol]["live_remaining_qty"] = max(0, target_qty - filled_qty)
+        if active_or_filled:
+            target_qty = sum(_int_value(s.get("size")) for s in active_or_filled)
+            context[symbol]["live_remaining_qty"] = max(0, target_qty - filled_qty)
+        elif filled_qty <= 0:
+            context[symbol]["live_remaining_qty"] = None
+        else:
+            context[symbol]["live_remaining_qty"] = 0
         statuses = [str(signal.get("status") or "") for signal in signals if signal.get("status")]
         if statuses:
             if all(status == "filled" for status in statuses):
@@ -2308,7 +2323,7 @@ def _attach_live_plan_item_context(
                 "account_current_shares": symbol_context.get("account_current_shares"),
                 "account_available_shares": symbol_context.get("account_available_shares"),
                 "live_filled_qty": _int_value(symbol_context.get("live_filled_qty")),
-                "live_remaining_qty": _int_value(symbol_context.get("live_remaining_qty")),
+                "live_remaining_qty": symbol_context.get("live_remaining_qty"),
                 "live_status": symbol_context.get("live_status"),
             }
         )
