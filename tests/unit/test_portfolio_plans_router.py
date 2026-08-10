@@ -2555,6 +2555,122 @@ def test_attach_live_context_preserves_plan_current_without_live_signals():
     assert enriched[0]["plan_current_shares"] == 500
 
 
+def test_external_manual_fill_requires_explicit_action():
+    """Missing action must fail closed — never silently default to sell."""
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError) as exc:
+        portfolio_plans.ExternalManualFill(
+            symbol="600000.SH",
+            filled_size=100,
+            filled_price=12.5,
+        )
+    assert "action" in str(exc.value)
+
+    fill = portfolio_plans.ExternalManualFill(
+        symbol="600000.SH",
+        action="BUY",
+        filled_size=100,
+        filled_price=12.5,
+    )
+    assert fill.action == "buy"
+
+
+def test_attach_live_context_excludes_cancelled_retry_from_remaining_gap():
+    """Filled original + cancelled retry must not inflate live_remaining_qty."""
+    finance = _finance_collections()
+    finance["trade_signals"].docs.extend(
+        [
+            {
+                "user_id": "user-1",
+                "plan_id": "plan-1",
+                "mode": "live",
+                "order_id": "orig",
+                "symbol": "000001.SZ",
+                "action": "buy",
+                "size": 1400,
+                "filled_qty": 1400,
+                "status": "filled",
+                "securities_account_id": "acct-1",
+            },
+            {
+                "user_id": "user-1",
+                "plan_id": "plan-1",
+                "mode": "live",
+                "order_id": "retry",
+                "symbol": "000001.SZ",
+                "action": "buy",
+                "size": 1400,
+                "filled_qty": 0,
+                "status": "cancelled",
+                "securities_account_id": "acct-1",
+                "replaces_order_id": "orig",
+            },
+        ]
+    )
+    items = [
+        {
+            "plan_id": "plan-1",
+            "symbol": "000001.SZ",
+            "action": "buy",
+            "current_shares": 0,
+            "target_shares": 1400,
+            "delta_shares": 1400,
+        }
+    ]
+
+    enriched = portfolio_plans._attach_live_plan_item_context(
+        finance_collections=finance,
+        plan={"plan_id": "plan-1", "live_signal_count": 2},
+        items=items,
+        user_id="user-1",
+    )
+
+    assert enriched[0]["live_filled_qty"] == 1400
+    assert enriched[0]["live_remaining_qty"] == 0
+    assert enriched[0]["current_shares"] == 1400
+
+
+def test_attach_live_context_leaves_remaining_null_when_all_signals_cancelled():
+    """All-terminal cancelled/failed with no fills → None so FE falls back to plan delta."""
+    finance = _finance_collections()
+    finance["trade_signals"].docs.append(
+        {
+            "user_id": "user-1",
+            "plan_id": "plan-1",
+            "mode": "live",
+            "order_id": "c1",
+            "symbol": "000001.SZ",
+            "action": "buy",
+            "size": 500,
+            "filled_qty": 0,
+            "status": "cancelled",
+            "securities_account_id": "acct-1",
+        }
+    )
+    items = [
+        {
+            "plan_id": "plan-1",
+            "symbol": "000001.SZ",
+            "action": "buy",
+            "current_shares": 0,
+            "target_shares": 500,
+            "delta_shares": 500,
+        }
+    ]
+
+    enriched = portfolio_plans._attach_live_plan_item_context(
+        finance_collections=finance,
+        plan={"plan_id": "plan-1", "live_signal_count": 1},
+        items=items,
+        user_id="user-1",
+    )
+
+    assert enriched[0]["live_filled_qty"] == 0
+    assert enriched[0]["live_remaining_qty"] is None
+    assert enriched[0]["live_status"] == "cancelled"
+
+
 def test_execute_paper_inherits_lineage_positions(monkeypatch):
     collections = _collections()
     parent = {
