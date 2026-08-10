@@ -26,7 +26,7 @@ CN_A_MORNING_OPEN = dt_time(9, 25)
 CN_A_MORNING_CLOSE = dt_time(11, 30)
 CN_A_AFTERNOON_OPEN = dt_time(13, 0)
 CN_A_AFTERNOON_CLOSE = dt_time(15, 0)
-DEFAULT_SIGNAL_VALID_TTL_SECONDS = 600
+DEFAULT_SIGNAL_VALID_TTL_SECONDS = 28800  # 8h: effectively entire A-share session (9:30–15:00)
 
 
 def _env_int(name: str, default: int) -> int:
