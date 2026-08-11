@@ -19,7 +19,11 @@ from calendar import monthrange
 from bson import ObjectId
 from stock_data_access.prices import AdjustedPriceDataAccess
 from services.industry_rs import build_industry_rs_details, normalize_stored_industry_rs_details
-from services.score_detail_meta import SCORE_HISTORY_PROJECTION, build_score_detail_payload
+from services.score_detail_meta import (
+    SCORE_HISTORY_PROJECTION,
+    build_score_detail_payload,
+    submodule_weights_from_details,
+)
 
 router = APIRouter(tags=["股票排名"])
 
@@ -40,8 +44,10 @@ _RANKING_RESPONSE_CACHE_LOCK = threading.Lock()
 _RANKING_RESPONSE_TTL_SECONDS = float(os.getenv("STOCK_RANKING_CACHE_TTL_SECONDS", "120"))
 _RANKING_RESPONSE_CACHE_MAX = 256
 
-# Submodule weights injected at response time (mirrors stock-scoring-system/scorers/*.py).
-# TODO: import from stock-scoring-system shared/scoring_weights once exposed to quantFinance.
+# Fallback submodule weights (mirrors stock-scoring-system/scorers/*.py).
+# Scorers that keep a score ledger report their own weights in `_formula.steps`,
+# which `submodule_weights_from_details` prefers; entries here exist only for the
+# dimensions not yet converted, and for documents scored before the conversion.
 SUBMODULE_WEIGHTS: Dict[str, Dict[str, float]] = {
     'cycle': {
         '短期周期(5-10日)': 0.4,
@@ -1868,7 +1874,10 @@ async def get_single_score_detail(
                 symbol=symbol,
                 category=category,
                 details=category_details,
-                weights=SUBMODULE_WEIGHTS.get(category, {}),
+                weights=(
+                    submodule_weights_from_details(category_details)
+                    or SUBMODULE_WEIGHTS.get(category, {})
+                ),
             ),
             'message': '获取评分详情成功'
         }

@@ -63,6 +63,32 @@ def build_score_meta(doc: Dict[str, Any]) -> Dict[str, Any]:
     return merged
 
 
+def submodule_weights_from_details(details: Any) -> Optional[Dict[str, float]]:
+    """Read submodule weights off a dimension's ``_formula`` steps.
+
+    Scorers that keep a ledger report the weight they actually applied, which
+    beats any table mirrored in this repo. Returns None for details written
+    before that, so callers can fall back to the mirror.
+    """
+    if not isinstance(details, dict):
+        return None
+    formula = details.get("_formula")
+    if not isinstance(formula, dict):
+        return None
+    steps = formula.get("steps")
+    if not isinstance(steps, list):
+        return None
+    weights: Dict[str, float] = {}
+    for step in steps:
+        if not isinstance(step, dict):
+            continue
+        rule = step.get("rule")
+        weight = step.get("weight")
+        if rule and isinstance(weight, (int, float)) and not isinstance(weight, bool):
+            weights[str(rule)] = float(weight)
+    return weights or None
+
+
 def extract_express_flags(details: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     """Scan category details for express / provisional data markers."""
     if not details or not isinstance(details, dict):

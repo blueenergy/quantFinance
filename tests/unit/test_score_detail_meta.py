@@ -7,7 +7,42 @@ from services.score_detail_meta import (
     build_score_meta,
     extract_express_flags,
     get_strategy_recommendations,
+    submodule_weights_from_details,
 )
+
+
+def test_submodule_weights_read_from_formula_steps():
+    details = {
+        "_formula": {
+            "base": 0,
+            "steps": [
+                {"rule": "短期周期(5-10日)", "delta": 33.2, "weight": 0.4},
+                {"rule": "中期周期(20-60日)", "delta": 30.8, "weight": 0.35},
+                {"rule": "长期周期(120-250日)", "delta": 21.25, "weight": 0.25},
+            ],
+        }
+    }
+    weights = submodule_weights_from_details(details)
+    assert weights == {
+        "短期周期(5-10日)": 0.4,
+        "中期周期(20-60日)": 0.35,
+        "长期周期(120-250日)": 0.25,
+    }
+
+
+def test_submodule_weights_absent_lets_caller_fall_back():
+    """Details from scorers without a ledger must return None, not an empty dict."""
+    assert submodule_weights_from_details({}) is None
+    assert submodule_weights_from_details(None) is None
+    assert submodule_weights_from_details({"_formula": {"steps": []}}) is None
+    # Flat bonuses carry no weight, so they cannot pose as a weight table.
+    assert submodule_weights_from_details(
+        {"_formula": {"steps": [{"rule": "5日趋势", "delta": 10}]}}
+    ) is None
+    # Booleans are ints in Python; they must not be mistaken for a weight.
+    assert submodule_weights_from_details(
+        {"_formula": {"steps": [{"rule": "x", "delta": 1, "weight": True}]}}
+    ) is None
 
 
 def test_score_history_projection_excludes_detail_blobs():
