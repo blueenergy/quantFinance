@@ -45,9 +45,13 @@ _RANKING_RESPONSE_TTL_SECONDS = float(os.getenv("STOCK_RANKING_CACHE_TTL_SECONDS
 _RANKING_RESPONSE_CACHE_MAX = 256
 
 # Fallback submodule weights (mirrors stock-scoring-system/scorers/*.py).
-# Scorers that keep a score ledger report their own weights in `_formula.steps`,
-# which `submodule_weights_from_details` prefers; entries here exist only for the
-# dimensions not yet converted, and for documents scored before the conversion.
+# All six scorers now report their own weights in `_formula.steps`, which
+# `submodule_weights_from_details` prefers. This table is the fallback for
+# documents scored before the ledger landed, and those do not age out: the
+# weekday job only writes a new document for the current score_date over the
+# core index universe, so historical dates and stocks outside that universe
+# keep their pre-ledger documents indefinitely. Deleting this table would drop
+# weights for them, so it stays until those documents are backfilled.
 SUBMODULE_WEIGHTS: Dict[str, Dict[str, float]] = {
     'cycle': {
         '短期周期(5-10日)': 0.4,
