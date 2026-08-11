@@ -19,6 +19,7 @@ from calendar import monthrange
 from bson import ObjectId
 from stock_data_access.prices import AdjustedPriceDataAccess
 from services.industry_rs import build_industry_rs_details, normalize_stored_industry_rs_details
+from services.score_detail_meta import SCORE_HISTORY_PROJECTION, build_score_detail_payload
 
 router = APIRouter(tags=["股票排名"])
 
@@ -40,6 +41,7 @@ _RANKING_RESPONSE_TTL_SECONDS = float(os.getenv("STOCK_RANKING_CACHE_TTL_SECONDS
 _RANKING_RESPONSE_CACHE_MAX = 256
 
 # Submodule weights injected at response time (mirrors stock-scoring-system/scorers/*.py).
+# TODO: import from stock-scoring-system shared/scoring_weights once exposed to quantFinance.
 SUBMODULE_WEIGHTS: Dict[str, Dict[str, float]] = {
     'cycle': {
         '短期周期(5-10日)': 0.4,
@@ -1800,13 +1802,14 @@ async def get_single_score_detail(
                 })
             return {
                 'success': True,
-                'data': {
-                    'symbol': symbol,
-                    'score_date': doc.get('score_date'),
-                    'category': category,
-                    'details': details_payload,
-                    'dimensions': dimensions,
-                },
+                'data': build_score_detail_payload(
+                    doc,
+                    symbol=symbol,
+                    category=category,
+                    details=details_payload,
+                    dimensions=dimensions,
+                    strategy=strategy,
+                ),
                 'message': '获取综合得分拆解成功'
             }
         if category == 'industry_rs':
@@ -1824,31 +1827,31 @@ async def get_single_score_detail(
             if details_payload.get('error'):
                 return {
                     'success': True,
-                    'data': {
-                        'symbol': symbol,
-                        'score_date': doc.get('score_date'),
-                        'category': category,
-                        'details': {
+                    'data': build_score_detail_payload(
+                        doc,
+                        symbol=symbol,
+                        category=category,
+                        details={
                             'score': doc.get('industry_rs_score'),
                             'score_date': doc.get('score_date'),
                             'windows': [],
                             'error': str(details_payload['error']),
                         },
-                        'weights': {},
-                        'dimensions': [],
-                    },
+                        weights={},
+                        dimensions=[],
+                    ),
                     'message': '行业相对强度明细暂不可用',
                 }
             return {
                 'success': True,
-                'data': {
-                    'symbol': symbol,
-                    'score_date': doc.get('score_date'),
-                    'category': category,
-                    'details': details_payload,
-                    'weights': {},
-                    'dimensions': [],
-                },
+                'data': build_score_detail_payload(
+                    doc,
+                    symbol=symbol,
+                    category=category,
+                    details=details_payload,
+                    weights={},
+                    dimensions=[],
+                ),
                 'message': '获取行业相对强度详情成功',
             }
         # 其它分类处理
@@ -1860,13 +1863,13 @@ async def get_single_score_detail(
         category_details = details.get(detail_field, doc.get(detail_field, {})) or {}
         return {
             'success': True,
-            'data': {
-                'symbol': symbol,
-                'score_date': doc.get('score_date'),
-                'category': category,
-                'details': category_details,
-                'weights': SUBMODULE_WEIGHTS.get(category, {}),
-            },
+            'data': build_score_detail_payload(
+                doc,
+                symbol=symbol,
+                category=category,
+                details=category_details,
+                weights=SUBMODULE_WEIGHTS.get(category, {}),
+            ),
             'message': '获取评分详情成功'
         }
     except HTTPException:
@@ -1893,12 +1896,12 @@ async def get_stock_score_history(
             score_date_filter = {"$lte": date}
             query["score_date"] = cast(Any, score_date_filter)
         # 查询最近days天的评分，按score_date降序
-        cursor = stock_scores.find(query).sort("score_date", -1).limit(days)
-        score_history = []
-        for score in cursor:
-            if '_id' in score:
-                score["_id"] = str(score["_id"])
-            score_history.append(score)
+        cursor = (
+            stock_scores.find(query, SCORE_HISTORY_PROJECTION)
+            .sort("score_date", -1)
+            .limit(days)
+        )
+        score_history = list(cursor)
         # 按日期升序返回
         score_history = sorted(score_history, key=lambda x: x.get("score_date", ""))
         return {

@@ -25,6 +25,11 @@ from services.portfolio_symbol_risk import (
     internal_signal_enabled,
 )
 from services.valuation import VALUATION_SOURCE, build_stock_valuation
+from services.score_detail_meta import (
+    SCORE_HISTORY_PROJECTION,
+    build_score_meta,
+    get_strategy_recommendations,
+)
 try:
     from stock_data_access.evidence_fingerprint import normalize_url
     from stock_data_access.indicators.nineturn import enrich_nineturn_signals, latest_signal_summary
@@ -226,18 +231,7 @@ def _score_history(symbol: str, limit: int = 60) -> List[Dict[str, Any]]:
     candidates = _symbol_candidates(symbol)
     cursor = collections["stock_scores"].find(
         {"symbol": {"$in": candidates}},
-        {
-            "_id": 0,
-            "symbol": 1,
-            "score_date": 1,
-            "technical_score": 1,
-            "fundamental_score": 1,
-            "value_score": 1,
-            "growth_score": 1,
-            "money_flow_score": 1,
-            "cycle_score": 1,
-            "composite_score": 1,
-        },
+        SCORE_HISTORY_PROJECTION,
         # See _latest_score: the deployed compound index does not include _id.
         sort=[("score_date", -1)],
         limit=limit,
@@ -1864,11 +1858,13 @@ def get_stock_workbench_nine_turn(
 @router.get("/{symbol}/workbench/scores")
 def get_stock_workbench_scores(
     symbol: str,
+    strategy: str = Query("balanced", description="综合分策略，用于 recommendations"),
     current_user: Dict[str, Any] = Depends(get_current_active_user),
 ):
     """Quant score section for the single-stock research workbench."""
     score = _latest_score(symbol)
     history = _score_history(symbol)
+    recommendations = get_strategy_recommendations(score, strategy=strategy) if score else None
     return {
         "success": True,
         "data": _json_safe(
@@ -1876,6 +1872,8 @@ def get_stock_workbench_scores(
                 "symbol": symbol,
                 "score": score,
                 "score_history": history,
+                "score_meta": build_score_meta(score) if score else None,
+                "recommendations": recommendations,
                 "data_status": _score_status(score),
             }
         ),
