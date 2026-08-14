@@ -1065,22 +1065,28 @@ async def get_portfolio_research_artifact(job_id: str, current_user: dict = Depe
 def _resolve_combo_file(combos_dir: Optional[str], file_rel: Optional[str]) -> Optional[Path]:
     """Resolve a per-combo detail JSON, mirroring the artifact path fallbacks.
 
-    ``file_rel`` is the manifest-relative path (``<base>_combos/<key>.json``); we also
-    try the recorded absolute ``combos_dir`` and the report-dir fallbacks so the file is
-    found whether the API runs on the host or inside the container mount.
+    ``file_rel`` is usually ``<combo_key>.json`` under ``combos_dir``; legacy rows
+    may store ``<combos_dir>/<key>.json`` or absolute container paths.
     """
     candidates: List[Path] = []
     file_path = Path(file_rel) if file_rel else None
     combos_path = Path(combos_dir) if combos_dir else None
+    combo_file_name = file_path.name if file_path else None
+    combos_leaf = combos_path.name if combos_path else None
+
     if file_path:
         candidates.append(file_path)
-    if combos_path and file_path:
-        candidates.append(combos_path / file_path.name)
+    if combos_path and combo_file_name:
+        candidates.append(combos_path / combo_file_name)
     for base_dir in _report_dir_candidates():
+        if combos_leaf and combo_file_name:
+            candidates.append(base_dir / combos_leaf / combo_file_name)
         if file_path:
             candidates.append(base_dir / file_path)
-        if combos_path and file_path:
-            candidates.append(base_dir / combos_path.name / file_path.name)
+        if combos_path and combo_file_name:
+            candidates.append(base_dir / combos_path.name / combo_file_name)
+        if file_path and len(file_path.parts) >= 2:
+            candidates.append(base_dir / Path(*file_path.parts[-2:]))
 
     seen = set()
     for candidate in candidates:

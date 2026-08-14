@@ -1035,6 +1035,23 @@ def test_resolve_combo_file_uses_manifest_relative_path(monkeypatch, tmp_path):
 
 
 @pytest.mark.unit
+def test_resolve_combo_file_uses_basename_combo_dir_and_file(monkeypatch, tmp_path):
+    report_dir = tmp_path / "portfolio-research"
+    combo_dir = report_dir / "job-1_result_combos"
+    combo_dir.mkdir(parents=True)
+    detail = combo_dir / "combo-key.json"
+    detail.write_text("{}", encoding="utf-8")
+    monkeypatch.setenv("PORTFOLIO_RESEARCH_REPORT_DIR", str(report_dir))
+
+    path = portfolio_research._resolve_combo_file(
+        "job-1_result_combos",
+        "combo-key.json",
+    )
+
+    assert path == detail
+
+
+@pytest.mark.unit
 def test_list_portfolio_research_result_rows_paginates(monkeypatch, tmp_path):
     collections = _collections()
     monkeypatch.setattr(portfolio_research, "get_trading_db_collections", lambda: collections)
@@ -1139,3 +1156,52 @@ def test_publish_portfolio_research_result_uses_selected_row(monkeypatch):
     assert "selection_mode" not in preset["params"]
     assert "threshold_lookback_days" not in preset["params"]
     assert "max_positions" not in preset["params"]
+
+
+@pytest.mark.unit
+def test_list_sw_l1_catalog_returns_sorted_l1_rows(monkeypatch):
+    class _DataColl:
+        def find(self, query, projection=None):
+            return [
+                {"index_code": "801080.SI", "industry_name": "电子"},
+                {"index_code": "801730.SI", "industry_name": "电力设备"},
+            ]
+
+    import db as db_module
+
+    monkeypatch.setattr(db_module, "data_db", {"sw_index_classify": _DataColl()})
+
+    response = asyncio.run(
+        portfolio_research.list_sw_l1_catalog(current_user={"id": "user-1"})
+    )
+    assert response["success"] is True
+    codes = [row["code"] for row in response["data"]]
+    assert codes == ["801080.SI", "801730.SI"]
+    assert response["data"][1]["name"] == "电力设备"
+
+
+@pytest.mark.unit
+def test_create_portfolio_research_job_with_industry_l1_sets_benchmark(monkeypatch):
+    collections = _collections()
+    monkeypatch.setattr(portfolio_research, "get_trading_db_collections", lambda: collections)
+
+    response = asyncio.run(
+        portfolio_research.create_portfolio_research_job(
+            portfolio_research.CreateResearchJobRequest(
+                name="industry smoke",
+                universe_index="csi1000",
+                start_date="2024-01-01",
+                end_date="2024-02-29",
+                industry_l1="801730.SI",
+                top_n_values=[8],
+                active_caps=[0.3],
+                index_benchmark_symbol="000852.SH",
+            ),
+            current_user={"id": "user-1"},
+        )
+    )
+
+    assert response["success"] is True
+    job = collections["portfolio_research_jobs"].docs[0]
+    assert job["params"]["industry_l1"] == "801730.SI"
+    assert job["params"]["index_benchmark_symbol"] == "801730.SI"
