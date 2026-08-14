@@ -126,7 +126,13 @@ class CreateResearchJobRequest(BaseModel):
     initial_capital: float = Field(default=1_000_000.0, gt=0)
     trailing_stop_pct: Optional[float] = Field(default=None, ge=0, le=1)
     trailing_stop_pcts: Optional[List[float]] = None
+    industry_l1: Optional[str] = Field(default=None, description="Optional Shenwan L1 code or name filter")
     force: bool = Field(default=False)
+
+    @field_validator("industry_l1", mode="before")
+    @classmethod
+    def _optional_industry_blank(cls, value: Any) -> Any:
+        return _blank_to_none(value)
 
     @field_validator(
         "buy_commission_rate",
@@ -194,6 +200,7 @@ class RerunResearchJobRequest(BaseModel):
     initial_capital: Optional[float] = Field(default=None, gt=0)
     trailing_stop_pct: Optional[float] = Field(default=None, ge=0, le=1)
     trailing_stop_pcts: Optional[List[float]] = None
+    industry_l1: Optional[str] = None
     force: bool = Field(default=True, description="Default true so a rerun is not skipped by cache/idempotency")
 
     @field_validator(
@@ -208,6 +215,7 @@ class RerunResearchJobRequest(BaseModel):
         "initial_capital",
         "trailing_stop_pct",
         "index_benchmark_symbol",
+        "industry_l1",
         mode="before",
     )
     @classmethod
@@ -718,6 +726,29 @@ def _delete_artifact_files(
     return stats
 
 
+@router.get("/sw-l1-catalog")
+async def list_sw_l1_catalog(current_user: dict = Depends(get_current_user)):
+    """Return Shenwan 2021 L1 industries for research UI pickers."""
+    from db import data_db
+
+    coll = data_db["sw_index_classify"]
+    cursor = coll.find(
+        {"src": "SW2021", "level": "L1"},
+        {"_id": 0, "index_code": 1, "industry_name": 1, "name": 1},
+    )
+    rows: List[Dict[str, str]] = []
+    seen: set[str] = set()
+    for doc in cursor:
+        code = str(doc.get("index_code") or "").strip()
+        if not code or code in seen:
+            continue
+        name = str(doc.get("industry_name") or doc.get("name") or code).strip()
+        rows.append({"code": code, "name": name})
+        seen.add(code)
+    rows.sort(key=lambda item: item["code"])
+    return {"success": True, "data": rows}
+
+
 @router.post("/jobs")
 async def create_portfolio_research_job(request: CreateResearchJobRequest, current_user: dict = Depends(get_current_user)):
     collections = get_trading_db_collections()
@@ -743,6 +774,15 @@ def _build_research_job_document(user_id: str, request: CreateResearchJobRequest
     params["rebalance_interval_days"] = request.rebalance_interval_days or [request.horizon]
     if request.universe_index == "csi2000" and request.index_benchmark_symbol == "000852.SH":
         params["index_benchmark_symbol"] = UNIVERSE_BENCHMARK_SYMBOLS["csi2000"]
+    industry_l1 = str(request.industry_l1 or "").strip()
+    if industry_l1:
+        params["industry_l1"] = industry_l1
+        default_bench = UNIVERSE_BENCHMARK_SYMBOLS.get(request.universe_index, "000852.SH")
+        if str(params.get("index_benchmark_symbol") or "") == default_bench:
+            if industry_l1.upper().endswith(".SI"):
+                params["index_benchmark_symbol"] = industry_l1
+            else:
+                params.pop("index_benchmark_symbol", None)
     return {
         "job_id": str(uuid.uuid4()),
         "user_id": user_id,

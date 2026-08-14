@@ -151,6 +151,7 @@ GROWTH_CYCLE_PARAMETER_SCHEMA = {
     "rebalance_days": {"type": "integer", "min": 1},
     "construction_mode": {"type": "enum", "options": ["top_n", "industry_capped", "industry_neutral"]},
     "max_industry_weight": {"type": "number", "min": 0, "max": 1, "nullable": True},
+    "industry_l1": {"type": "string", "nullable": True},
     "lot_size": {"type": "integer", "min": 1},
     "transaction_cost": {"type": "number", "min": 0},
     "buy_commission_rate": {"type": "number", "min": 0, "nullable": True},
