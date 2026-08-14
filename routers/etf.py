@@ -278,6 +278,77 @@ def _agg_etf_ohlc_to_df(df: pd.DataFrame, rule: str) -> pd.DataFrame:
     return ohlc
 
 
+def _sanitize_json_value(v: Any) -> Any:
+    import math
+
+    if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
+        return None
+    try:
+        from bson.decimal128 import Decimal128
+
+        if isinstance(v, Decimal128):
+            return float(str(v))
+    except Exception:
+        pass
+    if hasattr(v, "item"):
+        try:
+            return v.item()
+        except Exception:
+            pass
+    return v
+
+
+def _sanitize_json_tree(obj: Any) -> Any:
+    if isinstance(obj, dict):
+        return {k: _sanitize_json_tree(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_sanitize_json_tree(x) for x in obj]
+    return _sanitize_json_value(obj)
+
+
+@router.get("/heatmap")
+async def get_etf_heatmap(
+    window: str = Query("5d", description="1d, 5d, or 20d net inflow window"),
+    trade_date: Optional[str] = Query(
+        None,
+        description="As-of trade_date YYYYMMDD; default latest in etf_share_size",
+    ),
+):
+    """Cross-section heatmap: themed ETF buckets ranked by net subscription inflow."""
+    from services.etf_heatmap import ShareSizeStore, build_heatmap_payload, parse_window
+
+    try:
+        parse_window(window)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    store = ShareSizeStore(data_db["etf_share_size"], data_db["etf_basic"])
+    payload = build_heatmap_payload(store, window=window, trade_date=trade_date)
+    return _sanitize_json_tree(payload)
+
+
+@router.get("/heatmap/{bucket_id}/series")
+async def get_etf_heatmap_series(
+    bucket_id: str,
+    limit: int = Query(250, ge=1, le=500),
+    trade_date: Optional[str] = Query(
+        None,
+        description="As-of trade_date YYYYMMDD; default latest in etf_share_size",
+    ),
+):
+    """Time series for one bucket: daily net inflow bars + aggregate share line."""
+    from services.etf_heatmap import ShareSizeStore, build_bucket_series_payload
+
+    store = ShareSizeStore(data_db["etf_share_size"], data_db["etf_basic"])
+    try:
+        payload = build_bucket_series_payload(
+            store, bucket_id, limit=limit, trade_date=trade_date
+        )
+    except KeyError:
+        raise HTTPException(status_code=404, detail=f"Unknown heatmap bucket: {bucket_id}")
+    return _sanitize_json_tree(payload)
+
+
 @router.get("/{symbol}/kline")
 async def get_etf_kline(
     symbol: str, 
