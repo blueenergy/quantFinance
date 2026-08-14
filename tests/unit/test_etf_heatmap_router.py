@@ -148,6 +148,42 @@ def test_heatmap_series_for_bucket(monkeypatch, heatmap_share_docs):
 
 
 @pytest.mark.unit
+def test_heatmap_series_flagship_close_from_implied_nav(monkeypatch):
+    docs = [
+        {
+            "ts_code": "512760.SH",
+            "trade_date": "20250410",
+            "total_share": 1000.0,
+            "total_size": 2000.0,
+        },
+        {
+            "ts_code": "512760.SH",
+            "trade_date": "20250409",
+            "total_share": 990.0,
+            "total_size": 1980.0,
+        },
+    ]
+    monkeypatch.setattr(
+        etf_mod,
+        "data_db",
+        _make_data_db(
+            {
+                "etf_share_size": HeatmapShareSizeCollection(docs),
+                "etf_basic": BasicCollection([{"ts_code": "512760.SH", "name": "半导体ETF"}]),
+            }
+        ),
+    )
+    client = TestClient(app)
+    r = client.get(
+        "/api/etf/heatmap/semiconductor/series",
+        params={"limit": 10, "trade_date": "20250410"},
+    )
+    assert r.status_code == 200
+    last = r.json()["series"][-1]
+    assert last["flagship_close"] == pytest.approx(2.0)
+
+
+@pytest.mark.unit
 def test_heatmap_series_unknown_bucket(monkeypatch):
     monkeypatch.setattr(
         etf_mod,

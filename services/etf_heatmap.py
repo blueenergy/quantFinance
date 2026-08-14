@@ -45,7 +45,6 @@ ETF_HEATMAP_BUCKETS: List[Dict[str, Any]] = [
         "candidates": [
             "516160.SH",
             "159857.SZ",
-            "515790.SH",
             "561010.SH",
         ],
     },
@@ -68,7 +67,6 @@ ETF_HEATMAP_BUCKETS: List[Dict[str, Any]] = [
         "candidates": [
             "512690.SH",
             "159993.SZ",
-            "161725.SZ",  # exclude if not in DB — filtered at runtime
         ],
     },
     {
@@ -666,7 +664,7 @@ def build_bucket_series_payload(
                 "net_inflow": agg.get("net_inflow"),
                 "total_share": agg.get("total_share"),
                 "total_size": agg.get("total_size"),
-                "flagship_close": to_float(flagship_row.get("close")) or to_float(flagship_row.get("nav")),
+                "flagship_close": price_for_inflow(flagship_row),
             }
         )
 

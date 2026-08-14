@@ -7,6 +7,7 @@ from services.etf_heatmap import (
     daily_net_inflow_wan,
     parse_window,
     pick_top_members,
+    price_for_inflow,
     to_float,
 )
 
@@ -80,6 +81,21 @@ def test_bucket_candidates_exclude_feeder_names_by_curation():
     all_codes = [c for b in ETF_HEATMAP_BUCKETS for c in b["candidates"]]
     for code in all_codes:
         assert code.endswith((".SH", ".SZ")), code
+    assert "161725.SZ" not in all_codes
+
+
+def test_theme_buckets_do_not_share_candidate_codes():
+    seen = {}
+    for bucket in ETF_HEATMAP_BUCKETS:
+        if bucket["kind"] != "theme":
+            continue
+        for code in bucket["candidates"]:
+            assert code not in seen, f"{code} in {seen[code]} and {bucket['id']}"
+            seen[code] = bucket["id"]
+
+
+def test_price_for_inflow_uses_implied_nav_when_nav_and_close_missing():
+    assert price_for_inflow({"total_share": 100.0, "total_size": 250.0}) == pytest.approx(2.5)
 
 
 def test_to_float_decimal128():
