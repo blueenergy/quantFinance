@@ -416,6 +416,7 @@ PRESET_PARAM_KEYS = {
     "initial_capital",
     "trailing_stop_pct",
     "candidate_pool_enabled",
+    "industry_l1",
 }
 
 
@@ -522,6 +523,7 @@ def _candidate_strategy_config_from_row(job: Dict[str, Any], row: Dict[str, Any]
         "initial_capital": float(params.get("initial_capital") or 1_000_000.0),
         "trailing_stop_pct": trailing_stop_pct,
         "candidate_pool_enabled": bool(params.get("candidate_pool_enabled", True)),
+        "industry_l1": str(params.get("industry_l1") or "").strip() or None,
         "status": "draft",
         "version": 1,
     }
