@@ -191,6 +191,7 @@ def get_data_db():
         "hot_stock_raw": data_db["hot_stock_raw"],
         # Market data
         "volume_price": data_db["volume_price"],
+        "trade_calendar": data_db["trade_calendar"],
         "stock_adj_factor": data_db["stock_adj_factor"],
         "volume_price_realtime_latest": realtime_db["volume_price_realtime_latest"],
         "stock_weekly": data_db["stock_weekly"],

@@ -5389,10 +5389,17 @@ def _add_calendar_days(yyyymmdd: str, days: int) -> Optional[str]:
 def _distinct_trade_dates(data_collections: Dict[str, Any], query: Dict[str, Any]) -> List[str]:
     """Server-side distinct trade dates.
 
-    ``volume_price`` holds one row per (symbol, trade_date), so fetching rows to
-    dedupe dates in Python pulls the whole market table. ``distinct`` returns
-    only the distinct dates and lets MongoDB do the dedupe.
+    Prefers ``trade_calendar`` (full-year SSE calendar incl. future dates); falls
+    back to ``volume_price`` (historical bars only) when the calendar is missing
+    or empty. ``volume_price`` holds one row per (symbol, trade_date), so fetching
+    rows to dedupe dates in Python pulls the whole market table; ``distinct``
+    returns only the distinct dates and lets MongoDB do the dedupe.
     """
+    calendar = data_collections.get("trade_calendar")
+    if calendar is not None:
+        days = calendar.distinct("trade_date", query)
+        if days:
+            return sorted({str(d) for d in days if d})
     try:
         days = data_collections["volume_price"].distinct("trade_date", query)
     except Exception:
@@ -5430,7 +5437,10 @@ def _advance_trading_days(data_collections: Dict[str, Any], from_date: str, trad
             return future_dates[trading_day_offset - 1]
     future_dates = _distinct_trade_dates(data_collections, {"trade_date": {"$gt": anchor}})
     if len(future_dates) < trading_day_offset:
-        return future_dates[-1] if future_dates else None
+        # Calendar lacks enough future dates (e.g. beyond the stored calendar
+        # range): stay honest instead of reporting the last known trading date
+        # as the next rebalance day.
+        return None
     return future_dates[trading_day_offset - 1]
 
 
@@ -5570,9 +5580,14 @@ def _compute_current_cycle(
     base_date = latest_plan.get("base_date")
     rebalance_days = _rebalance_days_from_plan(latest_plan)
     elapsed_trading_days = 0
-    if previous_rebalance_date and base_date:
-        trading_dates = _trading_dates_between(data_collections, str(previous_rebalance_date), str(base_date))
-        elapsed_trading_days = max(0, len(trading_dates) - 1)
+    # Count elapsed trading days up to today (not cadence_plan.base_date) so a
+    # lineage without newer monitor/rebalance plans still shows the cycle
+    # advancing. Capped at rebalance_days: an overdue cycle reads N/N instead
+    # of a percentage above 100.
+    today = _business_today_yyyymmdd()
+    if previous_rebalance_date and today and today >= str(previous_rebalance_date):
+        trading_dates = _trading_dates_between(data_collections, str(previous_rebalance_date), today)
+        elapsed_trading_days = min(rebalance_days, max(0, len(trading_dates) - 1))
     remaining_days = max(0, rebalance_days - elapsed_trading_days)
     next_rebalance_estimate = None
     if base_date and remaining_days:
