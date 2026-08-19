@@ -119,6 +119,39 @@ def test_heatmap_invalid_window(monkeypatch):
 
 
 @pytest.mark.unit
+def test_heatmap_accepts_long_windows(monkeypatch, heatmap_share_docs):
+    monkeypatch.setattr(
+        etf_mod,
+        "data_db",
+        _make_data_db(
+            {
+                "etf_share_size": HeatmapShareSizeCollection(heatmap_share_docs),
+                "etf_basic": BasicCollection(
+                    [
+                        {"ts_code": "512760.SH", "name": "半导体ETF"},
+                        {"ts_code": "159995.SZ", "name": "芯片ETF"},
+                    ]
+                ),
+            }
+        ),
+    )
+    client = TestClient(app)
+    for window in ("60d", "120d", "ytd"):
+        r = client.get(
+            "/api/etf/heatmap",
+            params={"window": window, "trade_date": "20250410"},
+        )
+        assert r.status_code == 200, window
+        body = r.json()
+        assert body["window"] == window
+        assert body["window_long"] is True
+        if window == "ytd":
+            assert body["window_target_days"] is None
+        else:
+            assert body["window_target_days"] == int(window[:-1])
+
+
+@pytest.mark.unit
 def test_heatmap_series_for_bucket(monkeypatch, heatmap_share_docs):
     basic = [
         {"ts_code": "512760.SH", "name": "半导体ETF"},
@@ -181,6 +214,68 @@ def test_heatmap_series_flagship_close_from_implied_nav(monkeypatch):
     assert r.status_code == 200
     last = r.json()["series"][-1]
     assert last["flagship_close"] == pytest.approx(2.0)
+
+
+@pytest.mark.unit
+def test_heatmap_default_as_of_ignores_collection_max_outlier(monkeypatch, heatmap_share_docs):
+    docs = list(heatmap_share_docs) + [
+        {
+            "ts_code": "999999.SH",
+            "trade_date": "20250412",
+            "total_share": 1.0,
+            "total_size": 1.0,
+        },
+        {
+            "ts_code": "512760.SH",
+            "trade_date": "20250411",
+            "total_share": 1010.0,
+            "total_size": 2020.0,
+            "nav": 2.0,
+        },
+        {
+            "ts_code": "510300.SH",
+            "trade_date": "20250410",
+            "total_share": 100.0,
+            "total_size": 100.0,
+            "nav": 1.0,
+        },
+        {
+            "ts_code": "159919.SZ",
+            "trade_date": "20250410",
+            "total_share": 100.0,
+            "total_size": 100.0,
+            "nav": 1.0,
+        },
+        {
+            "ts_code": "510330.SH",
+            "trade_date": "20250410",
+            "total_share": 100.0,
+            "total_size": 100.0,
+            "nav": 1.0,
+        },
+    ]
+    basic = [
+        {"ts_code": "512760.SH", "name": "半导体ETF"},
+        {"ts_code": "159995.SZ", "name": "芯片ETF"},
+    ]
+    monkeypatch.setattr(
+        etf_mod,
+        "data_db",
+        _make_data_db(
+            {
+                "etf_share_size": HeatmapShareSizeCollection(docs),
+                "etf_basic": BasicCollection(basic),
+            }
+        ),
+    )
+    client = TestClient(app)
+    r = client.get("/api/etf/heatmap", params={"window": "1d"})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["trade_date"] == "20250410"
+    semi = next(c for c in body["cells"] if c["bucket_id"] == "semiconductor")
+    assert semi["members"]
+    assert semi["net_inflow"] == pytest.approx(50.0)
 
 
 @pytest.mark.unit

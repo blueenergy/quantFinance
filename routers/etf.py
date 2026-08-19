@@ -308,10 +308,10 @@ def _sanitize_json_tree(obj: Any) -> Any:
 
 @router.get("/heatmap")
 async def get_etf_heatmap(
-    window: str = Query("5d", description="1d, 5d, or 20d net inflow window"),
+    window: str = Query("5d", description="1d, 5d, 20d, 60d, 120d, or ytd net inflow window"),
     trade_date: Optional[str] = Query(
         None,
-        description="As-of trade_date YYYYMMDD; default latest in etf_share_size",
+        description="As-of trade_date YYYYMMDD; default coverage date among heatmap ETFs",
     ),
 ):
     """Cross-section heatmap: themed ETF buckets ranked by net subscription inflow."""
@@ -333,7 +333,7 @@ async def get_etf_heatmap_series(
     limit: int = Query(250, ge=1, le=500),
     trade_date: Optional[str] = Query(
         None,
-        description="As-of trade_date YYYYMMDD; default latest in etf_share_size",
+        description="As-of trade_date YYYYMMDD; default coverage date among heatmap ETFs",
     ),
 ):
     """Time series for one bucket: daily net inflow bars + aggregate share line."""
