@@ -5590,8 +5590,13 @@ def _compute_current_cycle(
         elapsed_trading_days = min(rebalance_days, max(0, len(trading_dates) - 1))
     remaining_days = max(0, rebalance_days - elapsed_trading_days)
     next_rebalance_estimate = None
-    if base_date and remaining_days:
-        next_rebalance_estimate = _advance_trading_days(data_collections, str(base_date), remaining_days)
+    # remaining_days is measured from today, so the estimate must also start
+    # from today. Advancing from latest_plan.base_date (often the previous
+    # rebalance) would subtract elapsed twice and land too early.
+    if remaining_days and today:
+        next_rebalance_estimate = _advance_trading_days(
+            data_collections, str(today), remaining_days
+        )
     return {
         "previous_rebalance_date": previous_rebalance_date,
         "previous_rebalance_plan_id": (

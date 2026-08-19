@@ -4974,6 +4974,9 @@ def test_lineage_timeline_ignores_manual_records_for_rebalance_cadence(monkeypat
             },
         ]
     )
+    # Cycle elapsed-days count to business today. Without a freeze, a 2025
+    # fixture looks fully overdue in 2026 CI and next_rebalance_estimate is None.
+    monkeypatch.setattr(portfolio_plans, "_business_today_yyyymmdd", lambda: "20250110")
     _patch_lineage_live_env(monkeypatch, cols, fin, data)
 
     resp = asyncio.run(
@@ -4985,7 +4988,8 @@ def test_lineage_timeline_ignores_manual_records_for_rebalance_cadence(monkeypat
     payload = resp["data"]
     assert payload["today_state"] == "已补录手工清仓"
     assert payload["current_cycle"]["latest_rebalance_plan_id"] == "reb-1"
-    # 20250102 anchor + 10 trading days (now that the fake Mongo honours $gt).
+    # As-of 20250110: 8 sessions since 20250102, 2 remaining from today
+    # → 20250112. Manual fill is not the cadence anchor.
     assert payload["current_cycle"]["next_rebalance_estimate"] == "20250112"
     manual_node = next(row for row in payload["timeline"] if row["plan_id"] == "manual-clear")
     assert manual_node["node_type"] == "manual"
