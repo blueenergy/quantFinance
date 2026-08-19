@@ -1473,6 +1473,11 @@ def get_market_spectrum_realtime_sectors(
         "snapshot_time": {"$gte": start_time, "$lte": end_time},
         "level": level,
     }
+    # Legacy docs omit ma_period and are treated as MA5.
+    if ma_period == 5:
+        query["$or"] = [{"ma_period": 5}, {"ma_period": {"$exists": False}}]
+    else:
+        query["ma_period"] = ma_period
     if sector_code:
         query["sector_code"] = sector_code
 
@@ -1484,8 +1489,11 @@ def get_market_spectrum_realtime_sectors(
         "sector_code": 1,
         "sector_name": 1,
         "stock_count": 1,
+        "ma_period": 1,
         "above_ma5_count": 1,
         "above_ma5_ratio": 1,
+        "above_ma_count": 1,
+        "above_ma_ratio": 1,
         "positive_count": 1,
         "negative_count": 1,
         "flat_count": 1,
@@ -1501,8 +1509,10 @@ def get_market_spectrum_realtime_sectors(
         total = int(row.get("stock_count") or 0)
         if total <= 0:
             continue
-        above = int(row.get("above_ma5_count") or 0)
-        yang = _num_or_none(row.get("above_ma5_ratio"))
+        above = int(row.get("above_ma_count") or row.get("above_ma5_count") or 0)
+        yang = _num_or_none(row.get("above_ma_ratio"))
+        if yang is None:
+            yang = _num_or_none(row.get("above_ma5_ratio"))
         if yang is None:
             yang = above / total
         docs.append({
@@ -1525,7 +1535,7 @@ def get_market_spectrum_realtime_sectors(
             "total_amount_yuan": _num_or_none(row.get("total_amount_yuan")),
             "relative_positive_ratio": _num_or_none(row.get("relative_positive_ratio")),
             "distribution": _sector_strength_distribution(row),
-            "ma_period": ma_period,
+            "ma_period": int(row.get("ma_period") or ma_period),
             "granularity": "daily_realtime_sector",
             "data_source": row.get("data_source"),
             "updated_at": row.get("updated_at"),
