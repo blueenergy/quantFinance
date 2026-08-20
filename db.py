@@ -61,6 +61,8 @@ def get_db_collections() -> Dict[str, Collection]:
         "intraday_t0_position_snapshots": db["intraday_t0_position_snapshots"],
         "intraday_t0_signal_evaluations": db["intraday_t0_signal_evaluations"],
         "intraday_t0_trades": db["intraday_t0_trades"],
+        "intraday_t0_execution_settings": db["intraday_t0_execution_settings"],
+        "intraday_t0_executions": db["intraday_t0_executions"],
         # Strategy
         "strategy_template": db["strategy_template"],  # 策略参数模板
         "strategy_metadata": db["strategy_metadata"],  # 策略元数据（key和name）

@@ -30,6 +30,14 @@ from services.intraday_t0_trades import (
     preview_trade_from_signal,
     record_trade,
 )
+from services.intraday_t0_execution import (
+    ensure_intraday_t0_execution_indexes,
+    get_user_settings,
+    list_executions,
+    preview_execution_async,
+    submit_execution_async,
+    upsert_user_settings,
+)
 
 
 router = APIRouter(prefix="/intraday-t0", tags=["日内T+0"])
@@ -52,6 +60,24 @@ class GenerateSignalsPayload(BaseModel):
 
 class WatchlistImportPayload(BaseModel):
     default_quantity: int = Field(100, ge=0)
+
+
+class ExecutionSettingsPayload(BaseModel):
+    plan_id: Optional[str] = None
+    securities_account_id: Optional[str] = None
+    auto_execute_enabled: Optional[bool] = None
+    auto_min_score: Optional[float] = Field(None, ge=0, le=100)
+    sell_qty_ratio: Optional[float] = Field(None, gt=0, le=1)
+
+
+class ExecutionSubmitPayload(BaseModel):
+    signal_id: str = Field(..., min_length=1)
+    plan_id: Optional[str] = None
+    securities_account_id: Optional[str] = None
+    quantity: Optional[int] = Field(None, gt=0)
+    pair_id: Optional[str] = None
+    sell_qty_ratio: Optional[float] = Field(None, gt=0, le=1)
+    dry_run: bool = False
 
 
 class RecordTradePayload(BaseModel):
@@ -368,6 +394,91 @@ def get_trade_day_summary(
         raise HTTPException(status_code=500, detail=f"获取T+0日终汇总失败: {exc}")
 
 
+@router.get("/execution/settings")
+def get_execution_settings(current_user: dict = Depends(get_current_active_user)):
+    try:
+        return get_user_settings(_user_id(current_user))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"获取T+0执行设置失败: {exc}")
+
+
+@router.put("/execution/settings")
+def update_execution_settings(
+    payload: ExecutionSettingsPayload,
+    current_user: dict = Depends(get_current_active_user),
+):
+    try:
+        return upsert_user_settings(
+            _user_id(current_user),
+            payload.model_dump(exclude_none=True),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"更新T+0执行设置失败: {exc}")
+
+
+@router.post("/execution/preview")
+async def preview_execution(
+    payload: ExecutionSubmitPayload,
+    current_user: dict = Depends(get_current_active_user),
+):
+    try:
+        return await preview_execution_async(
+            _user_id(current_user),
+            payload.signal_id,
+            plan_id=payload.plan_id,
+            securities_account_id=payload.securities_account_id,
+            quantity=payload.quantity,
+            pair_id=payload.pair_id,
+            sell_qty_ratio=payload.sell_qty_ratio,
+            current_user=current_user,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"预览T+0下单失败: {exc}")
+
+
+@router.post("/execution/submit")
+async def submit_execution(
+    payload: ExecutionSubmitPayload,
+    current_user: dict = Depends(get_current_active_user),
+):
+    try:
+        return await submit_execution_async(
+            _user_id(current_user),
+            payload.signal_id,
+            plan_id=payload.plan_id,
+            securities_account_id=payload.securities_account_id,
+            quantity=payload.quantity,
+            pair_id=payload.pair_id,
+            sell_qty_ratio=payload.sell_qty_ratio,
+            dry_run=payload.dry_run,
+            current_user=current_user,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"提交T+0下单失败: {exc}")
+
+
+@router.get("/execution/history")
+def get_execution_history(
+    limit: int = Query(100, ge=1, le=500),
+    current_user: dict = Depends(get_current_active_user),
+):
+    try:
+        rows = list_executions(_user_id(current_user), limit=limit)
+        return {"success": True, "count": len(rows), "data": rows}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"获取T+0执行历史失败: {exc}")
+
+
 @router.post("/trades/day-close-check")
 def run_day_close_check(
     trade_date: Optional[str] = Query(None, description="YYYYMMDD or YYYY-MM-DD"),
@@ -383,3 +494,4 @@ def run_day_close_check(
 def _ensure_indexes_on_startup() -> None:
     ensure_intraday_t0_indexes()
     ensure_intraday_t0_trade_indexes()
+    ensure_intraday_t0_execution_indexes()

@@ -661,6 +661,12 @@ def generate_signals_for_user(
         }
         result = coll.insert_one(doc)
         doc["_id"] = result.inserted_id
+        try:
+            from services.intraday_t0_execution import maybe_auto_execute_after_signal
+
+            maybe_auto_execute_after_signal(user_id, doc)
+        except Exception:
+            pass
         signals.append(serialize_doc(doc))
     return {
         "success": True,
