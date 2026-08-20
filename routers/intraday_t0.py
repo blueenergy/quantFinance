@@ -21,7 +21,15 @@ from services.intraday_t0_signals import (
     performance_summary,
     upsert_mock_position,
 )
-from utils.stock_utils import serialize_doc
+from services.intraday_t0_trades import (
+    day_close_check,
+    day_summary,
+    ensure_intraday_t0_trade_indexes,
+    list_open_pairs,
+    list_trades,
+    preview_trade_from_signal,
+    record_trade,
+)
 
 
 router = APIRouter(prefix="/intraday-t0", tags=["日内T+0"])
@@ -44,6 +52,21 @@ class GenerateSignalsPayload(BaseModel):
 
 class WatchlistImportPayload(BaseModel):
     default_quantity: int = Field(100, ge=0)
+
+
+class RecordTradePayload(BaseModel):
+    symbol: str = Field(..., min_length=1)
+    leg: str = Field(..., pattern="^(sell|buy)$")
+    quantity: int = Field(..., gt=0)
+    price: float = Field(..., gt=0)
+    trade_date: Optional[str] = None
+    fees: float = Field(0.0, ge=0)
+    signal_id: Optional[str] = None
+    pair_id: Optional[str] = None
+    notes: Optional[str] = None
+
+
+from utils.stock_utils import serialize_doc
 
 
 def _user_id(current_user: Dict[str, Any]) -> str:
@@ -281,6 +304,82 @@ def export_signal_evaluations(
         raise HTTPException(status_code=500, detail=f"导出日内T+0评估失败: {exc}")
 
 
+@router.get("/trades/preview")
+def preview_trade(
+    signal_id: str = Query(..., min_length=1),
+    sell_qty_ratio: float = Query(0.5, gt=0, le=1),
+    current_user: dict = Depends(get_current_active_user),
+):
+    try:
+        return preview_trade_from_signal(_user_id(current_user), signal_id, sell_qty_ratio=sell_qty_ratio)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"预览T+0成交失败: {exc}")
+
+
+@router.post("/trades")
+def create_trade(
+    payload: RecordTradePayload,
+    current_user: dict = Depends(get_current_active_user),
+):
+    try:
+        return record_trade(_user_id(current_user), payload.model_dump(exclude_none=True))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"记录T+0成交失败: {exc}")
+
+
+@router.get("/trades")
+def get_trades(
+    trade_date: Optional[str] = Query(None, description="YYYYMMDD or YYYY-MM-DD"),
+    symbol: Optional[str] = Query(None),
+    limit: int = Query(200, ge=1, le=1000),
+    current_user: dict = Depends(get_current_active_user),
+):
+    try:
+        rows = list_trades(_user_id(current_user), trade_date=trade_date, symbol=symbol, limit=limit)
+        return {"success": True, "count": len(rows), "data": rows}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"获取T+0成交记录失败: {exc}")
+
+
+@router.get("/trades/open")
+def get_open_trade_pairs(
+    trade_date: Optional[str] = Query(None, description="YYYYMMDD or YYYY-MM-DD"),
+    current_user: dict = Depends(get_current_active_user),
+):
+    try:
+        rows = list_open_pairs(_user_id(current_user), trade_date=trade_date)
+        return {"success": True, "count": len(rows), "data": rows}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"获取未回补配对失败: {exc}")
+
+
+@router.get("/trades/day-summary")
+def get_trade_day_summary(
+    trade_date: Optional[str] = Query(None, description="YYYYMMDD or YYYY-MM-DD"),
+    current_user: dict = Depends(get_current_active_user),
+):
+    try:
+        return day_summary(_user_id(current_user), trade_date=trade_date)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"获取T+0日终汇总失败: {exc}")
+
+
+@router.post("/trades/day-close-check")
+def run_day_close_check(
+    trade_date: Optional[str] = Query(None, description="YYYYMMDD or YYYY-MM-DD"),
+    current_user: dict = Depends(get_current_active_user),
+):
+    try:
+        return day_close_check(_user_id(current_user), trade_date=trade_date)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"T+0日终检查失败: {exc}")
+
+
 @router.on_event("startup")
 def _ensure_indexes_on_startup() -> None:
     ensure_intraday_t0_indexes()
+    ensure_intraday_t0_trade_indexes()
