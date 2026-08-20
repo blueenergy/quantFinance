@@ -10,7 +10,7 @@ approved portfolio plan -> trade_signals -> quantTrader -> miniQMT -> execution/
 
 Every state field has exactly one authority. Publish-time risk checks and sell
 sizing must read only from the source below — no implicit third source (see
-`execution_chain_simplification.plan.md` §S5). This closes the "three sets of
+llm-wiki `projects/trading/execution-chain-roadmap.md` §权威来源). This closes the "three sets of
 numbers" gap between UI, lineage, and the broker (risks R4/R5).
 
 | Concern | Authoritative source | Used for |
