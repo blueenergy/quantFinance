@@ -47,6 +47,34 @@ def _user_id(current_user: Dict[str, Any]) -> str:
     return str(current_user["id"])
 
 
+@router.get("/health/liveness")
+def intraday_t0_liveness():
+    """Structural health for dev/CI and k8s liveness — no live market data required."""
+    from services.intraday_t0_health import run_liveness_checks
+
+    report = run_liveness_checks()
+    status_code = 200 if report.overall in {"pass", "warn"} else 503
+    from fastapi.responses import JSONResponse
+
+    return JSONResponse(content=report.to_dict(), status_code=status_code)
+
+
+@router.get("/health/readiness")
+def intraday_t0_readiness(
+    trade_date: Optional[str] = Query(None, description="YYYYMMDD or YYYY-MM-DD"),
+    user_id: Optional[str] = Query(None, description="Optional user scope"),
+    _: bool = Depends(require_hermes_quant_internal_key),
+):
+    """Prod pre-flight: realtime pipeline + signal activity for trade_date."""
+    from services.intraday_t0_health import run_readiness_checks
+
+    report = run_readiness_checks(trade_date=trade_date, user_id=user_id)
+    status_code = 200 if report.overall in {"pass", "warn"} else 503
+    from fastapi.responses import JSONResponse
+
+    return JSONResponse(content=report.to_dict(), status_code=status_code)
+
+
 @router.get("/positions")
 def get_positions(
     source: str = Query("auto", pattern="^(auto|real|mock|watchlist)$"),
