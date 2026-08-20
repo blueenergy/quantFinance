@@ -267,6 +267,7 @@ def get_data_db():
         "index_cape_daily": data_db["index_cape_daily"],
         "market_regime_reports": data_db["market_regime_reports"],
         "index_daily_basic": data_db["index_daily_basic"],
+        "market_pe_daily": data_db["market_pe_daily"],
         "margin_market_daily": data_db["margin_market_daily"],
         # X (Twitter) influencer tweets (written by quant-data-engine run_x_influencer_sync)
         "x_influencer_posts": data_db["x_influencer_posts"],

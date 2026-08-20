@@ -50,7 +50,10 @@ def _client() -> TestClient:
 
 
 @pytest.mark.unit
-def test_pick_pe_index_prefers_sse_then_fallback():
+def test_pick_pe_index_prefers_alla_then_sse():
+    code, name = pick_pe_index(["000300.SH", "ALLA.WI", "000001.SH"])
+    assert code == "ALLA.WI"
+    assert name == "全A（自算）"
     code, name = pick_pe_index(["000300.SH", "000001.SH", "399006.SZ"])
     assert code == "000001.SH"
     assert name == "上证指数"
@@ -85,7 +88,11 @@ def test_overview_returns_pe_and_margin_series(monkeypatch):
     monkeypatch.setattr(
         market_stats,
         "get_data_db",
-        lambda: {"index_daily_basic": _Coll(pe_docs), "margin_market_daily": _Coll(margin_docs)},
+        lambda: {
+            "index_daily_basic": _Coll(pe_docs),
+            "market_pe_daily": _Coll([]),
+            "margin_market_daily": _Coll(margin_docs),
+        },
     )
     res = _client().get("/api/market-stats/overview", params={"days": 60})
     assert res.status_code == 200
@@ -104,10 +111,50 @@ def test_overview_empty_collections(monkeypatch):
     monkeypatch.setattr(
         market_stats,
         "get_data_db",
-        lambda: {"index_daily_basic": _Coll([]), "margin_market_daily": _Coll([])},
+        lambda: {
+            "index_daily_basic": _Coll([]),
+            "market_pe_daily": _Coll([]),
+            "margin_market_daily": _Coll([]),
+        },
     )
     res = _client().get("/api/market-stats/overview")
     assert res.status_code == 200
     body = res.json()
     assert body["pe"]["series"] == []
     assert body["margin"]["latest"] is None
+
+
+@pytest.mark.unit
+def test_overview_defaults_to_alla_and_lists_it_first(monkeypatch):
+    pe_docs = [
+        {"ts_code": "000001.SH", "trade_date": "20260811", "pe_ttm": 14.2},
+    ]
+    alla_docs = [
+        {
+            "ts_code": "ALLA.WI",
+            "trade_date": "20260811",
+            "pe_ttm": 18.5,
+            "n_used": 3200,
+            "n_loss": 800,
+            "n_missing": 100,
+            "n_universe": 4100,
+            "method": "cap_harmonic_ttm",
+        }
+    ]
+    monkeypatch.setattr(
+        market_stats,
+        "get_data_db",
+        lambda: {
+            "index_daily_basic": _Coll(pe_docs),
+            "market_pe_daily": _Coll(alla_docs),
+            "margin_market_daily": _Coll([]),
+        },
+    )
+    res = _client().get("/api/market-stats/overview", params={"days": 60})
+    assert res.status_code == 200
+    body = res.json()
+    assert body["pe"]["index_code"] == "ALLA.WI"
+    assert body["pe"]["index_name"] == "全A（自算）"
+    assert body["pe"]["available_indices"][0]["ts_code"] == "ALLA.WI"
+    assert body["pe"]["latest"]["pe_ttm"] == pytest.approx(18.5)
+    assert body["pe"]["latest"]["n_used"] == 3200

@@ -9,11 +9,14 @@ from fastapi import APIRouter, Depends, Query
 from auth import get_current_active_user
 from db import get_data_db
 from services.market_stats import (
+    ALLA_CODE,
     MARGIN_ALL_EXCHANGE,
     MARGIN_DELTA_WINDOW,
     PE_INDEX_LABELS,
     attach_window_delta,
     lookback_start,
+    merge_pe_by_code,
+    pe_index_sort_key,
     pick_pe_index,
     serialize_margin_row,
     serialize_pe_row,
@@ -41,7 +44,7 @@ def _empty_overview() -> Dict[str, Any]:
 @router.get("/overview", summary="市场统计图数据（两融 + 指数市盈率）")
 async def get_market_stats_overview(
     days: int = Query(750, ge=60, le=2500, description="返回最近 N 个交易日"),
-    pe_index: Optional[str] = Query(None, description="指数代码，如 000001.SH；缺省按上证→沪深300→创业板 回退"),
+    pe_index: Optional[str] = Query(None, description="指数代码，如 ALLA.WI / 000001.SH；缺省按全A自算→上证→沪深300→创业板 回退"),
     current_user: dict = Depends(get_current_active_user),
 ):
     data = get_data_db()
@@ -50,26 +53,45 @@ async def get_market_stats_overview(
     payload = _empty_overview()
 
     pe_coll = data.get("index_daily_basic")
+    alla_coll = data.get("market_pe_daily")
+    index_docs: List[Dict[str, Any]] = []
+    alla_docs: List[Dict[str, Any]] = []
+    pe_projection = {
+        "_id": 0,
+        "ts_code": 1,
+        "trade_date": 1,
+        "pe": 1,
+        "pe_ttm": 1,
+        "pb": 1,
+        "close": 1,
+        "total_mv": 1,
+        "n_universe": 1,
+        "n_used": 1,
+        "n_loss": 1,
+        "n_missing": 1,
+        "method": 1,
+        "universe": 1,
+    }
     if pe_coll is not None:
-        pe_docs = list(
-            pe_coll.find(
-                {"trade_date": {"$gte": start}},
-                {"_id": 0, "ts_code": 1, "trade_date": 1, "pe": 1, "pe_ttm": 1, "pb": 1, "close": 1, "total_mv": 1},
+        index_docs = list(
+            pe_coll.find({"trade_date": {"$gte": start}}, pe_projection).sort("trade_date", 1)
+        )
+    if alla_coll is not None:
+        alla_docs = list(
+            alla_coll.find(
+                {"ts_code": ALLA_CODE, "trade_date": {"$gte": start}},
+                pe_projection,
             ).sort("trade_date", 1)
         )
-        by_code: Dict[str, List[Dict[str, Any]]] = {}
-        for doc in pe_docs:
-            code = doc.get("ts_code")
-            if not code:
-                continue
-            by_code.setdefault(code, []).append(doc)
+    by_code = merge_pe_by_code(index_docs, alla_docs)
+    if by_code:
         available = [
             {
                 "ts_code": code,
                 "name": PE_INDEX_LABELS.get(code, code),
                 "points": len(rows),
             }
-            for code, rows in sorted(by_code.items())
+            for code, rows in sorted(by_code.items(), key=lambda item: (pe_index_sort_key(item[0]), item[0]))
         ]
         chosen, name = pick_pe_index(by_code.keys(), pe_index)
         series_docs = by_code.get(chosen or "", [])[-days:]

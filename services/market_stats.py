@@ -4,15 +4,18 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
+ALLA_CODE = "ALLA.WI"
+
 PE_INDEX_LABELS = {
+    ALLA_CODE: "全A（自算）",
     "000001.SH": "上证指数",
     "000300.SH": "沪深300",
     "399006.SZ": "创业板指",
     "000985.SH": "中证全指",
 }
 
-# Tushare index_dailybasic 实际只有前三只；000985 若将来有数据再出现在切换里。
-PE_FALLBACK_CODES = ("000001.SH", "000300.SH", "399006.SZ", "000985.SH")
+# ALLA.WI 来自 market_pe_daily；其余来自 Tushare index_dailybasic（000985 通常无数据）。
+PE_FALLBACK_CODES = (ALLA_CODE, "000001.SH", "000300.SH", "399006.SZ", "000985.SH")
 MARGIN_ALL_EXCHANGE = "ALL"
 MARGIN_DELTA_WINDOW = 30
 
@@ -57,8 +60,30 @@ def pick_pe_index(
     return None, None
 
 
+def pe_index_sort_key(code: str) -> int:
+    try:
+        return PE_FALLBACK_CODES.index(code)
+    except ValueError:
+        return len(PE_FALLBACK_CODES)
+
+
+def merge_pe_by_code(
+    index_docs: Sequence[Dict[str, Any]],
+    alla_docs: Sequence[Dict[str, Any]] = (),
+) -> Dict[str, List[Dict[str, Any]]]:
+    by_code: Dict[str, List[Dict[str, Any]]] = {}
+    for doc in index_docs:
+        code = doc.get("ts_code")
+        if not code or code == ALLA_CODE:
+            continue
+        by_code.setdefault(str(code), []).append(doc)
+    if alla_docs:
+        by_code[ALLA_CODE] = list(alla_docs)
+    return by_code
+
+
 def serialize_pe_row(doc: Dict[str, Any]) -> Dict[str, Any]:
-    return {
+    row = {
         "trade_date": doc.get("trade_date"),
         "pe": _to_float(doc.get("pe")),
         "pe_ttm": _to_float(doc.get("pe_ttm")),
@@ -66,6 +91,10 @@ def serialize_pe_row(doc: Dict[str, Any]) -> Dict[str, Any]:
         "close": _to_float(doc.get("close")),
         "total_mv": _to_float(doc.get("total_mv")),
     }
+    for field in ("n_universe", "n_used", "n_loss", "n_missing", "method", "universe"):
+        if field in doc:
+            row[field] = doc.get(field)
+    return row
 
 
 def serialize_margin_row(doc: Dict[str, Any]) -> Dict[str, Any]:
