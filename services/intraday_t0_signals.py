@@ -826,28 +826,212 @@ def evaluate_signals_for_user(user_id: str, trade_date: Optional[str] = None) ->
     return {"success": True, "trade_date": td, "signals_count": len(signals), "evaluations_written": written}
 
 
+def _summarize_return_values(signal_type: str, values: List[float]) -> Dict[str, Any]:
+    if not values:
+        return {"count": 0, "avg_return_pct": 0.0, "win_rate": 0.0}
+    wins = [v for v in values if (v > 0 if signal_type == "BUY_WATCH" else v < 0)]
+    return {
+        "count": len(values),
+        "avg_return_pct": sum(values) / len(values),
+        "win_rate": len(wins) / len(values),
+    }
+
+
+def _group_evaluations_by_signal_horizon(
+    rows: Iterable[Dict[str, Any]],
+) -> Dict[Tuple[str, ...], List[float]]:
+    grouped: Dict[Tuple[str, ...], List[float]] = {}
+    for row in rows:
+        ret = to_float(row.get("return_pct"))
+        if ret is None:
+            continue
+        key = (
+            str(row.get("signal_type") or "UNKNOWN"),
+            str(row.get("horizon") or "unknown"),
+        )
+        grouped.setdefault(key, []).append(ret)
+    return grouped
+
+
+def _group_evaluations_by_symbol_horizon(
+    rows: Iterable[Dict[str, Any]],
+) -> Dict[Tuple[str, ...], List[float]]:
+    grouped: Dict[Tuple[str, ...], List[float]] = {}
+    for row in rows:
+        ret = to_float(row.get("return_pct"))
+        symbol = str(row.get("symbol") or "").strip()
+        if ret is None or not symbol:
+            continue
+        key = (
+            symbol,
+            str(row.get("signal_type") or "UNKNOWN"),
+            str(row.get("horizon") or "unknown"),
+        )
+        grouped.setdefault(key, []).append(ret)
+    return grouped
+
+
+def _group_evaluations_by_reason_horizon(
+    user_id: str,
+    trade_date: Optional[str],
+    evaluation_rows: Iterable[Dict[str, Any]],
+) -> Dict[Tuple[str, ...], List[float]]:
+    signal_query: Dict[str, Any] = {
+        "user_id": user_id,
+        "signal_type": {"$in": sorted(WATCH_SIGNAL_TYPES)},
+    }
+    if trade_date:
+        signal_query["trade_date"] = compact_trade_date(trade_date)
+    signals = list(
+        get_db_collections()["intraday_t0_signals"].find(
+            signal_query,
+            {"_id": 1, "reason_codes": 1, "signal_type": 1},
+        )
+    )
+    reason_by_signal = {str(doc["_id"]): doc for doc in signals}
+    grouped: Dict[Tuple[str, ...], List[float]] = {}
+    for row in evaluation_rows:
+        ret = to_float(row.get("return_pct"))
+        signal_id = str(row.get("signal_id") or "")
+        if ret is None or not signal_id:
+            continue
+        signal_doc = reason_by_signal.get(signal_id)
+        if not signal_doc:
+            continue
+        signal_type = str(signal_doc.get("signal_type") or row.get("signal_type") or "UNKNOWN")
+        if signal_type not in WATCH_SIGNAL_TYPES:
+            continue
+        horizon = str(row.get("horizon") or "unknown")
+        for reason in signal_doc.get("reason_codes") or []:
+            reason_code = str(reason or "").strip()
+            if not reason_code:
+                continue
+            grouped.setdefault((reason_code, signal_type, horizon), []).append(ret)
+    return grouped
+
+
+def _rows_from_grouped(
+    grouped: Dict[Tuple[str, ...], List[float]],
+    field_names: List[str],
+) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    for key, values in sorted(grouped.items()):
+        signal_type = key[-2]
+        stats = _summarize_return_values(signal_type, values)
+        row = dict(zip(field_names, key))
+        row.update(stats)
+        rows.append(row)
+    return rows
+
+
 def performance_summary(user_id: str, trade_date: Optional[str] = None) -> Dict[str, Any]:
     ensure_intraday_t0_indexes()
     query: Dict[str, Any] = {"user_id": user_id}
     if trade_date:
         query["trade_date"] = compact_trade_date(trade_date)
     rows = list(get_db_collections()["intraday_t0_signal_evaluations"].find(query, {"_id": 0}))
-    grouped: Dict[Tuple[str, str], List[float]] = {}
+    summary = _rows_from_grouped(
+        _group_evaluations_by_signal_horizon(rows),
+        ["signal_type", "horizon"],
+    )
+    by_symbol = _rows_from_grouped(
+        _group_evaluations_by_symbol_horizon(rows),
+        ["symbol", "signal_type", "horizon"],
+    )
+    by_reason = _rows_from_grouped(
+        _group_evaluations_by_reason_horizon(user_id, trade_date, rows),
+        ["reason_code", "signal_type", "horizon"],
+    )
+    return {
+        "success": True,
+        "data": summary,
+        "by_symbol": by_symbol,
+        "by_reason": by_reason,
+        "raw_count": len(rows),
+    }
+
+
+def _csv_cell(value: Any) -> str:
+    text = "" if value is None else str(value)
+    if any(ch in text for ch in [",", '"', "\n", "\r"]):
+        return f'"{text.replace(chr(34), chr(34) + chr(34))}"'
+    return text
+
+
+def export_signals_csv(user_id: str, trade_date: Optional[str] = None) -> str:
+    ensure_intraday_t0_indexes()
+    query: Dict[str, Any] = {"user_id": user_id}
+    if trade_date:
+        query["trade_date"] = compact_trade_date(trade_date)
+    rows = list(
+        get_db_collections()["intraday_t0_signals"]
+        .find(query, {"_id": 0})
+        .sort([("snapshot_time", -1), ("_id", -1)])
+    )
+    headers = [
+        "trade_date",
+        "snapshot_time",
+        "symbol",
+        "name",
+        "signal_type",
+        "signal_score",
+        "price",
+        "position_source",
+        "reason_codes",
+        "market_yang_spectrum",
+        "bid_ask_imbalance",
+        "intraday_position",
+        "pct_chg",
+        "pnl_pct",
+    ]
+    lines = [",".join(headers)]
     for row in rows:
-        key = (str(row.get("signal_type") or "UNKNOWN"), str(row.get("horizon") or "unknown"))
-        ret = to_float(row.get("return_pct"))
-        if ret is not None:
-            grouped.setdefault(key, []).append(ret)
-    summary = []
-    for (signal_type, horizon), values in sorted(grouped.items()):
-        wins = [v for v in values if (v > 0 if signal_type == "BUY_WATCH" else v < 0)]
-        summary.append(
-            {
-                "signal_type": signal_type,
-                "horizon": horizon,
-                "count": len(values),
-                "avg_return_pct": sum(values) / len(values),
-                "win_rate": len(wins) / len(values) if values else 0,
-            }
-        )
-    return {"success": True, "data": summary, "raw_count": len(rows)}
+        features = row.get("features") or {}
+        values = {
+            "trade_date": row.get("trade_date"),
+            "snapshot_time": row.get("snapshot_time"),
+            "symbol": row.get("symbol"),
+            "name": row.get("name"),
+            "signal_type": row.get("signal_type"),
+            "signal_score": row.get("signal_score"),
+            "price": row.get("price"),
+            "position_source": row.get("position_source"),
+            "reason_codes": "|".join(row.get("reason_codes") or []),
+            "market_yang_spectrum": features.get("market_yang_spectrum"),
+            "bid_ask_imbalance": features.get("bid_ask_imbalance"),
+            "intraday_position": features.get("intraday_position"),
+            "pct_chg": features.get("pct_chg"),
+            "pnl_pct": features.get("pnl_pct"),
+        }
+        lines.append(",".join(_csv_cell(values[header]) for header in headers))
+    return "\n".join(lines) + ("\n" if lines else "")
+
+
+def export_evaluations_csv(user_id: str, trade_date: Optional[str] = None) -> str:
+    ensure_intraday_t0_indexes()
+    query: Dict[str, Any] = {"user_id": user_id}
+    if trade_date:
+        query["trade_date"] = compact_trade_date(trade_date)
+    rows = list(
+        get_db_collections()["intraday_t0_signal_evaluations"]
+        .find(query, {"_id": 0})
+        .sort([("trade_date", -1), ("symbol", 1), ("horizon", 1)])
+    )
+    headers = [
+        "signal_id",
+        "user_id",
+        "symbol",
+        "trade_date",
+        "signal_type",
+        "horizon",
+        "base_price",
+        "future_price",
+        "future_snapshot_time",
+        "future_trade_date",
+        "return_pct",
+        "evaluated_at",
+    ]
+    lines = [",".join(headers)]
+    for row in rows:
+        lines.append(",".join(_csv_cell(row.get(header)) for header in headers))
+    return "\n".join(lines) + ("\n" if lines else "")

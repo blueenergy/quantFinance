@@ -4,6 +4,7 @@ from typing import Any, Dict, Optional
 
 from bson import ObjectId
 from fastapi import APIRouter, Body, Depends, HTTPException, Query
+from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
 from auth import get_current_active_user, require_hermes_quant_internal_key
@@ -12,6 +13,8 @@ from services.intraday_t0_signals import (
     create_mock_positions_from_watchlist,
     ensure_intraday_t0_indexes,
     evaluate_signals_for_user,
+    export_evaluations_csv,
+    export_signals_csv,
     generate_signals_for_all_users,
     generate_signals_for_user,
     get_user_positions,
@@ -236,6 +239,46 @@ def get_signal_performance(
         return performance_summary(_user_id(current_user), trade_date=trade_date)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"获取日内T+0表现统计失败: {exc}")
+
+
+@router.get("/signals/export")
+def export_signals(
+    trade_date: Optional[str] = Query(None, description="YYYYMMDD or YYYY-MM-DD"),
+    current_user: dict = Depends(get_current_active_user),
+):
+    from services.intraday_t0_signals import compact_trade_date
+
+    try:
+        td = compact_trade_date(trade_date) if trade_date else "all"
+        content = export_signals_csv(_user_id(current_user), trade_date=trade_date)
+        filename = f"intraday_t0_signals_{td}.csv"
+        return Response(
+            content=content,
+            media_type="text/csv; charset=utf-8",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"导出日内T+0信号失败: {exc}")
+
+
+@router.get("/signals/evaluations/export")
+def export_signal_evaluations(
+    trade_date: Optional[str] = Query(None, description="YYYYMMDD or YYYY-MM-DD"),
+    current_user: dict = Depends(get_current_active_user),
+):
+    from services.intraday_t0_signals import compact_trade_date
+
+    try:
+        td = compact_trade_date(trade_date) if trade_date else "all"
+        content = export_evaluations_csv(_user_id(current_user), trade_date=trade_date)
+        filename = f"intraday_t0_evaluations_{td}.csv"
+        return Response(
+            content=content,
+            media_type="text/csv; charset=utf-8",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"导出日内T+0评估失败: {exc}")
 
 
 @router.on_event("startup")

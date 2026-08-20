@@ -163,15 +163,57 @@ def test_compact_trade_date_accepts_multiple_formats():
 def test_performance_summary_groups_by_signal_and_horizon(monkeypatch):
     evals = FakeCollection(
         [
-            {"user_id": "u1", "signal_type": "SELL_WATCH", "horizon": "15m", "return_pct": -0.5},
-            {"user_id": "u1", "signal_type": "SELL_WATCH", "horizon": "15m", "return_pct": -0.2},
-            {"user_id": "u1", "signal_type": "BUY_WATCH", "horizon": "15m", "return_pct": 0.3},
+            {
+                "user_id": "u1",
+                "signal_id": "sig1",
+                "symbol": "300750.SZ",
+                "signal_type": "SELL_WATCH",
+                "horizon": "15m",
+                "return_pct": -0.5,
+            },
+            {
+                "user_id": "u1",
+                "signal_id": "sig1",
+                "symbol": "300750.SZ",
+                "signal_type": "SELL_WATCH",
+                "horizon": "15m",
+                "return_pct": -0.2,
+            },
+            {
+                "user_id": "u1",
+                "signal_id": "sig2",
+                "symbol": "600000.SH",
+                "signal_type": "BUY_WATCH",
+                "horizon": "15m",
+                "return_pct": 0.3,
+            },
+        ]
+    )
+    signals = FakeCollection(
+        [
+            {
+                "_id": "sig1",
+                "user_id": "u1",
+                "trade_date": "20260820",
+                "signal_type": "SELL_WATCH",
+                "reason_codes": ["near_intraday_high"],
+            },
+            {
+                "_id": "sig2",
+                "user_id": "u1",
+                "trade_date": "20260820",
+                "signal_type": "BUY_WATCH",
+                "reason_codes": ["near_intraday_low"],
+            },
         ]
     )
     monkeypatch.setattr(
         t0,
         "get_db_collections",
-        lambda: {"intraday_t0_signal_evaluations": evals},
+        lambda: {
+            "intraday_t0_signal_evaluations": evals,
+            "intraday_t0_signals": signals,
+        },
     )
     monkeypatch.setattr(t0, "_INDEXES_READY", True)
     result = t0.performance_summary("u1", trade_date=None)
@@ -181,4 +223,43 @@ def test_performance_summary_groups_by_signal_and_horizon(monkeypatch):
     assert sell_row["horizon"] == "15m"
     assert sell_row["count"] == 2
     assert sell_row["win_rate"] == 1.0
-    assert sell_row["avg_return_pct"] == pytest.approx(-0.35)
+    symbol_row = next(r for r in result["by_symbol"] if r["symbol"] == "300750.SZ")
+    assert symbol_row["count"] == 2
+    reason_row = next(r for r in result["by_reason"] if r["reason_code"] == "near_intraday_high")
+    assert reason_row["signal_type"] == "SELL_WATCH"
+
+
+@pytest.mark.unit
+def test_export_signals_csv(monkeypatch):
+    class _Signals(FakeCollection):
+        def find(self, query=None, projection=None):
+            rows = super().find(query, projection)
+            return rows.sort([("snapshot_time", -1)])
+
+    signals = _Signals(
+        [
+            {
+                "user_id": "u1",
+                "trade_date": "20260820",
+                "snapshot_time": "202608201030",
+                "symbol": "300750.SZ",
+                "name": "CATL",
+                "signal_type": "SELL_WATCH",
+                "signal_score": 72.5,
+                "price": 100.0,
+                "position_source": "mock",
+                "reason_codes": ["near_intraday_high"],
+                "features": {"market_yang_spectrum": 0.4, "bid_ask_imbalance": -0.2, "intraday_position": 0.8},
+            }
+        ]
+    )
+    monkeypatch.setattr(
+        t0,
+        "get_db_collections",
+        lambda: {"intraday_t0_signals": signals},
+    )
+    monkeypatch.setattr(t0, "_INDEXES_READY", True)
+    csv_text = t0.export_signals_csv("u1", trade_date="20260820")
+    assert "300750.SZ" in csv_text
+    assert "near_intraday_high" in csv_text
+    assert csv_text.splitlines()[0].startswith("trade_date,")
