@@ -11,10 +11,10 @@ from __future__ import annotations
 
 import argparse
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-from pymongo import ASCENDING, DESCENDING, MongoClient
+from pymongo import MongoClient
 from pymongo.collection import Collection
 from pymongo.database import Database
 
@@ -268,6 +268,16 @@ EXPECTED: Dict[str, List[IndexSpec]] = {
                   reason="盈利预告最新"),
         IndexSpec("earnings_disclosure", [("ts_code", 1), ("end_date", -1)],
                   reason="业绩披露日历"),
+        IndexSpec("daily_gold_snapshots", [("recipe_id", 1), ("score_date", -1)],
+                  unique=True, reason="每日金股快照"),
+        IndexSpec("daily_gold_lots", [("recipe_id", 1), ("lot_id", 1)],
+                  unique=True, reason="每日金股账本 lot"),
+        IndexSpec("daily_gold_lots", [("recipe_id", 1), ("symbol", 1), ("entry_score_date", 1)],
+                  unique=True, reason="同一配方同日信号仅创建一笔"),
+        IndexSpec("daily_gold_lots", [("recipe_id", 1), ("status", 1), ("symbol", 1)],
+                  reason="每日金股活跃仓位查询"),
+        IndexSpec("daily_gold_lots", [("recipe_id", 1), ("status", 1), ("exit_date", -1)],
+                  reason="每日金股已结束战绩查询"),
     ],
 }
 

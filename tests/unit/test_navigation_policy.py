@@ -25,6 +25,7 @@ def test_compute_visible_tab_ids_admin_sees_all():
     assert "data-pulse" in ids
     assert "market-analysis" in ids
     assert "limit-up-ladder" in ids
+    assert "daily-gold-picks" in ids
     assert "market-regime" in ids
 
 

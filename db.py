@@ -210,6 +210,8 @@ def get_data_db():
         "sector_flow": data_db["sector_flow"],
         "theme_lag_candidates": data_db["theme_lag_candidates"],
         "theme_lag_candidate_validation": data_db["theme_lag_candidate_validation"],
+        "daily_gold_snapshots": data_db["daily_gold_snapshots"],
+        "daily_gold_lots": data_db["daily_gold_lots"],
         # Market sentiment
         "market_spectrum": data_db["market_spectrum"],
         "market_spectrum_minute": data_db["market_spectrum_minute"],

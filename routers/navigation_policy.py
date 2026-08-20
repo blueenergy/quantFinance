@@ -28,6 +28,7 @@ KNOWN_MAIN_TABS: List[tuple] = [
     ("us-rates", False),
     ("x-influencer-voices", False),
     ("theme-lag-recommend", False),
+    ("daily-gold-picks", False),
     ("sector-concept", True),
     ("hot-stock", True),
     ("etf", True),
