@@ -37,11 +37,12 @@ def test_compute_visible_tab_ids_free_inherit_excludes_req_vip_tabs():
     assert ids[0] == "market-events"
     assert ids.index("market-events") < ids.index("global-market-brief")
     assert ids.index("global-market-brief") < ids.index("limit-up-ladder")
-    assert ids.index("market-risk") < ids.index("market-regime") < ids.index("china-macro")
+    assert ids.index("market-risk") < ids.index("market-regime") < ids.index("market-stats") < ids.index("china-macro")
     assert "data-pulse" in ids
     assert "market-analysis" in ids
     assert "limit-up-ladder" in ids
     assert "market-regime" in ids
+    assert "market-stats" in ids
 
 
 @pytest.mark.unit

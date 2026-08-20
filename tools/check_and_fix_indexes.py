@@ -251,6 +251,10 @@ EXPECTED: Dict[str, List[IndexSpec]] = {
         IndexSpec("fund_holdings", [("ts_code", 1), ("end_date", -1)],
                   reason="基金持仓最新"),
         # 宏观 / 利率
+        IndexSpec("index_daily_basic", [("ts_code", 1), ("trade_date", 1)],
+                  unique=True, reason="指数估值按代码+日期"),
+        IndexSpec("margin_market_daily", [("trade_date", 1), ("exchange_id", 1)],
+                  unique=True, reason="两融按日期+交易所"),
         IndexSpec("us_rates_daily", [("trade_date", -1)], reason="美债利率最新"),
         IndexSpec("global_market_daily", [("symbol", 1), ("trade_date", -1)],
                   reason="全球行情最新"),

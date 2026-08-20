@@ -73,6 +73,7 @@ from routers.strategy_workers import router as strategy_workers_router
 from routers.limit_up_ladder import router as ladder_router
 from routers.risk_report import router as risk_report_router
 from routers.market_regime import router as market_regime_router
+from routers.market_stats import router as market_stats_router
 from routers.x_influencer import router as x_influencer_router
 from routers.scheduler_admin import router as scheduler_admin_router
 from routers.sector_concept import router as sector_concept_router
@@ -205,6 +206,7 @@ if not _MCP_ONLY_PROCESS:
 app.include_router(ladder_router, prefix="/api", tags=["连板天梯"])
 app.include_router(risk_report_router, prefix="/api", tags=["市场风险预警"])
 app.include_router(market_regime_router, prefix="/api", tags=["A股广度估值扫描"])
+app.include_router(market_stats_router, prefix="/api", tags=["市场统计"])
 app.include_router(x_influencer_router, prefix="/api", tags=["X大V情报"])
 app.include_router(scheduler_admin_router, prefix="/api/admin/scheduler", tags=["定时任务管理"])
 app.include_router(sector_concept_router, prefix="/api", tags=["板块与概念解析"])
