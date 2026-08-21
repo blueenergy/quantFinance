@@ -114,7 +114,9 @@ def aggregate_stats(closed_lots: List[Dict[str, Any]]) -> Dict[str, Any]:
     losses = [r for r in rets if r <= 0]
     avg_win = sum(wins) / len(wins) if wins else None
     avg_loss = sum(abs(r) for r in losses) / len(losses) if losses else None
-    profit_factor = (avg_win / avg_loss) if avg_win is not None and avg_loss and avg_loss > 0 else None
+    payoff_ratio = (avg_win / avg_loss) if avg_win is not None and avg_loss and avg_loss > 0 else None
+    gross_loss = sum(abs(r) for r in losses)
+    profit_factor = (sum(wins) / gross_loss) if gross_loss > 0 else None
     trailing = [lot for lot in scored if lot.get("outcome") == "trailing_stop"]
     return {
         "closed_count": len(closed_lots),
@@ -124,6 +126,7 @@ def aggregate_stats(closed_lots: List[Dict[str, Any]]) -> Dict[str, Any]:
         "loss_count": len(losses),
         "win_rate": (len(wins) / len(scored)) if scored else None,
         "avg_return_pct": (sum(rets) / len(rets)) if rets else None,
+        "payoff_ratio": payoff_ratio,
         "profit_factor": profit_factor,
         "trailing_stop_count": len(trailing),
         "trailing_stop_win_count": sum(1 for lot in trailing if float(lot.get("return_pct") or 0) > 0),

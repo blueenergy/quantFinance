@@ -110,12 +110,15 @@ def test_aggregate_stats_win_rate():
     stats = aggregate_stats(
         [
             {"outcome": "trailing_stop", "return_pct": 0.04},
+            {"outcome": "expire", "return_pct": 0.02},
             {"outcome": "trailing_stop", "return_pct": -0.02},
             {"outcome": "insufficient_data", "return_pct": None},
         ]
     )
-    assert stats["scored_count"] == 2
-    assert stats["win_rate"] == pytest.approx(0.5)
+    assert stats["scored_count"] == 3
+    assert stats["win_rate"] == pytest.approx(2 / 3)
+    assert stats["payoff_ratio"] == pytest.approx(1.5)
+    assert stats["profit_factor"] == pytest.approx(3.0)
 
 
 @pytest.mark.unit
