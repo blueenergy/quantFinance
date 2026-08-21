@@ -20,6 +20,7 @@ RECIPES: Dict[str, Dict[str, Any]] = {
         "hold_top_n": 20,
         "rebalance_trading_days": 20,
         "trailing_stop_pct": 0.08,
+        "loss_stop_cooldown_trading_days": 5,
     },
     "daily_gold_v1_hs300_g60c40": {
         "recipe_id": "daily_gold_v1_hs300_g60c40",
@@ -31,6 +32,7 @@ RECIPES: Dict[str, Dict[str, Any]] = {
         "hold_top_n": 20,
         "rebalance_trading_days": 20,
         "trailing_stop_pct": 0.08,
+        "loss_stop_cooldown_trading_days": 5,
     },
 }
 

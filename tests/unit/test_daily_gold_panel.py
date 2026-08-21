@@ -175,6 +175,7 @@ def test_build_daily_gold_panel_merges_rank_delta():
     assert panel["success"] is True
     assert panel["score_date"] == "20260820"
     assert len(panel["recipes"]) == 2
+    assert panel["recipe"]["loss_stop_cooldown_trading_days"] == 5
     assert panel["top10"][0]["prev_rank"] == 2
     assert panel["top10"][0]["rank_delta"] == 1
     assert len(panel["open_lots"]) == 1
