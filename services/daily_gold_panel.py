@@ -146,6 +146,7 @@ def build_daily_gold_panel(
     recipe = RECIPES[rid]
     snapshots_col = data_db["daily_gold_snapshots"]
     lots_col = data_db["daily_gold_lots"]
+    twr_col = data_db["daily_gold_twr"]
 
     requested = normalize_score_date(score_date)
     if score_date and not requested:
@@ -231,6 +232,18 @@ def build_daily_gold_panel(
     )
     closed_lots = closed_as_of[: max(1, int(closed_limit))]
     stats = aggregate_stats(closed_as_of)
+    strategy_twr = (
+        twr_col.find_one(
+            {
+                "recipe_id": rid,
+                "score_date": {"$lte": resolved_date},
+            },
+            projection={"_id": 0},
+            sort=[("score_date", -1)],
+        )
+        if resolved_date
+        else None
+    )
 
     return {
         "success": True,
@@ -246,4 +259,5 @@ def build_daily_gold_panel(
         "open_lots": [_lot_public(lot) for lot in open_lots],
         "recent_closed": [_lot_public(lot) for lot in closed_lots],
         "stats": stats,
+        "strategy_twr": _jsonify(strategy_twr) if strategy_twr else None,
     }

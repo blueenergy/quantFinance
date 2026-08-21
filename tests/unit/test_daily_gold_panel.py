@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 from bson import ObjectId
 
+from db import get_data_db
 from services.daily_gold_panel import (
     DEFAULT_RECIPE_ID,
     _jsonify,
@@ -94,6 +95,11 @@ def test_resolve_recipe_id_defaults():
 
 
 @pytest.mark.unit
+def test_data_db_exposes_daily_gold_twr_collection():
+    assert "daily_gold_twr" in get_data_db()
+
+
+@pytest.mark.unit
 def test_jsonify_converts_mongo_object_id():
     object_id = ObjectId()
     assert _jsonify({"_id": object_id}) == {"_id": str(object_id)}
@@ -149,6 +155,22 @@ def test_build_daily_gold_panel_merges_rank_delta():
             "entry_score_date": "20260819",
         }
     )
+    data_db["daily_gold_twr"].docs.extend(
+        [
+            {
+                "recipe_id": DEFAULT_RECIPE_ID,
+                "score_date": "20260819",
+                "cumulative_return": 0.08,
+            },
+            {
+                "recipe_id": DEFAULT_RECIPE_ID,
+                "score_date": "20260820",
+                "cumulative_return": 0.10,
+                "max_drawdown": -0.03,
+                "active_lots": 12,
+            },
+        ]
+    )
     panel = build_daily_gold_panel(data_db=data_db, recipe_id=DEFAULT_RECIPE_ID, score_date="20260820")
     assert panel["success"] is True
     assert panel["score_date"] == "20260820"
@@ -156,6 +178,8 @@ def test_build_daily_gold_panel_merges_rank_delta():
     assert panel["top10"][0]["prev_rank"] == 2
     assert panel["top10"][0]["rank_delta"] == 1
     assert len(panel["open_lots"]) == 1
+    assert panel["strategy_twr"]["cumulative_return"] == pytest.approx(0.10)
+    assert panel["strategy_twr"]["active_lots"] == 12
 
 
 @pytest.mark.unit
@@ -196,6 +220,20 @@ def test_historical_panel_excludes_future_exit_and_current_peak():
             "outcome": "trailing_stop",
         }
     )
+    data_db["daily_gold_twr"].docs.extend(
+        [
+            {
+                "recipe_id": DEFAULT_RECIPE_ID,
+                "score_date": "20260819",
+                "cumulative_return": 0.05,
+            },
+            {
+                "recipe_id": DEFAULT_RECIPE_ID,
+                "score_date": "20260820",
+                "cumulative_return": 0.08,
+            },
+        ]
+    )
 
     panel = build_daily_gold_panel(
         data_db=data_db,
@@ -207,3 +245,4 @@ def test_historical_panel_excludes_future_exit_and_current_peak():
     assert panel["recent_closed"] == []
     assert panel["open_lots"][0]["status"] == "open"
     assert panel["open_lots"][0]["peak_high"] is None
+    assert panel["strategy_twr"]["cumulative_return"] == pytest.approx(0.05)

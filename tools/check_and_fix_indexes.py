@@ -278,6 +278,8 @@ EXPECTED: Dict[str, List[IndexSpec]] = {
                   reason="每日金股活跃仓位查询"),
         IndexSpec("daily_gold_lots", [("recipe_id", 1), ("status", 1), ("exit_date", -1)],
                   reason="每日金股已结束战绩查询"),
+        IndexSpec("daily_gold_twr", [("recipe_id", 1), ("score_date", -1)],
+                  unique=True, reason="每日金股可变投入 TWR 曲线"),
     ],
 }
 
