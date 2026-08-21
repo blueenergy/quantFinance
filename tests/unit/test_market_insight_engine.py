@@ -52,8 +52,17 @@ class FakeCollection:
 
     def _match(self, row, query):
         for key, value in query.items():
+            if key == "$or":
+                if not any(self._match(row, clause) for clause in value):
+                    return False
+                continue
             current = row.get(key)
             if isinstance(value, dict):
+                if "$exists" in value:
+                    exists = key in row and row.get(key) is not None
+                    if bool(value["$exists"]) != exists:
+                        return False
+                    continue
                 if "$gt" in value and not (current > value["$gt"]):
                     return False
                 if "$lte" in value and not (current <= value["$lte"]):
@@ -982,6 +991,41 @@ def test_get_market_insight_focus_includes_existing_review(monkeypatch):
     assert result["data"][0]["review"]["status"] == "confirmed"
     assert result["data"][0]["review"]["label"] == "已验证"
     assert result["data"][0]["review"]["summary"] == "已延续"
+
+
+@pytest.mark.unit
+def test_get_market_insight_overview_pins_ma5_and_exposes_both_periods(monkeypatch):
+    realtime = {
+        "market_spectrum_realtime_daily": FakeCollection(
+            [
+                {
+                    "snapshot_trade_date": "20260515",
+                    "snapshot_time": "202605151030",
+                    "ma_period": 30,
+                    "granularity": "daily_realtime",
+                    "yang_spectrum": 0.62,
+                },
+                {
+                    "snapshot_trade_date": "20260515",
+                    "snapshot_time": "202605151030",
+                    "ma_period": 5,
+                    "granularity": "daily_realtime",
+                    "yang_spectrum": 0.48,
+                },
+            ]
+        ),
+    }
+    finance = {"market_insight_events": FakeCollection([])}
+    monkeypatch.setattr(engine, "get_data_db", lambda: realtime)
+    monkeypatch.setattr(engine, "get_db_collections", lambda: finance)
+
+    overview = engine.get_market_insight_overview("20260515")
+
+    assert overview["latest_spectrum"]["yang_spectrum"] == pytest.approx(0.48)
+    assert overview["spectra_by_ma_period"]["5"]["yang_spectrum"] == pytest.approx(0.48)
+    assert overview["spectra_by_ma_period"]["30"]["yang_spectrum"] == pytest.approx(0.62)
+    assert overview["market_state"] == "分化/震荡"
+    assert overview["market_state_ma_period"] == 5
 
 
 @pytest.mark.unit

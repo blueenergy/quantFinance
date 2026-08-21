@@ -22,6 +22,10 @@ EVENT_TYPES = {
     "VOLUME_QUALITY_SHIFT",
 }
 
+# Short-term insight logic uses MA5 realtime spectrum; MA30 is shown for context only.
+MARKET_INSIGHT_PRIMARY_MA_PERIOD = 5
+MARKET_INSIGHT_DISPLAY_MA_PERIODS = (5, 30)
+
 EVENT_TYPE_METADATA: Dict[str, Dict[str, Any]] = {
     "MARKET_BREADTH_RECOVERY": {
         "label": "广度修复",
@@ -201,10 +205,40 @@ def _snapshot_plus(snapshot_time: str, minutes: int) -> str:
     return (dt + timedelta(minutes=minutes)).strftime("%Y%m%d%H%M")
 
 
-def _latest_spectrum(trade_date: str) -> Dict[str, Any]:
+def _spectrum_ma_period_clause(ma_period: int) -> Dict[str, Any]:
+    """Pin realtime spectrum reads to one MA period (legacy rows default to MA5)."""
+    if ma_period == MARKET_INSIGHT_PRIMARY_MA_PERIOD:
+        return {
+            "$or": [
+                {"ma_period": ma_period, "granularity": "daily_realtime"},
+                {"ma_period": {"$exists": False}},
+            ]
+        }
+    return {"ma_period": ma_period, "granularity": "daily_realtime"}
+
+
+def _spectrum_query(
+    trade_date: str,
+    ma_period: int,
+    *,
+    snapshot_time_lte: Optional[str] = None,
+) -> Dict[str, Any]:
+    query: Dict[str, Any] = {
+        "snapshot_trade_date": trade_date,
+        **_spectrum_ma_period_clause(ma_period),
+    }
+    if snapshot_time_lte:
+        query["snapshot_time"] = {"$lte": snapshot_time_lte}
+    return query
+
+
+def _latest_spectrum(
+    trade_date: str,
+    ma_period: int = MARKET_INSIGHT_PRIMARY_MA_PERIOD,
+) -> Dict[str, Any]:
     return (
         get_data_db()["market_spectrum_realtime_daily"].find_one(
-            {"snapshot_trade_date": trade_date},
+            _spectrum_query(trade_date, ma_period),
             {"_id": 0},
             sort=[("snapshot_time", DESCENDING)],
         )
@@ -212,11 +246,16 @@ def _latest_spectrum(trade_date: str) -> Dict[str, Any]:
     )
 
 
-def _previous_spectrum(trade_date: str, snapshot_time: str, minutes: int = 15) -> Dict[str, Any]:
+def _previous_spectrum(
+    trade_date: str,
+    snapshot_time: str,
+    minutes: int = 15,
+    ma_period: int = MARKET_INSIGHT_PRIMARY_MA_PERIOD,
+) -> Dict[str, Any]:
     target = _snapshot_minus(snapshot_time, minutes)
     return (
         get_data_db()["market_spectrum_realtime_daily"].find_one(
-            {"snapshot_trade_date": trade_date, "snapshot_time": {"$lte": target}},
+            _spectrum_query(trade_date, ma_period, snapshot_time_lte=target),
             {"_id": 0},
             sort=[("snapshot_time", DESCENDING)],
         )
@@ -640,7 +679,11 @@ def _build_early_sector_diffusion_event(
 
 def get_market_insight_overview(trade_date: Optional[str] = None) -> Dict[str, Any]:
     td = _compact_trade_date(trade_date)
-    spectrum = _latest_spectrum(td)
+    spectrum = _latest_spectrum(td, MARKET_INSIGHT_PRIMARY_MA_PERIOD)
+    spectra_by_ma_period = {
+        str(period): _latest_spectrum(td, period)
+        for period in MARKET_INSIGHT_DISPLAY_MA_PERIODS
+    }
     latest_event = get_db_collections()["market_insight_events"].find_one(
         {"trade_date": td}, {"_id": 0, "snapshot_time": 1}, sort=[("snapshot_time", DESCENDING)]
     )
@@ -658,7 +701,9 @@ def get_market_insight_overview(trade_date: Optional[str] = None) -> Dict[str, A
         "success": True,
         "trade_date": td,
         "market_state": state,
+        "market_state_ma_period": MARKET_INSIGHT_PRIMARY_MA_PERIOD,
         "latest_spectrum": spectrum,
+        "spectra_by_ma_period": spectra_by_ma_period,
         "latest_event_snapshot_time": (latest_event or {}).get("snapshot_time"),
         "event_count": event_count,
     }
