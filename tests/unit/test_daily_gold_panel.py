@@ -155,6 +155,36 @@ def test_build_daily_gold_panel_merges_rank_delta():
             "entry_score_date": "20260819",
         }
     )
+    data_db["daily_gold_lots"].docs.append(
+        {
+            "recipe_id": DEFAULT_RECIPE_ID,
+            "lot_id": "closed-lot",
+            "symbol": "000002.SZ",
+            "status": "closed",
+            "entry_score_date": "20260818",
+            "entry_date": "20260819",
+            "entry_price": 10,
+            "entry_adjusted_price": 10,
+            "exit_date": "20260820",
+            "exit_price": 9,
+            "return_pct": -0.1,
+            "outcome": "trailing_stop",
+        }
+    )
+    data_db["volume_price"].docs.append(
+        {
+            "symbol": "000002.SZ",
+            "trade_date": "20260821",
+            "close": 6,
+        }
+    )
+    data_db["stock_adj_factor"].docs.append(
+        {
+            "symbol": "000002.SZ",
+            "trade_date": "20260821",
+            "adj_factor": 2,
+        }
+    )
     data_db["daily_gold_twr"].docs.extend(
         [
             {
@@ -179,6 +209,8 @@ def test_build_daily_gold_panel_merges_rank_delta():
     assert panel["top10"][0]["prev_rank"] == 2
     assert panel["top10"][0]["rank_delta"] == 1
     assert len(panel["open_lots"]) == 1
+    assert panel["recent_closed"][0]["hold_to_latest_return_pct"] == pytest.approx(0.2)
+    assert panel["recent_closed"][0]["hold_to_latest_date"] == "20260821"
     assert panel["strategy_twr"]["cumulative_return"] == pytest.approx(0.10)
     assert panel["strategy_twr"]["active_lots"] == 12
 

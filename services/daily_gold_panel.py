@@ -87,6 +87,78 @@ def _lot_public(lot: Dict[str, Any]) -> Dict[str, Any]:
     return row
 
 
+def _positive_float(value: Any) -> Optional[float]:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number > 0 else None
+
+
+def _attach_hold_to_latest_returns(data_db, lots: List[Dict[str, Any]]) -> None:
+    """Add a post-exit, HFQ-comparable return for recent closed lots."""
+    daily_col = data_db["volume_price"]
+    factor_col = data_db["stock_adj_factor"]
+    realtime_col = data_db.get("volume_price_realtime_latest")
+    today = datetime.now().strftime("%Y%m%d")
+
+    for lot in lots:
+        symbol = str(lot.get("symbol") or "")
+        entry_adjusted = _positive_float(lot.get("entry_adjusted_price"))
+        if entry_adjusted is None:
+            entry_price = _positive_float(lot.get("entry_price"))
+            entry_factor = _positive_float(lot.get("entry_adj_factor"))
+            if entry_price is not None and entry_factor is not None:
+                entry_adjusted = entry_price * entry_factor
+        if not symbol or entry_adjusted is None:
+            continue
+
+        candidates = []
+        daily = daily_col.find_one(
+            {"symbol": symbol, "trade_date": {"$lte": today}},
+            projection={"_id": 0, "trade_date": 1, "close": 1},
+            sort=[("trade_date", -1)],
+        )
+        if daily:
+            candidates.append((str(daily.get("trade_date") or ""), 0, "daily_close", daily))
+        if realtime_col is not None:
+            realtime = realtime_col.find_one(
+                {"symbol": symbol},
+                projection={"_id": 0, "trade_date": 1, "snapshot_time": 1, "close": 1},
+            )
+            if realtime and str(realtime.get("trade_date") or "") <= today:
+                candidates.append(
+                    (
+                        str(realtime.get("trade_date") or ""),
+                        1,
+                        "realtime",
+                        realtime,
+                    )
+                )
+        candidates = [
+            candidate
+            for candidate in candidates
+            if candidate[0] and _positive_float(candidate[3].get("close")) is not None
+        ]
+        if not candidates:
+            continue
+        mark_date, _, mark_source, mark = max(candidates, key=lambda candidate: (candidate[0], candidate[1]))
+        factor = factor_col.find_one(
+            {"symbol": symbol, "trade_date": {"$lte": mark_date}},
+            projection={"_id": 0, "adj_factor": 1},
+            sort=[("trade_date", -1)],
+        )
+        mark_factor = _positive_float((factor or {}).get("adj_factor"))
+        mark_close = _positive_float(mark.get("close"))
+        if mark_factor is None or mark_close is None:
+            continue
+        mark_adjusted = mark_close * mark_factor
+        lot["hold_to_latest_return_pct"] = mark_adjusted / entry_adjusted - 1.0
+        lot["hold_to_latest_date"] = mark_date
+        lot["hold_to_latest_price"] = mark_close
+        lot["hold_to_latest_price_source"] = mark_source
+
+
 def latest_snapshot_date(snapshots_col, recipe_id: str, end_date: Optional[str] = None) -> Optional[str]:
     query: Dict[str, Any] = {"recipe_id": recipe_id}
     if end_date:
@@ -233,6 +305,7 @@ def build_daily_gold_panel(
         reverse=True,
     )
     closed_lots = closed_as_of[: max(1, int(closed_limit))]
+    _attach_hold_to_latest_returns(data_db, closed_lots)
     stats = aggregate_stats(closed_as_of)
     strategy_twr = (
         twr_col.find_one(
