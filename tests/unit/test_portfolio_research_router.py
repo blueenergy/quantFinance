@@ -330,6 +330,46 @@ def test_create_portfolio_research_job_accepts_regime_cash_on_any_universe(monke
 
 
 @pytest.mark.unit
+def test_create_portfolio_research_job_accepts_cash_only_regime_modes(monkeypatch):
+    collections = _collections()
+    monkeypatch.setattr(portfolio_research, "get_trading_db_collections", lambda: collections)
+
+    response = asyncio.run(
+        portfolio_research.create_portfolio_research_job(
+            portfolio_research.CreateResearchJobRequest(
+                name="research",
+                universe_index="csi1000",
+                start_date="2025-01-01",
+                end_date="2025-01-31",
+                regime_modes=["bull_g60_else_cash"],
+            ),
+            current_user={"id": "user-1"},
+        )
+    )
+
+    assert response["success"] is True
+    params = collections["portfolio_research_jobs"].docs[0]["params"]
+    assert params["regime_modes"] == ["bull_g60_else_cash"]
+    assert params["regime_cash"] is False
+
+
+@pytest.mark.unit
+def test_research_job_requests_reject_invalid_or_empty_regime_modes():
+    common = {
+        "name": "research",
+        "start_date": "2025-01-01",
+        "end_date": "2025-01-31",
+    }
+
+    with pytest.raises(ValueError):
+        portfolio_research.CreateResearchJobRequest(**common, regime_modes=["bogus"])
+    with pytest.raises(ValueError):
+        portfolio_research.CreateResearchJobRequest(**common, regime_modes=[])
+    with pytest.raises(ValueError):
+        portfolio_research.RerunResearchJobRequest(regime_modes=["bogus"])
+
+
+@pytest.mark.unit
 def test_list_portfolio_research_jobs_includes_timing_and_progress_fields(monkeypatch):
     collections = _collections()
     monkeypatch.setattr(portfolio_research, "get_trading_db_collections", lambda: collections)
@@ -800,7 +840,10 @@ def test_publish_portfolio_research_result_creates_parameter_preset(monkeypatch)
             "result_id": "result-1",
             "job_id": "job-1",
             "user_id": "user-1",
-            "best_row": {"risk_adjusted_score": 1.2},
+            "best_row": {
+                "risk_adjusted_score": 1.2,
+                "regime_mode": "bull_g60_else_cash",
+            },
             "data_watermark": {"stock_scores_max_date": "20250131"},
             "candidate_strategy_config": {
                 "preset_id": "research_strategy",
@@ -827,6 +870,7 @@ def test_publish_portfolio_research_result_creates_parameter_preset(monkeypatch)
     assert preset["source"] == "portfolio_research"
     assert preset["research_job_id"] == "job-1"
     assert preset["params"]["top_n"] == 10
+    assert preset["params"]["regime_cash"] is True
     assert collections["portfolio_research_reviews"].docs[0]["decision"] == "preset_published"
 
 
@@ -1166,6 +1210,7 @@ def test_publish_portfolio_research_result_uses_selected_row(monkeypatch):
                     "rebalance_interval_days": 20,
                     "trailing_stop_pct": 0.15,
                     "construction_mode": "top_n",
+                    "regime_mode": "bull_g60_else_cash",
                 },
             ),
             current_user={"id": "user-1", "username": "alice"},
@@ -1175,6 +1220,7 @@ def test_publish_portfolio_research_result_uses_selected_row(monkeypatch):
     preset = collections["portfolio_strategy_param_presets"].find_one({"preset_id": response["data"]["preset"]["preset_id"]})
     assert preset["params"]["top_n"] == 20
     assert preset["params"]["trailing_stop_pct"] == 0.15
+    assert preset["params"]["regime_cash"] is True
     # Selection-mode keys stay out of preset params so params_hash keeps matching
     # presets published before dynamic thresholds existed.
     assert "selection_mode" not in preset["params"]

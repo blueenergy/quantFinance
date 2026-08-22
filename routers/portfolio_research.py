@@ -98,6 +98,7 @@ ScoreSpec = Annotated[
     Union[ColumnScoreSpec, WeightedScoreSpec],
     Field(discriminator="mode"),
 ]
+RegimeMode = Literal["off", "bull_g60_else_cash"]
 
 
 class CreateResearchJobRequest(BaseModel):
@@ -129,7 +130,12 @@ class CreateResearchJobRequest(BaseModel):
     industry_l1: Optional[str] = Field(default=None, description="Optional Shenwan L1 code or name filter")
     regime_cash: bool = Field(
         default=False,
-        description="If true, sweep always-invest vs bull-invest/non-bull-cash. Not universe-gated.",
+        description="If true and regime_modes is omitted, run only bull-invest / non-bull-cash.",
+    )
+    regime_modes: Optional[List[RegimeMode]] = Field(
+        default=None,
+        min_length=1,
+        description="Position modes to sweep: off and/or bull_g60_else_cash. Independent first-class arms.",
     )
     force: bool = Field(default=False)
 
@@ -206,6 +212,7 @@ class RerunResearchJobRequest(BaseModel):
     trailing_stop_pcts: Optional[List[float]] = None
     industry_l1: Optional[str] = None
     regime_cash: Optional[bool] = None
+    regime_modes: Optional[List[RegimeMode]] = Field(default=None, min_length=1)
     force: bool = Field(default=True, description="Default true so a rerun is not skipped by cache/idempotency")
 
     @field_validator(
@@ -227,7 +234,7 @@ class RerunResearchJobRequest(BaseModel):
     def _optional_blank(cls, value: Any) -> Any:
         return _blank_to_none(value)
 
-    @field_validator("rebalance_interval_days", "top_n_values", "active_caps", "trailing_stop_pcts", mode="before")
+    @field_validator("rebalance_interval_days", "top_n_values", "active_caps", "trailing_stop_pcts", "regime_modes", mode="before")
     @classmethod
     def _drop_null_list_items(cls, value: Any) -> Any:
         """Axios JSON-encodes NaN as null; drop those items instead of 422."""
@@ -422,6 +429,7 @@ PRESET_PARAM_KEYS = {
     "trailing_stop_pct",
     "candidate_pool_enabled",
     "industry_l1",
+    "regime_cash",
 }
 
 
@@ -498,7 +506,7 @@ def _candidate_strategy_config_from_row(job: Dict[str, Any], row: Dict[str, Any]
             trailing_stop_pct = None
     else:
         trailing_stop_pct = params.get("trailing_stop_pct")
-    return {
+    candidate = {
         "preset_id": preset_id,
         "strategy_template_id": "growth_cycle_index_enhanced",
         "name": f"{universe.upper()} {score_variant} {variant} Top{top_n} {rebalance_days}d",
@@ -532,6 +540,9 @@ def _candidate_strategy_config_from_row(job: Dict[str, Any], row: Dict[str, Any]
         "status": "draft",
         "version": 1,
     }
+    if str(row.get("regime_mode") or "off") == "bull_g60_else_cash":
+        candidate["regime_cash"] = True
+    return candidate
 
 
 def _load_full_result_rows(result: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -1161,6 +1172,13 @@ async def publish_portfolio_research_result(
     candidate = dict(result.get("candidate_strategy_config") or {})
     if request.selected_row:
         candidate = _candidate_strategy_config_from_row(job, request.selected_row)
+    elif (
+        "regime_cash" not in candidate
+        and str((result.get("best_row") or {}).get("regime_mode") or "off") == "bull_g60_else_cash"
+    ):
+        # Backfill results emitted by workers from before regime mode was
+        # included in candidate_strategy_config.
+        candidate["regime_cash"] = True
     if not candidate:
         raise HTTPException(status_code=400, detail="candidate strategy config is missing")
     job_params = job.get("params") or {}
