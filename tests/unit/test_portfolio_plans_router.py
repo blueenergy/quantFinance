@@ -26,13 +26,10 @@ def test_portfolio_param_summary_flags_csi1000_cash_overlay():
     ) == "csi1000 · Top20 · 20d · top_n · 非牛空仓"
 
 
-def test_validate_params_override_rejects_regime_cash_outside_csi1000():
-    with pytest.raises(Exception) as exc:
-        portfolio_plans._validate_params_override({"universe_index": "csi500", "regime_cash": True})
-    assert exc.value.status_code == 400
-    assert "中证1000" in str(exc.value.detail)
+def test_validate_params_override_allows_regime_cash_on_any_universe():
+    portfolio_plans._validate_params_override({"universe_index": "csi500", "regime_cash": True})
     portfolio_plans._validate_params_override({"universe_index": "csi1000", "regime_cash": True})
-    portfolio_plans._validate_params_override({"universe_index": "csi500", "regime_cash": False})
+    portfolio_plans._validate_params_override({"universe_index": "hs300", "regime_cash": False})
 
 
 def test_normalize_live_target_shares_non_star_uses_legacy_lot_rounding():

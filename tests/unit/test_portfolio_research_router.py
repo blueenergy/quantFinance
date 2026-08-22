@@ -306,6 +306,30 @@ def test_create_portfolio_research_job_accepts_trailing_stop_pcts(monkeypatch):
 
 
 @pytest.mark.unit
+def test_create_portfolio_research_job_accepts_regime_cash_on_any_universe(monkeypatch):
+    collections = _collections()
+    monkeypatch.setattr(portfolio_research, "get_trading_db_collections", lambda: collections)
+
+    response = asyncio.run(
+        portfolio_research.create_portfolio_research_job(
+            portfolio_research.CreateResearchJobRequest(
+                name="research",
+                universe_index="csi500",
+                start_date="2025-01-01",
+                end_date="2025-01-31",
+                regime_cash=True,
+            ),
+            current_user={"id": "user-1"},
+        )
+    )
+
+    assert response["success"] is True
+    params = collections["portfolio_research_jobs"].docs[0]["params"]
+    assert params["universe_index"] == "csi500"
+    assert params["regime_cash"] is True
+
+
+@pytest.mark.unit
 def test_list_portfolio_research_jobs_includes_timing_and_progress_fields(monkeypatch):
     collections = _collections()
     monkeypatch.setattr(portfolio_research, "get_trading_db_collections", lambda: collections)

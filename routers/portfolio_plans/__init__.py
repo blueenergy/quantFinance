@@ -1118,14 +1118,6 @@ def _validate_params_override(params: Dict[str, Any]) -> None:
             raise HTTPException(status_code=400, detail="growth_weight and cycle_weight must be between 0 and 1")
         if abs((growth + cycle) - 1) > 1e-6:
             raise HTTPException(status_code=400, detail="growth_weight and cycle_weight must add up to 1")
-    regime_cash = params.get("regime_cash")
-    if regime_cash in {True, "true", "True", "1", "on", "yes"}:
-        universe = str(params.get("universe_index") or "csi1000").strip().lower()
-        if universe != "csi1000":
-            raise HTTPException(
-                status_code=400,
-                detail="非牛空仓仅适用于中证1000（csi1000）。同一规则在中证500上伤害收益，不得用于其它股票池。",
-            )
     if params.get("initial_capital") is not None:
         try:
             initial_capital = float(params["initial_capital"])

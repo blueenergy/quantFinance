@@ -127,6 +127,10 @@ class CreateResearchJobRequest(BaseModel):
     trailing_stop_pct: Optional[float] = Field(default=None, ge=0, le=1)
     trailing_stop_pcts: Optional[List[float]] = None
     industry_l1: Optional[str] = Field(default=None, description="Optional Shenwan L1 code or name filter")
+    regime_cash: bool = Field(
+        default=False,
+        description="If true, sweep always-invest vs bull-invest/non-bull-cash. Not universe-gated.",
+    )
     force: bool = Field(default=False)
 
     @field_validator("industry_l1", mode="before")
@@ -201,6 +205,7 @@ class RerunResearchJobRequest(BaseModel):
     trailing_stop_pct: Optional[float] = Field(default=None, ge=0, le=1)
     trailing_stop_pcts: Optional[List[float]] = None
     industry_l1: Optional[str] = None
+    regime_cash: Optional[bool] = None
     force: bool = Field(default=True, description="Default true so a rerun is not skipped by cache/idempotency")
 
     @field_validator(
