@@ -151,6 +151,8 @@ GROWTH_CYCLE_PARAMETER_SCHEMA = {
     "rebalance_days": {"type": "integer", "min": 1},
     "construction_mode": {"type": "enum", "options": ["top_n", "industry_capped", "industry_neutral"]},
     "max_industry_weight": {"type": "number", "min": 0, "max": 1, "nullable": True},
+    # CSI1000-only overlay: bull → full book, non-bull → cash. Rejected on other universes.
+    "regime_cash": {"type": "boolean"},
     "industry_l1": {"type": "string", "nullable": True},
     "lot_size": {"type": "integer", "min": 1},
     "transaction_cost": {"type": "number", "min": 0},
@@ -206,6 +208,7 @@ PLAN_SNAPSHOT_PARAM_KEYS = PLAN_PARAM_KEYS | {
     "candidate_pool_enabled",
     "candidate_pool_multiplier",
     "min_buy_lots",
+    "regime_cash",
 }
 DEFAULT_STRATEGY_TEMPLATES = (
     {
@@ -1115,6 +1118,14 @@ def _validate_params_override(params: Dict[str, Any]) -> None:
             raise HTTPException(status_code=400, detail="growth_weight and cycle_weight must be between 0 and 1")
         if abs((growth + cycle) - 1) > 1e-6:
             raise HTTPException(status_code=400, detail="growth_weight and cycle_weight must add up to 1")
+    regime_cash = params.get("regime_cash")
+    if regime_cash in {True, "true", "True", "1", "on", "yes"}:
+        universe = str(params.get("universe_index") or "csi1000").strip().lower()
+        if universe != "csi1000":
+            raise HTTPException(
+                status_code=400,
+                detail="非牛空仓仅适用于中证1000（csi1000）。同一规则在中证500上伤害收益，不得用于其它股票池。",
+            )
     if params.get("initial_capital") is not None:
         try:
             initial_capital = float(params["initial_capital"])
@@ -4811,6 +4822,8 @@ def _portfolio_param_summary(params_snapshot: Optional[Dict[str, Any]]) -> str:
     mode = params.get("construction_mode")
     if mode:
         parts.append(str(mode))
+    if params.get("regime_cash") is True:
+        parts.append("非牛空仓")
     return " · ".join(parts)
 
 

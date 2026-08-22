@@ -11,6 +11,30 @@ def test_allowed_universe_indices_include_csi2000():
     assert "csi2000" in portfolio_plans.ALLOWED_UNIVERSE_INDICES
 
 
+def test_portfolio_param_summary_flags_csi1000_cash_overlay():
+    assert portfolio_plans._portfolio_param_summary(
+        {"universe_index": "csi1000", "top_n": 20, "rebalance_days": 20, "construction_mode": "top_n"}
+    ) == "csi1000 · Top20 · 20d · top_n"
+    assert portfolio_plans._portfolio_param_summary(
+        {
+            "universe_index": "csi1000",
+            "top_n": 20,
+            "rebalance_days": 20,
+            "construction_mode": "top_n",
+            "regime_cash": True,
+        }
+    ) == "csi1000 · Top20 · 20d · top_n · 非牛空仓"
+
+
+def test_validate_params_override_rejects_regime_cash_outside_csi1000():
+    with pytest.raises(Exception) as exc:
+        portfolio_plans._validate_params_override({"universe_index": "csi500", "regime_cash": True})
+    assert exc.value.status_code == 400
+    assert "中证1000" in str(exc.value.detail)
+    portfolio_plans._validate_params_override({"universe_index": "csi1000", "regime_cash": True})
+    portfolio_plans._validate_params_override({"universe_index": "csi500", "regime_cash": False})
+
+
 def test_normalize_live_target_shares_non_star_uses_legacy_lot_rounding():
     # No symbol -> legacy behavior (round-lot delta), unchanged.
     assert portfolio_plans._normalize_live_target_shares(0, 300, 100) == (300, [])
