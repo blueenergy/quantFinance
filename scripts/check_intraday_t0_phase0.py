@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Intraday T+0 health check CLI (see intraday_t0.plan.md).
+"""Intraday T+0 health check CLI (see llm-wiki projects/trading/intraday-t0-rollout.md).
 
 Modes:
   liveness  — dev/CI: Mongo, indexes, engine smoke (no live market data required)

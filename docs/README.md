@@ -167,7 +167,7 @@ python volume_price_collector.py --update-existing
 
 ## 📊 市场结构与阴阳谱
 市场参与度与情绪趋势可通过“市场阴阳谱”页面查看：
-- 指标解释、交互说明与扩展建议参见 [MARKET_SPECTRUM_GUIDE.md](MARKET_SPECTRUM_GUIDE.md)
+- 指标与排障见 [quantFinance-dashboard/docs/MARKET_SPECTRUM_GUIDE.md](../../quantFinance-dashboard/docs/MARKET_SPECTRUM_GUIDE.md)
 该页面提供：阳谱/阴谱折线趋势、35%/50% 阈值参考、快捷日期区间与缩放。
 
 ## 项目结构
