@@ -116,7 +116,14 @@ def _attach_hold_to_latest_returns(data_db, lots: List[Dict[str, Any]]) -> None:
         candidates = []
         daily = daily_col.find_one(
             {"symbol": symbol, "trade_date": {"$lte": today}},
-            projection={"_id": 0, "trade_date": 1, "close": 1},
+            projection={
+                "_id": 0,
+                "trade_date": 1,
+                "close": 1,
+                "source": 1,
+                "update_time": 1,
+                "updated_at": 1,
+            },
             sort=[("trade_date", -1)],
         )
         if daily:
@@ -124,7 +131,14 @@ def _attach_hold_to_latest_returns(data_db, lots: List[Dict[str, Any]]) -> None:
         if realtime_col is not None:
             realtime = realtime_col.find_one(
                 {"symbol": symbol},
-                projection={"_id": 0, "trade_date": 1, "snapshot_time": 1, "close": 1},
+                projection={
+                    "_id": 0,
+                    "trade_date": 1,
+                    "snapshot_time": 1,
+                    "updated_at": 1,
+                    "close": 1,
+                    "data_source": 1,
+                },
             )
             if realtime and str(realtime.get("trade_date") or "") <= today:
                 candidates.append(
@@ -157,6 +171,14 @@ def _attach_hold_to_latest_returns(data_db, lots: List[Dict[str, Any]]) -> None:
         lot["hold_to_latest_date"] = mark_date
         lot["hold_to_latest_price"] = mark_close
         lot["hold_to_latest_price_source"] = mark_source
+        lot["hold_to_latest_data_source"] = (
+            mark.get("data_source") if mark_source == "realtime" else mark.get("source")
+        )
+        lot["hold_to_latest_updated_at"] = (
+            mark.get("snapshot_time")
+            or mark.get("updated_at")
+            or mark.get("update_time")
+        )
 
 
 def latest_snapshot_date(snapshots_col, recipe_id: str, end_date: Optional[str] = None) -> Optional[str]:

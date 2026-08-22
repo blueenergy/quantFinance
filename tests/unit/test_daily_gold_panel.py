@@ -185,6 +185,16 @@ def test_build_daily_gold_panel_merges_rank_delta():
             "adj_factor": 2,
         }
     )
+    data_db["volume_price_realtime_latest"].docs.append(
+        {
+            "symbol": "000002.SZ",
+            "trade_date": "20260821",
+            "snapshot_time": "20260821 14:59:00",
+            "updated_at": "20260821 14:59:05",
+            "close": 6.5,
+            "data_source": "miniqmt_full_market_daily",
+        }
+    )
     data_db["daily_gold_twr"].docs.extend(
         [
             {
@@ -209,8 +219,11 @@ def test_build_daily_gold_panel_merges_rank_delta():
     assert panel["top10"][0]["prev_rank"] == 2
     assert panel["top10"][0]["rank_delta"] == 1
     assert len(panel["open_lots"]) == 1
-    assert panel["recent_closed"][0]["hold_to_latest_return_pct"] == pytest.approx(0.2)
+    assert panel["recent_closed"][0]["hold_to_latest_return_pct"] == pytest.approx(0.3)
     assert panel["recent_closed"][0]["hold_to_latest_date"] == "20260821"
+    assert panel["recent_closed"][0]["hold_to_latest_price_source"] == "realtime"
+    assert panel["recent_closed"][0]["hold_to_latest_data_source"] == "miniqmt_full_market_daily"
+    assert panel["recent_closed"][0]["hold_to_latest_updated_at"] == "20260821 14:59:00"
     assert panel["strategy_twr"]["cumulative_return"] == pytest.approx(0.10)
     assert panel["strategy_twr"]["active_lots"] == 12
 
