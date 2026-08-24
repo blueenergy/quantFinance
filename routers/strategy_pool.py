@@ -2,8 +2,14 @@ from fastapi import APIRouter, HTTPException, Depends, Query
 from typing import List, Dict, Any, Optional
 from db import get_db_collections
 from auth import get_current_user
-import time
 from datetime import datetime, timedelta
+from services.strategy_pool_chart import (
+    DEFAULT_LOOKAHEAD_DAYS,
+    DEFAULT_LOOKBACK_DAYS,
+    DEFAULT_MAX_ROUNDS,
+    assemble_chart_context,
+    yyyymmdd,
+)
 
 router = APIRouter(tags=["strategy-pool"])
 
@@ -345,6 +351,49 @@ def get_preset_params(
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/chart-context")
+def get_strategy_pool_chart_context(
+    symbol: str = Query(..., description="Stock symbol"),
+    strategy: str = Query(..., description="Strategy key"),
+    preset: Optional[str] = Query(None, description="Preset name"),
+    signal_date: str = Query(..., description="Pool signal date YYYYMMDD"),
+    max_rounds: int = Query(DEFAULT_MAX_ROUNDS, ge=1, le=40),
+    lookback_days: int = Query(DEFAULT_LOOKBACK_DAYS, ge=30, le=800),
+    lookahead_days: int = Query(DEFAULT_LOOKAHEAD_DAYS, ge=0, le=400),
+    current_user: Dict = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """K-line overlay for the strategy pool: recent buy/sell rounds + forward returns.
+
+    Hindsight by design: bars after ``signal_date`` are included so the user can
+    judge whether that signal worked. Not an as-of reconstruction.
+    """
+    _ = current_user
+    signal = yyyymmdd(signal_date)
+    if not signal:
+        raise HTTPException(status_code=400, detail="signal_date must be YYYYMMDD")
+
+    collections = get_db_collections()
+    trade_coll = collections.get("strategy_trade_history")
+    if trade_coll is None:
+        raise HTTPException(status_code=404, detail="strategy_trade_history collection not found")
+
+    try:
+        return assemble_chart_context(
+            trade_coll=trade_coll,
+            symbol=symbol,
+            strategy=strategy,
+            preset=preset,
+            signal_date=signal,
+            max_rounds=max_rounds,
+            lookback_days=lookback_days,
+            lookahead_days=lookahead_days,
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 @router.get("/backtest-result")

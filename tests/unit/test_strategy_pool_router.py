@@ -791,3 +791,89 @@ def test_get_strategy_pool_backtest_result_includes_params_used(client, monkeypa
     assert len(data['trades']) == 2
 
     client.app.dependency_overrides.clear()
+
+
+@pytest.mark.unit
+def test_chart_context_returns_kline_markers_and_forward_returns(client, monkeypatch):
+    from auth import get_current_user
+
+    def mock_auth():
+        return {'id': 'user1', 'username': 'testuser'}
+
+    client.app.dependency_overrides[get_current_user] = mock_auth
+
+    docs = [
+        {
+            'date': '20260108',
+            'strategy': 'hidden_dragon',
+            'preset': 'dragon_default',
+            'symbol': '000001.SZ',
+            'datetime': '2026-01-08 10:00:00',
+            'action': 'BUY',
+            'price': 10.0,
+            'quantity': 100,
+            'pnl': 0.0,
+        },
+        {
+            'date': '20260109',
+            'strategy': 'hidden_dragon',
+            'preset': 'dragon_default',
+            'symbol': '000001.SZ',
+            'datetime': '2026-01-09 10:00:00',
+            'action': 'SELL',
+            'price': 11.0,
+            'quantity': 100,
+            'pnl': 100.0,
+        },
+    ]
+
+    def fake_kline(symbol, start_date, end_date, adjust='qfq'):
+        assert symbol == '000001.SZ'
+        assert adjust == 'qfq'
+        assert start_date < '20260109' <= end_date
+        return [
+            {'trade_date': '20260107', 'open': 9.5, 'high': 9.8, 'low': 9.4, 'close': 9.6, 'volume': 1},
+            {'trade_date': '20260108', 'open': 9.8, 'high': 10.2, 'low': 9.7, 'close': 10.0, 'volume': 2},
+            {'trade_date': '20260109', 'open': 10.1, 'high': 11.2, 'low': 10.0, 'close': 11.0, 'volume': 3},
+            {'trade_date': '20260112', 'open': 11.0, 'high': 11.4, 'low': 10.8, 'close': 11.2, 'volume': 3},
+        ]
+
+    monkeypatch.setattr('services.strategy_pool_chart.load_adjusted_kline', fake_kline)
+    monkeypatch.setattr(
+        'routers.strategy_pool.get_db_collections',
+        lambda: {'strategy_trade_history': _TradeHistoryCollection(docs)},
+    )
+
+    res = client.get(
+        '/api/strategy-pool/chart-context'
+        '?symbol=000001&strategy=hidden_dragon&preset=dragon_default&signal_date=20260108'
+    )
+    assert res.status_code == 200
+    body = res.json()
+    assert body['success'] is True
+    assert body['symbol'] == '000001.SZ'
+    assert body['signal_date'] == '20260108'
+    assert body['kline']['count'] == 4
+    kinds = [m['kind'] for m in body['markers']]
+    assert kinds == ['buy', 'sell']
+    assert any(m['highlighted'] for m in body['markers'])
+    assert body['forward_returns']['horizons'][0]['available'] is True
+    assert '事后验证' in body['disclaimer']
+
+    client.app.dependency_overrides.clear()
+
+
+@pytest.mark.unit
+def test_chart_context_rejects_bad_signal_date(client, monkeypatch):
+    from auth import get_current_user
+
+    client.app.dependency_overrides[get_current_user] = lambda: {'id': 'user1'}
+    monkeypatch.setattr(
+        'routers.strategy_pool.get_db_collections',
+        lambda: {'strategy_trade_history': _TradeHistoryCollection([])},
+    )
+    res = client.get(
+        '/api/strategy-pool/chart-context?symbol=000001.SZ&strategy=hidden_dragon&signal_date=today'
+    )
+    assert res.status_code == 400
+    client.app.dependency_overrides.clear()
