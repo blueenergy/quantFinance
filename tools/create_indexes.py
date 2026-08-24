@@ -53,6 +53,13 @@ def ensure_indexes():
 
     # Define indexes: (keys, options)
     score_indexes: List[Tuple[List[Tuple[str, int]], dict]] = [
+        # One score per symbol per day, enforced by the database. Writers upsert
+        # on exactly this filter, but nothing stopped a second pass from
+        # inserting a parallel copy: 20260421 carried two scores for every
+        # symbol for four months. Ascending because the descending twin below
+        # answers the mixed-direction ranking sort, and two indexes cannot share
+        # a key pattern with conflicting options.
+        ([("symbol", 1), ("score_date", 1)], {"name": "symbol_scoreDate_uniq", "unique": True}),
         # Latest-per-symbol queries
         ([("symbol", 1), ("score_date", -1)], {"name": "symbol_scoreDate_desc"}),
         # Date-filtered ranking queries
