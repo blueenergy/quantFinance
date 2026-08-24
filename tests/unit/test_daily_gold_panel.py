@@ -153,6 +153,10 @@ def test_build_daily_gold_panel_merges_rank_delta():
             "symbol": "000001.SZ",
             "status": "open",
             "entry_score_date": "20260819",
+            "entry_date": "20260820",
+            "entry_price": 10,
+            "entry_adjusted_price": 10,
+            "peak_high": 12,
         }
     )
     data_db["daily_gold_lots"].docs.append(
@@ -183,6 +187,29 @@ def test_build_daily_gold_panel_merges_rank_delta():
             "symbol": "000002.SZ",
             "trade_date": "20260821",
             "adj_factor": 2,
+        }
+    )
+    data_db["volume_price"].docs.append(
+        {
+            "symbol": "000001.SZ",
+            "trade_date": "20260820",
+            "close": 11,
+        }
+    )
+    data_db["stock_adj_factor"].docs.append(
+        {
+            "symbol": "000001.SZ",
+            "trade_date": "20260820",
+            "adj_factor": 1,
+        }
+    )
+    data_db["volume_price_realtime_latest"].docs.append(
+        {
+            "symbol": "000001.SZ",
+            "trade_date": "20260821",
+            "snapshot_time": "20260821 14:59:00",
+            "close": 11.5,
+            "data_source": "miniqmt_full_market_daily",
         }
     )
     data_db["volume_price_realtime_latest"].docs.append(
@@ -219,6 +246,10 @@ def test_build_daily_gold_panel_merges_rank_delta():
     assert panel["top10"][0]["prev_rank"] == 2
     assert panel["top10"][0]["rank_delta"] == 1
     assert len(panel["open_lots"]) == 1
+    assert panel["open_lots"][0]["current_price"] == pytest.approx(11.5)
+    assert panel["open_lots"][0]["unrealized_return_pct"] == pytest.approx(0.15)
+    assert panel["open_lots"][0]["current_price_source"] == "realtime"
+    assert panel["open_lots"][0]["peak_high"] == pytest.approx(12)
     assert panel["recent_closed"][0]["hold_to_latest_return_pct"] == pytest.approx(0.3)
     assert panel["recent_closed"][0]["hold_to_latest_date"] == "20260821"
     assert panel["recent_closed"][0]["hold_to_latest_price_source"] == "realtime"
@@ -266,6 +297,20 @@ def test_historical_panel_excludes_future_exit_and_current_peak():
             "outcome": "trailing_stop",
         }
     )
+    data_db["volume_price"].docs.extend(
+        [
+            {"symbol": "000001.SZ", "trade_date": "20260819", "close": 10.5},
+            {"symbol": "000001.SZ", "trade_date": "20260820", "close": 20},
+        ]
+    )
+    data_db["volume_price_realtime_latest"].docs.append(
+        {
+            "symbol": "000001.SZ",
+            "trade_date": "20260820",
+            "close": 21,
+            "data_source": "miniqmt_full_market_daily",
+        }
+    )
     data_db["daily_gold_twr"].docs.extend(
         [
             {
@@ -291,4 +336,6 @@ def test_historical_panel_excludes_future_exit_and_current_peak():
     assert panel["recent_closed"] == []
     assert panel["open_lots"][0]["status"] == "open"
     assert panel["open_lots"][0]["peak_high"] is None
+    assert panel["open_lots"][0]["current_price"] == pytest.approx(10.5)
+    assert panel["open_lots"][0]["current_price_source"] == "daily_close"
     assert panel["strategy_twr"]["cumulative_return"] == pytest.approx(0.05)

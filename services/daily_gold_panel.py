@@ -95,90 +95,147 @@ def _positive_float(value: Any) -> Optional[float]:
     return number if number > 0 else None
 
 
-def _attach_hold_to_latest_returns(data_db, lots: List[Dict[str, Any]]) -> None:
-    """Add a post-exit, HFQ-comparable return for recent closed lots."""
+def _entry_adjusted_price(lot: Dict[str, Any]) -> Optional[float]:
+    entry_adjusted = _positive_float(lot.get("entry_adjusted_price"))
+    if entry_adjusted is not None:
+        return entry_adjusted
+    entry_price = _positive_float(lot.get("entry_price"))
+    entry_factor = _positive_float(lot.get("entry_adj_factor"))
+    if entry_price is not None and entry_factor is not None:
+        return entry_price * entry_factor
+    return None
+
+
+def _adj_factor_as_of(data_db, symbol: str, as_of_date: str) -> Optional[float]:
+    factor = data_db["stock_adj_factor"].find_one(
+        {"symbol": symbol, "trade_date": {"$lte": as_of_date}},
+        projection={"_id": 0, "adj_factor": 1},
+        sort=[("trade_date", -1)],
+    )
+    return _positive_float((factor or {}).get("adj_factor"))
+
+
+def _quote_as_of(
+    data_db,
+    symbol: str,
+    as_of_date: str,
+    *,
+    allow_realtime: bool,
+) -> Optional[Dict[str, Any]]:
+    """Latest real close at or before as_of_date; realtime wins on the same day."""
+    if not symbol or not as_of_date:
+        return None
     daily_col = data_db["volume_price"]
-    factor_col = data_db["stock_adj_factor"]
-    realtime_col = data_db.get("volume_price_realtime_latest")
-    today = datetime.now().strftime("%Y%m%d")
-
-    for lot in lots:
-        symbol = str(lot.get("symbol") or "")
-        entry_adjusted = _positive_float(lot.get("entry_adjusted_price"))
-        if entry_adjusted is None:
-            entry_price = _positive_float(lot.get("entry_price"))
-            entry_factor = _positive_float(lot.get("entry_adj_factor"))
-            if entry_price is not None and entry_factor is not None:
-                entry_adjusted = entry_price * entry_factor
-        if not symbol or entry_adjusted is None:
-            continue
-
-        candidates = []
-        daily = daily_col.find_one(
-            {"symbol": symbol, "trade_date": {"$lte": today}},
+    realtime_col = data_db.get("volume_price_realtime_latest") if allow_realtime else None
+    candidates = []
+    daily = daily_col.find_one(
+        {"symbol": symbol, "trade_date": {"$lte": as_of_date}},
+        projection={
+            "_id": 0,
+            "trade_date": 1,
+            "close": 1,
+            "source": 1,
+            "update_time": 1,
+            "updated_at": 1,
+        },
+        sort=[("trade_date", -1)],
+    )
+    if daily:
+        candidates.append((str(daily.get("trade_date") or ""), 0, "daily_close", daily))
+    if realtime_col is not None:
+        realtime = realtime_col.find_one(
+            {"symbol": symbol},
             projection={
                 "_id": 0,
                 "trade_date": 1,
-                "close": 1,
-                "source": 1,
-                "update_time": 1,
+                "snapshot_time": 1,
                 "updated_at": 1,
+                "close": 1,
+                "data_source": 1,
             },
-            sort=[("trade_date", -1)],
         )
-        if daily:
-            candidates.append((str(daily.get("trade_date") or ""), 0, "daily_close", daily))
-        if realtime_col is not None:
-            realtime = realtime_col.find_one(
-                {"symbol": symbol},
-                projection={
-                    "_id": 0,
-                    "trade_date": 1,
-                    "snapshot_time": 1,
-                    "updated_at": 1,
-                    "close": 1,
-                    "data_source": 1,
-                },
-            )
-            if realtime and str(realtime.get("trade_date") or "") <= today:
-                candidates.append(
-                    (
-                        str(realtime.get("trade_date") or ""),
-                        1,
-                        "realtime",
-                        realtime,
-                    )
+        if realtime and str(realtime.get("trade_date") or "") <= as_of_date:
+            candidates.append(
+                (
+                    str(realtime.get("trade_date") or ""),
+                    1,
+                    "realtime",
+                    realtime,
                 )
-        candidates = [
-            candidate
-            for candidate in candidates
-            if candidate[0] and _positive_float(candidate[3].get("close")) is not None
-        ]
-        if not candidates:
-            continue
-        mark_date, _, mark_source, mark = max(candidates, key=lambda candidate: (candidate[0], candidate[1]))
-        factor = factor_col.find_one(
-            {"symbol": symbol, "trade_date": {"$lte": mark_date}},
-            projection={"_id": 0, "adj_factor": 1},
-            sort=[("trade_date", -1)],
-        )
-        mark_factor = _positive_float((factor or {}).get("adj_factor"))
-        mark_close = _positive_float(mark.get("close"))
-        if mark_factor is None or mark_close is None:
-            continue
-        mark_adjusted = mark_close * mark_factor
-        lot["hold_to_latest_return_pct"] = mark_adjusted / entry_adjusted - 1.0
-        lot["hold_to_latest_date"] = mark_date
-        lot["hold_to_latest_price"] = mark_close
-        lot["hold_to_latest_price_source"] = mark_source
-        lot["hold_to_latest_data_source"] = (
+            )
+    candidates = [
+        candidate
+        for candidate in candidates
+        if candidate[0] and _positive_float(candidate[3].get("close")) is not None
+    ]
+    if not candidates:
+        return None
+    mark_date, _, mark_source, mark = max(candidates, key=lambda candidate: (candidate[0], candidate[1]))
+    mark_close = _positive_float(mark.get("close"))
+    if mark_close is None:
+        return None
+    return {
+        "close": mark_close,
+        "trade_date": mark_date,
+        "price_source": mark_source,
+        "data_source": (
             mark.get("data_source") if mark_source == "realtime" else mark.get("source")
-        )
-        lot["hold_to_latest_updated_at"] = (
+        ),
+        "updated_at": (
             mark.get("snapshot_time")
             or mark.get("updated_at")
             or mark.get("update_time")
-        )
+        ),
+    }
+
+
+def _attach_hold_to_latest_returns(data_db, lots: List[Dict[str, Any]]) -> None:
+    """Add a post-exit, HFQ-comparable return for recent closed lots."""
+    today = datetime.now().strftime("%Y%m%d")
+    for lot in lots:
+        symbol = str(lot.get("symbol") or "")
+        entry_adjusted = _entry_adjusted_price(lot)
+        if not symbol or entry_adjusted is None:
+            continue
+        quote = _quote_as_of(data_db, symbol, today, allow_realtime=True)
+        if not quote:
+            continue
+        mark_factor = _adj_factor_as_of(data_db, symbol, quote["trade_date"])
+        if mark_factor is None:
+            continue
+        lot["hold_to_latest_return_pct"] = quote["close"] * mark_factor / entry_adjusted - 1.0
+        lot["hold_to_latest_date"] = quote["trade_date"]
+        lot["hold_to_latest_price"] = quote["close"]
+        lot["hold_to_latest_price_source"] = quote["price_source"]
+        lot["hold_to_latest_data_source"] = quote["data_source"]
+        lot["hold_to_latest_updated_at"] = quote["updated_at"]
+
+
+def _attach_open_lot_marks(
+    data_db,
+    lots: List[Dict[str, Any]],
+    *,
+    as_of_date: Optional[str],
+    allow_realtime: bool,
+) -> None:
+    """Attach the latest real mark so the holdings table can sit next to cost."""
+    if not as_of_date:
+        return
+    for lot in lots:
+        symbol = str(lot.get("symbol") or "")
+        quote = _quote_as_of(data_db, symbol, as_of_date, allow_realtime=allow_realtime)
+        if not quote:
+            continue
+        lot["current_price"] = quote["close"]
+        lot["current_price_date"] = quote["trade_date"]
+        lot["current_price_source"] = quote["price_source"]
+        lot["current_price_data_source"] = quote["data_source"]
+        lot["current_price_updated_at"] = quote["updated_at"]
+        entry_adjusted = _entry_adjusted_price(lot)
+        mark_factor = _adj_factor_as_of(data_db, symbol, quote["trade_date"])
+        if entry_adjusted is None or mark_factor is None:
+            continue
+        lot["unrealized_return_pct"] = quote["close"] * mark_factor / entry_adjusted - 1.0
 
 
 def latest_snapshot_date(snapshots_col, recipe_id: str, end_date: Optional[str] = None) -> Optional[str]:
@@ -321,6 +378,12 @@ def build_daily_gold_panel(
             # Current lot documents only retain the latest peak. Do not leak a
             # future high into a historical as-of view.
             lot["peak_high"] = None
+    _attach_open_lot_marks(
+        data_db,
+        open_lots,
+        as_of_date=datetime.now().strftime("%Y%m%d") if not historical else resolved_date,
+        allow_realtime=not historical,
+    )
     open_lots.sort(key=lambda lot: (str(lot.get("entry_score_date") or ""), str(lot.get("symbol") or "")), reverse=True)
     closed_as_of.sort(
         key=lambda lot: (str(lot.get("exit_date") or ""), str(lot.get("updated_at") or "")),
