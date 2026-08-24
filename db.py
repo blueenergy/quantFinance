@@ -13,8 +13,18 @@ data_db_name = os.getenv("DATA_DB_NAME", "quant_data")
 realtime_db_name = os.getenv("REALTIME_DB_NAME", "quant_realtime")
 trading_db_name = os.getenv("TRADING_DB_NAME", "quant_trading")
 
-# Singleton client (reuse across app)
-client = MongoClient(mongo_url)
+# Singleton client (reuse across app). pymongo defaults to maxIdleTimeMS=None,
+# which never reclaims an idle connection, so this process would ratchet up to
+# maxPoolSize and hold there until mongod runs out of file descriptors. Same env
+# names as stock_data_access.mongo_context, deliberately not imported from it:
+# db.py must not depend on the submodule pointer being bumped in lockstep.
+MAX_IDLE_TIME_MS = int(os.getenv("MONGO_MAX_IDLE_TIME_MS", "60000"))
+MAX_POOL_SIZE = int(os.getenv("MONGO_MAX_POOL_SIZE", "50"))
+client = MongoClient(
+    mongo_url,
+    maxIdleTimeMS=MAX_IDLE_TIME_MS,
+    maxPoolSize=MAX_POOL_SIZE,
+)
 db = client[DB_NAME]
 # Separate DB for quantAnalyzer outputs (read-only in quantFinance)
 analyzer_db = client[ANALYZER_DB_NAME]
