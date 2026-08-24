@@ -6,7 +6,10 @@ yet written an explicit block (details_schema_version 0 fallback).
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Dict, List, Optional
+
+logger = logging.getLogger(__name__)
 
 SCORE_DIMENSION_KEYS = (
     "technical",
@@ -28,6 +31,38 @@ SCORE_HISTORY_PROJECTION: Dict[str, int] = {
     "composite_score": 1,
     **{f"{key}_score": 1 for key in SCORE_DIMENSION_KEYS},
 }
+
+
+def load_score_details(db, doc: Dict[str, Any]) -> Dict[str, Any]:
+    """Read a score's ``details`` / ``strategy_scores``, split collection first.
+
+    These two fields are 92.9% of a stock_scores document and only this endpoint
+    reads them, so they live in ``stock_score_details`` keyed by
+    ``"{score_date}:{symbol}"``. The inline copy on the score document is the
+    fallback, which covers databases the backfill has not reached and any
+    deployment where the migration was never applied.
+    """
+    symbol = doc.get("symbol")
+    score_date = doc.get("score_date")
+    if symbol and score_date:
+        stored = db["stock_score_details"].find_one({"_id": f"{score_date}:{symbol}"})
+        if stored:
+            return {
+                "details": stored.get("details") or {},
+                "strategy_scores": stored.get("strategy_scores") or {},
+            }
+
+    inline_details = doc.get("details")
+    inline_strategy = doc.get("strategy_scores")
+    if inline_details is None and inline_strategy is None:
+        # Neither location has anything. Before the split this could not happen,
+        # so say so rather than rendering a blank detail page that looks like a
+        # scoring gap.
+        logger.warning("no score details for %s@%s in either location", symbol, score_date)
+    return {
+        "details": inline_details or {},
+        "strategy_scores": inline_strategy or {},
+    }
 
 
 def _dimensions_computed(doc: Dict[str, Any]) -> List[str]:

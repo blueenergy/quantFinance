@@ -22,6 +22,7 @@ from services.industry_rs import build_industry_rs_details, normalize_stored_ind
 from services.score_detail_meta import (
     SCORE_HISTORY_PROJECTION,
     build_score_detail_payload,
+    load_score_details,
     submodule_weights_from_details,
 )
 
@@ -1755,13 +1756,15 @@ async def get_single_score_detail(
             doc = stock_scores.find_one(query, sort=[('score_date', -1)])
         if not doc:
             raise HTTPException(status_code=404, detail="未找到对应评分记录")
+        # details/strategy_scores 已拆到 stock_score_details，未回填的文档回落到内联副本
+        detail_blocks = load_score_details(db, doc)
         # 处理综合得分拆解
         if category == 'composite':
             composite_score = doc.get('composite_score') or {}
             # 确保 composite_score 统一为 dict
             if not isinstance(composite_score, dict):
                 composite_score = {'balanced': composite_score}
-            strategy_scores = doc.get('strategy_scores') or {}
+            strategy_scores = detail_blocks['strategy_scores']
             strat_obj = strategy_scores.get(strategy) or strategy_scores.get('balanced') or {}
             weight_map = strat_obj.get('weight') or strat_obj.get('weights') or {}
             # 如果 weight_map 为空，尝试 fallback 通用默认权重（以 balanced 为例）
@@ -1866,7 +1869,7 @@ async def get_single_score_detail(
             }
         # 其它分类处理
         detail_field = cat_map[category]
-        details = doc.get('details') or {}
+        details = detail_blocks['details']
         # 兼容旧结构: 直接平铺字段
         if not details and any(k.endswith('_details') for k in doc.keys()):
             details = {k: v for k, v in doc.items() if k.endswith('_details')}

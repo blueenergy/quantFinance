@@ -1,5 +1,7 @@
 """Tests for score detail provenance helpers."""
 
+import logging
+
 from services.score_detail_meta import (
     SCORE_DIMENSION_KEYS,
     SCORE_HISTORY_PROJECTION,
@@ -7,8 +9,93 @@ from services.score_detail_meta import (
     build_score_meta,
     extract_express_flags,
     get_strategy_recommendations,
+    load_score_details,
     submodule_weights_from_details,
 )
+
+
+class _FakeDetailsCollection:
+    def __init__(self, docs=()):
+        self._docs = {doc["_id"]: doc for doc in docs}
+        self.queried = []
+
+    def find_one(self, query):
+        self.queried.append(query)
+        return self._docs.get(query.get("_id"))
+
+
+class _FakeDB(dict):
+    pass
+
+
+def _db(*docs):
+    return _FakeDB({"stock_score_details": _FakeDetailsCollection(docs)})
+
+
+def test_load_score_details_prefers_the_split_collection():
+    db = _db({
+        "_id": "20260821:600000.SH",
+        "details": {"cycle_details": {"score": 61}},
+        "strategy_scores": {"balanced": {"comp_score": 70}},
+    })
+    doc = {
+        "symbol": "600000.SH",
+        "score_date": "20260821",
+        # A stale inline copy must lose to the split collection.
+        "details": {"cycle_details": {"score": 1}},
+        "strategy_scores": {"balanced": {"comp_score": 1}},
+    }
+
+    blocks = load_score_details(db, doc)
+
+    assert blocks["details"] == {"cycle_details": {"score": 61}}
+    assert blocks["strategy_scores"] == {"balanced": {"comp_score": 70}}
+
+
+def test_load_score_details_falls_back_to_the_inline_copy():
+    """Documents the backfill has not reached still have to render."""
+    db = _db()
+    doc = {
+        "symbol": "600000.SH",
+        "score_date": "20100104",
+        "details": {"cycle_details": {"score": 42}},
+        "strategy_scores": {"balanced": {"comp_score": 55}},
+    }
+
+    blocks = load_score_details(db, doc)
+
+    assert blocks["details"] == {"cycle_details": {"score": 42}}
+    assert blocks["strategy_scores"] == {"balanced": {"comp_score": 55}}
+
+
+def test_load_score_details_keys_on_date_then_symbol():
+    db = _db()
+    load_score_details(db, {"symbol": "600000.SH", "score_date": "20260821"})
+
+    assert db["stock_score_details"].queried == [{"_id": "20260821:600000.SH"}]
+
+
+def test_load_score_details_returns_empty_blocks_not_none():
+    blocks = load_score_details(_db(), {"symbol": "X", "score_date": "20260821"})
+
+    assert blocks == {"details": {}, "strategy_scores": {}}
+
+
+def test_load_score_details_warns_when_neither_place_has_it(caplog):
+    """After the inline copy is dropped, a gap must be visible in the log."""
+    with caplog.at_level(logging.WARNING):
+        load_score_details(_db(), {"symbol": "600000.SH", "score_date": "20260821"})
+
+    assert "no score details for 600000.SH@20260821" in caplog.text
+
+
+def test_load_score_details_does_not_warn_when_the_score_had_none(caplog):
+    """A reduced-mode score legitimately stores empty blocks."""
+    doc = {"symbol": "600000.SH", "score_date": "20260821", "details": {}, "strategy_scores": {}}
+    with caplog.at_level(logging.WARNING):
+        load_score_details(_db(), doc)
+
+    assert "no score details" not in caplog.text
 
 
 def test_submodule_weights_read_from_formula_steps():

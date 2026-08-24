@@ -96,7 +96,12 @@ def test_stock_score_detail_industry_rs_computes_breakdown():
             }
         ]),
     }
-    finance_db = {"stock_scores": FakeCollection([doc])}
+    finance_db = {
+        "stock_scores": FakeCollection([doc]),
+        # Mirrors get_db_collections(); empty here, so the endpoint falls back
+        # to the details still inlined on the score document above.
+        "stock_score_details": FakeCollection([]),
+    }
 
     with patch.object(stock_ranking, "get_db_collections", return_value=finance_db), patch.object(
         stock_ranking, "get_data_db", return_value=data_db
