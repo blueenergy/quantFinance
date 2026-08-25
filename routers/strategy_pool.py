@@ -47,6 +47,15 @@ def attach_sw_l1_industry(stocks: List[Dict[str, Any]], stock_info_coll) -> None
             stock["industry"] = industry
 
 
+def _require_yyyymmdd(value: Optional[str], field: str) -> str:
+    if not value:
+        return ""
+    stamp = yyyymmdd(value)
+    if not stamp:
+        raise HTTPException(status_code=400, detail=f"{field} must be YYYYMMDD")
+    return stamp
+
+
 def _extract_params_from_template_doc(doc: Dict[str, Any]) -> Dict[str, Any]:
     """Extract plain params dict from a strategy_template document.
 
@@ -242,34 +251,58 @@ def get_available_presets(
 
 @router.get("/stocks")
 def get_pool_stocks(
-    date: str = Query(..., description="Date in YYYYMMDD format"),
+    date: Optional[str] = Query(None, description="Single date YYYYMMDD"),
+    start_date: Optional[str] = Query(None, description="Inclusive range start YYYYMMDD"),
+    end_date: Optional[str] = Query(None, description="Inclusive range end YYYYMMDD"),
     strategy: Optional[str] = Query(None, description="Filter by strategy key"),
     preset: Optional[str] = Query(None, description="Filter by preset name (e.g., conservative, aggressive, default)"),
+    limit: int = Query(500, ge=1, le=2000, description="Max rows after date filtering"),
     current_user: Dict = Depends(get_current_user)
 ) -> Dict[str, Any]:
-    """Get stocks in the strategy pool for a specific date, strategy, and preset."""
+    """Get stocks in the strategy pool for one date or an inclusive date range."""
     try:
+        date_stamp = _require_yyyymmdd(date, "date")
+        start_stamp = _require_yyyymmdd(start_date, "start_date")
+        end_stamp = _require_yyyymmdd(end_date, "end_date")
+        if not date_stamp and not start_stamp and not end_stamp:
+            raise HTTPException(status_code=400, detail="date or start_date/end_date is required")
+        if start_stamp and end_stamp and start_stamp > end_stamp:
+            raise HTTPException(status_code=400, detail="start_date must be on or before end_date")
+
         collections = get_db_collections()
         pool_coll = collections.get("strategy_stock_pool")
         if pool_coll is None:
-            return {"success": True, "stocks": []}
-        
-        query = {"date": date}
+            return {"success": True, "stocks": [], "count": 0}
+
+        query: Dict[str, Any] = {}
         if strategy:
             query["strategy"] = strategy
         if preset:
             query["preset"] = preset
-            
-        cursor = pool_coll.find(query, {"_id": 0})
-        stocks = list(cursor)
+        if date_stamp:
+            query["date"] = date_stamp
+
+        stocks = list(pool_coll.find(query, {"_id": 0}))
+        if not date_stamp:
+            lo = start_stamp or "00000000"
+            hi = end_stamp or "99999999"
+            stocks = [
+                row for row in stocks
+                if lo <= yyyymmdd(row.get("date")) <= hi
+            ]
+        stocks = stocks[: int(limit)]
         attach_sw_l1_industry(stocks, collections.get("stock_info"))
 
         return {
-            "success": True, 
-            "date": date,
+            "success": True,
+            "date": date_stamp or None,
+            "start_date": start_stamp or None,
+            "end_date": end_stamp or None,
             "count": len(stocks),
-            "stocks": stocks
+            "stocks": stocks,
         }
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

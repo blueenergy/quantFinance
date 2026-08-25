@@ -298,6 +298,50 @@ def test_get_pool_stocks_empty_result(client, monkeypatch):
 
 
 @pytest.mark.unit
+def test_get_pool_stocks_range_filters_inclusive_dates(client, monkeypatch):
+    from auth import get_current_user
+
+    client.app.dependency_overrides[get_current_user] = lambda: {'id': 'user1'}
+    pool = FakeCollection(
+        [
+            {'date': '20260720', 'strategy': 'k_regime', 'symbol': 'AAA.SZ'},
+            {'date': '20260801', 'strategy': 'k_regime', 'symbol': 'BBB.SZ'},
+            {'date': '20260812', 'strategy': 'k_regime', 'symbol': 'CCC.SZ'},
+            {'date': '20260812', 'strategy': 'hidden_dragon', 'symbol': 'DDD.SZ'},
+            {'date': '20260825', 'strategy': 'k_regime', 'symbol': 'EEE.SZ'},
+        ]
+    )
+    monkeypatch.setattr(
+        'routers.strategy_pool.get_db_collections',
+        lambda: {'strategy_stock_pool': pool},
+    )
+    res = client.get(
+        '/api/strategy-pool/stocks?strategy=k_regime&start_date=20260801&end_date=20260812'
+    )
+    assert res.status_code == 200
+    body = res.json()
+    assert body['count'] == 2
+    assert {row['symbol'] for row in body['stocks']} == {'BBB.SZ', 'CCC.SZ'}
+    assert body['start_date'] == '20260801'
+    assert body['end_date'] == '20260812'
+    client.app.dependency_overrides.clear()
+
+
+@pytest.mark.unit
+def test_get_pool_stocks_requires_date_or_range(client, monkeypatch):
+    from auth import get_current_user
+
+    client.app.dependency_overrides[get_current_user] = lambda: {'id': 'user1'}
+    monkeypatch.setattr(
+        'routers.strategy_pool.get_db_collections',
+        lambda: {'strategy_stock_pool': FakeCollection([])},
+    )
+    res = client.get('/api/strategy-pool/stocks?strategy=k_regime')
+    assert res.status_code == 400
+    client.app.dependency_overrides.clear()
+
+
+@pytest.mark.unit
 def test_get_preset_params_supports_prefixed_presets_and_params_with_desc(client, monkeypatch):
     """Test /api/strategy-pool/params resolves preset name variants and extracts params_with_desc."""
     from auth import get_current_user
