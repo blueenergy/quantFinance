@@ -53,6 +53,15 @@ ALLOWED_SCORE_COLUMNS = {
     "composite_growth_cycle_score",
     *(f"{dimension}_score" for dimension in ATOMIC_SCORE_DIMENSIONS),
 }
+ALLOWED_REGIME_RULES = {
+    "k_slow_anchor",
+    "k_slow_anchor_with_volume",
+    "k_slow_anchor_with_volatility",
+    "k_slow_anchor_with_vol_and_atr",
+    "k_fast_price",
+    "k_fast_symmetric",
+    "k_fast_only",
+}
 
 
 def _blank_to_none(value: Any) -> Any:
@@ -60,6 +69,18 @@ def _blank_to_none(value: Any) -> Any:
     if value == "" or value is None:
         return None
     return value
+
+
+def _normalize_regime_rule(value: Any) -> Optional[str]:
+    value = _blank_to_none(value)
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    if text not in ALLOWED_REGIME_RULES:
+        raise ValueError(f"unsupported regime_rule: {text}")
+    return text
 
 
 class ColumnScoreSpec(BaseModel):
@@ -137,6 +158,13 @@ class CreateResearchJobRequest(BaseModel):
         min_length=1,
         description="Position modes to sweep: off and/or bull_g60_else_cash. Independent first-class arms.",
     )
+    regime_rule: Optional[str] = Field(
+        default=None,
+        description=(
+            "Index regime label preset used by non-bull cash. "
+            "Default k_slow_anchor; k_slow_anchor_with_vol_and_atr is volume-price timing."
+        ),
+    )
     force: bool = Field(default=False)
 
     @field_validator("industry_l1", mode="before")
@@ -156,6 +184,11 @@ class CreateResearchJobRequest(BaseModel):
     @classmethod
     def _optional_float_blank(cls, value: Any) -> Any:
         return _blank_to_none(value)
+
+    @field_validator("regime_rule", mode="before")
+    @classmethod
+    def _optional_regime_rule(cls, value: Any) -> Any:
+        return _normalize_regime_rule(value)
 
     @model_validator(mode="after")
     def _validate_score_inputs(self) -> "CreateResearchJobRequest":
@@ -213,6 +246,7 @@ class RerunResearchJobRequest(BaseModel):
     industry_l1: Optional[str] = None
     regime_cash: Optional[bool] = None
     regime_modes: Optional[List[RegimeMode]] = Field(default=None, min_length=1)
+    regime_rule: Optional[str] = None
     force: bool = Field(default=True, description="Default true so a rerun is not skipped by cache/idempotency")
 
     @field_validator(
@@ -233,6 +267,11 @@ class RerunResearchJobRequest(BaseModel):
     @classmethod
     def _optional_blank(cls, value: Any) -> Any:
         return _blank_to_none(value)
+
+    @field_validator("regime_rule", mode="before")
+    @classmethod
+    def _optional_regime_rule(cls, value: Any) -> Any:
+        return _normalize_regime_rule(value)
 
     @field_validator("rebalance_interval_days", "top_n_values", "active_caps", "trailing_stop_pcts", "regime_modes", mode="before")
     @classmethod
@@ -430,6 +469,7 @@ PRESET_PARAM_KEYS = {
     "candidate_pool_enabled",
     "industry_l1",
     "regime_cash",
+    "regime_rule",
 }
 
 
@@ -542,6 +582,9 @@ def _candidate_strategy_config_from_row(job: Dict[str, Any], row: Dict[str, Any]
     }
     if str(row.get("regime_mode") or "off") == "bull_g60_else_cash":
         candidate["regime_cash"] = True
+        rule = str(params.get("regime_rule") or "").strip()
+        if rule:
+            candidate["regime_rule"] = rule
     return candidate
 
 

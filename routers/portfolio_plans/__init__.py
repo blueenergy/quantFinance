@@ -153,6 +153,16 @@ GROWTH_CYCLE_PARAMETER_SCHEMA = {
     "max_industry_weight": {"type": "number", "min": 0, "max": 1, "nullable": True},
     # CSI1000-only overlay: bull → full book, non-bull → cash. Rejected on other universes.
     "regime_cash": {"type": "boolean"},
+    "regime_rule": {
+        "type": "enum",
+        "options": [
+            "k_slow_anchor",
+            "k_slow_anchor_with_vol_and_atr",
+            "k_slow_anchor_with_volume",
+            "k_slow_anchor_with_volatility",
+        ],
+        "nullable": True,
+    },
     "industry_l1": {"type": "string", "nullable": True},
     "lot_size": {"type": "integer", "min": 1},
     "transaction_cost": {"type": "number", "min": 0},
@@ -209,6 +219,7 @@ PLAN_SNAPSHOT_PARAM_KEYS = PLAN_PARAM_KEYS | {
     "candidate_pool_multiplier",
     "min_buy_lots",
     "regime_cash",
+    "regime_rule",
 }
 DEFAULT_STRATEGY_TEMPLATES = (
     {
@@ -4816,6 +4827,11 @@ def _portfolio_param_summary(params_snapshot: Optional[Dict[str, Any]]) -> str:
         parts.append(str(mode))
     if params.get("regime_cash") is True:
         parts.append("非牛空仓")
+        rule = str(params.get("regime_rule") or "").strip()
+        if rule == "k_slow_anchor_with_vol_and_atr":
+            parts.append("量价择时")
+        elif rule and rule != "k_slow_anchor":
+            parts.append(rule)
     return " · ".join(parts)
 
 

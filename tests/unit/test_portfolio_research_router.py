@@ -354,6 +354,30 @@ def test_create_portfolio_research_job_accepts_cash_only_regime_modes(monkeypatc
 
 
 @pytest.mark.unit
+def test_create_portfolio_research_job_accepts_volume_price_regime_rule(monkeypatch):
+    collections = _collections()
+    monkeypatch.setattr(portfolio_research, "get_trading_db_collections", lambda: collections)
+
+    response = asyncio.run(
+        portfolio_research.create_portfolio_research_job(
+            portfolio_research.CreateResearchJobRequest(
+                name="research",
+                universe_index="csi1000",
+                start_date="2025-01-01",
+                end_date="2025-01-31",
+                regime_modes=["bull_g60_else_cash"],
+                regime_rule="k_slow_anchor_with_vol_and_atr",
+            ),
+            current_user={"id": "user-1"},
+        )
+    )
+
+    assert response["success"] is True
+    params = collections["portfolio_research_jobs"].docs[0]["params"]
+    assert params["regime_rule"] == "k_slow_anchor_with_vol_and_atr"
+
+
+@pytest.mark.unit
 def test_research_job_requests_reject_invalid_or_empty_regime_modes():
     common = {
         "name": "research",
@@ -367,6 +391,10 @@ def test_research_job_requests_reject_invalid_or_empty_regime_modes():
         portfolio_research.CreateResearchJobRequest(**common, regime_modes=[])
     with pytest.raises(ValueError):
         portfolio_research.RerunResearchJobRequest(regime_modes=["bogus"])
+    with pytest.raises(ValueError):
+        portfolio_research.CreateResearchJobRequest(**common, regime_rule="not_a_rule")
+    with pytest.raises(ValueError):
+        portfolio_research.RerunResearchJobRequest(regime_rule="not_a_rule")
 
 
 @pytest.mark.unit

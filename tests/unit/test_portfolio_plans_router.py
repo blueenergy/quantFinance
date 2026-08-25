@@ -24,6 +24,16 @@ def test_portfolio_param_summary_flags_csi1000_cash_overlay():
             "regime_cash": True,
         }
     ) == "csi1000 · Top20 · 20d · top_n · 非牛空仓"
+    assert portfolio_plans._portfolio_param_summary(
+        {
+            "universe_index": "csi1000",
+            "top_n": 20,
+            "rebalance_days": 20,
+            "construction_mode": "top_n",
+            "regime_cash": True,
+            "regime_rule": "k_slow_anchor_with_vol_and_atr",
+        }
+    ) == "csi1000 · Top20 · 20d · top_n · 非牛空仓 · 量价择时"
 
 
 def test_validate_params_override_allows_regime_cash_on_any_universe():
