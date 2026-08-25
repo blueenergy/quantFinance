@@ -220,6 +220,8 @@ def test_get_available_presets_for_strategies(client, monkeypatch):
         {'date': '20260109', 'strategy': 'turtle', 'preset': 'turtle_conservative', 'symbol': '000007.SZ'},
         {'date': '20260109', 'strategy': 'turtle', 'preset': 'turtle_standard', 'symbol': '000008.SZ'},
         {'date': '20260109', 'strategy': 'turtle', 'preset': 'turtle_aggressive', 'symbol': '000009.SZ'},
+        # k_regime is an independent timing strategy, not a dragon/turtle overlay
+        {'date': '20260109', 'strategy': 'k_regime', 'preset': 'k_regime_default', 'symbol': '300750.SZ'},
     ]
 
     fake_col = FakeCollection(pool_data)
@@ -252,6 +254,13 @@ def test_get_available_presets_for_strategies(client, monkeypatch):
     assert data['success'] is True
     assert data['strategy'] == 'turtle'
     assert set(data['presets']) == {'turtle_conservative', 'turtle_standard', 'turtle_aggressive'}
+
+    res = client.get('/api/strategy-pool/presets?strategy=k_regime')
+    assert res.status_code == 200
+    data = res.json()
+    assert data['success'] is True
+    assert data['strategy'] == 'k_regime'
+    assert data['presets'] == ['k_regime_default']
 
     client.app.dependency_overrides.clear()
 
@@ -488,6 +497,65 @@ def test_get_strategy_pool_backtest_result_reconstructs_metrics_trades_equity_an
         {'date': '20260109', 'value': 1000100.0},
     ]
 
+    client.app.dependency_overrides.clear()
+
+
+@pytest.mark.unit
+def test_get_strategy_pool_backtest_result_default_window_keeps_multi_year_tape(client, monkeypatch):
+    from auth import get_current_user
+
+    client.app.dependency_overrides[get_current_user] = lambda: {'id': 'user1'}
+    docs = [
+        {
+            'date': '20210301',
+            'strategy': 'k_regime',
+            'preset': 'k_regime_default',
+            'symbol': '300750.SZ',
+            'datetime': '2021-03-01 15:00:00',
+            'action': 'BUY',
+            'price': 100.0,
+            'quantity': 0,
+            'pnl': 0,
+            'cumulative_pnl': 0,
+            'hist_return': 0.4,
+            'hist_sharpe_ratio': 0.8,
+            'hist_max_drawdown': -0.2,
+            'hist_win_rate': 0.5,
+            'hist_total_trades': 4,
+            'hist_calmar_ratio': 0.9,
+        },
+        {
+            'date': '20260109',
+            'strategy': 'k_regime',
+            'preset': 'k_regime_default',
+            'symbol': '300750.SZ',
+            'datetime': '2026-01-09 15:00:00',
+            'action': 'SELL',
+            'price': 140.0,
+            'quantity': 0,
+            'pnl': 0.4,
+            'cumulative_pnl': 0.4,
+            'hist_return': 0.4,
+            'hist_sharpe_ratio': 0.8,
+            'hist_max_drawdown': -0.2,
+            'hist_win_rate': 0.5,
+            'hist_total_trades': 4,
+            'hist_calmar_ratio': 0.9,
+        },
+    ]
+    monkeypatch.setattr(
+        'routers.strategy_pool.get_db_collections',
+        lambda: {'strategy_trade_history': _TradeHistoryCollection(docs)},
+    )
+    res = client.get(
+        '/api/strategy-pool/backtest-result'
+        '?symbol=300750.SZ&strategy=k_regime&preset=k_regime_default&end_date=20260109'
+    )
+    assert res.status_code == 200
+    body = res.json()
+    assert len(body['trades']) == 2
+    assert body['trades'][0]['datetime'].startswith('2021-03-01')
+    assert body['metrics']['calmar_ratio'] == 0.9
     client.app.dependency_overrides.clear()
 
 
@@ -876,4 +944,54 @@ def test_chart_context_rejects_bad_signal_date(client, monkeypatch):
         '/api/strategy-pool/chart-context?symbol=000001.SZ&strategy=hidden_dragon&signal_date=today'
     )
     assert res.status_code == 400
+    client.app.dependency_overrides.clear()
+
+
+@pytest.mark.unit
+def test_attach_sw_l1_keeps_existing_and_fills_from_stock_info():
+    from routers.strategy_pool import attach_sw_l1_industry
+
+    stocks = [
+        {'symbol': '300750.SZ', 'industry': '电力设备'},
+        {'symbol': '000001.SZ', 'name': '平安银行'},
+        {'symbol': '000002', 'name': '万科A'},
+    ]
+    info = FakeCollection(
+        [
+            {'symbol': '000001.SZ', 'ts_code': '000001.SZ', 'sw_l1': '银行'},
+            {'symbol': '000002.SZ', 'ts_code': '000002.SZ', 'sw_l1': '房地产'},
+        ]
+    )
+    attach_sw_l1_industry(stocks, info)
+    assert stocks[0]['industry'] == '电力设备'
+    assert stocks[1]['industry'] == '银行'
+    assert stocks[2]['industry'] == '房地产'
+
+
+@pytest.mark.unit
+def test_get_pool_stocks_attaches_sw_l1_industry(client, monkeypatch):
+    from auth import get_current_user
+
+    client.app.dependency_overrides[get_current_user] = lambda: {'id': 'user1'}
+    pool = FakeCollection(
+        [
+            {
+                'date': '20260109',
+                'strategy': 'hidden_dragon',
+                'symbol': '000001.SZ',
+                'name': '平安银行',
+            }
+        ]
+    )
+    info = FakeCollection(
+        [{'symbol': '000001.SZ', 'ts_code': '000001.SZ', 'sw_l1': '银行'}]
+    )
+    monkeypatch.setattr(
+        'routers.strategy_pool.get_db_collections',
+        lambda: {'strategy_stock_pool': pool, 'stock_info': info},
+    )
+    res = client.get('/api/strategy-pool/stocks?date=20260109&strategy=hidden_dragon')
+    assert res.status_code == 200
+    stocks = res.json()['stocks']
+    assert stocks[0]['industry'] == '银行'
     client.app.dependency_overrides.clear()

@@ -10,9 +10,12 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 FORWARD_HORIZONS: Tuple[int, ...] = (1, 5, 20)
-DEFAULT_MAX_ROUNDS = 8
-DEFAULT_LOOKBACK_DAYS = 240
+DEFAULT_MAX_ROUNDS = 20
+DEFAULT_LOOKBACK_DAYS = 1200
 DEFAULT_LOOKAHEAD_DAYS = 90
+DEFAULT_BACKTEST_DAYS_BACK = 2200
+MAX_BACKTEST_DAYS_BACK = 3000
+MAX_CHART_LOOKBACK_DAYS = 2500
 HINDSIGHT_DISCLAIMER = "含信号日之后走势，仅供事后验证，不是当时可见盘面。"
 
 

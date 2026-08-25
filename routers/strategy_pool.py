@@ -4,14 +4,47 @@ from db import get_db_collections
 from auth import get_current_user
 from datetime import datetime, timedelta
 from services.strategy_pool_chart import (
+    DEFAULT_BACKTEST_DAYS_BACK,
     DEFAULT_LOOKAHEAD_DAYS,
     DEFAULT_LOOKBACK_DAYS,
     DEFAULT_MAX_ROUNDS,
+    MAX_BACKTEST_DAYS_BACK,
+    MAX_CHART_LOOKBACK_DAYS,
     assemble_chart_context,
+    symbol_candidates,
     yyyymmdd,
 )
 
 router = APIRouter(tags=["strategy-pool"])
+
+
+def _sw_l1_name(doc: Optional[Dict[str, Any]]) -> str:
+    if not isinstance(doc, dict):
+        return ""
+    return str(doc.get("sw_l1") or doc.get("sw_l1_name") or doc.get("industry") or "").strip()
+
+
+def attach_sw_l1_industry(stocks: List[Dict[str, Any]], stock_info_coll) -> None:
+    """Fill ``industry`` with Shenwan L1 name; keep an existing pool value."""
+    if not stocks:
+        return
+    for stock in stocks:
+        existing = str(stock.get("industry") or stock.get("sw_l1") or "").strip()
+        if existing:
+            stock["industry"] = existing
+            continue
+        if stock_info_coll is None:
+            continue
+        industry = ""
+        for key in symbol_candidates(str(stock.get("symbol") or "")):
+            doc = stock_info_coll.find_one({"symbol": key})
+            if doc is None:
+                doc = stock_info_coll.find_one({"ts_code": key})
+            industry = _sw_l1_name(doc)
+            if industry:
+                break
+        if industry:
+            stock["industry"] = industry
 
 
 def _extract_params_from_template_doc(doc: Dict[str, Any]) -> Dict[str, Any]:
@@ -178,6 +211,7 @@ def get_available_presets(
             "hidden_dragon": ["dragon_"],
             "single_yang": ["yang_"],
             "turtle": ["turtle_"],
+            "k_regime": ["k_regime_"],
         }
 
         prefixes = prefix_map.get(strategy, [strategy + "_"])
@@ -227,11 +261,9 @@ def get_pool_stocks(
             query["preset"] = preset
             
         cursor = pool_coll.find(query, {"_id": 0})
-        stocks = []
-        for doc in cursor:
-            # Add some derived fields if needed
-            stocks.append(doc)
-        
+        stocks = list(cursor)
+        attach_sw_l1_industry(stocks, collections.get("stock_info"))
+
         return {
             "success": True, 
             "date": date,
@@ -360,7 +392,7 @@ def get_strategy_pool_chart_context(
     preset: Optional[str] = Query(None, description="Preset name"),
     signal_date: str = Query(..., description="Pool signal date YYYYMMDD"),
     max_rounds: int = Query(DEFAULT_MAX_ROUNDS, ge=1, le=40),
-    lookback_days: int = Query(DEFAULT_LOOKBACK_DAYS, ge=30, le=800),
+    lookback_days: int = Query(DEFAULT_LOOKBACK_DAYS, ge=30, le=MAX_CHART_LOOKBACK_DAYS),
     lookahead_days: int = Query(DEFAULT_LOOKAHEAD_DAYS, ge=0, le=400),
     current_user: Dict = Depends(get_current_user),
 ) -> Dict[str, Any]:
@@ -402,7 +434,12 @@ def get_strategy_pool_backtest_result(
     strategy: str = Query(..., description="Strategy key"),
     preset: Optional[str] = Query(None, description="Preset name"),
     end_date: Optional[str] = Query(None, description="Optional end date (YYYYMMDD)"),
-    days_back: int = Query(360, ge=30, le=2000, description="Lookback days for the result window"),
+    days_back: int = Query(
+        DEFAULT_BACKTEST_DAYS_BACK,
+        ge=30,
+        le=MAX_BACKTEST_DAYS_BACK,
+        description="Lookback days for the result window",
+    ),
     initial_cash: float = Query(1_000_000.0, gt=0, description="Initial cash used to build equity curve"),
     current_user: Dict = Depends(get_current_user),
 ) -> Dict[str, Any]:
@@ -464,6 +501,8 @@ def get_strategy_pool_backtest_result(
             "win_rate": float(last_doc.get("hist_win_rate", 0) or 0),
             "total_trades": int(last_doc.get("hist_total_trades", 0) or 0),
         }
+        if last_doc.get("hist_calmar_ratio") is not None:
+            metrics["calmar_ratio"] = float(last_doc.get("hist_calmar_ratio") or 0)
 
         trades: List[Dict[str, Any]] = []
         equity_by_date: Dict[str, float] = {}
