@@ -1822,6 +1822,7 @@ async def get_single_score_detail(
                     details=details_payload,
                     dimensions=dimensions,
                     strategy=strategy,
+                    strategy_scores=strategy_scores,
                 ),
                 'message': '获取综合得分拆解成功'
             }

@@ -143,11 +143,16 @@ def extract_express_flags(details: Optional[Dict[str, Any]]) -> Dict[str, Any]:
 
 
 def get_strategy_recommendations(
-    doc: Dict[str, Any],
+    strategy_scores: Any,
     strategy: str = "balanced",
 ) -> Optional[Dict[str, Any]]:
-    """Return strategy recommendations blob when stored on the score document."""
-    strategy_scores = doc.get("strategy_scores") or {}
+    """Return the recommendations blob for a strategy.
+
+    Takes ``strategy_scores`` rather than the score document on purpose: the
+    field lives in ``stock_score_details`` now, so reading it off the document
+    would silently yield None for every score written after the split. Callers
+    pass what :func:`load_score_details` resolved.
+    """
     if not isinstance(strategy_scores, dict):
         return None
     strat_obj = strategy_scores.get(strategy) or strategy_scores.get("balanced")
@@ -173,6 +178,7 @@ def build_score_detail_payload(
     weights: Optional[Dict[str, float]] = None,
     dimensions: Optional[List[Dict[str, Any]]] = None,
     strategy: str = "balanced",
+    strategy_scores: Any = None,
 ) -> Dict[str, Any]:
     """Standard envelope for /stock-score-detail responses."""
     meta = build_score_meta(doc)
@@ -191,7 +197,7 @@ def build_score_detail_payload(
     if dimensions is not None:
         payload["dimensions"] = dimensions
     if category == "composite":
-        recommendations = get_strategy_recommendations(doc, strategy=strategy)
+        recommendations = get_strategy_recommendations(strategy_scores, strategy=strategy)
         if recommendations:
             payload["recommendations"] = recommendations
     return payload

@@ -29,6 +29,7 @@ from services.score_detail_meta import (
     SCORE_HISTORY_PROJECTION,
     build_score_meta,
     get_strategy_recommendations,
+    load_score_details,
 )
 try:
     from stock_data_access.evidence_fingerprint import normalize_url
@@ -1864,7 +1865,10 @@ def get_stock_workbench_scores(
     """Quant score section for the single-stock research workbench."""
     score = _latest_score(symbol)
     history = _score_history(symbol)
-    recommendations = get_strategy_recommendations(score, strategy=strategy) if score else None
+    recommendations = None
+    if score:
+        blocks = load_score_details(get_db_collections(), score)
+        recommendations = get_strategy_recommendations(blocks["strategy_scores"], strategy=strategy)
     return {
         "success": True,
         "data": _json_safe(

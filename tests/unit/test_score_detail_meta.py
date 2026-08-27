@@ -189,21 +189,19 @@ def test_extract_express_flags():
 
 
 def test_get_strategy_recommendations():
-    doc = {
-        "strategy_scores": {
-            "balanced": {
-                "comp_score": 75.5,
-                "weight": {"growth": 0.15},
-                "recommendations": {
-                    "overall_rating": "推荐",
-                    "strengths": ["growth: 80.0分"],
-                    "weaknesses": [],
-                    "risk_level": "中等风险",
-                },
-            }
+    strategy_scores = {
+        "balanced": {
+            "comp_score": 75.5,
+            "weight": {"growth": 0.15},
+            "recommendations": {
+                "overall_rating": "推荐",
+                "strengths": ["growth: 80.0分"],
+                "weaknesses": [],
+                "risk_level": "中等风险",
+            },
         }
     }
-    rec = get_strategy_recommendations(doc, strategy="balanced")
+    rec = get_strategy_recommendations(strategy_scores, strategy="balanced")
     assert rec is not None
     assert rec["overall_rating"] == "推荐"
     assert rec["comp_score"] == 75.5
@@ -214,12 +212,6 @@ def test_build_score_detail_payload_includes_meta_and_recommendations():
         "score_date": "20240809",
         "algorithm_version": "v0.1",
         "growth_score": 80,
-        "strategy_scores": {
-            "balanced": {
-                "comp_score": 75,
-                "recommendations": {"overall_rating": "推荐"},
-            }
-        },
     }
     payload = build_score_detail_payload(
         doc,
@@ -228,6 +220,25 @@ def test_build_score_detail_payload_includes_meta_and_recommendations():
         details={"综合得分(当前策略)": 75},
         dimensions=[],
         strategy="balanced",
+        strategy_scores={
+            "balanced": {
+                "comp_score": 75,
+                "recommendations": {"overall_rating": "推荐"},
+            }
+        },
     )
     assert payload["meta"]["details_schema_version"] == 0
     assert payload["recommendations"]["overall_rating"] == "推荐"
+
+
+def test_build_score_detail_payload_without_strategy_scores_omits_recommendations():
+    """The score document no longer carries strategy_scores, so nothing may be
+    inferred from it: callers must pass what load_score_details resolved."""
+    payload = build_score_detail_payload(
+        {"score_date": "20240809", "growth_score": 80},
+        symbol="000001.SZ",
+        category="composite",
+        details={},
+        strategy="balanced",
+    )
+    assert "recommendations" not in payload
