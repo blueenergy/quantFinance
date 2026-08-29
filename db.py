@@ -243,6 +243,8 @@ def get_data_db():
         "index_constituents": data_db["index_constituents"],
         # Fund holdings snapshots (if sync task enabled)
         "fund_holdings": data_db["fund_holdings"],
+        "fund_basic": data_db["fund_basic"],
+        "fund_inventory_snapshots": data_db["fund_inventory_snapshots"],
         # Stock reference data
         "stock_info": data_db["stock_info"],
         "stock_basic": data_db["stock_basic"],

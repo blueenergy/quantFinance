@@ -36,6 +36,7 @@ KNOWN_MAIN_TABS: List[tuple] = [
     ("shenwan-index", True),
     ("history", False),
     ("stock-workbench", False),
+    ("fund-inventory", False),
     ("strategy-pool", False),
     ("ranking", False),
     ("entropy-ranking", False),

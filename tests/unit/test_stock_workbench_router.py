@@ -1464,6 +1464,9 @@ def test_workbench_main_includes_lazy_signals_section_status(monkeypatch):
     assert signals["found"] is False
     assert "SWOT" in signals["expected_freshness"]
     assert "symbol_risk_findings" in signals["source"]
+    fund_inv = response["data"]["data_status"]["sections"]["fund_inventory"]
+    assert fund_inv["found"] is False
+    assert "fund_inventory_snapshots" in fund_inv["source"]
 
 
 def test_get_stock_workbench_signals_returns_swot_payload(monkeypatch):

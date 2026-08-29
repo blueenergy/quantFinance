@@ -20,6 +20,7 @@ from db import get_analyzer_db, get_data_db, get_db_collections
 from routers.stock import _json_safe, _symbol_candidates
 from services.analysis_history import build_user_analysis_history_payload
 from services.analysis_tasks import build_task_doc
+from services.fund_inventory import public_snapshot
 from services.portfolio_symbol_risk import (
     build_workbench_swot_section,
     internal_signal_enabled,
@@ -1736,6 +1737,39 @@ def _shareholder_section(symbol: str) -> Dict[str, Any]:
     }
 
 
+def _fund_inventory_section(symbol: str) -> Dict[str, Any]:
+    data = get_data_db()
+    coll = _data_collection(data, "fund_inventory_snapshots")
+    candidates = _symbol_candidates(symbol)
+    keys: List[str] = []
+    for cand in candidates:
+        keys.append(cand)
+        if "." in cand:
+            keys.append(cand.split(".", 1)[0])
+    doc = None
+    if coll is not None:
+        doc = coll.find_one(
+            {
+                "symbol": {"$in": list(dict.fromkeys(keys))},
+                "universe": "active_equity",
+                "price_adjusted": True,
+            },
+            {"_id": 0},
+            sort=[("period_curr", -1)],
+        )
+    snap = public_snapshot(doc)
+    return {
+        "symbol": symbol,
+        "snapshot": snap,
+        "data_status": _section_status(
+            found=bool(snap),
+            as_of=(snap or {}).get("period_curr"),
+            expected_freshness="季报/年报披露后生成；默认年报↔半年报全持仓对比，不是今日买卖",
+            source="quant_data.fund_inventory_snapshots",
+        ),
+    }
+
+
 @router.get("/{symbol}/workbench")
 def get_stock_workbench(
     symbol: str,
@@ -1782,6 +1816,11 @@ def get_stock_workbench(
                 found=False,
                 expected_freshness="进入股东筹码页签后按需加载",
                 source="quant_data.stk_holdernumber/hk_hold/stk_holdertrade/share_float/repurchase",
+            ),
+            "fund_inventory": _section_status(
+                found=False,
+                expected_freshness="进入公募库存页签后按需加载",
+                source="quant_data.fund_inventory_snapshots",
             ),
             "signals": _section_status(
                 found=False,
@@ -1958,6 +1997,18 @@ def get_stock_workbench_shareholders(
     return {
         "success": True,
         "data": _json_safe(_shareholder_section(symbol)),
+    }
+
+
+@router.get("/{symbol}/workbench/fund-inventory")
+def get_stock_workbench_fund_inventory(
+    symbol: str,
+    current_user: Dict[str, Any] = Depends(get_current_active_user),
+):
+    """Active mutual-fund inventory four-state section (price-adjusted)."""
+    return {
+        "success": True,
+        "data": _json_safe(_fund_inventory_section(symbol)),
     }
 
 
