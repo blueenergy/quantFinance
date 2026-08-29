@@ -17,7 +17,7 @@ from pydantic import BaseModel, Field
 
 from auth import get_current_active_user
 from db import get_analyzer_db, get_data_db, get_db_collections
-from routers.stock import _json_safe, _symbol_candidates
+from routers.stock import _json_safe, _ohlcv_collection_name, _symbol_candidates
 from services.analysis_history import build_user_analysis_history_payload
 from services.analysis_tasks import build_task_doc
 from services.fund_inventory import public_snapshot
@@ -210,6 +210,8 @@ def _first_float(*values: Any) -> Optional[float]:
 
 
 def _find_first(collection, candidates: List[str], projection: Optional[Dict[str, int]] = None) -> Optional[Dict[str, Any]]:
+    if collection is None:
+        return None
     for field in ("symbol", "ts_code", "con_code"):
         doc = collection.find_one({field: {"$in": candidates}}, projection)
         if doc:
@@ -242,7 +244,8 @@ def _score_history(symbol: str, limit: int = 60) -> List[Dict[str, Any]]:
 
 
 def _latest_daily_quote(data: Any, candidates: List[str], trade_date: Any = None) -> Optional[Dict[str, Any]]:
-    volume_price = data["volume_price"]
+    sample = candidates[0] if candidates else ""
+    volume_price = data.get(_ohlcv_collection_name(sample)) or data["volume_price"]
     # Prefer symbol first: most deployments index volume_price by symbol; ts_code-only first can full-scan.
     for field in ("symbol", "ts_code"):
         base: Dict[str, Any] = {field: {"$in": candidates}}
@@ -1037,6 +1040,10 @@ def _stock_identity(symbol: str) -> Dict[str, Any]:
     data = get_data_db()
     candidates = _symbol_candidates(symbol)
     stock = _find_first(data["stock_info"], candidates) or {}
+    if not stock:
+        stock = _find_first(data.get("hk_stock_info"), candidates) or {}
+    if not stock:
+        stock = _find_first(data.get("us_stock_info"), candidates) or {}
     if not stock:
         stock = _find_first(data["stock_basic"], candidates) or {}
     if not stock:

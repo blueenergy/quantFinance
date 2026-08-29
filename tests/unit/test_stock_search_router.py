@@ -79,6 +79,44 @@ def test_search_stocks_matches_pinyin_prefix_without_full_scan(monkeypatch):
     assert "$or" in collection.queries[0]
 
 
+def test_symbol_candidates_pad_hk_code():
+    assert "00700.HK" in stock._symbol_candidates("700")
+    assert "00700.HK" in stock._symbol_candidates("00700.HK")
+
+
+def test_ohlcv_collection_name_routes_markets():
+    assert stock._ohlcv_collection_name("000001.SZ") == "volume_price"
+    assert stock._ohlcv_collection_name("00700.HK") == "hk_volume_price"
+    assert stock._ohlcv_collection_name("AAPL") == "us_volume_price"
+
+
+def test_search_stocks_includes_hk(monkeypatch):
+    a_share = _Collection(
+        [{"_id": "1", "symbol": "000001.SZ", "name": "平安银行", "pinyin": "PAYH"}]
+    )
+    hk = _Collection(
+        [{"_id": "2", "symbol": "00700.HK", "name": "腾讯控股", "pinyin": "TXKG"}]
+    )
+    monkeypatch.setattr(
+        stock,
+        "get_data_db",
+        lambda: {
+            "stock_info": a_share,
+            "etf_basic": _Collection([]),
+            "hk_stock_info": hk,
+            "us_stock_info": _Collection([]),
+        },
+    )
+
+    response = stock.search_stocks("700")
+
+    assert response["success"] is True
+    symbols = [row["symbol"] for row in response["data"]]
+    assert "00700.HK" in symbols
+    hk_row = next(row for row in response["data"] if row["symbol"] == "00700.HK")
+    assert hk_row["market"] == "HK"
+
+
 def test_search_stocks_digit_prefix(monkeypatch):
     collection = _Collection(
         [{"_id": "1", "symbol": "600000.SH", "name": "浦发银行", "pinyin": "PFYH"}]

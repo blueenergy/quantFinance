@@ -119,6 +119,8 @@ def get_db_collections() -> Dict[str, Collection]:
         # Stock reference data lives in quant_data
         "stock_info": data_db["stock_info"],
         "etf_basic": data_db["etf_basic"],
+        "hk_stock_info": data_db["hk_stock_info"],
+        "us_stock_info": data_db["us_stock_info"],
         "index_constituents": data_db["index_constituents"],
     }
 
@@ -207,8 +209,14 @@ def get_data_db():
         "hot_stock_raw": data_db["hot_stock_raw"],
         # Market data
         "volume_price": data_db["volume_price"],
+        "hk_volume_price": data_db["hk_volume_price"],
+        "us_volume_price": data_db["us_volume_price"],
         "trade_calendar": data_db["trade_calendar"],
+        "hk_trade_calendar": data_db["hk_trade_calendar"],
+        "us_trade_calendar": data_db["us_trade_calendar"],
         "stock_adj_factor": data_db["stock_adj_factor"],
+        "hk_adj_factor": data_db["hk_adj_factor"],
+        "us_adj_factor": data_db["us_adj_factor"],
         "volume_price_realtime_latest": realtime_db["volume_price_realtime_latest"],
         "stock_weekly": data_db["stock_weekly"],
         "stock_monthly": data_db["stock_monthly"],
@@ -247,6 +255,8 @@ def get_data_db():
         "fund_inventory_snapshots": data_db["fund_inventory_snapshots"],
         # Stock reference data
         "stock_info": data_db["stock_info"],
+        "hk_stock_info": data_db["hk_stock_info"],
+        "us_stock_info": data_db["us_stock_info"],
         "stock_basic": data_db["stock_basic"],
         "sw_index_member": data_db["sw_index_member"],
         "sw_daily": data_db["sw_daily"],
