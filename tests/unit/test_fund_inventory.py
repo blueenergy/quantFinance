@@ -109,6 +109,36 @@ def test_public_snapshot_does_not_claim_adjustment_when_prices_missing():
 
 
 @pytest.mark.unit
+def test_public_snapshot_labels_provisional_top10_scope():
+    snap = public_snapshot(
+        _doc(
+            quality_status="provisional",
+            comparison_scope="top10",
+            market="HK",
+            ts_code="00700.HK",
+            price_source="fund_report_implied",
+            corporate_action_adjusted=False,
+            price_note="由基金报告推导，未校正公司行动。",
+            quality={
+                "status": "provisional",
+                "strategy_coverage_pct": 100.0,
+                "holding_depth_pct": 20.0,
+                "full_readiness_pct": 20.0,
+            },
+            state="inventory_exit",
+        )
+    )
+    assert snap["state_label"] == "退出前十大"
+    assert snap["quality_status"] == "provisional"
+    assert snap["quality"]["holding_depth_pct"] == 20.0
+    assert "不代表完整全持仓" in snap["lag_note"]
+    assert "暂未校正拆股" in snap["lag_note"]
+    assert snap["market"] == "HK"
+    assert snap["corporate_action_adjusted"] is False
+    assert "前十大" in snap["four_questions"][0]["question"]
+
+
+@pytest.mark.unit
 def test_workbench_fund_inventory_section(monkeypatch):
     monkeypatch.setattr(
         "routers.stock_workbench.get_data_db",
@@ -148,6 +178,30 @@ def test_list_snapshots_filters_state(monkeypatch):
     assert rows[0]["name"] == "寒武纪"
     assert body["data"]["counts"]["incumbent_strengthen"] == 1
     assert body["data"]["counts"]["new_inventory"] == 1
+
+
+@pytest.mark.unit
+def test_list_snapshots_filters_market(monkeypatch):
+    coll = _Collection(
+        [
+            _doc(symbol="300502", market="A"),
+            _doc(symbol="00700.HK", ts_code="00700.HK", name="腾讯控股", market="HK"),
+        ]
+    )
+    monkeypatch.setattr(
+        "routers.fund_inventory.get_data_db",
+        lambda: {"fund_inventory_snapshots": coll},
+    )
+    body = list_fund_inventory_snapshots(
+        period="20260630",
+        state=None,
+        market="HK",
+        limit=50,
+        sort="net_ex_price",
+        current_user={"id": "u1"},
+    )
+    assert [row["ts_code"] for row in body["data"]["rows"]] == ["00700.HK"]
+    assert body["data"]["market"] == "HK"
 
 
 @pytest.mark.unit

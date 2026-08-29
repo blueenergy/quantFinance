@@ -21,6 +21,7 @@ InventoryState = Literal[
     "inventory_exit",
 ]
 InventorySort = Literal["net_ex_price", "net", "net_asc"]
+InventoryMarket = Literal["A", "HK"]
 
 
 def _coll():
@@ -54,6 +55,7 @@ def list_fund_inventory_snapshots(
         description="本期 end_date YYYYMMDD",
     ),
     state: Optional[InventoryState] = Query(default=None),
+    market: Optional[InventoryMarket] = Query(default=None),
     limit: int = Query(default=50, ge=1, le=500),
     sort: InventorySort = Query(default="net_ex_price"),
     current_user: Dict[str, Any] = Depends(get_current_active_user),
@@ -66,6 +68,7 @@ def list_fund_inventory_snapshots(
         "universe": _UNIVERSE,
         "price_adjusted": True,
     }
+    market_filter = market if isinstance(market, str) and market in {"A", "HK"} else None
     period_curr = (period or "").strip()
     if not period_curr:
         latest = coll.find_one(
@@ -78,6 +81,8 @@ def list_fund_inventory_snapshots(
         query["period_curr"] = period_curr
     if state:
         query["state"] = state
+    if market_filter:
+        query["market"] = market_filter
 
     sort_field = "net_ex_price"
     descending = True
@@ -101,7 +106,18 @@ def list_fund_inventory_snapshots(
     count_query = {"universe": _UNIVERSE, "price_adjusted": True}
     if period_curr:
         count_query["period_curr"] = period_curr
+    if market_filter:
+        count_query["market"] = market_filter
     try:
+        quality_doc = coll.find_one(
+            count_query,
+            {
+                "_id": 0,
+                "quality_status": 1,
+                "comparison_scope": 1,
+                "quality": 1,
+            },
+        )
         for st in (
             "incumbent_strengthen",
             "new_inventory",
@@ -118,7 +134,11 @@ def list_fund_inventory_snapshots(
         "data": {
             "period": period_curr,
             "state": state,
+            "market": market_filter,
             "rows": [public_snapshot(row) for row in rows],
             "counts": counts,
+            "quality_status": (quality_doc or {}).get("quality_status"),
+            "comparison_scope": (quality_doc or {}).get("comparison_scope"),
+            "quality": (quality_doc or {}).get("quality") or {},
         },
     }
