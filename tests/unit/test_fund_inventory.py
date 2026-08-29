@@ -1,8 +1,11 @@
+from datetime import date
+
 import pytest
 
 from routers.fund_inventory import list_fund_inventory_periods, list_fund_inventory_snapshots
 from routers.stock_workbench import _fund_inventory_section
-from services.fund_inventory import public_snapshot
+from services.fund_inventory import classify_inventory_candidate, public_snapshot
+from services.fund_inventory_context import build_candidate_contexts
 
 YI = 1e8
 
@@ -46,6 +49,29 @@ class _Collection:
             if value != expected:
                 return False
         return True
+
+
+class _SortableRows(list):
+    def sort(self, spec):
+        rows = list(self)
+        for field, direction in reversed(spec):
+            rows.sort(
+                key=lambda row: row.get(field) or "",
+                reverse=direction < 0,
+            )
+        return _SortableRows(rows)
+
+
+class _ContextCollection:
+    def __init__(self, *, aggregate_rows=None, find_rows=None):
+        self.aggregate_rows = list(aggregate_rows or [])
+        self.find_rows = list(find_rows or [])
+
+    def aggregate(self, pipeline):
+        return list(self.aggregate_rows)
+
+    def find(self, query=None, projection=None):
+        return _SortableRows(dict(row) for row in self.find_rows)
 
 
 def _doc(**overrides):
@@ -139,6 +165,202 @@ def test_public_snapshot_labels_provisional_top10_scope():
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize(
+    ("state", "context", "expected"),
+    [
+        (
+            "incumbent_strengthen",
+            {
+                "score": {
+                    "growth_score": 70,
+                    "fundamental_score": 60,
+                    "value_score": 55,
+                },
+                "financials": [
+                    {"q_netprofit_yoy": 18},
+                    {"q_netprofit_yoy": 12},
+                ],
+                "ytd_return_pct": 20,
+            },
+            "underpriced",
+        ),
+        (
+            "incumbent_strengthen",
+            {
+                "score": {
+                    "growth_score": 70,
+                    "fundamental_score": 60,
+                    "value_score": 25,
+                },
+                "financials": [
+                    {"q_netprofit_yoy": 18},
+                    {"q_netprofit_yoy": 12},
+                ],
+                "ytd_return_pct": 80,
+            },
+            "crowded_trend",
+        ),
+        (
+            "new_inventory",
+            {
+                "score": {
+                    "growth_score": 65,
+                    "fundamental_score": 55,
+                    "value_score": 50,
+                },
+                "financials": [
+                    {"q_netprofit_yoy": 15},
+                    {"q_netprofit_yoy": -8},
+                ],
+                "ytd_return_pct": 12,
+            },
+            "earnings_inflection",
+        ),
+        (
+            "inventory_turnover",
+            {"ytd_return_pct": 65},
+            "high_level_turnover",
+        ),
+        (
+            "inventory_exit",
+            {
+                "score": {
+                    "growth_score": 35,
+                    "fundamental_score": 40,
+                    "value_score": 45,
+                },
+                "financials": [
+                    {"q_netprofit_yoy": -20},
+                    {"q_netprofit_yoy": -5},
+                ],
+                "ytd_return_pct": -15,
+            },
+            "negative_combo",
+        ),
+    ],
+)
+def test_classify_inventory_candidate_combinations(state, context, expected):
+    result = classify_inventory_candidate(_doc(state=state), context)
+    assert result["category"] == expected
+    assert result["evidence"]
+    assert result["rule_version"] == "fund_inventory_candidate_v1"
+
+
+@pytest.mark.unit
+def test_provisional_exit_is_not_classified_as_negative():
+    result = classify_inventory_candidate(
+        _doc(state="inventory_exit", quality_status="provisional"),
+        {
+            "score": {"growth_score": 30},
+            "financials": [
+                {"q_netprofit_yoy": -20},
+                {"q_netprofit_yoy": -5},
+            ],
+            "ytd_return_pct": -15,
+        },
+    )
+    assert result["category"] == "other"
+    assert "不按完整持仓退出判负面" in result["caveat"]
+
+
+@pytest.mark.unit
+def test_unadjusted_ytd_return_does_not_drive_price_categories():
+    result = classify_inventory_candidate(
+        _doc(state="incumbent_strengthen"),
+        {
+            "score": {
+                "growth_score": 70,
+                "fundamental_score": 60,
+                "value_score": 20,
+            },
+            "financials": [
+                {"q_netprofit_yoy": 18},
+                {"q_netprofit_yoy": 12},
+            ],
+            "ytd_return_pct": 80,
+            "ytd_adjustment_degraded": True,
+        },
+    )
+    assert result["category"] == "other"
+    assert "复权数据不足" in result["evidence"][-2]
+
+
+@pytest.mark.unit
+def test_hk_without_comparable_scores_reports_insufficient_data():
+    result = classify_inventory_candidate(
+        _doc(ts_code="00700.HK", market="HK"),
+    )
+    assert result["category"] == "insufficient_data"
+    assert "港股暂缺" in result["caveat"]
+
+
+@pytest.mark.unit
+def test_build_candidate_contexts_uses_adjusted_ytd_return():
+    symbol = "300502.SZ"
+    contexts = build_candidate_contexts(
+        [_doc(ts_code=symbol, market="A")],
+        finance_collections={
+            "stock_scores": _ContextCollection(
+                aggregate_rows=[
+                    {
+                        "symbol": symbol,
+                        "score_date": "20260828",
+                        "growth_score": 70,
+                        "fundamental_score": 60,
+                        "value_score": 50,
+                    }
+                ]
+            )
+        },
+        data_collections={
+            "financial_indicator": _ContextCollection(
+                find_rows=[
+                    {
+                        "ts_code": symbol,
+                        "end_date": "20260331",
+                        "q_netprofit_yoy": 18,
+                    },
+                    {
+                        "ts_code": symbol,
+                        "end_date": "20251231",
+                        "q_netprofit_yoy": 12,
+                    },
+                ]
+            ),
+            "volume_price": _ContextCollection(
+                aggregate_rows=[
+                    {
+                        "_id": symbol,
+                        "first_date": "20260105",
+                        "first_close": 100,
+                        "last_date": "20260828",
+                        "last_close": 60,
+                    }
+                ]
+            ),
+            "stock_adj_factor": _ContextCollection(
+                find_rows=[
+                    {
+                        "symbol": symbol,
+                        "trade_date": "20260105",
+                        "adj_factor": 1,
+                    },
+                    {
+                        "symbol": symbol,
+                        "trade_date": "20260828",
+                        "adj_factor": 2,
+                    },
+                ]
+            ),
+        },
+        as_of=date(2026, 8, 29),
+    )
+    assert contexts[symbol]["ytd_return_pct"] == 20.0
+    assert contexts[symbol]["ytd_adjustment_degraded"] is False
+    assert len(contexts[symbol]["financials"]) == 2
+
+
+@pytest.mark.unit
 def test_workbench_fund_inventory_section(monkeypatch):
     monkeypatch.setattr(
         "routers.stock_workbench.get_data_db",
@@ -166,6 +388,10 @@ def test_list_snapshots_filters_state(monkeypatch):
         ]
     )
     monkeypatch.setattr("routers.fund_inventory.get_data_db", lambda: {"fund_inventory_snapshots": coll})
+    monkeypatch.setattr(
+        "routers.fund_inventory.build_candidate_contexts",
+        lambda *args, **kwargs: {},
+    )
     body = list_fund_inventory_snapshots(
         period="20260630",
         state="new_inventory",
@@ -191,6 +417,10 @@ def test_list_snapshots_filters_market(monkeypatch):
     monkeypatch.setattr(
         "routers.fund_inventory.get_data_db",
         lambda: {"fund_inventory_snapshots": coll},
+    )
+    monkeypatch.setattr(
+        "routers.fund_inventory.build_candidate_contexts",
+        lambda *args, **kwargs: {},
     )
     body = list_fund_inventory_snapshots(
         period="20260630",

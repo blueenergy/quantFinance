@@ -7,8 +7,9 @@ from typing import Any, Dict, Literal, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 
 from auth import get_current_active_user
-from db import get_data_db
+from db import get_data_db, get_db_collections
 from services.fund_inventory import public_snapshot
+from services.fund_inventory_context import build_candidate_contexts
 
 router = APIRouter(prefix="/fund-inventory", tags=["公募库存"])
 logger = logging.getLogger(__name__)
@@ -129,13 +130,31 @@ def list_fund_inventory_snapshots(
         logger.exception("count fund inventory states failed")
         raise HTTPException(status_code=503, detail="公募库存数据暂时不可用") from exc
 
+    candidate_contexts: Dict[str, Dict[str, Any]] = {}
+    try:
+        candidate_contexts = build_candidate_contexts(
+            rows,
+            finance_collections=get_db_collections(),
+            data_collections=get_data_db(),
+        )
+    except Exception:
+        # Candidate classification is an enrichment. Inventory accounting stays
+        # available and explicitly reports insufficient context if it fails.
+        logger.exception("load fund inventory candidate context failed")
+
     return {
         "success": True,
         "data": {
             "period": period_curr,
             "state": state,
             "market": market_filter,
-            "rows": [public_snapshot(row) for row in rows],
+            "rows": [
+                public_snapshot(
+                    row,
+                    candidate_contexts.get(str(row.get("ts_code") or "")),
+                )
+                for row in rows
+            ],
             "counts": counts,
             "quality_status": (quality_doc or {}).get("quality_status"),
             "comparison_scope": (quality_doc or {}).get("comparison_scope"),
