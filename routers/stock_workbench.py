@@ -245,7 +245,10 @@ def _score_history(symbol: str, limit: int = 60) -> List[Dict[str, Any]]:
 
 def _latest_daily_quote(data: Any, candidates: List[str], trade_date: Any = None) -> Optional[Dict[str, Any]]:
     sample = candidates[0] if candidates else ""
-    volume_price = data.get(_ohlcv_collection_name(sample)) or data["volume_price"]
+    # pymongo forbids truth testing on Collection, so fall back on key lookup.
+    volume_price = data.get(_ohlcv_collection_name(sample))
+    if volume_price is None:
+        volume_price = data["volume_price"]
     # Prefer symbol first: most deployments index volume_price by symbol; ts_code-only first can full-scan.
     for field in ("symbol", "ts_code"):
         base: Dict[str, Any] = {field: {"$in": candidates}}

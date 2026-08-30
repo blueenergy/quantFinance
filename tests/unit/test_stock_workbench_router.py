@@ -33,6 +33,13 @@ class _Collection:
     def __init__(self, docs=None):
         self.docs = list(docs or [])
 
+    def __bool__(self):
+        # Mirror pymongo: truth testing a Collection must raise, not silently pass.
+        raise NotImplementedError(
+            "Collection objects do not implement truth value testing or bool(). "
+            "Please compare with None instead: collection is not None"
+        )
+
     def find_one(self, query=None, projection=None, sort=None):
         rows = [dict(doc) for doc in self.docs if self._matches(doc, query or {})]
         if sort:
@@ -98,6 +105,32 @@ def test_latest_daily_quote_uses_index_covered_sort():
 
     assert quote["trade_date"] == "20260610"
     assert quotes.find_one_sorts == [[("trade_date", -1)]]
+
+
+def test_latest_daily_quote_routes_hk_symbol_to_hk_collection():
+    a_share = _RecordingCollection(
+        [{"symbol": "000001.SZ", "trade_date": "20260610", "close": 10.0}]
+    )
+    hk = _RecordingCollection(
+        [{"symbol": "00700.HK", "trade_date": "20260611", "close": 400.0}]
+    )
+
+    quote = _latest_daily_quote(
+        {"volume_price": a_share, "hk_volume_price": hk}, ["00700.HK"]
+    )
+
+    assert quote["close"] == 400.0
+    assert a_share.find_one_sorts == []
+
+
+def test_latest_daily_quote_falls_back_when_market_collection_absent():
+    a_share = _RecordingCollection(
+        [{"symbol": "AAPL", "trade_date": "20260610", "close": 1.0}]
+    )
+
+    quote = _latest_daily_quote({"volume_price": a_share}, ["AAPL"])
+
+    assert quote["close"] == 1.0
 
 
 def test_score_queries_use_index_covered_sort(monkeypatch):
