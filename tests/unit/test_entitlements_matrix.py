@@ -14,6 +14,18 @@ from services.quota_manager import QuotaManager
 
 
 @pytest.mark.unit
+def test_copywork_nav_order_sits_between_inventory_and_strategy_pool():
+    cats = em.build_categories()
+    main = next(c for c in cats if c["category_id"] == "main_nav")
+    orders = {}
+    for sec in main["sections"]:
+        tab = next((row for row in sec["rows"] if row["row_type"] == "tab"), None)
+        if tab:
+            orders[tab["key"]] = tab["order"]
+    assert orders["nav.fund-inventory"] < orders["nav.fund-copywork"] < orders["nav.strategy-pool"]
+
+
+@pytest.mark.unit
 def test_build_categories_watchlist_has_deep_analysis_child():
     cats = em.build_categories()
     main = next(c for c in cats if c["category_id"] == "main_nav")

@@ -47,6 +47,7 @@ from routers.user_config import router as user_config_router
 from routers.stock import router as stock_router
 from routers.stock_workbench import router as stock_workbench_router
 from routers.fund_inventory import router as fund_inventory_router
+from routers.fund_copywork import router as fund_copywork_router
 from routers.market import router as market_router
 from routers.daily_gold import router as daily_gold_router
 from routers.admin import router as admin_router
@@ -172,6 +173,7 @@ app.include_router(navigation_user_router, prefix="/api/user", tags=["主导航"
 app.include_router(stock_router, prefix="/api/stock", tags=["股票"])
 app.include_router(stock_workbench_router, prefix="/api/stock", tags=["股票工作台"])
 app.include_router(fund_inventory_router, prefix="/api", tags=["公募库存"])
+app.include_router(fund_copywork_router, prefix="/api", tags=["公募抄作业"])
 app.include_router(market_router, prefix="/api", tags=["市场分析"])
 app.include_router(daily_gold_router, prefix="/api", tags=["每日金股"])
 app.include_router(admin_router, prefix="/api/admin", tags=["管理员"])

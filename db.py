@@ -253,6 +253,9 @@ def get_data_db():
         "fund_holdings": data_db["fund_holdings"],
         "fund_basic": data_db["fund_basic"],
         "fund_inventory_snapshots": data_db["fund_inventory_snapshots"],
+        "fund_copywork_meta": data_db["fund_copywork_meta"],
+        "fund_copywork_products": data_db["fund_copywork_products"],
+        "fund_copywork_stocks": data_db["fund_copywork_stocks"],
         # Stock reference data
         "stock_info": data_db["stock_info"],
         "hk_stock_info": data_db["hk_stock_info"],
