@@ -651,7 +651,7 @@ async def stock_ranking(
     if ic not in _RANKING_INDEX_CODES:
         return {"success": False, "error": f"不支持的 index_code: {ic}，可选: {', '.join(_RANKING_INDEX_CODES)}"}
 
-    from utils.score_utils import extract_strategy_score, safe_round
+    from stock_data_access.score_utils import extract_strategy_score, safe_round
     db = get_db_collections()
     stock_scores = db["stock_scores"]
     stock_info = db["stock_info"]
@@ -2943,7 +2943,7 @@ async def stock_score_detail(
     返回字段：综合评分（balanced/aggressive/conservative 三策略）及
     cycle/value/fundamental/growth/technical/money_flow 六维子评分。
     """
-    from utils.score_utils import safe_round
+    from stock_data_access.score_utils import safe_round
     db = get_db_collections()
     doc = db["stock_scores"].find_one({"symbol": symbol}, sort=[("score_date", -1)])
     if not doc:
@@ -3544,7 +3544,7 @@ async def user_watchlist_stocks(
 
     需要在 MCP headers 中设置 X-User-Token（通过 user_login 工具获取）。
     """
-    from utils.score_utils import safe_round
+    from stock_data_access.score_utils import safe_round
     user_id = user["id"]
     colls = get_db_collections()
 

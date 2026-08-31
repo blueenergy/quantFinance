@@ -4,7 +4,7 @@ import threading
 import time
 from fastapi import APIRouter, HTTPException, Depends, Query, Request
 from db import get_db_collections, get_data_db
-from utils.score_utils import (
+from stock_data_access.score_utils import (
     parse_score_weights,
     safe_round,
     safe_round_or_none,
