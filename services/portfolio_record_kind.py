@@ -29,7 +29,7 @@ rows carry ``plan_type == "rebalance"``::
     1. manual_action in {external_manual, external_liquidation} -> ledger_event
     2. plan_id contains "_extman_"                               -> ledger_event
     3. plan_type == "monitor"                                    -> observation
-    4. plan_type == "rebalance"                                  -> trade_plan
+    4. plan_type in TRADE_PLAN_PLAN_TYPES                        -> trade_plan
     5. otherwise                                                 -> ValueError
 """
 
@@ -40,6 +40,18 @@ from typing import Any, Mapping
 RECORD_KIND_TRADE_PLAN = "trade_plan"
 RECORD_KIND_OBSERVATION = "observation"
 RECORD_KIND_LEDGER_EVENT = "ledger_event"
+
+# A cadence or discretionary rebalance of the strategy's target portfolio.
+PLAN_TYPE_REBALANCE = "rebalance"
+# An intraday T+0 leg on an already-held position. Kept distinct from
+# ``rebalance`` so it does not read as a portfolio decision: the cadence
+# anchor query in the plan generator matches on plan_type == "rebalance",
+# so sharing that value would push the next scheduled rebalance out.
+PLAN_TYPE_INTRADAY_T0 = "intraday_t0"
+
+# plan_type values that denote an executable trade decision (record_kind
+# trade_plan). Extend this rather than adding branches in classify_record.
+TRADE_PLAN_PLAN_TYPES = frozenset({PLAN_TYPE_REBALANCE, PLAN_TYPE_INTRADAY_T0})
 
 VALID_RECORD_KINDS = frozenset(
     {
@@ -74,7 +86,7 @@ def classify_record(doc: Mapping[str, Any]) -> str:
     plan_type = doc.get("plan_type")
     if plan_type == "monitor":
         return RECORD_KIND_OBSERVATION
-    if plan_type == "rebalance":
+    if plan_type in TRADE_PLAN_PLAN_TYPES:
         return RECORD_KIND_TRADE_PLAN
 
     # Legacy ledger rows were written with plan_type == "manual"; treat any

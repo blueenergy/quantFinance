@@ -4,6 +4,7 @@ from datetime import datetime
 import pytest
 
 from routers import portfolio_plans
+from services import portfolio_record_kind
 from services.live_trade_signals import DEFAULT_SIGNAL_VALID_TTL_SECONDS
 
 
@@ -5567,6 +5568,84 @@ def test_live_rebalance_caps_sell_to_account_available(monkeypatch):
     assert item["account_available_shares"] == 200
     assert "account_position_capped" in item["blockers"]
     assert data_out["capped_symbols"] == ["600000.SH"]
+
+
+def test_live_rebalance_stamps_intraday_t0_plan_type(monkeypatch):
+    """T+0 legs must not look like a portfolio rebalance to downstream queries."""
+    cols, fin, data = _live_rebalance_env()
+    _patch_lineage_live_env(monkeypatch, cols, fin, data)
+    monkeypatch.setattr(portfolio_plans, "schedule_snapshot_rebuild", lambda *a, **k: None)
+
+    resp = asyncio.run(
+        portfolio_plans.live_rebalance_portfolio(
+            "pla",
+            portfolio_plans.LiveRebalanceRequest(
+                securities_account_id="acct-1",
+                targets={"600000.SH": 300},
+                plan_type="intraday_t0",
+                dry_run=False,
+            ),
+            current_user={"id": "user-1"},
+        )
+    )
+
+    plan = next(
+        p for p in cols["portfolio_trade_plans"].docs
+        if p.get("plan_id") == resp["data"]["plan_id"]
+    )
+    assert plan["plan_type"] == "intraday_t0"
+    # A T+0 leg is not a rebalance day, and must still classify as a trade plan.
+    assert plan["is_rebalance_day"] is False
+    assert plan["record_kind"] == "trade_plan"
+    assert portfolio_record_kind.classify_record(plan) == "trade_plan"
+    assert portfolio_record_kind.require_record_kind(plan) == "trade_plan"
+
+
+def test_live_rebalance_defaults_to_rebalance_plan_type(monkeypatch):
+    cols, fin, data = _live_rebalance_env()
+    _patch_lineage_live_env(monkeypatch, cols, fin, data)
+    monkeypatch.setattr(portfolio_plans, "schedule_snapshot_rebuild", lambda *a, **k: None)
+
+    resp = asyncio.run(
+        portfolio_plans.live_rebalance_portfolio(
+            "pla",
+            portfolio_plans.LiveRebalanceRequest(
+                securities_account_id="acct-1",
+                targets={"600000.SH": 300},
+                dry_run=False,
+            ),
+            current_user={"id": "user-1"},
+        )
+    )
+
+    plan = next(
+        p for p in cols["portfolio_trade_plans"].docs
+        if p.get("plan_id") == resp["data"]["plan_id"]
+    )
+    assert plan["plan_type"] == "rebalance"
+    assert plan["is_rebalance_day"] is True
+
+
+def test_live_rebalance_rejects_unknown_plan_type(monkeypatch):
+    cols, fin, data = _live_rebalance_env()
+    _patch_lineage_live_env(monkeypatch, cols, fin, data)
+
+    with pytest.raises(portfolio_plans.HTTPException) as exc:
+        asyncio.run(
+            portfolio_plans.live_rebalance_portfolio(
+                "pla",
+                portfolio_plans.LiveRebalanceRequest(
+                    securities_account_id="acct-1",
+                    targets={"600000.SH": 0},
+                    plan_type="monitor",
+                    dry_run=True,
+                ),
+                current_user={"id": "user-1"},
+            )
+        )
+
+    assert exc.value.status_code == 400
+    assert "unsupported plan_type" in exc.value.detail
 
 
 def test_live_rebalance_rejects_targets_from_a_stale_holdings_read(monkeypatch):

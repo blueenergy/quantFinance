@@ -43,7 +43,11 @@ from services.portfolio_plan_remainder import (
     build_remainder_specs,
     build_topup_signal_doc,
 )
-from services.portfolio_record_kind import RECORD_KIND_TRADE_PLAN
+from services.portfolio_record_kind import (
+    PLAN_TYPE_REBALANCE,
+    RECORD_KIND_TRADE_PLAN,
+    TRADE_PLAN_PLAN_TYPES,
+)
 
 import routers.portfolio_plans as _pp
 from . import (
@@ -411,6 +415,12 @@ async def live_rebalance_portfolio(
     plan = _pp._require_plan(trading_collections, plan_id, current_user)
     if not request.targets:
         raise HTTPException(status_code=400, detail="targets must include at least one symbol")
+    requested_plan_type = str(request.plan_type or PLAN_TYPE_REBALANCE).strip()
+    if requested_plan_type not in TRADE_PLAN_PLAN_TYPES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"unsupported plan_type: {requested_plan_type!r}",
+        )
     account = _pp._require_securities_account(finance_collections, request.securities_account_id, user_id)
     if not _pp._account_live_enabled(account):
         raise HTTPException(
@@ -640,12 +650,15 @@ async def live_rebalance_portfolio(
         "strategy_name": plan.get("strategy_name"),
         "base_date": base_date,
         "execute_date": base_date,
-        "plan_type": "rebalance",
+        "plan_type": requested_plan_type,
         "record_kind": RECORD_KIND_TRADE_PLAN,
+        # origin stays "manual": downstream strategy-cadence and trailing-stop
+        # queries use origin != "manual" to mean "a strategy decision", and an
+        # intraday leg is not one.
         "origin": "manual",
         "manual_action": manual_action,
         "is_liquidation": is_liquidation,
-        "is_rebalance_day": True,
+        "is_rebalance_day": requested_plan_type == PLAN_TYPE_REBALANCE,
         "monitor_can_trade": False,
         "trading_enabled": True,
         "executable": True,

@@ -315,6 +315,10 @@ class LiveRebalanceRequest(BaseModel):
     # quantity than intended if the lineage moved in between. Declaring the
     # basis makes that a 409 instead of a silently wrong order size.
     expected_current_shares: Optional[Dict[str, int]] = Field(default=None)
+    # What kind of decision this publish represents. Defaults to a portfolio
+    # rebalance; intraday T+0 legs pass their own type so they do not read as
+    # rebalances downstream. Must be one of TRADE_PLAN_PLAN_TYPES.
+    plan_type: Optional[str] = Field(default=None)
     # Add reduced/cleared symbols to the lineage exclusion list so the next
     # strategy rebalance does not buy them back.
     exclude_after: bool = Field(default=False)

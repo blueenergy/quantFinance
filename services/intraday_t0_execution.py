@@ -24,6 +24,7 @@ from services.intraday_t0_trades import (
     record_trade,
     trade_exists_for_signal,
 )
+from services.portfolio_record_kind import PLAN_TYPE_INTRADAY_T0
 from utils.stock_utils import serialize_doc
 from utils.symbol_utils import normalize_symbol
 
@@ -424,6 +425,7 @@ async def preview_execution_async(
         securities_account_id=intent["securities_account_id"],
         targets={intent["symbol"]: intent["target_shares"]},
         expected_current_shares={intent["symbol"]: intent["current_shares"]},
+        plan_type=PLAN_TYPE_INTRADAY_T0,
         exclude_after=False,
         dry_run=True,
     )
@@ -561,6 +563,9 @@ async def submit_execution_async(
         # target_shares was derived from intent's current_shares; if the lineage
         # moved since, the absolute target would sell the wrong quantity.
         expected_current_shares={intent["symbol"]: intent["current_shares"]},
+        # Keeps T+0 legs out of the strategy's cadence anchor query, which
+        # matches plan_type == "rebalance" without excluding manual origin.
+        plan_type=PLAN_TYPE_INTRADAY_T0,
         exclude_after=False,
         dry_run=dry_run,
     )
