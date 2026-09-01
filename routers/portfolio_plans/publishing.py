@@ -429,6 +429,39 @@ async def live_rebalance_portfolio(
     current_by_key: Dict[str, Dict[str, Any]] = {}
     for row in holdings:
         current_by_key[_symbol_key(row.get("symbol"))] = row
+
+    # Reject targets computed from a holdings read that is no longer current.
+    # Absolute targets against a moved basis trade the wrong quantity, e.g. an
+    # intraday T+0 leg filling between the caller's read and this one.
+    stale_targets: List[Dict[str, Any]] = []
+    for symbol, expected in (request.expected_current_shares or {}).items():
+        actual_shares = _int_value((current_by_key.get(_symbol_key(symbol)) or {}).get("shares"))
+        if _int_value(expected) != actual_shares:
+            stale_targets.append(
+                {
+                    "symbol": symbol,
+                    "expected_current_shares": _int_value(expected),
+                    "actual_current_shares": actual_shares,
+                }
+            )
+    if stale_targets:
+        log.warning(
+            "live-rebalance stale basis anchor=%s account=%s %s",
+            plan_id,
+            request.securities_account_id,
+            ",".join(
+                f"{row['symbol']}:{row['expected_current_shares']}!={row['actual_current_shares']}"
+                for row in stale_targets
+            ),
+        )
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "live holdings changed since targets were computed",
+                "stale_targets": stale_targets,
+            },
+        )
+
     securities_account_id = str(account.get("_id") or request.securities_account_id)
     account_positions_by_key, account_positions_synced = _pp._account_positions_by_symbol(
         finance_collections,

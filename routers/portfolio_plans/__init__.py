@@ -310,6 +310,11 @@ class LiveRebalanceRequest(BaseModel):
     # position untouched. target=0 clears a holding; target>current adds; a full
     # liquidation is simply every held symbol mapped to 0.
     targets: Dict[str, int] = Field(default_factory=dict)
+    # Optimistic concurrency guard. ``targets`` is absolute, so a caller that
+    # derived them from an earlier holdings read would trade a different
+    # quantity than intended if the lineage moved in between. Declaring the
+    # basis makes that a 409 instead of a silently wrong order size.
+    expected_current_shares: Optional[Dict[str, int]] = Field(default=None)
     # Add reduced/cleared symbols to the lineage exclusion list so the next
     # strategy rebalance does not buy them back.
     exclude_after: bool = Field(default=False)

@@ -5569,6 +5569,62 @@ def test_live_rebalance_caps_sell_to_account_available(monkeypatch):
     assert data_out["capped_symbols"] == ["600000.SH"]
 
 
+def test_live_rebalance_rejects_targets_from_a_stale_holdings_read(monkeypatch):
+    """Absolute targets against a moved basis must 409, not trade a wrong size."""
+    cols, fin, data = _live_rebalance_env()
+    _patch_lineage_live_env(monkeypatch, cols, fin, data)
+
+    with pytest.raises(portfolio_plans.HTTPException) as exc:
+        asyncio.run(
+            portfolio_plans.live_rebalance_portfolio(
+                "pla",
+                portfolio_plans.LiveRebalanceRequest(
+                    securities_account_id="acct-1",
+                    targets={"600000.SH": 250},
+                    # Caller believed it held 1000; the lineage really holds 500,
+                    # so target=250 would sell 250 instead of the intended 750.
+                    expected_current_shares={"600000.SH": 1000},
+                    dry_run=True,
+                ),
+                current_user={"id": "user-1"},
+            )
+        )
+
+    assert exc.value.status_code == 409
+    assert "changed since targets were computed" in exc.value.detail["message"]
+    assert exc.value.detail["stale_targets"] == [
+        {
+            "symbol": "600000.SH",
+            "expected_current_shares": 1000,
+            "actual_current_shares": 500,
+        }
+    ]
+    # Nothing published: only the seed buy signal remains.
+    assert len(fin["trade_signals"].docs) == 1
+
+
+def test_live_rebalance_accepts_targets_with_a_matching_basis(monkeypatch):
+    cols, fin, data = _live_rebalance_env()
+    _patch_lineage_live_env(monkeypatch, cols, fin, data)
+
+    resp = asyncio.run(
+        portfolio_plans.live_rebalance_portfolio(
+            "pla",
+            portfolio_plans.LiveRebalanceRequest(
+                securities_account_id="acct-1",
+                targets={"600000.SH": 200},
+                expected_current_shares={"600000.SH": 500},
+                dry_run=True,
+            ),
+            current_user={"id": "user-1"},
+        )
+    )
+
+    item = resp["data"]["items"][0]
+    assert item["delta_shares"] == -300
+    assert item["target_shares"] == 200
+
+
 def test_live_rebalance_reports_partially_dropped_reduction(monkeypatch):
     """A reduction the broker cannot fill must surface even when others succeed."""
     cols, fin, data = _live_rebalance_env()
