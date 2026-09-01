@@ -159,6 +159,13 @@ def _pair_info(user_id: str, pair_id: str) -> Dict[str, Any]:
     }
 
 
+def _try_pair_info(user_id: str, pair_id: str) -> Optional[Dict[str, Any]]:
+    try:
+        return _pair_info(user_id, pair_id)
+    except ValueError:
+        return None
+
+
 def _uncovered_qty_for_pair(user_id: str, pair_id: str) -> int:
     rows = _load_pair_rows(user_id, pair_id)
     if not rows:
@@ -299,18 +306,26 @@ def record_trade(user_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
 
     if leg == "sell":
         if pair_id:
-            pair = _pair_info(user_id, pair_id)
-            if pair.get("style") != "buy_first":
-                raise ValueError("sell with pair_id only closes buy_first pairs")
-            if normalize_symbol(str(pair.get("symbol") or "")) != symbol:
-                raise ValueError("pair_id symbol mismatch")
-            uncovered = to_int(pair.get("uncovered_qty"))
-            if uncovered <= 0:
-                raise ValueError("open pair has no uncovered quantity")
-            available = _broker_available_qty(user_id, symbol)
-            max_qty = min(uncovered, available) if available > 0 else uncovered
-            if quantity > max_qty:
-                raise ValueError(f"sell quantity exceeds close limit ({max_qty})")
+            pair = _try_pair_info(user_id, pair_id)
+            if pair:
+                if pair.get("style") != "buy_first":
+                    raise ValueError("sell with pair_id only closes buy_first pairs")
+                if normalize_symbol(str(pair.get("symbol") or "")) != symbol:
+                    raise ValueError("pair_id symbol mismatch")
+                uncovered = to_int(pair.get("uncovered_qty"))
+                if uncovered <= 0:
+                    raise ValueError("open pair has no uncovered quantity")
+                available = _broker_available_qty(user_id, symbol)
+                max_qty = min(uncovered, available) if available > 0 else uncovered
+                if quantity > max_qty:
+                    raise ValueError(f"sell quantity exceeds close limit ({max_qty})")
+            else:
+                open_pair = find_open_pair_for_symbol(user_id, symbol, trade_date=trade_date)
+                if open_pair:
+                    raise ValueError("open pair exists — close it before opening a new sell_first pair")
+                available = _broker_available_qty(user_id, symbol)
+                if available > 0 and quantity > available:
+                    raise ValueError(f"quantity exceeds available_qty ({available})")
         else:
             open_pair = find_open_pair_for_symbol(user_id, symbol, trade_date=trade_date)
             if open_pair:
@@ -321,14 +336,24 @@ def record_trade(user_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
                 raise ValueError(f"quantity exceeds available_qty ({available})")
     else:
         if pair_id:
-            pair = _pair_info(user_id, pair_id)
-            if pair.get("style") == "buy_first":
-                raise ValueError("cannot add buy leg to an open buy_first pair")
-            if normalize_symbol(str(pair.get("symbol") or "")) != symbol:
-                raise ValueError("pair_id symbol mismatch")
-            uncovered = to_int(pair.get("uncovered_qty"))
-            if quantity > uncovered:
-                raise ValueError(f"buy quantity exceeds uncovered sell qty ({uncovered})")
+            pair = _try_pair_info(user_id, pair_id)
+            if pair:
+                if pair.get("style") == "buy_first":
+                    raise ValueError("cannot add buy leg to an open buy_first pair")
+                if normalize_symbol(str(pair.get("symbol") or "")) != symbol:
+                    raise ValueError("pair_id symbol mismatch")
+                uncovered = to_int(pair.get("uncovered_qty"))
+                if quantity > uncovered:
+                    raise ValueError(f"buy quantity exceeds uncovered sell qty ({uncovered})")
+            else:
+                open_pair = find_open_pair_for_symbol(user_id, symbol, trade_date=trade_date)
+                if open_pair:
+                    raise ValueError("open pair exists — close it before opening a new buy_first pair")
+                capacity = _buy_first_open_capacity(user_id, symbol)
+                if capacity <= 0:
+                    raise ValueError("no buy_first capacity — available_qty exhausted or zero")
+                if quantity > capacity:
+                    raise ValueError(f"buy quantity exceeds buy_first capacity ({capacity})")
         else:
             open_pair = find_open_pair_for_symbol(user_id, symbol, trade_date=trade_date)
             if open_pair:
@@ -357,6 +382,17 @@ def record_trade(user_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     result = _trades_coll().insert_one(doc)
     doc["_id"] = result.inserted_id
     return {"success": True, "data": serialize_doc(doc)}
+
+
+def trade_exists_for_signal(user_id: str, signal_id: str) -> bool:
+    ensure_intraday_t0_trade_indexes()
+    return (
+        _trades_coll().find_one(
+            {"user_id": user_id, "signal_id": signal_id},
+            {"_id": 1},
+        )
+        is not None
+    )
 
 
 def list_trades(

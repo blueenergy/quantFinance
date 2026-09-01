@@ -294,6 +294,91 @@ def test_build_buy_first_close_intent(monkeypatch):
 
 
 @pytest.mark.unit
+def test_sync_execution_trade_leg_records_open_pair(monkeypatch):
+    trade_rows = []
+
+    class _InsertCollection:
+        def __init__(self):
+            self.rows = trade_rows
+
+        def find_one(self, query, projection=None):
+            for row in self.rows:
+                if all(row.get(k) == v for k, v in query.items() if k != "_id"):
+                    return row
+            return None
+
+        def find(self, query):
+            class _Cursor:
+                def __init__(self, rows):
+                    self._rows = rows
+
+                def sort(self, *_a, **_k):
+                    return self
+
+                def __iter__(self):
+                    return iter(self._rows)
+
+            rows = [r for r in self.rows if r.get("user_id") == query.get("user_id")]
+            if "pair_id" in query:
+                rows = [r for r in rows if r.get("pair_id") == query.get("pair_id")]
+            return _Cursor(rows)
+
+        def insert_one(self, doc):
+            doc = dict(doc)
+            doc["_id"] = ObjectId()
+            self.rows.append(doc)
+
+            class _Result:
+                inserted_id = doc["_id"]
+
+            return _Result()
+
+    signal_id = str(ObjectId())
+    signals = FakeCollection(
+        [
+            {
+                "_id": ObjectId(signal_id),
+                "user_id": "u1",
+                "symbol": "300750.SZ",
+                "signal_type": "BUY_WATCH",
+                "price": 198.5,
+                "trade_date": "20260820",
+            }
+        ]
+    )
+    trades_coll = _InsertCollection()
+    monkeypatch.setattr(
+        execution,
+        "get_db_collections",
+        lambda: {
+            "intraday_t0_trades": trades_coll,
+            "intraday_t0_signals": signals,
+            "trader_positions": FakeCollection(
+                [{"user_id": "u1", "symbol": "300750.SZ", "available_qty": 500}]
+            ),
+        },
+    )
+    monkeypatch.setattr("services.intraday_t0_trades.get_db_collections", execution.get_db_collections)
+    monkeypatch.setattr(execution, "ensure_intraday_t0_execution_indexes", lambda: None)
+    monkeypatch.setattr("services.intraday_t0_trades.ensure_intraday_t0_trade_indexes", lambda: None)
+
+    intent = {
+        "signal_id": signal_id,
+        "symbol": "300750.SZ",
+        "action": "buy",
+        "quantity": 100,
+        "pair_id": "pair-buy-first",
+        "pair_style": "buy_first",
+    }
+    signal = {"price": 198.5, "trade_date": "20260820"}
+    result = execution.sync_execution_trade_leg("u1", intent, signal)
+    assert result is not None
+    assert result["data"]["pair_id"] == "pair-buy-first"
+    assert result["data"]["leg"] == "buy"
+    assert execution.sync_execution_trade_leg("u1", intent, signal) is None
+
+
+@pytest.mark.unit
 def test_execution_exists_for_signal(monkeypatch):
     signal_id = "sig-1"
     executions = FakeCollection([{"signal_id": signal_id, "user_id": "u1"}])

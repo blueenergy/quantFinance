@@ -12,7 +12,7 @@ from bson import ObjectId
 from pymongo import ASCENDING, DESCENDING
 
 from db import get_db_collections
-from services.intraday_t0_signals import now_ts, to_float, to_int
+from services.intraday_t0_signals import compact_trade_date, now_ts, to_float, to_int
 from services.intraday_t0_trades import (
     DEFAULT_BUY_QTY_RATIO,
     DEFAULT_SELL_QTY_RATIO,
@@ -21,6 +21,8 @@ from services.intraday_t0_trades import (
     find_open_pair_for_symbol,
     list_open_pairs,
     preview_trade_from_signal,
+    record_trade,
+    trade_exists_for_signal,
 )
 from utils.stock_utils import serialize_doc
 from utils.symbol_utils import normalize_symbol
@@ -417,6 +419,50 @@ async def preview_execution_async(
     }
 
 
+def sync_execution_trade_leg(
+    user_id: str,
+    intent: Dict[str, Any],
+    signal: Dict[str, Any],
+    *,
+    auto: bool = False,
+) -> Optional[Dict[str, Any]]:
+    """Mirror a submitted execution leg into the trade ledger for pair routing."""
+    signal_id = str(intent.get("signal_id") or "")
+    if signal_id and trade_exists_for_signal(user_id, signal_id):
+        return None
+    price = to_float(signal.get("price"))
+    if price is None or price <= 0:
+        log.warning(
+            "skip trade ledger sync: signal %s has no price",
+            signal_id or intent.get("symbol"),
+        )
+        return None
+    trade_date = compact_trade_date(signal.get("trade_date"))
+    try:
+        return record_trade(
+            user_id,
+            {
+                "symbol": intent["symbol"],
+                "leg": intent["action"],
+                "quantity": intent["quantity"],
+                "price": price,
+                "trade_date": trade_date,
+                "fees": 0.0,
+                "signal_id": signal_id or None,
+                "pair_id": intent.get("pair_id"),
+                "notes": "auto_sync_from_execution" if auto else "sync_from_execution",
+            },
+        )
+    except ValueError as exc:
+        log.warning(
+            "trade ledger sync failed user=%s signal=%s: %s",
+            user_id,
+            signal_id,
+            exc,
+        )
+        return None
+
+
 async def submit_execution_async(
     user_id: str,
     signal_id: str,
@@ -435,6 +481,7 @@ async def submit_execution_async(
     if execution_exists_for_signal(signal_id):
         raise ValueError("signal already submitted for execution")
     current_user = current_user or {"id": user_id}
+    signal = _load_signal(signal_id, user_id)
     intent = build_execution_intent(
         user_id,
         signal_id,
@@ -487,10 +534,12 @@ async def submit_execution_async(
         "rebalance_plan_id": (rebalance_data or {}).get("plan_id"),
     }
     _executions_coll().insert_one(exec_doc)
+    trade_sync = sync_execution_trade_leg(user_id, intent, signal, auto=auto)
     return {
         "success": True,
         "intent": intent,
         "execution": serialize_doc(exec_doc),
+        "trade_sync": trade_sync,
         "rebalance": rebalance_data,
     }
 

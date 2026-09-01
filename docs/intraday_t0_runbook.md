@@ -177,6 +177,8 @@ curl -X POST "http://<API>/api/intraday-t0/signals/generate" \
 
 自动下单：`BUY_WATCH` 开 buy_first 需同时满足 `buy_first_enabled=true` 与用户/全局自动开关。
 
+Phase 3 **提交下单**成功后会用信号价自动写入 `intraday_t0_trades`（`sync_from_execution`），供第二腿 pair 路由；成交价以人工补记或日后成交回填为准。
+
 ### 日终检查
 
 `day_close_check` 两类告警：
