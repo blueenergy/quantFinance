@@ -118,6 +118,18 @@ def _require_securities_account_doc(
     )
 
 # Fields quantTrader may set via POST /trader/signals/{order_id}/status (allowlist).
+# Healthy / deliberate-final statuses whose update clears any previous
+# last_error. Failure statuses (failed / rejected / retry_pending) keep it.
+_SIGNAL_STATUSES_CLEARING_ERROR = frozenset(
+    {
+        "pending",
+        "submitted",
+        "partial_filled",
+        "filled",
+        "cancelled",
+    }
+)
+
 _TRADER_SIGNAL_STATUS_ALLOWED_FIELDS = frozenset(
     {
         "status",
@@ -286,6 +298,11 @@ def update_signal_status(
         filtered = {
             k: v for k, v in status_update.items() if k in _TRADER_SIGNAL_STATUS_ALLOWED_FIELDS
         }
+        # A healthy transition clears the previous failure's diagnostic text;
+        # keeping it made filled orders carry a stale 'order not found' error
+        # forever (2026-09-01). Failure statuses keep last_error for diagnosis.
+        if filtered.get("status") in _SIGNAL_STATUSES_CLEARING_ERROR:
+            filtered["last_error"] = ""
         filtered["updated_at"] = time.time()
 
         result = signals_coll.update_one(
