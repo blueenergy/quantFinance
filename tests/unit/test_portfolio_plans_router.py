@@ -5528,7 +5528,15 @@ def test_live_rebalance_skips_sell_when_account_position_zero(monkeypatch):
         )
 
     assert exc.value.status_code == 400
-    assert "no executable changes" in exc.value.detail
+    assert "no executable changes" in exc.value.detail["message"]
+    # A dropped reduction must be reported, never silently swallowed.
+    dropped = exc.value.detail["dropped_targets"]
+    assert len(dropped) == 1
+    assert dropped[0]["symbol"] == "600000.SH"
+    assert dropped[0]["reason_code"] == "account_position_not_sellable"
+    assert dropped[0]["current_shares"] == 500
+    assert dropped[0]["requested_target_shares"] == 0
+    assert dropped[0]["account_available_shares"] == 0
 
 
 def test_live_rebalance_caps_sell_to_account_available(monkeypatch):
@@ -5558,6 +5566,83 @@ def test_live_rebalance_caps_sell_to_account_available(monkeypatch):
     assert item["account_current_shares"] == 200
     assert item["account_available_shares"] == 200
     assert "account_position_capped" in item["blockers"]
+    assert data_out["capped_symbols"] == ["600000.SH"]
+
+
+def test_live_rebalance_reports_partially_dropped_reduction(monkeypatch):
+    """A reduction the broker cannot fill must surface even when others succeed."""
+    cols, fin, data = _live_rebalance_env()
+    data["volume_price_realtime_latest"].docs.extend(
+        [
+            {"symbol": "000001", "close": 10.0, "trade_date": "20250131"},
+            {"symbol": "000001.SZ", "close": 10.0, "trade_date": "20250131"},
+        ]
+    )
+    fin["trade_signals"].docs.append(
+        {"order_id": "o-buy-2", "user_id": "user-1", "mode": "live", "plan_id": "pla", "symbol": "000001.SZ", "name": "平安银行", "created_at": 1}
+    )
+    fin["trade_executions"].docs.append(
+        {"order_id": "o-buy-2", "user_id": "user-1", "symbol": "000001.SZ", "side": "BUY", "status": "filled", "filled_size": 300, "filled_price": 9.0, "timestamp": 1.0}
+    )
+    # Held, but the broker reports nothing sellable — e.g. an intraday T+0 leg
+    # already consumed the available quantity for this symbol.
+    fin["trader_positions"].docs.append(
+        {"user_id": "user-1", "securities_account_id": "acct-1", "symbol": "000001.SZ", "qty": 300, "can_use_volume": 0}
+    )
+    _patch_lineage_live_env(monkeypatch, cols, fin, data)
+
+    resp = asyncio.run(
+        portfolio_plans.live_rebalance_portfolio(
+            "pla",
+            portfolio_plans.LiveRebalanceRequest(
+                securities_account_id="acct-1",
+                targets={"600000.SH": 0, "000001.SZ": 0},
+                dry_run=True,
+            ),
+            current_user={"id": "user-1"},
+        )
+    )
+
+    data_out = resp["data"]
+    assert data_out["changed_symbols"] == ["600000.SH"]
+    dropped = data_out["dropped_targets"]
+    assert len(dropped) == 1
+    assert dropped[0]["symbol"] == "000001.SZ"
+    assert dropped[0]["reason_code"] == "account_position_not_sellable"
+    assert dropped[0]["current_shares"] == 300
+    assert dropped[0]["requested_target_shares"] == 0
+    # skipped_items subsumes dropped targets so existing consumers see them too.
+    assert any(row.get("reason_code") == "account_position_not_sellable" for row in data_out["skipped_items"])
+    assert data_out["plan"]["summary"]["skip_count"] == 1
+
+
+def test_live_rebalance_publish_flags_capped_sell_in_operation_log(monkeypatch):
+    cols, fin, data = _live_rebalance_env()
+    fin["trader_positions"].docs = [
+        {"user_id": "user-1", "securities_account_id": "acct-1", "symbol": "600000.SH", "qty": 200, "can_use_volume": 200}
+    ]
+    _patch_lineage_live_env(monkeypatch, cols, fin, data)
+    monkeypatch.setattr(portfolio_plans, "schedule_snapshot_rebuild", lambda *a, **k: None)
+
+    resp = asyncio.run(
+        portfolio_plans.live_rebalance_portfolio(
+            "pla",
+            portfolio_plans.LiveRebalanceRequest(
+                securities_account_id="acct-1", targets={"600000.SH": 0}, dry_run=False
+            ),
+            current_user={"id": "user-1"},
+        )
+    )
+
+    assert resp["data"]["capped_symbols"] == ["600000.SH"]
+    log_row = next(
+        row
+        for row in cols["portfolio_plan_operation_logs"].docs
+        if row.get("operation_type") == "live_rebalance_publish"
+    )
+    assert log_row["status"] == "partial"
+    assert log_row["payload"]["capped_symbols"] == ["600000.SH"]
+    assert log_row["payload"]["dropped_targets"] == []
 
 
 def test_live_rebalance_liquidation_publishes_and_creates_manual_plan(monkeypatch):

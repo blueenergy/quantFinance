@@ -345,6 +345,34 @@ def _normalize_live_target_shares(
     return current - sell_qty, blockers
 
 
+def _dropped_target_record(
+    symbol: str,
+    reason_code: str,
+    reason: str,
+    *,
+    current_shares: int,
+    requested_target_shares: int,
+    account_current_shares: Optional[int] = None,
+    account_available_shares: Optional[int] = None,
+    blockers: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """Describe a requested target that produced no order.
+
+    A dropped reduction may be a stop-loss that never reached the broker, so
+    callers must be able to tell it apart from a target that was already met.
+    """
+    return {
+        "symbol": symbol,
+        "reason_code": reason_code,
+        "reason": reason,
+        "current_shares": current_shares,
+        "requested_target_shares": requested_target_shares,
+        "account_current_shares": account_current_shares,
+        "account_available_shares": account_available_shares,
+        "blockers": list(blockers or []),
+    }
+
+
 def _live_signal_is_blocked(item: Dict[str, Any]) -> bool:
     """Whether a discretionary live order should abort publishing.
 
@@ -423,6 +451,7 @@ async def live_rebalance_portfolio(
 
     items: List[Dict[str, Any]] = []
     manual_exclude_symbols: List[str] = []
+    dropped_targets: List[Dict[str, Any]] = []
     estimated_buy = 0.0
     estimated_sell = 0.0
     rank = 0
@@ -447,16 +476,53 @@ async def live_rebalance_portfolio(
                 # sellable. The lineage ledger may be stale after external
                 # clean-up, so never generate a sell for shares the account
                 # does not currently hold.
+                dropped_targets.append(
+                    _dropped_target_record(
+                        symbol,
+                        "account_position_not_sellable",
+                        "broker account reports no sellable shares for this symbol",
+                        current_shares=current_shares,
+                        requested_target_shares=_int_value(request.targets[symbol]),
+                        account_current_shares=account_current_shares,
+                        account_available_shares=account_available_shares,
+                        blockers=blockers,
+                    )
+                )
                 continue
             sell_qty = abs(delta)
             capped_sell_qty = min(sell_qty, account_available_shares)
             if capped_sell_qty <= 0:
+                dropped_targets.append(
+                    _dropped_target_record(
+                        symbol,
+                        "sell_capped_to_zero",
+                        "available broker quantity left nothing to sell",
+                        current_shares=current_shares,
+                        requested_target_shares=_int_value(request.targets[symbol]),
+                        account_current_shares=account_current_shares,
+                        account_available_shares=account_available_shares,
+                        blockers=blockers,
+                    )
+                )
                 continue
             if capped_sell_qty < sell_qty:
                 delta = -capped_sell_qty
                 target_shares = current_shares + delta
                 blockers.append("account_position_capped")
         if delta == 0:
+            if blockers:
+                dropped_targets.append(
+                    _dropped_target_record(
+                        symbol,
+                        "normalized_to_no_change",
+                        "requested change did not survive lot-size normalization",
+                        current_shares=current_shares,
+                        requested_target_shares=_int_value(request.targets[symbol]),
+                        account_current_shares=account_current_shares,
+                        account_available_shares=account_available_shares,
+                        blockers=blockers,
+                    )
+                )
             continue
         rank += 1
         price = (
@@ -501,8 +567,31 @@ async def live_rebalance_portfolio(
             }
         )
 
+    capped_symbols = sorted(
+        {item["symbol"] for item in items if "account_position_capped" in (item.get("blockers") or [])}
+    )
+    if dropped_targets or capped_symbols:
+        log.warning(
+            "live-rebalance anchor=%s account=%s dropped=%s capped=%s",
+            plan_id,
+            securities_account_id,
+            ",".join(f"{row['symbol']}:{row['reason_code']}" for row in dropped_targets) or "-",
+            ",".join(capped_symbols) or "-",
+        )
+
     if not items:
-        raise HTTPException(status_code=400, detail="targets produced no executable changes after lot-size normalization")
+        reason_summary = ", ".join(f"{row['symbol']}({row['reason_code']})" for row in dropped_targets)
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": (
+                    f"targets produced no executable changes: {reason_summary}"
+                    if reason_summary
+                    else "targets produced no executable changes"
+                ),
+                "dropped_targets": dropped_targets,
+            },
+        )
 
     is_liquidation = all(item["action"] == "sell" and item["target_shares"] == 0 for item in items)
     manual_action = "liquidate" if is_liquidation else "rebalance"
@@ -538,22 +627,30 @@ async def live_rebalance_portfolio(
             "buy_count": sum(1 for item in items if item["action"] == "buy"),
             "sell_count": sum(1 for item in items if item["action"] == "sell"),
             "hold_count": 0,
-            "skip_count": 0,
+            "skip_count": len(dropped_targets),
             "estimated_buy_amount": estimated_buy,
             "estimated_sell_amount": estimated_sell,
             "manual_action": manual_action,
         },
+        "dropped_targets": dropped_targets,
+        "capped_symbols": capped_symbols,
         "created_at": now,
         "updated_at": now,
     }
 
     signals: List[Dict[str, Any]] = []
-    skipped_items: List[Dict[str, Any]] = []
+    skipped_items: List[Dict[str, Any]] = list(dropped_targets)
     for item in items:
         try:
             signal = build_portfolio_plan_live_signal(plan=plan_doc, item=item, account=account, now=now)
         except Exception as exc:  # noqa: BLE001
-            skipped_items.append({"symbol": item.get("symbol"), "reason": str(exc)})
+            skipped_items.append(
+                {
+                    "symbol": item.get("symbol"),
+                    "reason_code": "signal_build_failed",
+                    "reason": str(exc),
+                }
+            )
             continue
         if signal is not None:
             signals.append(signal.to_mongo())
@@ -607,6 +704,8 @@ async def live_rebalance_portfolio(
                     "new_signals": new_signals,
                     "existing_signals": existing_signals,
                     "skipped_items": skipped_items,
+                    "dropped_targets": dropped_targets,
+                    "capped_symbols": capped_symbols,
                     "risk_report": risk_report,
                     "manual_action": manual_action,
                     "changed_symbols": changed_symbols,
@@ -643,7 +742,7 @@ async def live_rebalance_portfolio(
         plan_id=new_plan_id,
         user_id=user_id,
         operation_type="live_rebalance_publish",
-        status="success",
+        status="partial" if dropped_targets or capped_symbols else "success",
         message="manual live rebalance signals published",
         payload={
             "anchor_plan_id": plan_id,
@@ -652,6 +751,8 @@ async def live_rebalance_portfolio(
             "inserted_count": inserted_count,
             "existing_count": len(existing_signals),
             "publish_duration_ms": publish_duration_ms,
+            "dropped_targets": dropped_targets,
+            "capped_symbols": capped_symbols,
         },
     )
     _pp.schedule_snapshot_rebuild(
@@ -686,6 +787,8 @@ async def live_rebalance_portfolio(
                 "new_signals": new_signals,
                 "existing_signals": existing_signals,
                 "skipped_items": skipped_items,
+                "dropped_targets": dropped_targets,
+                "capped_symbols": capped_symbols,
                 "risk_report": risk_report,
                 "inserted_count": inserted_count,
                 "existing_count": len(existing_signals),
