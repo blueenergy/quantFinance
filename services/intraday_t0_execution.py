@@ -98,8 +98,15 @@ def get_user_settings(user_id: str) -> Dict[str, Any]:
             resolved = _resolve_account_from_plan(user_id, str(payload["plan_id"]))
             if resolved:
                 payload["securities_account_id"] = resolved
-        except Exception:
-            pass
+        except Exception as exc:  # noqa: BLE001
+            # Falls back to the stored account id. Worth a line: this path scans
+            # the lineage, so a slow or unreachable trading db shows up here.
+            log.warning(
+                "intraday T+0 settings could not resolve account from plan %s for user %s: %s",
+                payload.get("plan_id"),
+                user_id,
+                exc,
+            )
     payload["global_auto_execute_enabled"] = _global_auto_execute_enabled()
     return {"success": True, "data": payload}
 
@@ -174,8 +181,11 @@ def _resolve_account_plan(
     plan_id: Optional[str],
     securities_account_id: Optional[str],
     current_user: Optional[Dict[str, Any]] = None,
+    settings: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, str]:
-    settings = get_user_settings(user_id)["data"]
+    # Reading settings scans the lineage to resolve the bound account, so
+    # callers that already hold them should pass them in rather than pay twice.
+    settings = settings if settings is not None else get_user_settings(user_id)["data"]
     resolved_plan = (plan_id or settings.get("plan_id") or "").strip()
     if not resolved_plan:
         raise ValueError("plan_id required — select a live portfolio first")
@@ -275,12 +285,18 @@ def build_execution_intent(
     if signal_type not in WATCH_TYPES:
         raise ValueError("only BUY_WATCH / SELL_WATCH signals can be executed")
     current_user = current_user or {"id": user_id}
-    accounts = _resolve_account_plan(user_id, plan_id, securities_account_id, current_user)
+    settings = get_user_settings(user_id)["data"]
+    accounts = _resolve_account_plan(
+        user_id,
+        plan_id,
+        securities_account_id,
+        current_user,
+        settings=settings,
+    )
     symbol = normalize_symbol(str(signal.get("symbol") or ""))
     if not symbol:
         raise ValueError("signal has no symbol")
 
-    settings = get_user_settings(user_id)["data"]
     sell_ratio = float(sell_qty_ratio if sell_qty_ratio is not None else settings.get("sell_qty_ratio") or DEFAULT_SELL_QTY_RATIO)
     buy_ratio = float(
         buy_qty_ratio
@@ -407,6 +423,7 @@ async def preview_execution_async(
     request = LiveRebalanceRequest(
         securities_account_id=intent["securities_account_id"],
         targets={intent["symbol"]: intent["target_shares"]},
+        expected_current_shares={intent["symbol"]: intent["current_shares"]},
         exclude_after=False,
         dry_run=True,
     )
@@ -419,12 +436,35 @@ async def preview_execution_async(
     }
 
 
+def submitted_leg_quantity(
+    signals: List[Dict[str, Any]],
+    symbol: str,
+    action: str,
+) -> int:
+    """Quantity actually sent to the broker for one symbol/leg.
+
+    The rebalance layer normalizes lots and caps sells at the account's
+    available quantity, so the submitted size can be smaller than the intent.
+    """
+    normalized = normalize_symbol(symbol)
+    wanted = str(action or "").lower()
+    total = 0
+    for row in signals:
+        if normalize_symbol(str(row.get("symbol") or "")) != normalized:
+            continue
+        if str(row.get("action") or "").lower() != wanted:
+            continue
+        total += to_int(row.get("size"))
+    return total
+
+
 def sync_execution_trade_leg(
     user_id: str,
     intent: Dict[str, Any],
     signal: Dict[str, Any],
     *,
     auto: bool = False,
+    submitted_qty: Optional[int] = None,
 ) -> Optional[Dict[str, Any]]:
     """Mirror a submitted execution leg into the trade ledger for pair routing."""
     signal_id = str(intent.get("signal_id") or "")
@@ -437,6 +477,25 @@ def sync_execution_trade_leg(
             signal_id or intent.get("symbol"),
         )
         return None
+    intended_qty = to_int(intent["quantity"])
+    quantity = to_int(submitted_qty) if submitted_qty else intended_qty
+    if submitted_qty is not None and to_int(submitted_qty) <= 0:
+        # Orders were published but none matched this symbol/leg. Recording the
+        # intent keeps the pair closeable; the mismatch needs a human look.
+        log.warning(
+            "trade ledger sync found no submitted order for signal %s %s %s; recording intent %s",
+            signal_id or "-",
+            intent.get("symbol"),
+            intent.get("action"),
+            intended_qty,
+        )
+    elif quantity != intended_qty:
+        log.warning(
+            "trade ledger sync for signal %s records submitted qty %s instead of intended %s",
+            signal_id or "-",
+            quantity,
+            intended_qty,
+        )
     trade_date = compact_trade_date(signal.get("trade_date"))
     try:
         return record_trade(
@@ -444,7 +503,7 @@ def sync_execution_trade_leg(
             {
                 "symbol": intent["symbol"],
                 "leg": intent["action"],
-                "quantity": intent["quantity"],
+                "quantity": quantity,
                 "price": price,
                 "trade_date": trade_date,
                 "fees": 0.0,
@@ -499,6 +558,9 @@ async def submit_execution_async(
     request = LiveRebalanceRequest(
         securities_account_id=intent["securities_account_id"],
         targets={intent["symbol"]: intent["target_shares"]},
+        # target_shares was derived from intent's current_shares; if the lineage
+        # moved since, the absolute target would sell the wrong quantity.
+        expected_current_shares={intent["symbol"]: intent["current_shares"]},
         exclude_after=False,
         dry_run=dry_run,
     )
@@ -516,6 +578,7 @@ async def submit_execution_async(
     if isinstance(rebalance_data, dict):
         signals = rebalance_data.get("signals") or rebalance_data.get("new_signals") or []
     order_ids = [s.get("order_id") for s in signals if s.get("order_id")]
+    submitted_qty = submitted_leg_quantity(signals, intent["symbol"], intent["action"])
     exec_doc = {
         "user_id": user_id,
         "signal_id": signal_id,
@@ -525,6 +588,7 @@ async def submit_execution_async(
         "action": intent["action"],
         "pair_style": intent.get("pair_style"),
         "quantity": intent["quantity"],
+        "submitted_quantity": submitted_qty,
         "target_shares": intent["target_shares"],
         "pair_id": intent.get("pair_id"),
         "order_ids": order_ids,
@@ -534,7 +598,13 @@ async def submit_execution_async(
         "rebalance_plan_id": (rebalance_data or {}).get("plan_id"),
     }
     _executions_coll().insert_one(exec_doc)
-    trade_sync = sync_execution_trade_leg(user_id, intent, signal, auto=auto)
+    trade_sync = sync_execution_trade_leg(
+        user_id,
+        intent,
+        signal,
+        auto=auto,
+        submitted_qty=submitted_qty,
+    )
     return {
         "success": True,
         "intent": intent,

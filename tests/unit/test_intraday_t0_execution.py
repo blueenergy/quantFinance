@@ -9,6 +9,18 @@ from services import intraday_t0_execution as execution
 from tests.unit.test_market_insight_engine import FakeCollection
 
 
+@pytest.fixture(autouse=True)
+def _keep_settings_off_the_trading_db(monkeypatch):
+    """Stub the lineage account lookup that ``get_user_settings`` performs.
+
+    That lookup reaches the trading db directly, so without this every test
+    with a stored ``plan_id`` waits out a MongoDB connection timeout. Returning
+    an empty id keeps the stored ``securities_account_id`` in play, which is
+    what these tests assert against.
+    """
+    monkeypatch.setattr(execution, "_resolve_account_from_plan", lambda *_a, **_k: "")
+
+
 @pytest.mark.unit
 def test_settings_defaults(monkeypatch):
     settings_coll = FakeCollection([])
@@ -293,47 +305,47 @@ def test_build_buy_first_close_intent(monkeypatch):
     assert intent["target_shares"] == 500
 
 
-@pytest.mark.unit
-def test_sync_execution_trade_leg_records_open_pair(monkeypatch):
-    trade_rows = []
+class _InsertCollection:
+    """Minimal insert/find double for the intraday_t0_trades ledger."""
 
-    class _InsertCollection:
-        def __init__(self):
-            self.rows = trade_rows
+    def __init__(self, rows=None):
+        self.rows = rows if rows is not None else []
 
-        def find_one(self, query, projection=None):
-            for row in self.rows:
-                if all(row.get(k) == v for k, v in query.items() if k != "_id"):
-                    return row
-            return None
+    def find_one(self, query, projection=None):
+        for row in self.rows:
+            if all(row.get(k) == v for k, v in query.items() if k != "_id"):
+                return row
+        return None
 
-        def find(self, query):
-            class _Cursor:
-                def __init__(self, rows):
-                    self._rows = rows
+    def find(self, query):
+        class _Cursor:
+            def __init__(self, rows):
+                self._rows = rows
 
-                def sort(self, *_a, **_k):
-                    return self
+            def sort(self, *_a, **_k):
+                return self
 
-                def __iter__(self):
-                    return iter(self._rows)
+            def __iter__(self):
+                return iter(self._rows)
 
-            rows = [r for r in self.rows if r.get("user_id") == query.get("user_id")]
-            if "pair_id" in query:
-                rows = [r for r in rows if r.get("pair_id") == query.get("pair_id")]
-            return _Cursor(rows)
+        rows = [r for r in self.rows if r.get("user_id") == query.get("user_id")]
+        if "pair_id" in query:
+            rows = [r for r in rows if r.get("pair_id") == query.get("pair_id")]
+        return _Cursor(rows)
 
-        def insert_one(self, doc):
-            doc = dict(doc)
-            doc["_id"] = ObjectId()
-            self.rows.append(doc)
+    def insert_one(self, doc):
+        doc = dict(doc)
+        doc["_id"] = ObjectId()
+        self.rows.append(doc)
 
-            class _Result:
-                inserted_id = doc["_id"]
+        class _Result:
+            inserted_id = doc["_id"]
 
-            return _Result()
+        return _Result()
 
-    signal_id = str(ObjectId())
+
+def _patch_trade_ledger_env(monkeypatch, signal_id):
+    """Wire the trade-ledger collections for sync_execution_trade_leg tests."""
     signals = FakeCollection(
         [
             {
@@ -361,6 +373,13 @@ def test_sync_execution_trade_leg_records_open_pair(monkeypatch):
     monkeypatch.setattr("services.intraday_t0_trades.get_db_collections", execution.get_db_collections)
     monkeypatch.setattr(execution, "ensure_intraday_t0_execution_indexes", lambda: None)
     monkeypatch.setattr("services.intraday_t0_trades.ensure_intraday_t0_trade_indexes", lambda: None)
+    return trades_coll
+
+
+@pytest.mark.unit
+def test_sync_execution_trade_leg_records_open_pair(monkeypatch):
+    signal_id = str(ObjectId())
+    _patch_trade_ledger_env(monkeypatch, signal_id)
 
     intent = {
         "signal_id": signal_id,
@@ -376,6 +395,58 @@ def test_sync_execution_trade_leg_records_open_pair(monkeypatch):
     assert result["data"]["pair_id"] == "pair-buy-first"
     assert result["data"]["leg"] == "buy"
     assert execution.sync_execution_trade_leg("u1", intent, signal) is None
+
+
+@pytest.mark.unit
+def test_submitted_leg_quantity_sums_matching_orders():
+    signals = [
+        {"symbol": "300750.SZ", "action": "sell", "size": 200},
+        {"symbol": "300750", "action": "sell", "size": 100},
+        {"symbol": "300750.SZ", "action": "buy", "size": 900},
+        {"symbol": "600000.SH", "action": "sell", "size": 700},
+    ]
+    assert execution.submitted_leg_quantity(signals, "300750.SZ", "sell") == 300
+    assert execution.submitted_leg_quantity(signals, "300750.SZ", "buy") == 900
+    assert execution.submitted_leg_quantity(signals, "000001.SZ", "sell") == 0
+
+
+@pytest.mark.unit
+def test_sync_execution_trade_leg_records_submitted_not_intended_qty(monkeypatch):
+    """A sell capped by available_qty must not leave the pair over-covered."""
+    signal_id = str(ObjectId())
+    _patch_trade_ledger_env(monkeypatch, signal_id)
+
+    intent = {
+        "signal_id": signal_id,
+        "symbol": "300750.SZ",
+        "action": "sell",
+        "quantity": 500,
+        "pair_id": "pair-sell-first",
+        "pair_style": "sell_first",
+    }
+    signal = {"price": 198.5, "trade_date": "20260820"}
+    result = execution.sync_execution_trade_leg("u1", intent, signal, submitted_qty=200)
+    assert result is not None
+    assert result["data"]["quantity"] == 200
+
+
+@pytest.mark.unit
+def test_sync_execution_trade_leg_falls_back_to_intent_when_unmatched(monkeypatch):
+    signal_id = str(ObjectId())
+    _patch_trade_ledger_env(monkeypatch, signal_id)
+
+    intent = {
+        "signal_id": signal_id,
+        "symbol": "300750.SZ",
+        "action": "sell",
+        "quantity": 300,
+        "pair_id": "pair-sell-first",
+        "pair_style": "sell_first",
+    }
+    signal = {"price": 198.5, "trade_date": "20260820"}
+    result = execution.sync_execution_trade_leg("u1", intent, signal, submitted_qty=0)
+    assert result is not None
+    assert result["data"]["quantity"] == 300
 
 
 @pytest.mark.unit
