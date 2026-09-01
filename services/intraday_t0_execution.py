@@ -6,7 +6,7 @@ import asyncio
 import logging
 import os
 import uuid
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from bson import ObjectId
 from pymongo import ASCENDING, DESCENDING
@@ -14,8 +14,11 @@ from pymongo import ASCENDING, DESCENDING
 from db import get_db_collections
 from services.intraday_t0_signals import now_ts, to_float, to_int
 from services.intraday_t0_trades import (
+    DEFAULT_BUY_QTY_RATIO,
     DEFAULT_SELL_QTY_RATIO,
     _broker_available_qty,
+    _buy_first_open_capacity,
+    find_open_pair_for_symbol,
     list_open_pairs,
     preview_trade_from_signal,
 )
@@ -69,6 +72,8 @@ def _default_settings(user_id: str) -> Dict[str, Any]:
         "auto_execute_enabled": False,
         "auto_min_score": _DEFAULT_AUTO_MIN_SCORE,
         "sell_qty_ratio": DEFAULT_SELL_QTY_RATIO,
+        "buy_qty_ratio": DEFAULT_BUY_QTY_RATIO,
+        "buy_first_enabled": False,
         "updated_at": None,
     }
 
@@ -82,6 +87,10 @@ def get_user_settings(user_id: str) -> Dict[str, Any]:
         return {"success": True, "data": data}
     payload = _default_settings(user_id)
     payload.update({k: doc.get(k) for k in payload if k in doc})
+    if payload.get("buy_qty_ratio") is None:
+        payload["buy_qty_ratio"] = payload.get("sell_qty_ratio") or DEFAULT_BUY_QTY_RATIO
+    if payload.get("buy_first_enabled") is None:
+        payload["buy_first_enabled"] = False
     if payload.get("plan_id"):
         try:
             resolved = _resolve_account_from_plan(user_id, str(payload["plan_id"]))
@@ -101,15 +110,20 @@ def upsert_user_settings(user_id: str, payload: Dict[str, Any]) -> Dict[str, Any
         "auto_execute_enabled",
         "auto_min_score",
         "sell_qty_ratio",
+        "buy_qty_ratio",
+        "buy_first_enabled",
     }
     update = {k: payload[k] for k in allowed if k in payload}
     if "auto_min_score" in update:
         update["auto_min_score"] = float(update["auto_min_score"])
-    if "sell_qty_ratio" in update:
-        ratio = float(update["sell_qty_ratio"])
-        if ratio <= 0 or ratio > 1:
-            raise ValueError("sell_qty_ratio must be in (0, 1]")
-        update["sell_qty_ratio"] = ratio
+    for ratio_key in ("sell_qty_ratio", "buy_qty_ratio"):
+        if ratio_key in update:
+            ratio = float(update[ratio_key])
+            if ratio <= 0 or ratio > 1:
+                raise ValueError(f"{ratio_key} must be in (0, 1]")
+            update[ratio_key] = ratio
+    if "buy_first_enabled" in update:
+        update["buy_first_enabled"] = bool(update["buy_first_enabled"])
     update["user_id"] = user_id
     update["updated_at"] = now_ts()
     if update.get("plan_id"):
@@ -203,8 +217,42 @@ def _resolve_open_pair(user_id: str, symbol: str, pair_id: Optional[str]) -> Dic
         raise ValueError("pair_id not found among open pairs for symbol")
     candidates = [p for p in open_pairs if normalize_symbol(p.get("symbol") or "") == normalized]
     if not candidates:
-        raise ValueError("no open sell pair for buy-back — record a sell leg first")
+        raise ValueError("no open pair for symbol")
     return candidates[-1]
+
+
+def _route_signal_execution(
+    user_id: str,
+    signal_type: str,
+    symbol: str,
+    *,
+    pair_id: Optional[str],
+    buy_first_enabled: bool,
+) -> Tuple[str, Optional[str], str]:
+    """Return (action, pair_id, pair_style) for a signal execution."""
+    open_pair: Optional[Dict[str, Any]] = None
+    if pair_id:
+        open_pair = _resolve_open_pair(user_id, symbol, pair_id)
+    else:
+        open_pair = find_open_pair_for_symbol(user_id, symbol)
+
+    if signal_type == "SELL_WATCH":
+        if open_pair and open_pair.get("style") == "buy_first":
+            return "sell", str(open_pair.get("pair_id")), "buy_first"
+        if open_pair and open_pair.get("style") == "sell_first":
+            raise ValueError("open sell_first pair exists — buy back before selling again")
+        return "sell", pair_id or str(uuid.uuid4()), "sell_first"
+
+    if signal_type == "BUY_WATCH":
+        if open_pair and open_pair.get("style") == "sell_first":
+            return "buy", str(open_pair.get("pair_id")), "sell_first"
+        if open_pair and open_pair.get("style") == "buy_first":
+            raise ValueError("open buy_first pair exists — sell back before buying again")
+        if not buy_first_enabled:
+            raise ValueError("buy_first disabled — enable buy_first_enabled in execution settings")
+        return "buy", pair_id or str(uuid.uuid4()), "buy_first"
+
+    raise ValueError("only BUY_WATCH / SELL_WATCH signals can be executed")
 
 
 def build_execution_intent(
@@ -216,6 +264,7 @@ def build_execution_intent(
     quantity: Optional[int] = None,
     pair_id: Optional[str] = None,
     sell_qty_ratio: Optional[float] = None,
+    buy_qty_ratio: Optional[float] = None,
     current_user: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     ensure_intraday_t0_execution_indexes()
@@ -230,15 +279,34 @@ def build_execution_intent(
         raise ValueError("signal has no symbol")
 
     settings = get_user_settings(user_id)["data"]
-    ratio = float(sell_qty_ratio if sell_qty_ratio is not None else settings.get("sell_qty_ratio") or DEFAULT_SELL_QTY_RATIO)
-    trade_preview = preview_trade_from_signal(user_id, signal_id, sell_qty_ratio=ratio)
+    sell_ratio = float(sell_qty_ratio if sell_qty_ratio is not None else settings.get("sell_qty_ratio") or DEFAULT_SELL_QTY_RATIO)
+    buy_ratio = float(
+        buy_qty_ratio
+        if buy_qty_ratio is not None
+        else settings.get("buy_qty_ratio")
+        or settings.get("sell_qty_ratio")
+        or DEFAULT_BUY_QTY_RATIO
+    )
+    buy_first_enabled = bool(settings.get("buy_first_enabled"))
+    trade_preview = preview_trade_from_signal(
+        user_id,
+        signal_id,
+        sell_qty_ratio=sell_ratio,
+        buy_qty_ratio=buy_ratio,
+    )
     warnings = list(trade_preview.get("warnings") or [])
 
-    current_shares = _lineage_shares(user_id, accounts["plan_id"], symbol, current_user)
-    resolved_pair_id = pair_id
-    action = "sell" if signal_type == "SELL_WATCH" else "buy"
+    action, resolved_pair_id, pair_style = _route_signal_execution(
+        user_id,
+        signal_type,
+        symbol,
+        pair_id=pair_id,
+        buy_first_enabled=buy_first_enabled,
+    )
 
-    if action == "sell":
+    current_shares = _lineage_shares(user_id, accounts["plan_id"], symbol, current_user)
+
+    if action == "sell" and pair_style == "sell_first":
         available = to_int(trade_preview.get("available_qty"))
         qty = to_int(quantity) if quantity is not None else to_int(trade_preview.get("suggested_qty"))
         qty = _round_lot(qty)
@@ -247,12 +315,9 @@ def build_execution_intent(
             warnings.append("quantity_capped_by_available_qty")
         if qty <= 0:
             raise ValueError("no sellable quantity after lot normalization")
-        if not resolved_pair_id:
-            resolved_pair_id = str(uuid.uuid4())
         target_shares = max(0, current_shares - qty)
-    else:
-        pair = _resolve_open_pair(user_id, symbol, pair_id)
-        resolved_pair_id = str(pair.get("pair_id"))
+    elif action == "buy" and pair_style == "sell_first":
+        pair = _resolve_open_pair(user_id, symbol, resolved_pair_id)
         uncovered = to_int(pair.get("uncovered_qty"))
         if uncovered <= 0:
             raise ValueError("open pair has no uncovered quantity")
@@ -261,6 +326,34 @@ def build_execution_intent(
         if qty <= 0:
             raise ValueError("buy quantity must be positive after lot normalization")
         target_shares = current_shares + qty
+    elif action == "buy" and pair_style == "buy_first":
+        capacity = _buy_first_open_capacity(user_id, symbol)
+        qty = to_int(quantity) if quantity is not None else to_int(trade_preview.get("suggested_qty"))
+        qty = _round_lot(qty)
+        if capacity > 0 and qty > capacity:
+            qty = _round_lot(capacity)
+            warnings.append("quantity_capped_by_buy_first_capacity")
+        if qty <= 0:
+            raise ValueError("no buy_first capacity after lot normalization")
+        target_shares = current_shares + qty
+    elif action == "sell" and pair_style == "buy_first":
+        pair = _resolve_open_pair(user_id, symbol, resolved_pair_id)
+        uncovered = to_int(pair.get("uncovered_qty"))
+        if uncovered <= 0:
+            raise ValueError("open pair has no uncovered quantity")
+        available = _broker_available_qty(user_id, symbol)
+        qty = to_int(quantity) if quantity is not None else to_int(trade_preview.get("suggested_qty"))
+        qty = _round_lot(qty)
+        max_qty = min(uncovered, available) if available > 0 else uncovered
+        qty = min(qty, _round_lot(max_qty))
+        if qty <= 0:
+            raise ValueError("no sellable quantity to close buy_first pair")
+        if available > 0 and qty > available:
+            qty = _round_lot(available)
+            warnings.append("quantity_capped_by_available_qty")
+        target_shares = max(0, current_shares - qty)
+    else:
+        raise ValueError(f"unsupported execution route: action={action} pair_style={pair_style}")
 
     return {
         "signal_id": signal_id,
@@ -268,13 +361,15 @@ def build_execution_intent(
         "signal_score": signal.get("signal_score"),
         "symbol": symbol,
         "action": action,
+        "pair_style": pair_style,
         "quantity": qty,
         "current_shares": current_shares,
         "target_shares": target_shares,
         "pair_id": resolved_pair_id,
         "plan_id": accounts["plan_id"],
         "securities_account_id": accounts["securities_account_id"],
-        "sell_qty_ratio": ratio,
+        "sell_qty_ratio": sell_ratio,
+        "buy_qty_ratio": buy_ratio,
         "available_qty": trade_preview.get("available_qty"),
         "warnings": warnings,
     }
@@ -289,6 +384,7 @@ async def preview_execution_async(
     quantity: Optional[int] = None,
     pair_id: Optional[str] = None,
     sell_qty_ratio: Optional[float] = None,
+    buy_qty_ratio: Optional[float] = None,
     current_user: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     current_user = current_user or {"id": user_id}
@@ -300,6 +396,7 @@ async def preview_execution_async(
         quantity=quantity,
         pair_id=pair_id,
         sell_qty_ratio=sell_qty_ratio,
+        buy_qty_ratio=buy_qty_ratio,
         current_user=current_user,
     )
     from routers.portfolio_plans import LiveRebalanceRequest
@@ -329,6 +426,7 @@ async def submit_execution_async(
     quantity: Optional[int] = None,
     pair_id: Optional[str] = None,
     sell_qty_ratio: Optional[float] = None,
+    buy_qty_ratio: Optional[float] = None,
     dry_run: bool = False,
     auto: bool = False,
     current_user: Optional[Dict[str, Any]] = None,
@@ -345,6 +443,7 @@ async def submit_execution_async(
         quantity=quantity,
         pair_id=pair_id,
         sell_qty_ratio=sell_qty_ratio,
+        buy_qty_ratio=buy_qty_ratio,
         current_user=current_user,
     )
     from routers.portfolio_plans import LiveRebalanceRequest
@@ -377,6 +476,7 @@ async def submit_execution_async(
         "securities_account_id": intent["securities_account_id"],
         "symbol": intent["symbol"],
         "action": intent["action"],
+        "pair_style": intent.get("pair_style"),
         "quantity": intent["quantity"],
         "target_shares": intent["target_shares"],
         "pair_id": intent.get("pair_id"),
@@ -416,6 +516,12 @@ def maybe_auto_execute_after_signal(user_id: str, signal_doc: Dict[str, Any]) ->
     settings = get_user_settings(user_id)["data"]
     if not settings.get("auto_execute_enabled"):
         return None
+    if signal_type == "BUY_WATCH":
+        symbol = normalize_symbol(str(signal_doc.get("symbol") or ""))
+        open_pair = find_open_pair_for_symbol(user_id, symbol) if symbol else None
+        opening_buy_first = not open_pair or open_pair.get("style") != "sell_first"
+        if opening_buy_first and not settings.get("buy_first_enabled"):
+            return None
     score = to_float(signal_doc.get("signal_score"))
     min_score = to_float(settings.get("auto_min_score"), _DEFAULT_AUTO_MIN_SCORE) or _DEFAULT_AUTO_MIN_SCORE
     if score is None or score < min_score:

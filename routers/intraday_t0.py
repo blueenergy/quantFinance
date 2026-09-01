@@ -68,6 +68,8 @@ class ExecutionSettingsPayload(BaseModel):
     auto_execute_enabled: Optional[bool] = None
     auto_min_score: Optional[float] = Field(None, ge=0, le=100)
     sell_qty_ratio: Optional[float] = Field(None, gt=0, le=1)
+    buy_qty_ratio: Optional[float] = Field(None, gt=0, le=1)
+    buy_first_enabled: Optional[bool] = None
 
 
 class ExecutionSubmitPayload(BaseModel):
@@ -75,8 +77,12 @@ class ExecutionSubmitPayload(BaseModel):
     plan_id: Optional[str] = None
     securities_account_id: Optional[str] = None
     quantity: Optional[int] = Field(None, gt=0)
-    pair_id: Optional[str] = None
+    pair_id: Optional[str] = Field(
+        None,
+        description="Optional pair id. Leave empty to open a new sell_first or buy_first pair.",
+    )
     sell_qty_ratio: Optional[float] = Field(None, gt=0, le=1)
+    buy_qty_ratio: Optional[float] = Field(None, gt=0, le=1)
     dry_run: bool = False
 
 
@@ -88,7 +94,10 @@ class RecordTradePayload(BaseModel):
     trade_date: Optional[str] = None
     fees: float = Field(0.0, ge=0)
     signal_id: Optional[str] = None
-    pair_id: Optional[str] = None
+    pair_id: Optional[str] = Field(
+        None,
+        description="Optional pair id. Leave empty to open a new sell_first or buy_first pair.",
+    )
     notes: Optional[str] = None
 
 
@@ -334,10 +343,16 @@ def export_signal_evaluations(
 def preview_trade(
     signal_id: str = Query(..., min_length=1),
     sell_qty_ratio: float = Query(0.5, gt=0, le=1),
+    buy_qty_ratio: Optional[float] = Query(None, gt=0, le=1),
     current_user: dict = Depends(get_current_active_user),
 ):
     try:
-        return preview_trade_from_signal(_user_id(current_user), signal_id, sell_qty_ratio=sell_qty_ratio)
+        return preview_trade_from_signal(
+            _user_id(current_user),
+            signal_id,
+            sell_qty_ratio=sell_qty_ratio,
+            buy_qty_ratio=buy_qty_ratio,
+        )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:
@@ -432,6 +447,7 @@ async def preview_execution(
             quantity=payload.quantity,
             pair_id=payload.pair_id,
             sell_qty_ratio=payload.sell_qty_ratio,
+            buy_qty_ratio=payload.buy_qty_ratio,
             current_user=current_user,
         )
     except ValueError as exc:
@@ -456,6 +472,7 @@ async def submit_execution(
             quantity=payload.quantity,
             pair_id=payload.pair_id,
             sell_qty_ratio=payload.sell_qty_ratio,
+            buy_qty_ratio=payload.buy_qty_ratio,
             dry_run=payload.dry_run,
             current_user=current_user,
         )

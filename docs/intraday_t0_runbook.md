@@ -146,3 +146,53 @@ curl -X POST "http://<API>/api/intraday-t0/signals/generate" \
 | 信号全 HOLD | 正常；看 score 分布，或调低阈值 |
 | 评估为 0 条 | 当日无信号或未点「评估」 |
 | 触发 401 | trigger key 与 internal key 不一致 |
+
+---
+
+## Phase 3b — 先买再卖（buy_first）
+
+### 语义
+
+不新增信号类型。`BUY_WATCH` / `SELL_WATCH` 打分不变；**由 open pair 的 style 决定执行方向**：
+
+| 当前状态 | `BUY_WATCH` | `SELL_WATCH` |
+|----------|-------------|--------------|
+| 无 open pair | 开 **buy_first**（需开关） | 开 sell_first |
+| sell_first 未平 | 买回补 | 拒绝 |
+| buy_first 未平 | 拒绝 | 卖旧仓关 pair |
+
+- `sell_first`：`uncovered_qty = sell_qty - buy_qty`（待买回）
+- `buy_first`：`uncovered_qty = buy_qty - sell_qty`（待卖出）
+
+### 硬性 cap
+
+买先开仓量 ≤ 当日券商 `available_qty`（旧仓可卖量），保证后续能用旧仓卖平、日终股数回到原样。同一 symbol 同时只允许 **一个** open pair（任意 style）。
+
+### 执行设置（Dashboard → 实盘执行）
+
+| 设置 | 默认 | 说明 |
+|------|------|------|
+| `buy_first_enabled` | **false** | 关闭时 `BUY_WATCH` 仅允许回补 sell_first |
+| `buy_qty_ratio` | 0.5 | 买先开仓 = 买先额度 × 比例（向下取整到 100 股） |
+
+自动下单：`BUY_WATCH` 开 buy_first 需同时满足 `buy_first_enabled=true` 与用户/全局自动开关。
+
+### 日终检查
+
+`day_close_check` 两类告警：
+
+- `uncovered_sell`：卖了没买回
+- `uncovered_buy`：买了没卖出（隔夜持股 + 占用现金）
+
+`day_summary` 拆分 `naked_sell_qty` / `naked_buy_qty`；`naked_qty` 为两者之和。
+
+### 典型流程
+
+```
+BUY_WATCH（无 pair，开关开）→ 买入开 buy_first → SELL_WATCH → 卖出关 pair
+SELL_WATCH（无 pair）→ 卖出开 sell_first → BUY_WATCH → 买入关 pair
+```
+
+### 已知限制
+
+与主 rebalance 同票叠加尚未互斥；上线前仅在非 rebalance 窗口手动执行。
