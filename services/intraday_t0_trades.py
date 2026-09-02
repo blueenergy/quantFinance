@@ -18,6 +18,7 @@ from services.intraday_t0_signals import (
     to_float,
     to_int,
 )
+from services.account_sellable import LEGACY_MODE_T0_CHAIN, sellable_shares
 from services.live_trade_signals import in_flight_sell_qty
 from utils.stock_utils import serialize_doc
 from utils.symbol_utils import normalize_symbol
@@ -79,38 +80,41 @@ def _load_signal_meta(signal_id: Optional[str], user_id: str) -> Dict[str, Any]:
 
 def _broker_available_qty(user_id: str, symbol: str) -> int:
     normalized = normalize_symbol(symbol)
+    projection = {"available_qty": 1, "can_use_volume": 1, "qty": 1, "synced_at": 1, "symbol": 1}
     doc = get_db_collections()["trader_positions"].find_one(
         {"user_id": user_id, "symbol": normalized},
-        {"available_qty": 1, "can_use_volume": 1, "qty": 1},
+        projection,
     )
     if not doc:
         for cand in {normalized, normalized.split(".")[0]}:
             doc = get_db_collections()["trader_positions"].find_one(
                 {"user_id": user_id, "symbol": cand},
-                {"available_qty": 1, "can_use_volume": 1, "qty": 1},
+                projection,
             )
             if doc:
                 break
     if not doc:
         return 0
-    snapshot_qty = to_int(doc.get("available_qty", doc.get("can_use_volume", doc.get("qty", 0))))
-    # Same-day sellable shares are non-renewable under T+1 settlement, and the
-    # main rebalance draws on the same pool. Yield to sell orders already in
-    # flight — a missed T+0 leg is cheaper than an unfilled strategy reduction.
     reserved = in_flight_sell_qty(
         get_db_collections(),
         user_id,
         {normalized, normalized.split(".")[0]},
     )
+    sellable = sellable_shares(
+        doc,
+        reserved=reserved,
+        legacy_mode=LEGACY_MODE_T0_CHAIN,
+        log_context="t0",
+    )
     if reserved:
         log.info(
             "T+0 available qty for %s reduced from %s to %s by %s shares of in-flight sells",
             normalized,
-            snapshot_qty,
-            max(0, snapshot_qty - reserved),
+            sellable.legacy_shares + reserved,
+            sellable.legacy_shares,
             reserved,
         )
-    return max(0, snapshot_qty - reserved)
+    return sellable.legacy_shares
 
 
 def _round_lot(qty: int) -> int:

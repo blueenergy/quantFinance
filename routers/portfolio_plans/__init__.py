@@ -21,6 +21,11 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from auth import get_current_user
 from db import db as finance_db
 from db import get_analyzer_db, get_data_db, get_db_collections, get_trading_db_collections
+from services.account_sellable import (
+    LEGACY_MODE_ACCOUNT_FALLBACK,
+    merge_sellable_bucket,
+    sellable_shares,
+)
 from services.analysis_tasks import build_task_doc, normalize_task_status
 from utils.time_display import add_display_time_fields
 from services.execution_policy import estimate_buy_order_cash_exposure
@@ -3149,10 +3154,25 @@ def _account_position_qty(pos: Dict[str, Any]) -> int:
 
 
 def _account_available_qty(pos: Dict[str, Any]) -> int:
-    for field in ("can_use_volume", "available_qty", "available_shares", "available_volume"):
-        if pos.get(field) is not None:
-            return _int_value(pos.get(field))
-    return _account_position_qty(pos)
+    return sellable_shares(pos, legacy_mode=LEGACY_MODE_ACCOUNT_FALLBACK).legacy_shares
+
+
+def _sellable_observability_from_bucket(account_pos: Dict[str, Any]) -> Dict[str, Any]:
+    """Optional sellable metadata attached to plan items and dropped targets."""
+    if not account_pos:
+        return {}
+    fields: Dict[str, Any] = {}
+    if "sellable_strict" in account_pos:
+        fields["sellable_shares_strict"] = account_pos.get("sellable_strict")
+    if "sellable_legacy" in account_pos:
+        fields["sellable_shares_legacy"] = account_pos.get("sellable_legacy")
+    if account_pos.get("sellable_source_field"):
+        fields["sellable_source_field"] = account_pos.get("sellable_source_field")
+    if account_pos.get("sellable_snapshot_age") is not None:
+        fields["sellable_snapshot_age_seconds"] = account_pos.get("sellable_snapshot_age")
+    if account_pos.get("sellable_diverges"):
+        fields["sellable_diverges"] = bool(account_pos.get("sellable_diverges"))
+    return fields
 
 
 def _account_positions_by_symbol(
@@ -3184,6 +3204,7 @@ def _account_positions_by_symbol(
                 "available_qty": 1,
                 "available_shares": 1,
                 "available_volume": 1,
+                "synced_at": 1,
             },
         )
     )
@@ -3194,7 +3215,12 @@ def _account_positions_by_symbol(
             continue
         bucket = positions.setdefault(key, {"current": 0, "available": 0})
         bucket["current"] += max(0, _account_position_qty(row))
-        bucket["available"] += max(0, _account_available_qty(row))
+        sellable = sellable_shares(
+            row,
+            legacy_mode=LEGACY_MODE_ACCOUNT_FALLBACK,
+            log_context="account_positions",
+        )
+        merge_sellable_bucket(bucket, sellable)
     return positions, bool(rows)
 
 

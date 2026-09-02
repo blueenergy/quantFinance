@@ -5570,6 +5570,39 @@ def test_live_rebalance_caps_sell_to_account_available(monkeypatch):
     assert data_out["capped_symbols"] == ["600000.SH"]
 
 
+def test_live_rebalance_surfaces_sellable_divergence_without_changing_size(monkeypatch):
+    """Phase 1 keeps legacy sizing; strict vs legacy only surfaces in metadata."""
+    cols, fin, data = _live_rebalance_env()
+    fin["trader_positions"].docs = [
+        {
+            "user_id": "user-1",
+            "securities_account_id": "acct-1",
+            "symbol": "600000.SH",
+            "qty": 500,
+        }
+    ]
+    _patch_lineage_live_env(monkeypatch, cols, fin, data)
+
+    resp = asyncio.run(
+        portfolio_plans.live_rebalance_portfolio(
+            "pla",
+            portfolio_plans.LiveRebalanceRequest(
+                securities_account_id="acct-1",
+                targets={"600000.SH": 0},
+                dry_run=True,
+            ),
+            current_user={"id": "user-1"},
+        )
+    )
+
+    item = resp["data"]["items"][0]
+    assert item["delta_shares"] == -500
+    assert resp["data"]["signals"][0]["size"] == 500
+    assert item["sellable_shares_strict"] == 0
+    assert item["sellable_shares_legacy"] == 500
+    assert item["sellable_diverges"] is True
+
+
 def test_live_rebalance_stamps_intraday_t0_plan_type(monkeypatch):
     """T+0 legs must not look like a portfolio rebalance to downstream queries."""
     cols, fin, data = _live_rebalance_env()

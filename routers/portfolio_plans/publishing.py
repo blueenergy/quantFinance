@@ -35,6 +35,7 @@ from services.live_trade_signals import (
 )
 from services.portfolio_lineage_state import mark_lineage_live
 from services.portfolio_risk_snapshots import capture_plan_risk_snapshot
+from services.account_sellable import LEGACY_MODE_OR_CHAIN, sellable_shares
 from services.portfolio_plan_market import (
     PRICE_SOURCE_DAILY_CLOSE,
     reprice_plan_items_for_publish,
@@ -107,6 +108,7 @@ def _build_live_publish_risk_report(
     for signal in signals:
         amount = abs(int(signal.get("size", 0) or 0)) * _numeric(signal.get("price"))
         blockers: List[str] = []
+        sellable_meta: Dict[str, Any] = {}
         if not _pp._account_live_enabled(account):
             blockers.append("live_trading_disabled")
         if not account.get("broker") or not account.get("account_id"):
@@ -136,10 +138,27 @@ def _build_live_publish_risk_report(
             position = positions_by_key.get(
                 (str(signal.get("securities_account_id") or ""), str(signal.get("symbol") or ""))
             ) or {}
-            available_qty = int(position.get("available_qty") or position.get("can_use_volume") or position.get("qty") or 0)
-            if int(signal.get("size", 0) or 0) > available_qty:
+            sellable = sellable_shares(
+                position,
+                legacy_mode=LEGACY_MODE_OR_CHAIN,
+                log_context="publish_risk",
+            )
+            if int(signal.get("size", 0) or 0) > sellable.legacy_shares:
                 blockers.append("insufficient_available_position")
+            sellable_meta = sellable.observability()
         day_reserved += amount
+        item_warnings = sorted(
+            {
+                warning
+                for warning in (
+                    ["priced_from_stale_close"]
+                    if str(signal.get("reference_price_source") or "") == PRICE_SOURCE_DAILY_CLOSE
+                    else []
+                )
+            }
+        )
+        if sellable_meta.get("sellable_diverges"):
+            item_warnings.append("sellable_quantity_diverges")
         items.append(
             {
                 "order_id": signal.get("order_id"),
@@ -159,16 +178,8 @@ def _build_live_publish_risk_report(
                 "valid_until": signal.get("valid_until"),
                 "estimated_amount": amount,
                 "blockers": sorted(set(blockers)),
-                "warnings": sorted(
-                    {
-                        warning
-                        for warning in (
-                            ["priced_from_stale_close"]
-                            if str(signal.get("reference_price_source") or "") == PRICE_SOURCE_DAILY_CLOSE
-                            else []
-                        )
-                    }
-                ),
+                "warnings": item_warnings,
+                **sellable_meta,
             }
         )
 
@@ -359,13 +370,14 @@ def _dropped_target_record(
     account_current_shares: Optional[int] = None,
     account_available_shares: Optional[int] = None,
     blockers: Optional[List[str]] = None,
+    sellable_observability: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Describe a requested target that produced no order.
 
     A dropped reduction may be a stop-loss that never reached the broker, so
     callers must be able to tell it apart from a target that was already met.
     """
-    return {
+    record = {
         "symbol": symbol,
         "reason_code": reason_code,
         "reason": reason,
@@ -375,6 +387,9 @@ def _dropped_target_record(
         "account_available_shares": account_available_shares,
         "blockers": list(blockers or []),
     }
+    if sellable_observability:
+        record.update(sellable_observability)
+    return record
 
 
 def _live_signal_is_blocked(item: Dict[str, Any]) -> bool:
@@ -513,6 +528,7 @@ async def live_rebalance_portfolio(
         account_pos = account_positions_by_key.get(symbol_key) or {"current": 0, "available": 0}
         account_current_shares = account_pos["current"] if account_positions_synced else None
         account_available_shares = account_pos["available"] if account_positions_synced else None
+        sellable_meta = _pp._sellable_observability_from_bucket(account_pos) if account_positions_synced else {}
         if delta < 0 and account_positions_synced:
             if account_current_shares <= 0 or account_available_shares <= 0:
                 # The broker account has synced and says this symbol is not
@@ -529,6 +545,7 @@ async def live_rebalance_portfolio(
                         account_current_shares=account_current_shares,
                         account_available_shares=account_available_shares,
                         blockers=blockers,
+                        sellable_observability=sellable_meta,
                     )
                 )
                 continue
@@ -545,6 +562,7 @@ async def live_rebalance_portfolio(
                         account_current_shares=account_current_shares,
                         account_available_shares=account_available_shares,
                         blockers=blockers,
+                        sellable_observability=sellable_meta,
                     )
                 )
                 continue
@@ -564,6 +582,7 @@ async def live_rebalance_portfolio(
                         account_current_shares=account_current_shares,
                         account_available_shares=account_available_shares,
                         blockers=blockers,
+                        sellable_observability=sellable_meta,
                     )
                 )
             continue
@@ -607,6 +626,7 @@ async def live_rebalance_portfolio(
                 "estimated_amount": abs(delta) * float(price or 0) if price else None,
                 "blockers": item_blockers,
                 "created_at": now,
+                **sellable_meta,
             }
         )
 
