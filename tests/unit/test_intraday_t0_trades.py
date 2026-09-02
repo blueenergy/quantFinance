@@ -48,6 +48,7 @@ def test_record_sell_and_buy_pair(monkeypatch):
             "intraday_t0_trades": trades_coll,
             "intraday_t0_signals": signals,
             "trader_positions": positions,
+            "trade_signals": FakeCollection([]),
         },
     )
     monkeypatch.setattr(trades, "ensure_intraday_t0_trade_indexes", lambda: None)
@@ -180,6 +181,7 @@ def test_record_buy_first_and_sell_pair(monkeypatch):
             "intraday_t0_trades": trades_coll,
             "intraday_t0_signals": FakeCollection([]),
             "trader_positions": positions,
+            "trade_signals": FakeCollection([]),
         },
     )
     monkeypatch.setattr(trades, "ensure_intraday_t0_trade_indexes", lambda: None)
@@ -240,6 +242,7 @@ def test_buy_first_open_exceeds_capacity_rejected(monkeypatch):
             "intraday_t0_trades": _InsertCollection(trade_rows := []),
             "intraday_t0_signals": FakeCollection([]),
             "trader_positions": positions,
+            "trade_signals": FakeCollection([]),
         },
     )
     monkeypatch.setattr(trades, "ensure_intraday_t0_trade_indexes", lambda: None)
@@ -301,6 +304,7 @@ def test_buy_first_open_rejected_when_existing_open_pair(monkeypatch):
             "intraday_t0_trades": trades_coll,
             "intraday_t0_signals": FakeCollection([]),
             "trader_positions": positions,
+            "trade_signals": FakeCollection([]),
         },
     )
     monkeypatch.setattr(trades, "ensure_intraday_t0_trade_indexes", lambda: None)
@@ -371,6 +375,7 @@ def test_preview_trade_buy_first_without_open_pair(monkeypatch):
         lambda: {
             "intraday_t0_signals": signals,
             "trader_positions": positions,
+            "trade_signals": FakeCollection([]),
             "intraday_t0_trades": FakeCollection([]),
         },
     )
@@ -406,6 +411,7 @@ def test_preview_trade_from_signal(monkeypatch):
         lambda: {
             "intraday_t0_signals": signals,
             "trader_positions": positions,
+            "trade_signals": FakeCollection([]),
             "intraday_t0_trades": FakeCollection([]),
         },
     )
@@ -415,3 +421,69 @@ def test_preview_trade_from_signal(monkeypatch):
     assert preview["suggested_qty"] == 200
     assert preview["available_qty"] == 500
     assert preview["pair_style"] == "sell_first"
+
+
+@pytest.mark.unit
+def test_available_qty_yields_to_in_flight_sells(monkeypatch):
+    """A pending strategy reduction must not be preempted by a T+0 leg."""
+    signal_id = str(ObjectId())
+    signals = FakeCollection(
+        [
+            {
+                "_id": ObjectId(signal_id),
+                "user_id": "u1",
+                "symbol": "300750.SZ",
+                "signal_type": "SELL_WATCH",
+                "signal_score": 80,
+            }
+        ]
+    )
+    positions = FakeCollection(
+        [{"user_id": "u1", "symbol": "300750.SZ", "available_qty": 500}]
+    )
+    live_signals = FakeCollection(
+        [
+            {
+                "user_id": "u1",
+                "symbol": "300750.SZ",
+                "mode": "live",
+                "action": "sell",
+                "status": "submitted",
+                "size": 300,
+            },
+            # Filled orders are already reflected in the broker snapshot, and a
+            # buy never competes for sellable shares.
+            {
+                "user_id": "u1",
+                "symbol": "300750.SZ",
+                "mode": "live",
+                "action": "sell",
+                "status": "filled",
+                "size": 100,
+            },
+            {
+                "user_id": "u1",
+                "symbol": "300750.SZ",
+                "mode": "live",
+                "action": "buy",
+                "status": "submitted",
+                "size": 400,
+            },
+        ]
+    )
+    monkeypatch.setattr(
+        trades,
+        "get_db_collections",
+        lambda: {
+            "intraday_t0_signals": signals,
+            "trader_positions": positions,
+            "trade_signals": live_signals,
+            "intraday_t0_trades": FakeCollection([]),
+        },
+    )
+    monkeypatch.setattr(trades, "ensure_intraday_t0_trade_indexes", lambda: None)
+    monkeypatch.setattr("services.intraday_t0_trades.latest_market_spectrum", lambda _td: {"yang_spectrum": 0.5})
+
+    preview = trades.preview_trade_from_signal("u1", signal_id)
+    assert preview["available_qty"] == 200
+    assert preview["suggested_qty"] == 100

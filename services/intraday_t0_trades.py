@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -17,8 +18,11 @@ from services.intraday_t0_signals import (
     to_float,
     to_int,
 )
+from services.live_trade_signals import in_flight_sell_qty
 from utils.stock_utils import serialize_doc
 from utils.symbol_utils import normalize_symbol
+
+log = logging.getLogger(__name__)
 
 LEG_TYPES = {"sell", "buy"}
 PAIR_STYLES = {"sell_first", "buy_first"}
@@ -89,7 +93,24 @@ def _broker_available_qty(user_id: str, symbol: str) -> int:
                 break
     if not doc:
         return 0
-    return to_int(doc.get("available_qty", doc.get("can_use_volume", doc.get("qty", 0))))
+    snapshot_qty = to_int(doc.get("available_qty", doc.get("can_use_volume", doc.get("qty", 0))))
+    # Same-day sellable shares are non-renewable under T+1 settlement, and the
+    # main rebalance draws on the same pool. Yield to sell orders already in
+    # flight — a missed T+0 leg is cheaper than an unfilled strategy reduction.
+    reserved = in_flight_sell_qty(
+        get_db_collections(),
+        user_id,
+        {normalized, normalized.split(".")[0]},
+    )
+    if reserved:
+        log.info(
+            "T+0 available qty for %s reduced from %s to %s by %s shares of in-flight sells",
+            normalized,
+            snapshot_qty,
+            max(0, snapshot_qty - reserved),
+            reserved,
+        )
+    return max(0, snapshot_qty - reserved)
 
 
 def _round_lot(qty: int) -> int:

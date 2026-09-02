@@ -168,6 +168,12 @@ curl -X POST "http://<API>/api/intraday-t0/signals/generate" \
 
 买先开仓量 ≤ 当日券商 `available_qty`（旧仓可卖量），保证后续能用旧仓卖平、日终股数回到原样。同一 symbol 同时只允许 **一个** open pair（任意 style）。
 
+T+0 读到的 `available_qty` 会先扣掉**在途实盘卖单**（`trade_signals` 中 `action=sell` 且状态属于 `ACTIVE_SIGNAL_STATUSES` 的部分）。T+1 交割下当日可卖量不可再生，主 rebalance 的减仓与 T+0 争的是同一份额度；主策略减仓属风控行为，因此让 T+0 让路。
+
+这里**不判断**券商快照是否已冻结在途量：`trader_positions.synced_at` 是 unix 秒而 signal 的 `created_at` 是 datetime，做时点比较需要跨时区换算，算错方向会阻塞止损。重复扣减只会让 T+0 更保守，是有意选择。反向不成立——主 rebalance 不做此扣减。
+
+因此盘中先发过主策略卖单时，T+0 的 `available_qty` 会小于券商界面显示值，日志 `T+0 available qty for ... reduced from ... by ... shares of in-flight sells` 会记录差额。
+
 ### 执行设置（Dashboard → 实盘执行）
 
 | 设置 | 默认 | 说明 |

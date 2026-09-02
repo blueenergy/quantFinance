@@ -368,6 +368,7 @@ def _patch_trade_ledger_env(monkeypatch, signal_id):
             "trader_positions": FakeCollection(
                 [{"user_id": "u1", "symbol": "300750.SZ", "available_qty": 500}]
             ),
+            "trade_signals": FakeCollection([]),
         },
     )
     monkeypatch.setattr("services.intraday_t0_trades.get_db_collections", execution.get_db_collections)

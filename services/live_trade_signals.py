@@ -376,6 +376,46 @@ def ensure_live_signal_contract(doc: Dict[str, Any]) -> Dict[str, Any]:
         raise HTTPException(status_code=422, detail=f"invalid live trade signal: {exc}") from exc
 
 
+def in_flight_sell_qty(
+    finance_collections: Dict[str, Any],
+    user_id: str,
+    symbols: Iterable[str],
+    securities_account_id: Optional[str] = None,
+) -> int:
+    """Shares already committed to the broker by live sell orders still in flight.
+
+    ``trader_positions`` is a periodic snapshot, so its available quantity can
+    still include shares an active sell order has claimed. Callers that must not
+    double-spend that quantity subtract this.
+
+    Deliberately does not try to tell whether the broker snapshot already froze
+    these shares: comparing signal timestamps against ``synced_at`` needs a
+    timezone-correct conversion that is easy to get wrong, and erring toward a
+    smaller available quantity only makes the caller more conservative.
+    """
+    candidates = [str(s).strip() for s in symbols if str(s or "").strip()]
+    if not candidates:
+        return 0
+    query: Dict[str, Any] = {
+        "user_id": str(user_id),
+        "mode": "live",
+        "action": "sell",
+        "symbol": {"$in": candidates},
+        "status": {"$in": sorted(ACTIVE_SIGNAL_STATUSES)},
+    }
+    if securities_account_id:
+        query["securities_account_id"] = str(securities_account_id)
+    total = 0
+    for row in finance_collections["trade_signals"].find(query, {"_id": 0, "size": 1}):
+        try:
+            size = int(row.get("size") or 0)
+        except (TypeError, ValueError):
+            continue
+        if size > 0:
+            total += size
+    return total
+
+
 def active_signal_query_for_order_ids(user_id: str, order_ids: Iterable[str]) -> Dict[str, Any]:
     return {
         "user_id": str(user_id),
