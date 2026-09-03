@@ -15,6 +15,7 @@ from services.portfolio_record_kind import (
     is_strategy_decision,
     require_record_kind,
     strategy_decision_mongo_filter,
+    strategy_generated_record_mongo_filter,
     strategy_rebalance_mongo_filter,
 )
 
@@ -119,6 +120,31 @@ def test_is_strategy_decision_false_for_monitor():
         "plan_type": "monitor",
     }
     assert is_strategy_decision(doc) is False
+
+
+def test_is_strategy_decision_preserves_ledger_override():
+    assert (
+        is_strategy_decision(
+            {
+                "record_kind": RECORD_KIND_TRADE_PLAN,
+                "origin": "strategy",
+                "manual_action": "external_manual",
+            }
+        )
+        is False
+    )
+
+
+def test_is_strategy_decision_fails_loud_without_record_kind():
+    with pytest.raises(ValueError, match="missing/invalid record_kind"):
+        is_strategy_decision({"origin": "strategy", "plan_type": "rebalance"})
+
+
+def test_strategy_generated_record_filter_includes_observations():
+    assert strategy_generated_record_mongo_filter(base_date="20250101") == {
+        "origin": {"$ne": "manual"},
+        "base_date": "20250101",
+    }
 
 
 def test_strategy_decision_mongo_filter_shape():

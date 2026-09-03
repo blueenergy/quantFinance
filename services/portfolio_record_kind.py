@@ -137,6 +137,18 @@ def is_strategy_decision(doc: Mapping[str, Any]) -> bool:
     return require_record_kind(doc) == RECORD_KIND_TRADE_PLAN
 
 
+def strategy_generated_record_mongo_filter(**extra: Any) -> Dict[str, Any]:
+    """Mongo query fragment for any strategy-generated record.
+
+    This is intentionally broader than ``strategy_decision_mongo_filter``:
+    monitor observations also count for lineage/day idempotency even though
+    they are not trade decisions.
+    """
+    query: Dict[str, Any] = {"origin": {"$ne": "manual"}}
+    query.update(extra)
+    return query
+
+
 def strategy_decision_mongo_filter(**extra: Any) -> Dict[str, Any]:
     """Mongo query fragment for strategy-generated trade plans.
 
