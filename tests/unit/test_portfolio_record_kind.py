@@ -12,7 +12,10 @@ from services.portfolio_record_kind import (
     RECORD_KIND_OBSERVATION,
     RECORD_KIND_TRADE_PLAN,
     classify_record,
+    is_strategy_decision,
     require_record_kind,
+    strategy_decision_mongo_filter,
+    strategy_rebalance_mongo_filter,
 )
 
 
@@ -88,3 +91,54 @@ def test_require_record_kind_lets_extman_override_bad_stamp():
 def test_require_record_kind_fails_loud_when_missing():
     with pytest.raises(ValueError):
         require_record_kind({"plan_id": "x"})
+
+
+def test_is_strategy_decision_true_for_strategy_trade_plan():
+    doc = {
+        "record_kind": RECORD_KIND_TRADE_PLAN,
+        "origin": "strategy",
+        "plan_type": "rebalance",
+    }
+    assert is_strategy_decision(doc) is True
+
+
+def test_is_strategy_decision_false_for_manual_rebalance():
+    doc = {
+        "record_kind": RECORD_KIND_TRADE_PLAN,
+        "origin": "manual",
+        "plan_type": "rebalance",
+        "manual_action": "rebalance",
+    }
+    assert is_strategy_decision(doc) is False
+
+
+def test_is_strategy_decision_false_for_monitor():
+    doc = {
+        "record_kind": RECORD_KIND_OBSERVATION,
+        "origin": "strategy",
+        "plan_type": "monitor",
+    }
+    assert is_strategy_decision(doc) is False
+
+
+def test_strategy_decision_mongo_filter_shape():
+    assert strategy_decision_mongo_filter(base_date="20250101") == {
+        "origin": {"$ne": "manual"},
+        "$or": [
+            {"record_kind": RECORD_KIND_TRADE_PLAN},
+            {"record_kind": {"$exists": False}},
+        ],
+        "base_date": "20250101",
+    }
+
+
+def test_strategy_rebalance_mongo_filter_adds_plan_type():
+    assert strategy_rebalance_mongo_filter(user_id="u1") == {
+        "origin": {"$ne": "manual"},
+        "$or": [
+            {"record_kind": RECORD_KIND_TRADE_PLAN},
+            {"record_kind": {"$exists": False}},
+        ],
+        "plan_type": "rebalance",
+        "user_id": "u1",
+    }

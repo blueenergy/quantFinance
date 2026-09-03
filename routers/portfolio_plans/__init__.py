@@ -66,6 +66,7 @@ from services.portfolio_record_kind import (
     RECORD_KIND_TRADE_PLAN,
     VALID_RECORD_KINDS,
     classify_record,
+    is_strategy_decision,
     require_record_kind,
 )
 
@@ -5845,16 +5846,8 @@ def _build_lineage_timeline_payload(
     )
     headline_plan = next((row for row in plans if _plan_action_required(row)), latest_plan)
 
-    def is_strategy_rebalance(row: Dict[str, Any]) -> bool:
-        # A scheduled (non-manual) trade plan. Manual off-cycle rebalances are
-        # trade_plans too, but excluded here by origin (provenance dimension).
-        return (
-            require_record_kind(row) == RECORD_KIND_TRADE_PLAN
-            and row.get("origin") != "manual"
-        )
-
     latest_rebalance = next(
-        (row for row in plans if is_strategy_rebalance(row)),
+        (row for row in plans if is_strategy_decision(row)),
         None,
     )
     latest_monitor = next(

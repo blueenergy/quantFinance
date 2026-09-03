@@ -672,9 +672,9 @@ async def live_rebalance_portfolio(
         "execute_date": base_date,
         "plan_type": requested_plan_type,
         "record_kind": RECORD_KIND_TRADE_PLAN,
-        # origin stays "manual": downstream strategy-cadence and trailing-stop
-        # queries use origin != "manual" to mean "a strategy decision", and an
-        # intraday leg is not one.
+        # origin stays "manual": downstream uses is_strategy_decision() /
+        # strategy_decision_mongo_filter() to exclude discretionary plans from
+        # cadence, trailing-stop, and supersede queries.
         "origin": "manual",
         "manual_action": manual_action,
         "is_liquidation": is_liquidation,

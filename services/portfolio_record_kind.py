@@ -35,7 +35,7 @@ rows carry ``plan_type == "rebalance"``::
 
 from __future__ import annotations
 
-from typing import Any, Mapping
+from typing import Any, Dict, Mapping
 
 RECORD_KIND_TRADE_PLAN = "trade_plan"
 RECORD_KIND_OBSERVATION = "observation"
@@ -123,3 +123,41 @@ def require_record_kind(doc: Mapping[str, Any]) -> str:
             f"plan_id={doc.get('plan_id')!r} record_kind={kind!r}"
         )
     return kind
+
+
+def is_strategy_decision(doc: Mapping[str, Any]) -> bool:
+    """True for strategy-generated trade plans (excludes manual discretionary).
+
+    ``origin`` is provenance; ``record_kind`` is entity type. Manual live/paper
+    rebalances are ``trade_plan`` rows too but must not drive cadence, trailing
+    stop, supersede, or timeline rebalance picks.
+    """
+    if str(doc.get("origin") or "") == "manual":
+        return False
+    return require_record_kind(doc) == RECORD_KIND_TRADE_PLAN
+
+
+def strategy_decision_mongo_filter(**extra: Any) -> Dict[str, Any]:
+    """Mongo query fragment for strategy-generated trade plans.
+
+    Pass field constraints as keyword args (``base_date``, ``status``, …).
+    Later keys override defaults on name collision.
+
+    Rows stamped before the ``record_kind`` migration may omit the field; they
+    still match when ``origin`` is not ``manual`` (same as the old
+    ``origin != manual`` queries).
+    """
+    query: Dict[str, Any] = {
+        "origin": {"$ne": "manual"},
+        "$or": [
+            {"record_kind": RECORD_KIND_TRADE_PLAN},
+            {"record_kind": {"$exists": False}},
+        ],
+    }
+    query.update(extra)
+    return query
+
+
+def strategy_rebalance_mongo_filter(**extra: Any) -> Dict[str, Any]:
+    """``strategy_decision_mongo_filter`` narrowed to cadence rebalance rows."""
+    return strategy_decision_mongo_filter(plan_type=PLAN_TYPE_REBALANCE, **extra)
