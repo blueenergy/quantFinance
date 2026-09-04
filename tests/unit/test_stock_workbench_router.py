@@ -75,6 +75,10 @@ class _Collection:
                     return False
                 if "$lt" in expected and not (value < expected["$lt"]):
                     return False
+                if "$gte" in expected and not (value >= expected["$gte"]):
+                    return False
+                if "$lte" in expected and not (value <= expected["$lte"]):
+                    return False
                 continue
             if value != expected:
                 return False
@@ -495,6 +499,55 @@ def test_kline_section_adds_partial_weekly_and_monthly_rows(monkeypatch):
         assert partial["amount_unit"] == "yuan"
     assert weekly["rows"][1]["trade_date"] == "20260612"
     assert monthly["rows"][1]["trade_date"] == "20260529"
+    assert weekly["rows"][0]["gs_formula_id"] == "decision_gs_v1"
+    assert weekly["rows"][0]["gs_signal"] is None
+    assert monthly["rows"][0].get("adjust") != "qfq"
+
+
+def test_kline_section_applies_qfq_and_attaches_decision_gs(monkeypatch):
+    data = {
+        "volume_price": _Collection(
+            [
+                {
+                    "symbol": "000001.SZ",
+                    "trade_date": "20260612",
+                    "open": 12,
+                    "high": 13,
+                    "low": 11,
+                    "close": 12,
+                    "pre_close": 10,
+                },
+                {
+                    "symbol": "000001.SZ",
+                    "trade_date": "20260611",
+                    "open": 10,
+                    "high": 11,
+                    "low": 9,
+                    "close": 10,
+                    "pre_close": 9,
+                },
+            ]
+        ),
+        "stock_weekly": _Collection([]),
+        "stock_monthly": _Collection([]),
+        "stock_adj_factor": _Collection(
+            [
+                {"symbol": "000001.SZ", "trade_date": "20260611", "adj_factor": 2.0},
+                {"symbol": "000001.SZ", "trade_date": "20260612", "adj_factor": 2.4},
+            ]
+        ),
+    }
+    monkeypatch.setattr("routers.stock_workbench.get_data_db", lambda: data)
+
+    section = _kline_section("000001.SZ", "1d")
+    latest, previous = section["rows"][0], section["rows"][1]
+    assert latest["trade_date"] == "20260612"
+    assert latest["adjust"] == "qfq"
+    assert latest["close"] == pytest.approx(12.0)
+    assert previous["close"] == pytest.approx(10.0 * 2.0 / 2.4)
+    assert latest["gs_formula_id"] == "decision_gs_v1"
+    assert "mj20" in latest
+    assert "gs_signal" in latest
 
 
 def test_money_flow_section_loads_history_on_demand(monkeypatch):

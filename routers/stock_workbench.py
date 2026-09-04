@@ -34,6 +34,7 @@ from services.score_detail_meta import (
 )
 try:
     from stock_data_access.evidence_fingerprint import normalize_url
+    from stock_data_access.indicators.decision_gs import attach_decision_gs
     from stock_data_access.indicators.nineturn import enrich_nineturn_signals, latest_signal_summary
 except ModuleNotFoundError:
     _stock_data_access_src = Path(__file__).resolve().parents[1] / "data-access-lib" / "src"
@@ -41,16 +42,20 @@ except ModuleNotFoundError:
         sys.path.insert(0, str(_stock_data_access_src))
     try:
         from stock_data_access.evidence_fingerprint import normalize_url
+        from stock_data_access.indicators.decision_gs import attach_decision_gs
         from stock_data_access.indicators.nineturn import enrich_nineturn_signals, latest_signal_summary
     except ModuleNotFoundError:
         log = logging.getLogger(__name__)
-        log.warning("stock_data_access is unavailable; nineturn signal enrichment is disabled")
+        log.warning("stock_data_access is unavailable; nineturn/decision_gs enrichment is disabled")
 
         def enrich_nineturn_signals(daily_quotes: List[Dict[str, Any]], nineturn_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             return []
 
         def latest_signal_summary(signals: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
             return None
+
+        def attach_decision_gs(rows: List[Dict[str, Any]], **_params: Any) -> List[Dict[str, Any]]:
+            return list(rows)
 
         def normalize_url(value: Any) -> str:
             return str(value or "").strip()
@@ -461,6 +466,99 @@ def _annotate_kline_amount_unit(rows: List[Dict[str, Any]], tf: str) -> List[Dic
     ]
 
 
+_QFQ_PRICE_COLS = ("open", "high", "low", "close", "pre_close")
+
+
+def _normalize_kline_date(value: Any) -> str:
+    text = str(value or "").replace("-", "").strip()
+    digits = "".join(ch for ch in text if ch.isdigit())
+    return digits[:8] if len(digits) >= 8 else text
+
+
+def _qfq_daily_kline_rows(data: Any, symbol: str, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Forward-adjust daily OHLC in place-copies so GS overlays match 同花顺 qfq."""
+    if not rows:
+        return rows
+    adj_coll = _data_collection(data, "stock_adj_factor")
+    if adj_coll is None:
+        return rows
+    dates = [_normalize_kline_date(row.get("trade_date")) for row in rows]
+    dates = [item for item in dates if item]
+    if not dates:
+        return rows
+    start, end = min(dates), max(dates)
+    candidates = _symbol_candidates(symbol)
+    try:
+        docs = list(
+            adj_coll.find(
+                {
+                    "$or": [
+                        {"symbol": {"$in": candidates}},
+                        {"ts_code": {"$in": candidates}},
+                    ],
+                    "trade_date": {"$gte": start, "$lte": end},
+                },
+                {"_id": 0, "trade_date": 1, "adj_factor": 1},
+            )
+        )
+    except Exception:
+        log.exception("qfq lookup failed for %s", symbol)
+        return rows
+    factor_by_date: Dict[str, float] = {}
+    for doc in docs:
+        key = _normalize_kline_date(doc.get("trade_date"))
+        factor = _to_float(doc.get("adj_factor"))
+        if key and factor is not None and factor > 0:
+            factor_by_date[key] = factor
+    if not factor_by_date:
+        return rows
+
+    chrono_dates = sorted({item for item in dates if item})
+    filled: Dict[str, float] = {}
+    last: Optional[float] = None
+    for day in chrono_dates:
+        if day in factor_by_date:
+            last = factor_by_date[day]
+        if last is not None:
+            filled[day] = last
+    if not filled:
+        return rows
+    anchor = filled[max(filled)]
+    if not anchor:
+        return rows
+
+    adjusted: List[Dict[str, Any]] = []
+    for row in rows:
+        merged = dict(row)
+        day = _normalize_kline_date(row.get("trade_date"))
+        factor = filled.get(day)
+        if factor is None:
+            adjusted.append(merged)
+            continue
+        multiplier = factor / anchor
+        for col in _QFQ_PRICE_COLS:
+            value = _to_float(merged.get(col))
+            if value is not None:
+                merged[col] = value * multiplier
+        merged["adjust"] = "qfq"
+        adjusted.append(merged)
+    return adjusted
+
+
+def _decorate_kline_rows(
+    data: Any,
+    symbol: str,
+    rows: List[Dict[str, Any]],
+    tf: str,
+) -> List[Dict[str, Any]]:
+    priced = _qfq_daily_kline_rows(data, symbol, rows) if tf == "1d" else rows
+    try:
+        return attach_decision_gs(priced)
+    except Exception:
+        log.exception("decision_gs attach failed for %s tf=%s", symbol, tf)
+        return priced
+
+
 def _with_partial_period_kline(
     data: Any,
     candidates: List[str],
@@ -774,6 +872,7 @@ def _quote_section(symbol: str) -> Dict[str, Any]:
     money_flow_summary = _money_flow_summary(money_flow_history_desc)
     entry_risk = _entry_risk_snapshot(daily_quotes, money_flow_history_desc)
     profiler.lap("money_flow_transform", rows=len(money_flow_history))
+    daily_quotes = _decorate_kline_rows(data, symbol, daily_quotes, "1d")
     status = _quote_status(quote)
     if not status["as_of"]:
         status["as_of"] = (daily_quotes[0] if daily_quotes else {}).get("trade_date")
@@ -824,6 +923,8 @@ def _kline_section(symbol: str, tf: str) -> Dict[str, Any]:
     )
     rows = _annotate_kline_amount_unit(rows, tfc)
     rows = _with_partial_period_kline(data, candidates, rows, tfc)
+    rows = _decorate_kline_rows(data, symbol, rows, tfc)
+    # Overlay fields: mj20/mj30/gs_signal (decision_gs_v1).
     profiler.lap("kline_query", tf=tfc, collection=collection_name, rows=len(rows), limit=limit)
     result = {
         "symbol": symbol,
