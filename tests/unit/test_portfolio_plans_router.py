@@ -5634,6 +5634,38 @@ def test_live_rebalance_stamps_intraday_t0_plan_type(monkeypatch):
     assert portfolio_record_kind.require_record_kind(plan) == "trade_plan"
 
 
+def test_live_rebalance_stamps_t0_order_remark(monkeypatch):
+    cols, fin, data = _live_rebalance_env()
+    _patch_lineage_live_env(monkeypatch, cols, fin, data)
+    monkeypatch.setattr(portfolio_plans, "schedule_snapshot_rebuild", lambda *a, **k: None)
+    t0_id = "64b7f0c2a1b2c3d4e5f60789"
+
+    resp = asyncio.run(
+        portfolio_plans.live_rebalance_portfolio(
+            "pla",
+            portfolio_plans.LiveRebalanceRequest(
+                securities_account_id="acct-1",
+                targets={"600000.SH": 300},
+                plan_type="intraday_t0",
+                t0_signal_id=t0_id,
+                dry_run=False,
+            ),
+            current_user={"id": "user-1"},
+        )
+    )
+
+    plan = next(
+        p for p in cols["portfolio_trade_plans"].docs
+        if p.get("plan_id") == resp["data"]["plan_id"]
+    )
+    assert plan["t0_signal_id"] == t0_id
+    new_sell = next(d for d in fin["trade_signals"].docs if d.get("action") == "sell")
+    assert new_sell["t0_signal_id"] == t0_id
+    assert new_sell["order_remark"] == f"t0:{t0_id}"
+    assert new_sell["order_id"]
+    assert new_sell["order_id"] != new_sell["order_remark"]
+
+
 def test_live_rebalance_defaults_to_rebalance_plan_type(monkeypatch):
     cols, fin, data = _live_rebalance_env()
     _patch_lineage_live_env(monkeypatch, cols, fin, data)

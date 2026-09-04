@@ -329,6 +329,9 @@ class LiveRebalanceRequest(BaseModel):
     # strategy rebalance does not buy them back.
     exclude_after: bool = Field(default=False)
     dry_run: bool = Field(default=False)
+    # When set, published trade_signals carry t0_signal_id and
+    # order_remark=t0:{id} so quantTrader fills can update the T+0 ledger.
+    t0_signal_id: Optional[str] = Field(default=None)
 
 
 class ExternalManualFill(BaseModel):

@@ -89,6 +89,36 @@ def _schedule_live_snapshot_rebuild_for_execution(
     threading.Thread(target=_run, daemon=True).start()
 
 
+def _maybe_sync_t0_fill_from_broker(
+    *,
+    user_id: str,
+    order_id: str,
+    filled_qty: Any,
+    filled_price: Any,
+    status: str,
+    collections: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Best-effort: T+0 ledger tracks broker fills, not submitted size."""
+    if not order_id:
+        return
+    try:
+        from services.intraday_t0_execution import apply_broker_fill_to_t0_ledger
+
+        apply_broker_fill_to_t0_ledger(
+            user_id,
+            order_id,
+            filled_qty=filled_qty,
+            filled_price=filled_price,
+            status=status,
+            collections=collections,
+        )
+    except Exception:
+        logger.exception(
+            "Failed to sync T+0 ledger from broker fill: order_id=%s",
+            order_id,
+        )
+
+
 def _require_securities_account_doc(
     securities_coll,
     *,
@@ -312,6 +342,19 @@ def update_signal_status(
         
         if result.matched_count == 0:
             raise HTTPException(status_code=404, detail="Signal not found")
+
+        qty_for_t0 = filtered.get("filled_qty")
+        if qty_for_t0 is None:
+            qty_for_t0 = signal.get("filled_qty")
+        if "filled_qty" in filtered or filtered.get("status") in _TERMINAL_EXECUTION_STATUSES:
+            _maybe_sync_t0_fill_from_broker(
+                user_id=user_id,
+                order_id=order_id,
+                filled_qty=qty_for_t0,
+                filled_price=filtered.get("avg_price", signal.get("avg_price")),
+                status=str(filtered.get("status") or signal.get("status") or ""),
+                collections=collections,
+            )
         
         return {"success": True, "order_id": order_id}
         
@@ -352,6 +395,14 @@ def create_execution(
             order_id=str(execution.get("order_id") or ""),
             execution_status=str(execution.get("status") or "filled"),
             signals_coll=signals_coll,
+        )
+        _maybe_sync_t0_fill_from_broker(
+            user_id=user_id,
+            order_id=str(execution.get("order_id") or ""),
+            filled_qty=execution.get("filled_size"),
+            filled_price=execution.get("filled_price"),
+            status=str(execution.get("status") or "filled"),
+            collections=collections,
         )
 
         return {

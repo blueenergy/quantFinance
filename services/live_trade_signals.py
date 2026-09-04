@@ -21,12 +21,34 @@ from services.execution_policy import (
 LIVE_SIGNAL_SOURCE_PORTFOLIO_PLAN = "portfolio_plan"
 TERMINAL_SIGNAL_STATUSES = {"filled", "executed", "rejected", "cancelled", "canceled", "partial_cancelled", "failed"}
 ACTIVE_SIGNAL_STATUSES = {"pending", "retry_pending", "submitted", "partial_filled", "cancel_requested"}
+# Broker-visible remark for T+0 legs. Keep in lockstep with
+# quantTrader MiniQMTBroker._order_remark_for_signal (same prefix).
+T0_ORDER_REMARK_PREFIX = "t0:"
 CN_TZ = ZoneInfo("Asia/Shanghai")
 CN_A_MORNING_OPEN = dt_time(9, 25)
 CN_A_MORNING_CLOSE = dt_time(11, 30)
 CN_A_AFTERNOON_OPEN = dt_time(13, 0)
 CN_A_AFTERNOON_CLOSE = dt_time(15, 0)
 DEFAULT_SIGNAL_VALID_TTL_SECONDS = 28800  # 8h: effectively entire A-share session (9:30–15:00)
+
+
+def t0_order_remark(t0_signal_id: Optional[str]) -> str:
+    """Return ``t0:{signal_id}`` for broker order_remark, or empty if missing."""
+    text = str(t0_signal_id or "").strip()
+    return f"{T0_ORDER_REMARK_PREFIX}{text}" if text else ""
+
+
+def stamp_t0_correlation(signals: Iterable[Dict[str, Any]], t0_signal_id: str) -> str:
+    """Stamp ``t0_signal_id`` / ``order_remark`` onto published live signals.
+
+    ``order_id`` stays the API idempotency key (P3-B). The broker remark is the
+    T+0 signal id so fills can be joined back without waiting on order_id.
+    """
+    remark = t0_order_remark(t0_signal_id)
+    for signal in signals:
+        signal["t0_signal_id"] = t0_signal_id
+        signal["order_remark"] = remark
+    return remark
 
 
 def _env_int(name: str, default: int) -> int:

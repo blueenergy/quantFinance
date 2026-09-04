@@ -13,6 +13,7 @@ from pymongo import ASCENDING, DESCENDING
 
 from db import get_db_collections
 from services.intraday_t0_signals import compact_trade_date, now_ts, to_float, to_int
+from services.live_trade_signals import t0_order_remark
 from services.intraday_t0_trades import (
     DEFAULT_BUY_QTY_RATIO,
     DEFAULT_SELL_QTY_RATIO,
@@ -55,6 +56,10 @@ def ensure_intraday_t0_execution_indexes() -> None:
         unique=True,
         name="signal_id_unique",
         partialFilterExpression={"signal_id": {"$type": "string"}},
+    )
+    executions.create_index(
+        [("order_ids", ASCENDING)],
+        name="order_ids_idx",
     )
     _EXEC_INDEXES_READY = True
 
@@ -426,6 +431,7 @@ async def preview_execution_async(
         targets={intent["symbol"]: intent["target_shares"]},
         expected_current_shares={intent["symbol"]: intent["current_shares"]},
         plan_type=PLAN_TYPE_INTRADAY_T0,
+        t0_signal_id=signal_id,
         exclude_after=False,
         dry_run=True,
     )
@@ -524,6 +530,205 @@ def sync_execution_trade_leg(
         return None
 
 
+_FILL_SYNC_STATUSES = frozenset(
+    {
+        "filled",
+        "executed",
+        "rejected",
+        "cancelled",
+        "canceled",
+        "partial_cancelled",
+        "failed",
+        "partial_filled",
+    }
+)
+
+
+def _find_t0_execution_for_order(
+    user_id: str,
+    order_id: str,
+    collections: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    if not order_id:
+        return None
+    executions = collections.get("intraday_t0_executions")
+    if executions is None:
+        return None
+    doc = executions.find_one({"user_id": user_id, "order_ids": order_id})
+    if doc:
+        return doc
+    signals = collections.get("trade_signals")
+    if signals is None:
+        return None
+    signal = signals.find_one(
+        {"user_id": user_id, "order_id": order_id},
+        {"t0_signal_id": 1},
+    )
+    t0_id = str((signal or {}).get("t0_signal_id") or "").strip()
+    if not t0_id:
+        return None
+    return executions.find_one({"user_id": user_id, "signal_id": t0_id})
+
+
+def _opposite_leg_qty(
+    user_id: str,
+    pair_id: Optional[str],
+    signal_id: str,
+    collections: Dict[str, Any],
+) -> int:
+    if not pair_id:
+        return 0
+    trades = collections.get("intraday_t0_trades")
+    if trades is None:
+        return 0
+    total = 0
+    for row in trades.find({"user_id": user_id, "pair_id": pair_id}):
+        if str(row.get("signal_id") or "") == signal_id:
+            continue
+        total += to_int(row.get("quantity"))
+    return total
+
+
+def apply_broker_fill_to_t0_ledger(
+    user_id: str,
+    order_id: str,
+    *,
+    filled_qty: Optional[int] = None,
+    filled_price: Optional[float] = None,
+    status: str = "",
+    collections: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
+    """Patch the T+0 trade ledger from a broker fill reported on ``order_id``.
+
+    Submit still records submitted qty so the pair stays reserved. This call
+    overwrites that quantity with the broker fill so cover sizing tracks deals,
+    not intents. Non-T+0 orders return None. Pass ``collections`` from the
+    trader ingest path so tests (and missing keys) do not open a new Mongo
+    client.
+    """
+    status_key = str(status or "").lower()
+    qty = to_int(filled_qty)
+    if status_key not in _FILL_SYNC_STATUSES and qty <= 0:
+        return None
+    cols = collections if collections is not None else get_db_collections()
+    exec_doc = _find_t0_execution_for_order(user_id, order_id, cols)
+    if not exec_doc:
+        return None
+    signal_id = str(exec_doc.get("signal_id") or "")
+    if not signal_id:
+        return None
+
+    price = to_float(filled_price)
+    now = now_ts()
+    fill_set: Dict[str, Any] = {
+        "filled_quantity": qty,
+        "fill_status": status_key or None,
+        "filled_at": now,
+        "status": status_key or exec_doc.get("status") or "submitted",
+    }
+    if price is not None and price > 0:
+        fill_set["fill_price"] = price
+    executions = cols.get("intraday_t0_executions")
+    if executions is None:
+        return None
+    executions.update_one(
+        {"_id": exec_doc["_id"]},
+        {"$set": fill_set},
+    )
+
+    trades = cols.get("intraday_t0_trades")
+    existing = (
+        trades.find_one({"user_id": user_id, "signal_id": signal_id}) if trades is not None else None
+    )
+    pair_id = str(exec_doc.get("pair_id") or (existing or {}).get("pair_id") or "") or None
+    opposite = _opposite_leg_qty(user_id, pair_id, signal_id, cols)
+    if trades is None:
+        return {"signal_id": signal_id, "quantity": qty, "updated": False}
+
+    if qty <= 0:
+        if existing and opposite <= 0:
+            trades.delete_one({"_id": existing["_id"]})
+            log.info(
+                "T+0 fill qty=0 removed ledger row user=%s signal=%s order_id=%s status=%s",
+                user_id,
+                signal_id,
+                order_id,
+                status_key,
+            )
+            return {"signal_id": signal_id, "quantity": 0, "removed": True}
+        if existing:
+            log.warning(
+                "T+0 fill qty=0 but opposite leg already recorded user=%s signal=%s "
+                "order_id=%s opposite=%s; zeroing ledger qty",
+                user_id,
+                signal_id,
+                order_id,
+                opposite,
+            )
+            trades.update_one(
+                {"_id": existing["_id"]},
+                {"$set": {"quantity": 0, "qty_source": "filled", "filled_at": now}},
+            )
+            return {"signal_id": signal_id, "quantity": 0, "removed": False}
+        return {"signal_id": signal_id, "quantity": 0, "removed": False}
+
+    if existing:
+        old_qty = to_int(existing.get("quantity"))
+        if qty < old_qty and opposite > 0:
+            log.warning(
+                "T+0 fill qty %s below submitted %s after opposite leg %s already "
+                "recorded user=%s signal=%s order_id=%s",
+                qty,
+                old_qty,
+                opposite,
+                user_id,
+                signal_id,
+                order_id,
+            )
+        patch: Dict[str, Any] = {
+            "quantity": qty,
+            "qty_source": "filled",
+            "filled_at": now,
+        }
+        if price is not None and price > 0:
+            patch["price"] = price
+        trades.update_one({"_id": existing["_id"]}, {"$set": patch})
+        return {"signal_id": signal_id, "quantity": qty, "updated": True}
+
+    if price is None or price <= 0:
+        log.warning(
+            "T+0 fill has no price; skip ledger insert user=%s signal=%s order_id=%s",
+            user_id,
+            signal_id,
+            order_id,
+        )
+        return {"signal_id": signal_id, "quantity": qty, "updated": False}
+
+    try:
+        recorded = record_trade(
+            user_id,
+            {
+                "symbol": exec_doc.get("symbol"),
+                "leg": exec_doc.get("action"),
+                "quantity": qty,
+                "price": price,
+                "signal_id": signal_id,
+                "pair_id": pair_id,
+                "notes": "sync_from_fill",
+            },
+        )
+    except ValueError as exc:
+        log.warning(
+            "T+0 fill ledger insert failed user=%s signal=%s order_id=%s: %s",
+            user_id,
+            signal_id,
+            order_id,
+            exc,
+        )
+        return None
+    return {"signal_id": signal_id, "quantity": qty, "inserted": True, "trade": recorded}
+
+
 async def submit_execution_async(
     user_id: str,
     signal_id: str,
@@ -566,6 +771,7 @@ async def submit_execution_async(
         # Keeps T+0 legs out of the strategy's cadence anchor query, which
         # matches plan_type == "rebalance" without excluding manual origin.
         plan_type=PLAN_TYPE_INTRADAY_T0,
+        t0_signal_id=signal_id,
         exclude_after=False,
         dry_run=dry_run,
     )
@@ -594,9 +800,11 @@ async def submit_execution_async(
         "pair_style": intent.get("pair_style"),
         "quantity": intent["quantity"],
         "submitted_quantity": submitted_qty,
+        "filled_quantity": 0,
         "target_shares": intent["target_shares"],
         "pair_id": intent.get("pair_id"),
         "order_ids": order_ids,
+        "order_remark": t0_order_remark(signal_id),
         "auto": bool(auto),
         "status": "submitted",
         "created_at": now_ts(),

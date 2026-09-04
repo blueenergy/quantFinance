@@ -71,6 +71,9 @@ Executable live signals must include:
 - `fee_model`: optional account fee model used only when broker execution reports do not include real fees. It may include `buy_commission_rate`, `sell_commission_rate`, `min_commission`, `stamp_tax_rate`, and `transfer_fee_rate`; estimated execution fees must be marked with `estimated_fee=true`.
 - `status`: initial value is `pending`.
 - `created_at`: signal creation time.
+- `t0_signal_id` / `order_remark`: optional. Intraday T+0 publish sets
+  `order_remark=t0:{t0_signal_id}` so broker fills can update the T+0 trade
+  ledger. `order_id` remains the API idempotency key.
 
 The backend helper `services.live_trade_signals.LiveTradeSignal` is the canonical validator for portfolio-plan-published signals.
 

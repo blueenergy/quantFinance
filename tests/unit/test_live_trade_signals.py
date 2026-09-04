@@ -8,11 +8,14 @@ from services.live_trade_signals import (
     PLAN_PHASE_DONE,
     PLAN_PHASE_SELL_SETTLED,
     PLAN_PHASE_SELLING,
+    T0_ORDER_REMARK_PREFIX,
     build_plan_sells_terminal_barrier,
     build_portfolio_plan_live_signal,
     default_activate_after,
     derive_execution_phase_state,
     sells_barrier_satisfied,
+    stamp_t0_correlation,
+    t0_order_remark,
 )
 
 
@@ -187,3 +190,18 @@ def test_build_portfolio_plan_live_signal_uses_open_auction_for_daily_close():
     assert signal is not None
     assert signal.max_slippage_bps == 100
     assert signal.effective_limit_price == protected_limit_price(66.71, 100, action="buy")
+
+
+def test_t0_order_remark_format():
+    assert t0_order_remark("abc123") == f"{T0_ORDER_REMARK_PREFIX}abc123"
+    assert t0_order_remark("  ") == ""
+    assert t0_order_remark(None) == ""
+
+
+def test_stamp_t0_correlation_sets_remark_without_touching_order_id():
+    signals = [{"order_id": "live-plan-1", "symbol": "600000.SH"}]
+    remark = stamp_t0_correlation(signals, "sig-99")
+    assert remark == "t0:sig-99"
+    assert signals[0]["order_id"] == "live-plan-1"
+    assert signals[0]["t0_signal_id"] == "sig-99"
+    assert signals[0]["order_remark"] == "t0:sig-99"

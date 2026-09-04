@@ -306,14 +306,24 @@ def test_build_buy_first_close_intent(monkeypatch):
 
 
 class _InsertCollection:
-    """Minimal insert/find double for the intraday_t0_trades ledger."""
+    """Minimal insert/find/update double for the T+0 ledger and executions."""
 
     def __init__(self, rows=None):
         self.rows = rows if rows is not None else []
 
+    def _matches(self, row, query):
+        for key, value in query.items():
+            current = row.get(key)
+            if isinstance(current, list) and not isinstance(value, list):
+                if value not in current:
+                    return False
+            elif current != value:
+                return False
+        return True
+
     def find_one(self, query, projection=None):
         for row in self.rows:
-            if all(row.get(k) == v for k, v in query.items() if k != "_id"):
+            if self._matches(row, query):
                 return row
         return None
 
@@ -328,14 +338,11 @@ class _InsertCollection:
             def __iter__(self):
                 return iter(self._rows)
 
-        rows = [r for r in self.rows if r.get("user_id") == query.get("user_id")]
-        if "pair_id" in query:
-            rows = [r for r in rows if r.get("pair_id") == query.get("pair_id")]
-        return _Cursor(rows)
+        return _Cursor([r for r in self.rows if self._matches(r, query or {})])
 
     def insert_one(self, doc):
         doc = dict(doc)
-        doc["_id"] = ObjectId()
+        doc.setdefault("_id", ObjectId())
         self.rows.append(doc)
 
         class _Result:
@@ -343,8 +350,38 @@ class _InsertCollection:
 
         return _Result()
 
+    def update_one(self, query, update, upsert=False):
+        for row in self.rows:
+            if self._matches(row, query):
+                row.update(update.get("$set", {}))
 
-def _patch_trade_ledger_env(monkeypatch, signal_id):
+                class _Result:
+                    matched_count = 1
+
+                return _Result()
+
+        class _Result:
+            matched_count = 0
+
+        return _Result()
+
+    def delete_one(self, query):
+        for index, row in enumerate(self.rows):
+            if self._matches(row, query):
+                self.rows.pop(index)
+
+                class _Result:
+                    deleted_count = 1
+
+                return _Result()
+
+        class _Result:
+            deleted_count = 0
+
+        return _Result()
+
+
+def _patch_trade_ledger_env(monkeypatch, signal_id, *, extra_collections=None):
     """Wire the trade-ledger collections for sync_execution_trade_leg tests."""
     signals = FakeCollection(
         [
@@ -359,17 +396,23 @@ def _patch_trade_ledger_env(monkeypatch, signal_id):
         ]
     )
     trades_coll = _InsertCollection()
+    collections = {
+        "intraday_t0_trades": trades_coll,
+        "intraday_t0_signals": signals,
+        "intraday_t0_executions": _InsertCollection(),
+        "trader_positions": FakeCollection(
+            [{"user_id": "u1", "symbol": "300750.SZ", "available_qty": 500}]
+        ),
+        "trade_signals": FakeCollection([]),
+    }
+    if extra_collections:
+        collections.update(extra_collections)
+        if "intraday_t0_trades" in extra_collections:
+            trades_coll = extra_collections["intraday_t0_trades"]
     monkeypatch.setattr(
         execution,
         "get_db_collections",
-        lambda: {
-            "intraday_t0_trades": trades_coll,
-            "intraday_t0_signals": signals,
-            "trader_positions": FakeCollection(
-                [{"user_id": "u1", "symbol": "300750.SZ", "available_qty": 500}]
-            ),
-            "trade_signals": FakeCollection([]),
-        },
+        lambda: collections,
     )
     monkeypatch.setattr("services.intraday_t0_trades.get_db_collections", execution.get_db_collections)
     monkeypatch.setattr(execution, "ensure_intraday_t0_execution_indexes", lambda: None)
@@ -448,6 +491,114 @@ def test_sync_execution_trade_leg_falls_back_to_intent_when_unmatched(monkeypatc
     result = execution.sync_execution_trade_leg("u1", intent, signal, submitted_qty=0)
     assert result is not None
     assert result["data"]["quantity"] == 300
+
+
+@pytest.mark.unit
+def test_apply_broker_fill_patches_submitted_qty(monkeypatch):
+    signal_id = str(ObjectId())
+    order_id = "live-t0-order-1"
+    exec_row = {
+        "_id": ObjectId(),
+        "user_id": "u1",
+        "signal_id": signal_id,
+        "order_ids": [order_id],
+        "symbol": "300750.SZ",
+        "action": "sell",
+        "pair_id": "pair-sell-first",
+        "quantity": 500,
+        "submitted_quantity": 500,
+        "status": "submitted",
+    }
+    trades_coll = _patch_trade_ledger_env(
+        monkeypatch,
+        signal_id,
+        extra_collections={"intraday_t0_executions": _InsertCollection([exec_row])},
+    )
+    intent = {
+        "signal_id": signal_id,
+        "symbol": "300750.SZ",
+        "action": "sell",
+        "quantity": 500,
+        "pair_id": "pair-sell-first",
+        "pair_style": "sell_first",
+    }
+    signal = {"price": 198.5, "trade_date": "20260820"}
+    execution.sync_execution_trade_leg("u1", intent, signal, submitted_qty=500)
+    assert trades_coll.rows[0]["quantity"] == 500
+
+    result = execution.apply_broker_fill_to_t0_ledger(
+        "u1",
+        order_id,
+        filled_qty=200,
+        filled_price=199.1,
+        status="filled",
+    )
+    assert result["quantity"] == 200
+    assert result["updated"] is True
+    assert trades_coll.rows[0]["quantity"] == 200
+    assert trades_coll.rows[0]["price"] == 199.1
+    assert trades_coll.rows[0]["qty_source"] == "filled"
+    assert exec_row["filled_quantity"] == 200
+    assert exec_row["status"] == "filled"
+
+
+@pytest.mark.unit
+def test_apply_broker_fill_ignores_non_t0_orders(monkeypatch):
+    signal_id = str(ObjectId())
+    _patch_trade_ledger_env(monkeypatch, signal_id)
+    assert (
+        execution.apply_broker_fill_to_t0_ledger(
+            "u1",
+            "some-rebalance-order",
+            filled_qty=100,
+            filled_price=10.0,
+            status="filled",
+        )
+        is None
+    )
+
+
+@pytest.mark.unit
+def test_apply_broker_fill_zero_qty_removes_uncovered_leg(monkeypatch):
+    signal_id = str(ObjectId())
+    order_id = "live-t0-order-cancel"
+    exec_row = {
+        "_id": ObjectId(),
+        "user_id": "u1",
+        "signal_id": signal_id,
+        "order_ids": [order_id],
+        "symbol": "300750.SZ",
+        "action": "sell",
+        "pair_id": "pair-sell-first",
+        "status": "submitted",
+    }
+    trades_coll = _patch_trade_ledger_env(
+        monkeypatch,
+        signal_id,
+        extra_collections={"intraday_t0_executions": _InsertCollection([exec_row])},
+    )
+    intent = {
+        "signal_id": signal_id,
+        "symbol": "300750.SZ",
+        "action": "sell",
+        "quantity": 300,
+        "pair_id": "pair-sell-first",
+        "pair_style": "sell_first",
+    }
+    execution.sync_execution_trade_leg(
+        "u1",
+        intent,
+        {"price": 198.5, "trade_date": "20260820"},
+        submitted_qty=300,
+    )
+    result = execution.apply_broker_fill_to_t0_ledger(
+        "u1",
+        order_id,
+        filled_qty=0,
+        status="cancelled",
+    )
+    assert result["removed"] is True
+    assert trades_coll.rows == []
 
 
 @pytest.mark.unit

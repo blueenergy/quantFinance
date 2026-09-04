@@ -31,6 +31,7 @@ from services.live_trade_signals import (
     ACTIVE_SIGNAL_STATUSES,
     active_signal_query_for_order_ids,
     build_portfolio_plan_live_signal,
+    stamp_t0_correlation,
     summarize_signal_statuses,
 )
 from services.portfolio_lineage_state import mark_lineage_live
@@ -689,6 +690,7 @@ async def live_rebalance_portfolio(
         "approved_by": user_id,
         "approved_at": now,
         "anchor_plan_id": plan_id,
+        "t0_signal_id": str(request.t0_signal_id or "").strip() or None,
         "summary": {
             "buy_count": sum(1 for item in items if item["action"] == "buy"),
             "sell_count": sum(1 for item in items if item["action"] == "sell"),
@@ -720,6 +722,10 @@ async def live_rebalance_portfolio(
             continue
         if signal is not None:
             signals.append(signal.to_mongo())
+
+    t0_signal_id = str(request.t0_signal_id or "").strip()
+    if t0_signal_id:
+        stamp_t0_correlation(signals, t0_signal_id)
 
     if not signals:
         raise HTTPException(

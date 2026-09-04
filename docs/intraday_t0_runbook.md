@@ -183,7 +183,7 @@ T+0 读到的 `available_qty` 会先扣掉**在途实盘卖单**（`trade_signal
 
 自动下单：`BUY_WATCH` 开 buy_first 需同时满足 `buy_first_enabled=true` 与用户/全局自动开关。
 
-Phase 3 **提交下单**成功后会用信号价自动写入 `intraday_t0_trades`（`sync_from_execution`），供第二腿 pair 路由；成交价以人工补记或日后成交回填为准。
+Phase 3 **提交下单**成功后会用信号价把 submitted 数量写入 `intraday_t0_trades`（`sync_from_execution`），用来锁住 pair、挡住第二腿开新仓。quantTrader 成交回流后，`apply_broker_fill_to_t0_ledger` 把同一行改成 **fill qty / fill price**（`qty_source=filled`）。配对覆盖以成交为准；成交为 0（撤单/废单）且对腿尚未记账时会删掉该行。broker 侧 `order_remark=t0:{signal_id}`。
 
 ### 日终检查
 
