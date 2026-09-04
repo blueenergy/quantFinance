@@ -50,6 +50,12 @@ def test_kline_series_stock_uses_adjusted_prices(monkeypatch, authed_client):
         "_index_prices",
         type("C", (), {"find": lambda *a, **k: _EmptyMongoCursor()})(),
     )
+
+    class _EmptyEtfBasic:
+        def find_one(self, *args, **kwargs):
+            return None
+
+    monkeypatch.setattr(kline_series, "_etf_basic", _EmptyEtfBasic())
     monkeypatch.setattr(kline_series, "AdjustedPriceDataAccess", lambda db: _FakeDao())
 
     resp = authed_client.get(
@@ -89,3 +95,101 @@ def test_kline_series_index_branch_ignores_adjust(monkeypatch, authed_client):
     assert body["source"] == "index_prices"
     assert body["adjust"] == "none"
     assert body["data"][0]["close"] == 100.5
+
+
+class _EtfColl:
+    def __init__(self, docs):
+        self.docs = list(docs)
+
+    def find_one(self, query=None, projection=None, sort=None):
+        rows = [dict(doc) for doc in self.docs if self._matches(doc, query or {})]
+        if sort:
+            field, direction = sort[0]
+            rows.sort(key=lambda row: str(row.get(field) or ""), reverse=direction < 0)
+        return rows[0] if rows else None
+
+    def find(self, query=None, projection=None, sort=None, limit=0):
+        rows = [dict(doc) for doc in self.docs if self._matches(doc, query or {})]
+        if sort:
+            field, direction = sort[0]
+            rows.sort(key=lambda row: str(row.get(field) or ""), reverse=direction < 0)
+        if limit:
+            rows = rows[:limit]
+        return rows
+
+    def _matches(self, doc, query):
+        for key, expected in query.items():
+            value = doc.get(key)
+            if isinstance(expected, dict):
+                if "$in" in expected and value not in expected["$in"]:
+                    return False
+                if "$gte" in expected and not (str(value) >= str(expected["$gte"])):
+                    return False
+                if "$lte" in expected and not (str(value) <= str(expected["$lte"])):
+                    return False
+                continue
+            if value != expected:
+                return False
+        return True
+
+
+@pytest.mark.unit
+def test_kline_series_etf_uses_etf_daily_not_volume_price(monkeypatch, authed_client):
+    monkeypatch.setattr(
+        kline_series,
+        "_index_prices",
+        type("C", (), {"find": lambda *a, **k: _EmptyMongoCursor()})(),
+    )
+    monkeypatch.setattr(
+        kline_series,
+        "_etf_basic",
+        _EtfColl([{"ts_code": "510300.SH", "name": "沪深300ETF"}]),
+    )
+    monkeypatch.setattr(
+        kline_series,
+        "_etf_daily",
+        _EtfColl(
+            [
+                {
+                    "ts_code": "510300.SH",
+                    "trade_date": "20240102",
+                    "open": 4.5,
+                    "high": 4.7,
+                    "low": 4.4,
+                    "close": 4.6,
+                    "vol": 100,
+                },
+                {
+                    "ts_code": "510300.SH",
+                    "trade_date": "20240101",
+                    "open": 4.4,
+                    "high": 4.5,
+                    "low": 4.3,
+                    "close": 4.5,
+                    "vol": 80,
+                },
+            ]
+        ),
+    )
+    monkeypatch.setattr(
+        kline_series,
+        "_etf_adj_factor",
+        _EtfColl(
+            [
+                {"ts_code": "510300.SH", "trade_date": "20240101", "adj_factor": 1.0},
+                {"ts_code": "510300.SH", "trade_date": "20240102", "adj_factor": 1.0},
+            ]
+        ),
+    )
+
+    resp = authed_client.get(
+        "/api/kline-series",
+        params={"symbol": "510300.SH", "start_date": "20240101", "end_date": "20240102"},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["source"] == "etf_daily"
+    assert body["count"] == 2
+    assert body["data"][0]["trade_date"] == "20240101"
+    assert body["data"][-1]["close"] == pytest.approx(4.6)
+    assert body["data"][-1]["volume"] == pytest.approx(100)

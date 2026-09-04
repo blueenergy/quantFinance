@@ -50,6 +50,13 @@ def empty_adj(monkeypatch):
     monkeypatch.setattr(records, 'adj_collection', FakeCollection([]))
 
 
+@pytest.fixture(autouse=True)
+def empty_etf_collections(monkeypatch):
+    monkeypatch.setattr(records, 'etf_basic_collection', FakeCollection([]))
+    monkeypatch.setattr(records, 'etf_daily_collection', FakeCollection([]))
+    monkeypatch.setattr(records, 'etf_adj_collection', FakeCollection([]))
+
+
 @pytest.mark.unit
 def test_get_records_and_project(monkeypatch, empty_adj):
     docs = [
@@ -250,3 +257,143 @@ def test_get_record_by_id(monkeypatch):
     assert resp.status_code == 200
     j = resp.json()
     assert j['symbol'] == '000001'
+
+
+class _EtfColl:
+    """Minimal collection that honors ts_code / $in / date range / sort / limit."""
+
+    def __init__(self, docs):
+        self.docs = list(docs)
+
+    def find_one(self, query=None, projection=None, sort=None):
+        rows = self._filter(query or {})
+        if sort:
+            field, direction = sort[0]
+            rows.sort(key=lambda row: str(row.get(field) or ''), reverse=direction < 0)
+        return dict(rows[0]) if rows else None
+
+    def find(self, query=None, projection=None, sort=None, limit=0):
+        rows = self._filter(query or {})
+        if sort:
+            field, direction = sort[0]
+            rows.sort(key=lambda row: str(row.get(field) or ''), reverse=direction < 0)
+        if limit:
+            rows = rows[:limit]
+        return [dict(row) for row in rows]
+
+    def _filter(self, query):
+        out = []
+        for doc in self.docs:
+            if self._matches(doc, query):
+                out.append(doc)
+        return out
+
+    def _matches(self, doc, query):
+        for key, expected in query.items():
+            value = doc.get(key)
+            if isinstance(expected, dict):
+                if '$in' in expected and value not in expected['$in']:
+                    return False
+                if '$gte' in expected and not (str(value) >= str(expected['$gte'])):
+                    return False
+                if '$lte' in expected and not (str(value) <= str(expected['$lte'])):
+                    return False
+                continue
+            if value != expected:
+                return False
+        return True
+
+
+@pytest.mark.unit
+def test_get_records_etf_uses_etf_daily_not_volume_price(monkeypatch, empty_adj):
+    monkeypatch.setattr(
+        records,
+        'etf_basic_collection',
+        _EtfColl([{'ts_code': '510300.SH', 'name': '沪深300ETF'}]),
+    )
+    monkeypatch.setattr(
+        records,
+        'etf_daily_collection',
+        _EtfColl(
+            [
+                {
+                    'ts_code': '510300.SH',
+                    'trade_date': '20260904',
+                    'open': 4.6,
+                    'high': 4.7,
+                    'low': 4.5,
+                    'close': 4.616,
+                    'vol': 1000,
+                },
+                {
+                    'ts_code': '510300.SH',
+                    'trade_date': '20260903',
+                    'open': 4.5,
+                    'high': 4.6,
+                    'low': 4.4,
+                    'close': 4.5,
+                    'vol': 800,
+                },
+            ]
+        ),
+    )
+    monkeypatch.setattr(
+        records,
+        'etf_adj_collection',
+        _EtfColl(
+            [
+                {'ts_code': '510300.SH', 'trade_date': '20260903', 'adj_factor': 1.0},
+                {'ts_code': '510300.SH', 'trade_date': '20260904', 'adj_factor': 1.0},
+            ]
+        ),
+    )
+    monkeypatch.setattr(
+        records,
+        'collection',
+        FakeCollection(
+            [
+                {
+                    '_id': '000000000000000000000099',
+                    'symbol': '510300.SH',
+                    'trade_date': '20260503',
+                    'open': 1.2,
+                    'close': 1.2,
+                }
+            ]
+        ),
+    )
+
+    client = TestClient(app)
+    resp = client.get('/api/records/?symbol=510300.SH&limit=10&include_scores=false')
+    assert resp.status_code == 200
+    payload = resp.json()
+    assert len(payload) == 2
+    assert payload[0]['symbol'] == '510300.SH'
+    assert payload[0]['name'] == '沪深300ETF'
+    assert payload[0]['close'] == pytest.approx(4.616)
+    assert payload[0]['volume'] == pytest.approx(1000)
+    assert payload[0]['trade_date'] == '20260904'
+    assert all(row['trade_date'] != '20260503' for row in payload)
+
+
+@pytest.mark.unit
+def test_get_records_etf_without_bars_does_not_fall_back_to_volume_price(monkeypatch, empty_adj):
+    monkeypatch.setattr(
+        records,
+        'etf_basic_collection',
+        _EtfColl([{'ts_code': '513260.SH', 'name': '恒生科技ETF'}]),
+    )
+    monkeypatch.setattr(records, 'etf_daily_collection', _EtfColl([]))
+    monkeypatch.setattr(records, 'collection', FakeCollection([
+        {
+            '_id': '000000000000000000000098',
+            'symbol': '513260.SH',
+            'trade_date': '20260503',
+            'close': 1.203,
+        }
+    ]))
+
+    client = TestClient(app)
+    resp = client.get('/api/records/?symbol=513260.SH&limit=10&include_scores=false')
+    assert resp.status_code == 200
+    assert resp.json() == []

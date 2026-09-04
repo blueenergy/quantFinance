@@ -20,6 +20,11 @@ from db import get_analyzer_db, get_data_db, get_db_collections
 from routers.stock import _json_safe, _ohlcv_collection_name, _symbol_candidates
 from services.analysis_history import build_user_analysis_history_payload
 from services.analysis_tasks import build_task_doc
+from services.etf_kline import (
+    map_etf_daily_row,
+    resample_ohlc_rows,
+    resolve_etf_ts_code,
+)
 from services.fund_inventory import public_snapshot
 from services.portfolio_symbol_risk import (
     build_workbench_swot_section,
@@ -250,6 +255,28 @@ def _score_history(symbol: str, limit: int = 60) -> List[Dict[str, Any]]:
 
 def _latest_daily_quote(data: Any, candidates: List[str], trade_date: Any = None) -> Optional[Dict[str, Any]]:
     sample = candidates[0] if candidates else ""
+    etf_ts = _resolve_etf_ts(data, sample)
+    if etf_ts:
+        etf_daily = _data_collection(data, "etf_daily")
+        if etf_daily is not None:
+            base = {"ts_code": etf_ts}
+            if trade_date:
+                same_day = etf_daily.find_one(
+                    {**base, "trade_date": trade_date},
+                    sort=[("trade_date", -1)],
+                )
+                if same_day:
+                    return _normalize_etf_kline_row(same_day, etf_ts)
+                doc = etf_daily.find_one(
+                    {**base, "trade_date": {"$lt": trade_date}},
+                    sort=[("trade_date", -1)],
+                )
+                if doc:
+                    return _normalize_etf_kline_row(doc, etf_ts)
+            else:
+                doc = etf_daily.find_one(base, sort=[("trade_date", -1)])
+                if doc:
+                    return _normalize_etf_kline_row(doc, etf_ts)
     # pymongo forbids truth testing on Collection, so fall back on key lookup.
     volume_price = data.get(_ohlcv_collection_name(sample))
     if volume_price is None:
@@ -475,11 +502,27 @@ def _normalize_kline_date(value: Any) -> str:
     return digits[:8] if len(digits) >= 8 else text
 
 
-def _qfq_daily_kline_rows(data: Any, symbol: str, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def _resolve_etf_ts(data: Any, symbol: str) -> Optional[str]:
+    return resolve_etf_ts_code(_data_collection(data, "etf_basic"), symbol)
+
+
+def _normalize_etf_kline_row(row: Dict[str, Any], ts_code: str) -> Dict[str, Any]:
+    mapped = map_etf_daily_row(row, symbol=ts_code, name=str(row.get("name") or ""))
+    merged = dict(row)
+    merged.update({key: value for key, value in mapped.items() if value is not None or key in mapped})
+    return merged
+
+
+def _qfq_daily_kline_rows(
+    data: Any,
+    symbol: str,
+    rows: List[Dict[str, Any]],
+    adj_collection_name: str = "stock_adj_factor",
+) -> List[Dict[str, Any]]:
     """Forward-adjust daily OHLC in place-copies so GS overlays match 同花顺 qfq."""
     if not rows:
         return rows
-    adj_coll = _data_collection(data, "stock_adj_factor")
+    adj_coll = _data_collection(data, adj_collection_name)
     if adj_coll is None:
         return rows
     dates = [_normalize_kline_date(row.get("trade_date")) for row in rows]
@@ -550,8 +593,13 @@ def _decorate_kline_rows(
     symbol: str,
     rows: List[Dict[str, Any]],
     tf: str,
+    adj_collection_name: str = "stock_adj_factor",
 ) -> List[Dict[str, Any]]:
-    priced = _qfq_daily_kline_rows(data, symbol, rows) if tf == "1d" else rows
+    priced = (
+        _qfq_daily_kline_rows(data, symbol, rows, adj_collection_name=adj_collection_name)
+        if tf == "1d"
+        else rows
+    )
     try:
         return attach_decision_gs(priced)
     except Exception:
@@ -829,14 +877,30 @@ def _quote_section(symbol: str) -> Dict[str, Any]:
     profiler.lap("setup", candidates=len(candidates))
     quote = _latest_quote(symbol)
     profiler.lap("latest_quote", found=bool(quote))
-    daily_quotes = _recent_kline_docs(
-        data,
-        "volume_price",
-        candidates,
-        limit=WORKBENCH_DAILY_KLINE_LIMIT,
-        fields=("symbol", "ts_code"),
-    )
-    profiler.lap("daily_kline", rows=len(daily_quotes))
+    etf_ts = _resolve_etf_ts(data, symbol)
+    if etf_ts:
+        daily_quotes = [
+            _normalize_etf_kline_row(row, etf_ts)
+            for row in _recent_kline_docs(
+                data,
+                "etf_daily",
+                [etf_ts],
+                limit=WORKBENCH_DAILY_KLINE_LIMIT,
+                fields=("ts_code",),
+            )
+        ]
+        daily_quotes = _decorate_kline_rows(
+            data, etf_ts, daily_quotes, "1d", adj_collection_name="etf_adj_factor"
+        )
+    else:
+        daily_quotes = _recent_kline_docs(
+            data,
+            "volume_price",
+            candidates,
+            limit=WORKBENCH_DAILY_KLINE_LIMIT,
+            fields=("symbol", "ts_code"),
+        )
+        profiler.lap("daily_kline", rows=len(daily_quotes))
     daily_basic = _recent_docs_for_symbol(
         data["financial_daily_basic"],
         candidates,
@@ -872,12 +936,19 @@ def _quote_section(symbol: str) -> Dict[str, Any]:
     money_flow_summary = _money_flow_summary(money_flow_history_desc)
     entry_risk = _entry_risk_snapshot(daily_quotes, money_flow_history_desc)
     profiler.lap("money_flow_transform", rows=len(money_flow_history))
-    daily_quotes = _decorate_kline_rows(data, symbol, daily_quotes, "1d")
+    if not etf_ts:
+        daily_quotes = _decorate_kline_rows(data, symbol, daily_quotes, "1d")
+    else:
+        profiler.lap("daily_kline", rows=len(daily_quotes))
     status = _quote_status(quote)
     if not status["as_of"]:
         status["as_of"] = (daily_quotes[0] if daily_quotes else {}).get("trade_date")
     status["found"] = bool(quote or daily_quotes or daily_basic or money_flow)
-    status["source"] = "quant_realtime.volume_price_realtime_latest + quant_data.volume_price/money_flow/financial_daily_basic"
+    status["source"] = (
+        "quant_data.etf_daily + etf_adj_factor"
+        if etf_ts
+        else "quant_realtime.volume_price_realtime_latest + quant_data.volume_price/money_flow/financial_daily_basic"
+    )
     result = {
         "symbol": symbol,
         "quote": quote,
@@ -897,11 +968,75 @@ def _quote_section(symbol: str) -> Dict[str, Any]:
     return result
 
 
+def _etf_kline_rows(data: Any, etf_ts: str, tfc: str) -> tuple[List[Dict[str, Any]], str, int]:
+    """Load ETF K-lines from etf_daily. Weekly/monthly are resampled from qfq daily."""
+    limit = {
+        "1d": WORKBENCH_DAILY_KLINE_LIMIT,
+        "1w": WORKBENCH_WEEKLY_KLINE_LIMIT,
+        "1m": WORKBENCH_MONTHLY_KLINE_LIMIT,
+    }[tfc]
+    if tfc == "1d":
+        rows = [
+            _normalize_etf_kline_row(row, etf_ts)
+            for row in _recent_kline_docs(
+                data,
+                "etf_daily",
+                [etf_ts],
+                limit=limit,
+                fields=("ts_code",),
+            )
+        ]
+        rows = _annotate_kline_amount_unit(rows, tfc)
+        rows = _decorate_kline_rows(
+            data, etf_ts, rows, "1d", adj_collection_name="etf_adj_factor"
+        )
+        return rows, "etf_daily", limit
+
+    fetch_limit = min(5_000, max(int(limit) * 35, 800))
+    daily = [
+        _normalize_etf_kline_row(row, etf_ts)
+        for row in _recent_kline_docs(
+            data,
+            "etf_daily",
+            [etf_ts],
+            limit=fetch_limit,
+            fields=("ts_code",),
+        )
+    ]
+    priced = _qfq_daily_kline_rows(
+        data, etf_ts, daily, adj_collection_name="etf_adj_factor"
+    )
+    rows = resample_ohlc_rows(priced, tfc)[:limit]
+    rows = _annotate_kline_amount_unit(rows, tfc)
+    try:
+        rows = attach_decision_gs(rows)
+    except Exception:
+        log.exception("decision_gs attach failed for ETF %s tf=%s", etf_ts, tfc)
+    return rows, "etf_daily", fetch_limit
+
+
 def _kline_section(symbol: str, tf: str) -> Dict[str, Any]:
     profiler = _WorkbenchProfiler("kline", symbol)
     data = get_data_db()
     candidates = _symbol_candidates(symbol)
     tfc = _normalize_timeframe(tf)
+    etf_ts = _resolve_etf_ts(data, symbol)
+    if etf_ts:
+        rows, collection_name, limit = _etf_kline_rows(data, etf_ts, tfc)
+        profiler.lap("kline_query", tf=tfc, collection=collection_name, rows=len(rows), limit=limit)
+        result = {
+            "symbol": symbol,
+            "tf": tfc,
+            "rows": rows,
+            "data_status": _section_status(
+                found=bool(rows),
+                as_of=(rows[0] if rows else {}).get("trade_date"),
+                expected_freshness="按周期切换时加载",
+                source=f"quant_data.{collection_name}",
+            ),
+        }
+        profiler.finish(tf=tfc, rows=len(rows))
+        return result
 
     collection_name = {
         "1d": "volume_price",

@@ -550,6 +550,96 @@ def test_kline_section_applies_qfq_and_attaches_decision_gs(monkeypatch):
     assert "gs_signal" in latest
 
 
+def test_kline_section_etf_reads_etf_daily_not_volume_price(monkeypatch):
+    data = {
+        "etf_basic": _Collection([{"ts_code": "510300.SH", "name": "沪深300ETF"}]),
+        "etf_daily": _Collection(
+            [
+                {
+                    "ts_code": "510300.SH",
+                    "trade_date": "20260904",
+                    "open": 4.6,
+                    "high": 4.7,
+                    "low": 4.5,
+                    "close": 4.616,
+                    "vol": 1000,
+                    "amount": 4000,
+                },
+                {
+                    "ts_code": "510300.SH",
+                    "trade_date": "20260903",
+                    "open": 4.5,
+                    "high": 4.6,
+                    "low": 4.4,
+                    "close": 4.5,
+                    "vol": 800,
+                    "amount": 3600,
+                },
+            ]
+        ),
+        "etf_adj_factor": _Collection(
+            [
+                {"ts_code": "510300.SH", "trade_date": "20260903", "adj_factor": 1.0},
+                {"ts_code": "510300.SH", "trade_date": "20260904", "adj_factor": 1.0},
+            ]
+        ),
+        "volume_price": _Collection(
+            [
+                {
+                    "symbol": "510300.SH",
+                    "trade_date": "20260503",
+                    "open": 1.2,
+                    "high": 1.2,
+                    "low": 1.2,
+                    "close": 1.2,
+                    "source": "eastmoney_snapshot",
+                }
+            ]
+        ),
+    }
+    monkeypatch.setattr("routers.stock_workbench.get_data_db", lambda: data)
+
+    section = _kline_section("510300.SH", "1d")
+    assert section["data_status"]["source"] == "quant_data.etf_daily"
+    assert section["rows"][0]["trade_date"] == "20260904"
+    assert section["rows"][0]["close"] == pytest.approx(4.616)
+    assert section["rows"][0]["volume"] == pytest.approx(1000)
+    assert all(row["trade_date"] != "20260503" for row in section["rows"])
+
+
+def test_kline_section_etf_weekly_resamples_daily(monkeypatch):
+    dates = ["20250407", "20250408", "20250409", "20250410", "20250411"]
+    daily = [
+        {
+            "ts_code": "510300.SH",
+            "trade_date": td,
+            "open": 1.0,
+            "high": 1.1,
+            "low": 0.9,
+            "close": 2.5 if td == "20250411" else 1.0,
+            "vol": 10.0,
+            "amount": 100.0,
+        }
+        for td in dates
+    ]
+    data = {
+        "etf_basic": _Collection([{"ts_code": "510300.SH", "name": "沪深300ETF"}]),
+        "etf_daily": _Collection(daily),
+        "etf_adj_factor": _Collection(
+            [{"ts_code": "510300.SH", "trade_date": td, "adj_factor": 1.0} for td in dates]
+        ),
+        "volume_price": _Collection([]),
+        "stock_weekly": _Collection([]),
+    }
+    monkeypatch.setattr("routers.stock_workbench.get_data_db", lambda: data)
+
+    section = _kline_section("510300.SH", "1w")
+    assert section["tf"] == "1w"
+    assert section["rows"][0]["trade_date"] == "20250411"
+    assert section["rows"][0]["close"] == pytest.approx(2.5)
+    assert section["rows"][0]["volume"] == pytest.approx(50.0)
+
+
 def test_money_flow_section_loads_history_on_demand(monkeypatch):
     data = {
         "money_flow": _Collection(

@@ -11,6 +11,7 @@ from pydantic import BaseModel
 
 from auth import get_current_active_user
 from db import get_data_db
+from services.etf_kline import load_etf_kline_rows
 from utils.stock_utils import serialize_doc
 
 try:
@@ -48,6 +49,9 @@ log = logging.getLogger(__name__)
 data_collections = get_data_db()
 collection = data_collections["volume_price"] # type: ignore
 adj_collection = data_collections["stock_adj_factor"]  # type: ignore
+etf_basic_collection = data_collections.get("etf_basic")
+etf_daily_collection = data_collections.get("etf_daily")
+etf_adj_collection = data_collections.get("etf_adj_factor")
 
 _PRICE_COLS = ("open", "high", "low", "close")
 
@@ -329,6 +333,33 @@ _RECORDS_PROJECT_WITH_SCORES = {
 }
 
 
+def _etf_records_or_none(
+    symbol: Optional[str],
+    limit: int,
+    start_date: Optional[str],
+    end_date: Optional[str],
+    adjust: str,
+) -> Optional[List[Dict[str, Any]]]:
+    """ETF K-lines from etf_daily. ``None`` = not an ETF; ``[]`` = ETF but no bars."""
+    if not symbol:
+        return None
+    start = (start_date or "").replace("-", "")[:8] or None
+    end = (end_date or "").replace("-", "")[:8] or None
+    rows = load_etf_kline_rows(
+        etf_basic_collection,
+        etf_daily_collection,
+        symbol,
+        start=start,
+        end=end,
+        limit=limit,
+    )
+    if rows is None:
+        return None
+    return _attach_decision_gs_fields(
+        _apply_records_adjustment(rows, adjust, etf_adj_collection)
+    )
+
+
 @router.get("/records/", response_model=List[RecordResponseModel])
 def get_records(
     symbol: Optional[str] = Query(None),
@@ -342,6 +373,10 @@ def get_records(
         description="是否关联 stock_scores；自选股 K 线浏览应关以降低延迟",
     ),
 ):
+    etf_docs = _etf_records_or_none(symbol, limit, start_date, end_date, adjust)
+    if etf_docs is not None:
+        return etf_docs
+
     query = {}
     if symbol:
         query["symbol"] = symbol

@@ -1,19 +1,24 @@
 """/api/kline-series — K线走势对比数据查询
 
-优先查 index_prices（ts_code 字段），无数据时回退查 volume_price（symbol 字段）。
-个股 volume_price 支持读取侧复权（默认前复权 qfq）。
+优先查 index_prices（ts_code 字段），其次场内 ETF（etf_daily），
+无数据时回退查 volume_price（symbol 字段）。
+个股 volume_price / ETF etf_daily 支持读取侧复权（默认前复权 qfq）。
 """
 from __future__ import annotations
 from typing import Optional
 from fastapi import APIRouter, Query, Depends
 from auth import get_current_active_user
 from db import data_db
+from services.etf_kline import load_etf_kline_rows
 from stock_data_access.prices import AdjustedPriceDataAccess, VALID_ADJUST
 
 router = APIRouter()
 
 _index_prices = data_db["index_prices"]
 _volume_price = data_db["volume_price"]
+_etf_basic = data_db["etf_basic"]
+_etf_daily = data_db["etf_daily"]
+_etf_adj_factor = data_db["etf_adj_factor"]
 
 _PROJ = {"_id": 0, "trade_date": 1, "open": 1, "high": 1, "low": 1, "close": 1, "volume": 1}
 
@@ -45,9 +50,29 @@ def get_kline_series(
         flt["trade_date"] = date_flt
     docs = list(_index_prices.find(flt, _PROJ).sort("trade_date", 1).limit(limit))
     source = "index_prices"
+    used_adjust = "none"
 
-    # 2. 回退查 volume_price（个股 + 部分指数如 000852.SZ）
+    # 2. 场内 ETF：etf_daily + etf_adj_factor（不要落到 volume_price 残留快照）
     if not docs:
+        etf_rows = load_etf_kline_rows(
+            _etf_basic,
+            _etf_daily,
+            symbol,
+            start=sd or None,
+            end=ed or None,
+            limit=limit,
+        )
+        if etf_rows is not None:
+            from routers.records import _apply_one_symbol
+
+            ts_code = etf_rows[0]["symbol"] if etf_rows else symbol
+            docs = _apply_one_symbol(etf_rows, ts_code, adjust, _etf_adj_factor)
+            docs = list(reversed(docs))
+            source = "etf_daily"
+            used_adjust = adjust
+
+    # 3. 回退查 volume_price（个股 + 部分指数如 000852.SZ）
+    if not docs and source != "etf_daily":
         if sd and ed:
             adj_dao = AdjustedPriceDataAccess(db=data_db)
             df = adj_dao.load_adjusted_ohlc(symbol, sd, ed, adjust=adjust)
@@ -62,6 +87,7 @@ def get_kline_series(
                 flt2["trade_date"] = date_flt
             docs = list(_volume_price.find(flt2, _PROJ).sort("trade_date", 1).limit(limit))
         source = "volume_price"
+        used_adjust = adjust
 
     result = [
         {
@@ -70,10 +96,16 @@ def get_kline_series(
             "high": d.get("high"),
             "low": d.get("low"),
             "close": d.get("close"),
-            "volume": d.get("volume"),
+            "volume": d.get("volume") if d.get("volume") is not None else d.get("vol"),
         }
         for d in docs
         if d.get("close") is not None
     ]
 
-    return {"success": True, "data": result, "source": source, "count": len(result), "adjust": adjust if source == "volume_price" else "none"}
+    return {
+        "success": True,
+        "data": result,
+        "source": source,
+        "count": len(result),
+        "adjust": used_adjust if source != "index_prices" else "none",
+    }
