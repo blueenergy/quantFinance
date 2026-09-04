@@ -245,14 +245,102 @@ class RecordResponseModel(BaseModel):
     adjust: Optional[str] = None
     adj_degraded: Optional[bool] = None
 
+_STOCK_SCORE_LOOKUP_STAGES = [
+    {
+        "$lookup": {
+            "from": "stock_scores",
+            "let": {"symbol": "$symbol", "trade_date_str": "$trade_date_str"},
+            "pipeline": [
+                {"$match": {"$expr": {"$and": [
+                    {"$eq": ["$symbol", "$$symbol"]},
+                    {"$eq": ["$score_date", "$$trade_date_str"]}
+                ]}}}
+            ],
+            "as": "score_docs"
+        }
+    },
+    {"$addFields": {
+        "score_doc": {"$arrayElemAt": ["$score_docs", 0]}
+    }},
+    {"$addFields": {
+        "composite_score": {"$ifNull": ["$score_doc.composite_score", None]},
+        "cycle_score": {"$ifNull": ["$score_doc.cycle_score", None]},
+        "growth_score": {"$ifNull": ["$score_doc.growth_score", None]},
+        "fundamental_score": {"$ifNull": ["$score_doc.fundamental_score", None]},
+        "value_score": {"$ifNull": ["$score_doc.value_score", None]},
+        "technical_score": {"$ifNull": ["$score_doc.technical_score", None]},
+        "money_flow_score": {"$ifNull": ["$score_doc.money_flow_score", None]},
+        "score_date": {"$ifNull": ["$score_doc.score_date", None]}
+    }},
+    {
+        "$addFields": {
+            "composite_score": {
+                "$cond": [
+                    {"$eq": [{"$type": "$composite_score"}, "object"]},
+                    "$composite_score.balanced",
+                    "$composite_score"
+                ]
+            }
+        }
+    },
+]
+
+_STOCK_INFO_LOOKUP_STAGES = [
+    {
+        "$lookup": {
+            "from": "stock_info",
+            "localField": "symbol",
+            "foreignField": "symbol",
+            "as": "stock_info_docs"
+        }
+    },
+    {"$addFields": {
+        "stock_info": {"$arrayElemAt": ["$stock_info_docs", 0]}
+    }},
+    {"$addFields": {
+        "name": {"$ifNull": ["$stock_info.name", ""]}
+    }},
+]
+
+_RECORDS_PROJECT_KLINE = {
+    "$project": {
+        "symbol": 1,
+        "trade_date": 1,
+        "open": 1,
+        "close": 1,
+        "high": 1,
+        "low": 1,
+        "volume": 1,
+        "name": 1,
+    }
+}
+
+_RECORDS_PROJECT_WITH_SCORES = {
+    "$project": {
+        **_RECORDS_PROJECT_KLINE["$project"],
+        "composite_score": 1,
+        "cycle_score": 1,
+        "fundamental_score": 1,
+        "growth_score": 1,
+        "technical_score": 1,
+        "money_flow_score": 1,
+        "score_date": 1,
+    }
+}
+
+
 @router.get("/records/", response_model=List[RecordResponseModel])
 def get_records(
-    symbol: Optional[str] = Query(None), 
-    limit: int = 10, 
+    symbol: Optional[str] = Query(None),
+    limit: int = 10,
     sort: Optional[str] = None,
     start_date: Optional[str] = Query(None),
     end_date: Optional[str] = Query(None),
     adjust: str = Query("qfq", description="复权口径: none/hfq/qfq，K线默认前复权"),
+    include_scores: bool = Query(
+        True,
+        description="是否关联 stock_scores；自选股 K 线浏览应关以降低延迟",
+    ),
 ):
     query = {}
     if symbol:
@@ -300,81 +388,12 @@ def get_records(
         direction = -1 if sort.startswith('-') else 1
         pipeline.append({"$sort": {field: direction}})
     pipeline.append({"$limit": limit})
-    # 左连接 stock_scores，按 symbol+trade_date_str 对 score_date
-    pipeline.append({
-        "$lookup": {
-            "from": "stock_scores",
-            "let": {"symbol": "$symbol", "trade_date_str": "$trade_date_str"},
-            "pipeline": [
-                {"$match": {"$expr": {"$and": [
-                    {"$eq": ["$symbol", "$$symbol"]},
-                    {"$eq": ["$score_date", "$$trade_date_str"]}
-                ]}}}
-            ],
-            "as": "score_docs"
-        }
-    })
-    pipeline.append({"$addFields": {
-        "score_doc": {"$arrayElemAt": ["$score_docs", 0]}
-    }})
-    # 合并评分字段到主文档
-    pipeline.append({"$addFields": {
-        "composite_score": {"$ifNull": ["$score_doc.composite_score", None]},
-        "cycle_score": {"$ifNull": ["$score_doc.cycle_score", None]},
-        "growth_score": {"$ifNull": ["$score_doc.growth_score", None]},
-        "fundamental_score": {"$ifNull": ["$score_doc.fundamental_score", None]},
-        "value_score": {"$ifNull": ["$score_doc.value_score", None]},
-        "technical_score": {"$ifNull": ["$score_doc.technical_score", None]},
-        "money_flow_score": {"$ifNull": ["$score_doc.money_flow_score", None]},
-        "score_date": {"$ifNull": ["$score_doc.score_date", None]}
-    }})
-    # composite_score 兼容 dict，始终返回 float（如 balanced）
-    pipeline.append({
-        "$addFields": {
-            "composite_score": {
-                "$cond": [
-                    {"$eq": [ {"$type": "$composite_score"}, "object"]},
-                    "$composite_score.balanced",
-                    "$composite_score"
-                ]
-            }
-        }
-    })
-    
-    # 添加 stock_info 左连接来获取股票名称
-    pipeline.append({
-        "$lookup": {
-            "from": "stock_info",
-            "localField": "symbol",
-            "foreignField": "symbol",
-            "as": "stock_info_docs"
-        }
-    })
-    pipeline.append({"$addFields": {
-        "stock_info": {"$arrayElemAt": ["$stock_info_docs", 0]}
-    }})
-    pipeline.append({"$addFields": {
-        "name": {"$ifNull": ["$stock_info.name", ""]}
-    }})
-    
-    # 最后的 $project 保留所需字段
-    pipeline.append({"$project": {
-        "symbol": 1,
-        "trade_date": 1,
-        "open": 1,
-        "close": 1,
-        "high": 1,
-        "low": 1,
-        "volume": 1,
-        "name": 1,
-        "composite_score": 1,
-        "cycle_score": 1,
-        "fundamental_score": 1,
-        "growth_score": 1,
-        "technical_score": 1,
-        "money_flow_score": 1,
-        "score_date": 1
-    }})
+    if include_scores:
+        # $expr lookup cannot use indexes well; skip this for K-line browsing.
+        pipeline.extend(_STOCK_SCORE_LOOKUP_STAGES)
+
+    pipeline.extend(_STOCK_INFO_LOOKUP_STAGES)
+    pipeline.append(_RECORDS_PROJECT_WITH_SCORES if include_scores else _RECORDS_PROJECT_KLINE)
     
     docs = [serialize_doc(doc) for doc in collection.aggregate(pipeline)]
     docs = _apply_records_adjustment(docs, adjust, adj_collection)

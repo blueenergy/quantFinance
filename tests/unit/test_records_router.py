@@ -187,6 +187,55 @@ def test_apply_none_leaves_raw_prices():
     assert out[0]['adj_degraded'] is False
 
 
+def _lookup_sources(pipeline):
+    return [stage['$lookup']['from'] for stage in pipeline if '$lookup' in stage]
+
+
+@pytest.mark.unit
+def test_include_scores_false_skips_stock_scores_lookup(monkeypatch, empty_adj):
+    class TrackingCollection(FakeCollection):
+        def __init__(self, docs=None):
+            super().__init__(docs)
+            self.pipelines = []
+
+        def aggregate(self, pipeline):
+            self.pipelines.append(pipeline)
+            return super().aggregate(pipeline)
+
+    coll = TrackingCollection([
+        {'_id': '000000000000000000000001', 'symbol': '000001', 'trade_date': '20250920', 'open': 10, 'close': 12},
+    ])
+    monkeypatch.setattr(records, 'collection', coll)
+
+    client = TestClient(app)
+    resp = client.get('/api/records/?symbol=000001&limit=1&include_scores=false')
+    assert resp.status_code == 200
+    assert _lookup_sources(coll.pipelines[0]) == ['stock_info']
+
+
+@pytest.mark.unit
+def test_include_scores_default_still_looks_up_stock_scores(monkeypatch, empty_adj):
+    class TrackingCollection(FakeCollection):
+        def __init__(self, docs=None):
+            super().__init__(docs)
+            self.pipelines = []
+
+        def aggregate(self, pipeline):
+            self.pipelines.append(pipeline)
+            return super().aggregate(pipeline)
+
+    coll = TrackingCollection([
+        {'_id': '000000000000000000000001', 'symbol': '000001', 'trade_date': '20250920', 'open': 10, 'close': 12},
+    ])
+    monkeypatch.setattr(records, 'collection', coll)
+
+    client = TestClient(app)
+    resp = client.get('/api/records/?symbol=000001&limit=1')
+    assert resp.status_code == 200
+    assert 'stock_scores' in _lookup_sources(coll.pipelines[0])
+    assert 'stock_info' in _lookup_sources(coll.pipelines[0])
+
+
 @pytest.mark.unit
 def test_get_record_by_id(monkeypatch):
     docs = [
