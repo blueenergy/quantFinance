@@ -111,6 +111,7 @@ def test_get_records_attaches_decision_gs(monkeypatch, empty_adj):
     assert payload[0]['mj20'] is not None
     assert payload[1]['mj20'] is not None
     assert payload[0]['gs_signal'] is None
+    assert payload[0]['gs_watch'] is None
 
 
 @pytest.mark.unit

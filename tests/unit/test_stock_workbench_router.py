@@ -548,6 +548,7 @@ def test_kline_section_applies_qfq_and_attaches_decision_gs(monkeypatch):
     assert latest["gs_formula_id"] == "decision_gs_v1"
     assert "mj20" in latest
     assert "gs_signal" in latest
+    assert "gs_watch" in latest
 
 
 def test_kline_section_etf_reads_etf_daily_not_volume_price(monkeypatch):

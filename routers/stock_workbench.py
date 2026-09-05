@@ -1059,7 +1059,7 @@ def _kline_section(symbol: str, tf: str) -> Dict[str, Any]:
     rows = _annotate_kline_amount_unit(rows, tfc)
     rows = _with_partial_period_kline(data, candidates, rows, tfc)
     rows = _decorate_kline_rows(data, symbol, rows, tfc)
-    # Overlay fields: mj20/mj30/gs_signal (decision_gs_v1).
+    # Overlay fields: mj20/mj30/gs_signal/gs_watch (decision_gs_v1).
     profiler.lap("kline_query", tf=tfc, collection=collection_name, rows=len(rows), limit=limit)
     result = {
         "symbol": symbol,

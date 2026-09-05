@@ -244,6 +244,7 @@ class RecordResponseModel(BaseModel):
     mj30: Optional[float] = None
     gs_is_bull: Optional[bool] = None
     gs_signal: Optional[str] = None
+    gs_watch: Optional[str] = None
     gs_warmup: Optional[bool] = None
     gs_formula_id: Optional[str] = None
     adjust: Optional[str] = None
