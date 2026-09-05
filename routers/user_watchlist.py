@@ -4,6 +4,7 @@
 """
 
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Depends, HTTPException
 from models.all_models import (
@@ -744,20 +745,13 @@ def _batch_latest_volume_price_map(
         docs.extend(
             volume_price_col.find(
                 {
-                    "symbol": {"$in": all_variants},
-                    "trade_date": recent_td_key,
+                    "$or": [
+                        {"symbol": {"$in": all_variants}, "trade_date": recent_td_key},
+                        {"ts_code": {"$in": all_variants}, "trade_date": recent_td_key},
+                    ]
                 },
                 projection,
-            ).sort([("symbol", 1), ("trade_date", -1)])
-        )
-        docs.extend(
-            volume_price_col.find(
-                {
-                    "ts_code": {"$in": all_variants},
-                    "trade_date": recent_td_key,
-                },
-                projection,
-            ).sort([("ts_code", 1), ("trade_date", -1)])
+            )
         )
     except Exception:
         return out
@@ -773,16 +767,14 @@ def _batch_latest_etf_daily_close_map(
     etf_daily_col,
     symbols: List[str],
     sym_ctx: Dict[str, Dict[str, Any]],
+    today: Optional[str] = None,
 ) -> Dict[str, Any]:
     """批量读取 ETF 最新收盘价，补足 volume_price 无昨收的情况。
 
-    每个 ``ts_code`` 只取最新一根日线，避免把该 ETF 的全部历史
-    ``etf_daily`` 拉进内存。
+    用近期 ``trade_date`` 约束一次 ``find``，避免把该 ETF 的全部历史
+    ``etf_daily`` 拉进内存，也不要对每只 ``find_one``。
     """
     out: Dict[str, Any] = {}
-    if etf_daily_col is None:
-        return out
-
     ts_codes = list(
         dict.fromkeys(
             sym_ctx[symbol].get("etf_ts")
@@ -790,26 +782,68 @@ def _batch_latest_etf_daily_close_map(
             if sym_ctx[symbol].get("etf_ts")
         )
     )
-    if not ts_codes:
+    packs = _batch_etf_daily_packs(etf_daily_col, ts_codes, today)
+    for symbol in symbols:
+        etf_ts = sym_ctx[symbol].get("etf_ts")
+        pack = packs.get(str(etf_ts) if etf_ts else "")
+        row = (pack or {}).get("row") if pack else None
+        if row and row.get("close") is not None:
+            out[symbol] = row.get("close")
+    return out
+
+
+def _batch_etf_daily_packs(
+    etf_daily_col,
+    ts_codes: List[str],
+    today: Optional[str] = None,
+) -> Dict[str, Optional[Dict[str, Any]]]:
+    """一次取出自选 ETF 近期日线，在内存里挑最新一根 + 前一交易日。"""
+    codes = [str(ts).strip() for ts in ts_codes if ts]
+    out: Dict[str, Optional[Dict[str, Any]]] = {code: None for code in codes}
+    if etf_daily_col is None or not codes:
         return out
 
-    latest_by_ts: Dict[str, Dict[str, Any]] = {}
+    today_yyyymmdd = today or _cn_calendar_today_yyyymmdd()
+    recent_td_key = _trade_date_match_recent(today_yyyymmdd)
+    projection = {
+        "ts_code": 1,
+        "trade_date": 1,
+        "open": 1,
+        "high": 1,
+        "low": 1,
+        "close": 1,
+        "pre_close": 1,
+        "change": 1,
+        "pct_chg": 1,
+        "vol": 1,
+        "volume": 1,
+        "amount": 1,
+    }
     try:
-        for ts_code in ts_codes:
-            doc = etf_daily_col.find_one(
-                {"ts_code": ts_code},
-                sort=[("trade_date", -1)],
+        docs = list(
+            etf_daily_col.find(
+                {"ts_code": {"$in": codes}, "trade_date": recent_td_key},
+                projection,
             )
-            if doc:
-                latest_by_ts[str(ts_code)] = doc
+        )
     except Exception:
         return out
 
-    for symbol in symbols:
-        etf_ts = sym_ctx[symbol].get("etf_ts")
-        doc = latest_by_ts.get(str(etf_ts) if etf_ts else "")
-        if doc and doc.get("close") is not None:
-            out[symbol] = doc.get("close")
+    by_ts: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for doc in docs:
+        ts_code = str(doc.get("ts_code") or "").strip()
+        if ts_code:
+            by_ts[ts_code].append(doc)
+
+    for ts_code in codes:
+        rows = by_ts.get(ts_code, [])
+        rows.sort(
+            key=lambda d: _norm_trade_date_to_yyyymmdd(d.get("trade_date")) or "",
+            reverse=True,
+        )
+        if not rows or rows[0].get("close") is None:
+            continue
+        out[ts_code] = {"row": rows[0], "prev": rows[1] if len(rows) > 1 else None}
     return out
 
 
@@ -817,20 +851,48 @@ def _etf_daily_intraday_pack(
     etf_daily_col, ts_code: str, today: str
 ) -> Optional[Dict[str, Any]]:
     """ETF：优先当日 Tushare 日线（盘后或已同步时才有），否则最新一根日线 + 前一交易日用于涨跌。"""
-    td_key = _trade_date_match_today(today)
-    row = etf_daily_col.find_one({"ts_code": ts_code, "trade_date": td_key})
-    if not row:
-        row = etf_daily_col.find_one({"ts_code": ts_code}, sort=[("trade_date", -1)])
-    if not row or row.get("close") is None:
+    packs = _batch_etf_daily_packs(etf_daily_col, [ts_code], today)
+    return packs.get(str(ts_code).strip()) if ts_code else None
+
+
+def _today_vp_from_latest(
+    latest_vp_map: Dict[str, Optional[Dict[str, Any]]],
+    today: str,
+) -> Dict[str, Optional[Dict[str, Any]]]:
+    """最新一根若就是上海今日，即可当盘中 bar，不必再查一遍 ``volume_price``。"""
+    out: Dict[str, Optional[Dict[str, Any]]] = {}
+    for symbol, doc in latest_vp_map.items():
+        if doc and _norm_trade_date_to_yyyymmdd(doc.get("trade_date")) == today:
+            out[symbol] = doc
+        else:
+            out[symbol] = None
+    return out
+
+
+def _etf_ts_from_info_map(
+    etf_info_map: Dict[str, Dict[str, Any]],
+    symbol: str,
+) -> Optional[str]:
+    info = etf_info_map.get(remove_exchange_suffix(symbol))
+    if not info:
         return None
-    td = row.get("trade_date")
-    prev = None
-    if td:
-        prev = etf_daily_col.find_one(
-            {"ts_code": ts_code, "trade_date": {"$lt": td}},
-            sort=[("trade_date", -1)],
-        )
-    return {"row": row, "prev": prev}
+    ts_code = str(info.get("ts_code") or "").strip()
+    return ts_code or None
+
+
+def _run_watchlist_lookups(jobs: Dict[str, Any]) -> Dict[str, Any]:
+    """彼此独立的 Mongo 读并行发出，总耗时接近最慢的那一次。"""
+    if not jobs:
+        return {}
+    if len(jobs) == 1:
+        name, fn = next(iter(jobs.items()))
+        return {name: fn()}
+    out: Dict[str, Any] = {}
+    with ThreadPoolExecutor(max_workers=len(jobs)) as pool:
+        futs = {pool.submit(fn): name for name, fn in jobs.items()}
+        for fut, name in futs.items():
+            out[name] = fut.result()
+    return out
 
 
 def _norm_keys_from_vp_doc(doc: Dict[str, Any]) -> List[str]:
@@ -953,47 +1015,62 @@ def get_user_watchlist_realtime(current_user: dict = Depends(get_current_active_
             }
         
         symbols = watchlist_doc["symbols"]  # e.g., ["600990", "300722"]
-        
-        # 2. 获取昨日收盘价（用于计算涨跌幅）
+
         etf_basic_col = data_collections.get("etf_basic")
         etf_daily_col = data_collections.get("etf_daily")
+        volume_price_col = data_collections["volume_price"]
+        stock_info_col = data_collections["stock_info"]
+        today = _cn_calendar_today_yyyymmdd()
+        # ETF 变体覆盖 SH/SZ/BJ，股票多几个后缀对 $in 无害，可与 etf_basic 并行。
+        sym_ctx: Dict[str, Dict[str, Any]] = {
+            symbol: {"variants": _etf_symbol_variants(symbol), "etf_ts": None}
+            for symbol in symbols
+        }
+        etf_variants = _unique_etf_variants_for_symbols(symbols)
 
-        etf_ts_map = _batch_etf_ts_code_map(etf_basic_col, symbols)
-        sym_ctx: Dict[str, Dict[str, Any]] = {}
+        lookups = _run_watchlist_lookups({
+            "etf_info": lambda: _batch_etf_info_map(etf_basic_col, symbols),
+            "sw": lambda: _load_sw_industry_map(
+                data_collections.get("sw_index_member"),
+                symbols,
+            ),
+            "stock_info": lambda: _batch_stock_info_map(stock_info_col, etf_variants),
+            "latest_vp": lambda: _batch_latest_volume_price_map(
+                volume_price_col, symbols, sym_ctx, today
+            ),
+            "etf_packs": lambda: _batch_etf_daily_packs(
+                etf_daily_col, etf_variants, today
+            ),
+        })
+        etf_info_map = lookups["etf_info"]
+        sw_industry_map = lookups["sw"]
+        stock_info_map = lookups["stock_info"]
+        latest_vp_map = lookups["latest_vp"]
+        etf_pack_by_ts = lookups["etf_packs"]
+
         for symbol in symbols:
-            etf_ts = etf_ts_map.get(symbol)
-            eff_variants = _merge_variants(_symbol_variants(symbol), [etf_ts] if etf_ts else [])
-            sym_ctx[symbol] = {"variants": eff_variants, "etf_ts": etf_ts}
-        sw_industry_map = _load_sw_industry_map(
-            data_collections.get("sw_index_member"),
-            symbols,
-        )
+            etf_ts = _etf_ts_from_info_map(etf_info_map, symbol)
+            if etf_ts:
+                sym_ctx[symbol]["etf_ts"] = etf_ts
+                if etf_ts not in sym_ctx[symbol]["variants"]:
+                    sym_ctx[symbol]["variants"].append(etf_ts)
 
         yesterday_close_map = {}
-        volume_price_col = data_collections["volume_price"]
-
-        # Key 与下方主循环的 symbol 一致（user_watchlists 原文）；命中文档靠 variants，避免后缀不一致丢 close。
-        today = _cn_calendar_today_yyyymmdd()
-        latest_vp_map = _batch_latest_volume_price_map(volume_price_col, symbols, sym_ctx, today)
-        etf_close_map = _batch_latest_etf_daily_close_map(etf_daily_col, symbols, sym_ctx)
+        etf_close_map = {}
+        for symbol in symbols:
+            pack = etf_pack_by_ts.get(str(sym_ctx[symbol].get("etf_ts") or ""))
+            row = (pack or {}).get("row") if pack else None
+            if row and row.get("close") is not None:
+                etf_close_map[symbol] = row.get("close")
         for symbol, latest_record in latest_vp_map.items():
             if latest_record and latest_record.get("close") is not None:
                 yesterday_close_map[symbol] = latest_record.get("close")
             elif symbol in etf_close_map:
                 yesterday_close_map[symbol] = etf_close_map[symbol]
 
-        vp_batch = _batch_intraday_volume_price_map(
-            volume_price_col, symbols, sym_ctx, today
-        )
+        vp_batch = _today_vp_from_latest(latest_vp_map, today)
 
         result = []
-        stock_info_col = data_collections["stock_info"]
-        all_variants = list(
-            dict.fromkeys(v for symbol in symbols for v in sym_ctx[symbol]["variants"])
-        )
-        stock_info_map = _batch_stock_info_map(stock_info_col, all_variants)
-        etf_info_map = _batch_etf_info_map(etf_basic_col, symbols)
-
         for symbol in symbols:
             etf_ts = sym_ctx[symbol]["etf_ts"]
             industry = ""
@@ -1027,43 +1104,42 @@ def get_user_watchlist_realtime(current_user: dict = Depends(get_current_active_
                 )
                 continue
 
-            if etf_ts and etf_daily_col is not None:
-                pack = _etf_daily_intraday_pack(etf_daily_col, etf_ts, today)
-                if pack:
-                    row = pack["row"]
-                    prev = pack.get("prev")
-                    close = row.get("close")
-                    if close is not None:
-                        close = float(close)
-                        prev_c = prev.get("close") if prev else None
-                        if prev_c is not None:
-                            prev_c = float(prev_c)
-                        ch = (
-                            (close - prev_c)
-                            if prev_c is not None
-                            else 0.0
+            pack = etf_pack_by_ts.get(str(etf_ts or "")) if etf_ts else None
+            if pack:
+                row = pack["row"]
+                prev = pack.get("prev")
+                close = row.get("close")
+                if close is not None:
+                    close = float(close)
+                    prev_c = prev.get("close") if prev else None
+                    if prev_c is not None:
+                        prev_c = float(prev_c)
+                    ch = (
+                        (close - prev_c)
+                        if prev_c is not None
+                        else 0.0
+                    )
+                    pct = (
+                        (ch / prev_c * 100.0)
+                        if prev_c not in (None, 0)
+                        else 0.0
+                    )
+                    bar = dict(row)
+                    bar["close"] = close
+                    bar["pre_close"] = prev_c
+                    bar["change"] = ch
+                    bar["pct_chg"] = pct
+                    result.append(
+                        _realtime_row_from_bar(
+                            symbol=symbol,
+                            name=name,
+                            industry=industry,
+                            sw_industry=sw_industry,
+                            asset_type=asset_type,
+                            bar=bar,
                         )
-                        pct = (
-                            (ch / prev_c * 100.0)
-                            if prev_c not in (None, 0)
-                            else 0.0
-                        )
-                        bar = dict(row)
-                        bar["close"] = close
-                        bar["pre_close"] = prev_c
-                        bar["change"] = ch
-                        bar["pct_chg"] = pct
-                        result.append(
-                            _realtime_row_from_bar(
-                                symbol=symbol,
-                                name=name,
-                                industry=industry,
-                                sw_industry=sw_industry,
-                                asset_type=asset_type,
-                                bar=bar,
-                            )
-                        )
-                        continue
+                    )
+                    continue
 
             latest_record = latest_vp_map.get(symbol)
             if latest_record and latest_record.get("close") is not None:

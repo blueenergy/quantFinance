@@ -226,7 +226,7 @@ class _CountingCollection(_Collection):
         return super().find_one(query, sort)
 
 
-def test_batch_latest_etf_daily_close_map_uses_find_one_not_full_history():
+def test_batch_latest_etf_daily_close_map_uses_bounded_find_not_full_history():
     docs = [
         {"ts_code": "510300.SH", "trade_date": f"2020{month:02d}01", "close": float(month)}
         for month in range(1, 13)
@@ -242,11 +242,12 @@ def test_batch_latest_etf_daily_close_map_uses_find_one_not_full_history():
         col,
         ["510300.SH"],
         {"510300.SH": {"etf_ts": "510300.SH"}},
+        today="20260701",
     )
 
     assert result == {"510300.SH": 4.25}
-    assert col.find_calls == 0
-    assert col.find_one_calls == 1
+    assert col.find_calls == 1
+    assert col.find_one_calls == 0
 
 
 def test_watchlist_realtime_etf_keeps_three_price_decimals(monkeypatch):
@@ -372,4 +373,92 @@ def test_watchlist_realtime_stock_uses_latest_daily_bar_on_weekend(monkeypatch):
             "update_time": "2026-09-04",
         }
     ]
+
+
+def test_watchlist_realtime_mixed_list_uses_one_find_per_collection(monkeypatch):
+    monkeypatch.setattr(user_watchlist, "_cn_calendar_today_yyyymmdd", lambda: "20260701")
+    volume_price = _CountingCollection(
+        [
+            {
+                "symbol": "000001.SZ",
+                "ts_code": "000001.SZ",
+                "trade_date": "20260701",
+                "source": "miniqmt",
+                "open": 10.1,
+                "high": 10.8,
+                "low": 10.0,
+                "close": 10.5,
+                "pre_close": 10.0,
+                "change": 0.5,
+                "pct_chg": 5.0,
+                "vol": 12345,
+                "update_time": "20260701 14:59:00",
+            }
+        ]
+    )
+    etf_basic = _CountingCollection(
+        [{"ts_code": "510300.SH", "name": "沪深300ETF"}]
+    )
+    etf_daily = _CountingCollection(
+        [
+            {
+                "ts_code": "510300.SH",
+                "trade_date": "20260630",
+                "open": 1.230,
+                "high": 1.240,
+                "low": 1.228,
+                "close": 1.229,
+                "vol": 100,
+            },
+            {
+                "ts_code": "510300.SH",
+                "trade_date": "20260701",
+                "open": 1.231,
+                "high": 1.238,
+                "low": 1.229,
+                "close": 1.234,
+                "vol": 200,
+            },
+        ]
+    )
+    stock_info = _CountingCollection(
+        [{"symbol": "000001.SZ", "name": "平安银行", "industry": "银行"}]
+    )
+    sw_index_member = _CountingCollection([])
+
+    monkeypatch.setattr(
+        user_watchlist,
+        "get_db_collections",
+        lambda: {
+            "user_watchlists": _Collection(
+                [{"user_id": "u1", "symbols": ["000001.SZ", "510300.SH"]}]
+            )
+        },
+    )
+    monkeypatch.setattr(
+        user_watchlist,
+        "get_data_db",
+        lambda: {
+            "volume_price": volume_price,
+            "stock_info": stock_info,
+            "etf_basic": etf_basic,
+            "etf_daily": etf_daily,
+            "sw_index_member": sw_index_member,
+            "minute_bars": _ExplodingCollection([]),
+        },
+    )
+
+    response = user_watchlist.get_user_watchlist_realtime({"id": "u1"})
+
+    assert response["success"] is True
+    assert [row["symbol"] for row in response["data"]] == ["000001.SZ", "510300.SH"]
+    assert response["data"][0]["price"] == 10.5
+    assert response["data"][1]["price"] == 1.234
+    assert volume_price.find_calls == 1
+    assert volume_price.find_one_calls == 0
+    assert etf_basic.find_calls == 1
+    assert etf_daily.find_calls == 1
+    assert etf_daily.find_one_calls == 0
+    assert stock_info.find_calls == 1
+    assert stock_info.find_one_calls == 0
 
