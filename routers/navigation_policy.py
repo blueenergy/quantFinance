@@ -61,6 +61,7 @@ KNOWN_MAIN_TABS: List[tuple] = [
     ("user-profile", False),
     ("chat", False),
     ("kline-comparison", False),
+    ("futures-kline", False),
 ]
 
 

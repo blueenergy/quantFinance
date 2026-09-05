@@ -193,3 +193,57 @@ def test_kline_series_etf_uses_etf_daily_not_volume_price(monkeypatch, authed_cl
     assert body["data"][0]["trade_date"] == "20240101"
     assert body["data"][-1]["close"] == pytest.approx(4.6)
     assert body["data"][-1]["volume"] == pytest.approx(100)
+
+
+@pytest.mark.unit
+def test_kline_series_futures_uses_fut_daily(monkeypatch, authed_client):
+    class _FutColl:
+        def find(self, flt, proj):
+            return _EmptyMongoCursor(
+                [
+                    {
+                        "ts_code": "IF.CFX",
+                        "trade_date": "20240102",
+                        "open": 3500.0,
+                        "high": 3520.0,
+                        "low": 3490.0,
+                        "close": 3515.0,
+                        "vol": 1000.0,
+                        "amount": 2000.0,
+                        "oi": 50000.0,
+                        "contract": "IF2401.CFX",
+                    }
+                ]
+            )
+
+    monkeypatch.setattr(
+        kline_series,
+        "_index_prices",
+        type("C", (), {"find": lambda *a, **k: _EmptyMongoCursor()})(),
+    )
+    monkeypatch.setattr(kline_series, "_etf_basic", _EtfColl([]))
+    monkeypatch.setattr(kline_series, "_fut_daily", _FutColl())
+
+    resp = authed_client.get(
+        "/api/kline-series",
+        params={"symbol": "IF.CFX", "start_date": "20240101", "end_date": "20240102"},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["source"] == "fut_daily"
+    assert body["adjust"] == "none"
+    assert body["count"] == 1
+    assert body["data"][0]["contract"] == "IF2401.CFX"
+    assert body["data"][0]["oi"] == pytest.approx(50000.0)
+
+
+@pytest.mark.unit
+def test_futures_varieties_endpoint(authed_client):
+    resp = authed_client.get("/api/futures/varieties")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["success"] is True
+    assert body["count"] == 16
+    codes = [row["ts_code"] for row in body["data"]["all"]]
+    assert "IF.CFX" in codes
+    assert "LC.GFE" in codes

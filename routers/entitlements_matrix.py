@@ -84,6 +84,7 @@ _NAV_ROWS: List[Tuple[str, str, int]] = [
     ("user-profile", "用户配置", 180),
     ("chat", "🤖 AI助手", 190),
     ("kline-comparison", "📈 走势对比", 195),
+    ("futures-kline", "📉 期货K线", 196),
 ]
 
 # 某主导航 Tab 下的页内操作 (action_key, 展示名)

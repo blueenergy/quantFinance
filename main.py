@@ -95,6 +95,7 @@ from routers.hermes_quant_tools import (
 )
 from routers.macro import router as macro_router
 from routers.kline_series import router as kline_series_router
+from routers.futures import router as futures_router
 from routers.intraday_t0 import router as intraday_t0_router
 from routers.market_insights import router as market_insights_router
 from routers.entropy_ranking import router as entropy_ranking_router
@@ -227,6 +228,7 @@ app.include_router(assistant_bff_router, prefix="/api/assistant", tags=["助手B
 app.include_router(hermes_quant_tools_router, prefix="/api", tags=["Hermes quant tools"])
 app.include_router(macro_router, prefix="/api", tags=["宏观分析"])
 app.include_router(kline_series_router, prefix="/api", tags=["K线对比"])
+app.include_router(futures_router, prefix="/api", tags=["期货"])
 app.include_router(intraday_t0_router, prefix="/api", tags=["日内T+0"])
 app.include_router(market_insights_router, prefix="/api", tags=["火眼金睛"])
 app.include_router(entropy_ranking_router, prefix="/api", tags=["熵值因子排名"])
