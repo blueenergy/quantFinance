@@ -113,3 +113,263 @@ def test_watchlist_realtime_uses_volume_price_snapshot(monkeypatch):
             "update_time": "2026-07-01 10:15:00",
         }
     ]
+
+
+def test_pick_best_intraday_prefers_miniqmt_over_eastmoney():
+    eastmoney = {"source": "eastmoney_snapshot", "close": 10.2}
+    miniqmt = {"source": "miniqmt", "close": 10.1}
+    tushare = {"source": "tushare_daily", "close": 10.0}
+
+    picked = user_watchlist._pick_best_intraday_from_today_docs(
+        [eastmoney, tushare, miniqmt]
+    )
+
+    assert picked is miniqmt
+
+
+def test_pick_latest_vp_doc_same_date_prefers_miniqmt():
+    eastmoney = {
+        "source": "eastmoney_snapshot",
+        "trade_date": "20260904",
+        "close": 10.2,
+    }
+    tushare = {"source": "tushare_daily", "trade_date": "20260904", "close": 10.0}
+    miniqmt = {"source": "miniqmt", "trade_date": "20260904", "close": 10.1}
+
+    picked = user_watchlist._pick_latest_vp_doc([eastmoney, tushare, miniqmt])
+
+    assert picked is miniqmt
+
+
+def test_watchlist_realtime_stock_prefers_miniqmt_over_eastmoney(monkeypatch):
+    monkeypatch.setattr(user_watchlist, "_cn_calendar_today_yyyymmdd", lambda: "20260904")
+    monkeypatch.setattr(
+        user_watchlist,
+        "get_db_collections",
+        lambda: {
+            "user_watchlists": _Collection(
+                [{"user_id": "u1", "symbols": ["000001.SZ"]}]
+            )
+        },
+    )
+    monkeypatch.setattr(
+        user_watchlist,
+        "get_data_db",
+        lambda: {
+            "volume_price": _Collection(
+                [
+                    {
+                        "symbol": "000001.SZ",
+                        "ts_code": "000001.SZ",
+                        "trade_date": "20260904",
+                        "source": "eastmoney_snapshot",
+                        "open": 9.9,
+                        "high": 10.0,
+                        "low": 9.8,
+                        "close": 9.95,
+                        "pre_close": 9.9,
+                        "change": 0.05,
+                        "pct_chg": 0.51,
+                        "volume": 1,
+                        "update_time": "20260904 09:35:00",
+                    },
+                    {
+                        "symbol": "000001.SZ",
+                        "ts_code": "000001.SZ",
+                        "trade_date": "20260904",
+                        "source": "miniqmt",
+                        "open": 10.1,
+                        "high": 10.8,
+                        "low": 10.0,
+                        "close": 10.5,
+                        "pre_close": 10.0,
+                        "change": 0.5,
+                        "pct_chg": 5.0,
+                        "vol": 12345,
+                        "update_time": "20260904 14:59:00",
+                    },
+                ]
+            ),
+            "stock_info": _Collection(
+                [{"symbol": "000001.SZ", "name": "平安银行", "industry": "银行"}]
+            ),
+            "etf_basic": _Collection([]),
+            "etf_daily": _Collection([]),
+            "sw_index_member": _Collection([]),
+            "minute_bars": _ExplodingCollection([]),
+        },
+    )
+
+    response = user_watchlist.get_user_watchlist_realtime({"id": "u1"})
+
+    assert response["success"] is True
+    row = response["data"][0]
+    assert row["price"] == 10.5
+    assert row["open"] == 10.1
+    assert row["high"] == 10.8
+    assert row["volume"] == 12345
+    assert row["update_time"] == "2026-09-04 14:59:00"
+
+
+class _CountingCollection(_Collection):
+    def __init__(self, docs=None):
+        super().__init__(docs)
+        self.find_calls = 0
+        self.find_one_calls = 0
+
+    def find(self, query=None, projection=None):
+        self.find_calls += 1
+        return super().find(query, projection)
+
+    def find_one(self, query, sort=None):
+        self.find_one_calls += 1
+        return super().find_one(query, sort)
+
+
+def test_batch_latest_etf_daily_close_map_uses_find_one_not_full_history():
+    docs = [
+        {"ts_code": "510300.SH", "trade_date": f"2020{month:02d}01", "close": float(month)}
+        for month in range(1, 13)
+    ]
+    docs.extend(
+        {"ts_code": "510300.SH", "trade_date": f"2021{month:02d}01", "close": float(month)}
+        for month in range(1, 13)
+    )
+    docs.append({"ts_code": "510300.SH", "trade_date": "20260701", "close": 4.25})
+    col = _CountingCollection(docs)
+
+    result = user_watchlist._batch_latest_etf_daily_close_map(
+        col,
+        ["510300.SH"],
+        {"510300.SH": {"etf_ts": "510300.SH"}},
+    )
+
+    assert result == {"510300.SH": 4.25}
+    assert col.find_calls == 0
+    assert col.find_one_calls == 1
+
+
+def test_watchlist_realtime_etf_keeps_three_price_decimals(monkeypatch):
+    monkeypatch.setattr(user_watchlist, "_cn_calendar_today_yyyymmdd", lambda: "20260701")
+    monkeypatch.setattr(
+        user_watchlist,
+        "get_db_collections",
+        lambda: {
+            "user_watchlists": _Collection(
+                [{"user_id": "u1", "symbols": ["510300.SH"]}]
+            )
+        },
+    )
+    monkeypatch.setattr(
+        user_watchlist,
+        "get_data_db",
+        lambda: {
+            "volume_price": _Collection([]),
+            "stock_info": _Collection([]),
+            "etf_basic": _Collection(
+                [{"ts_code": "510300.SH", "name": "沪深300ETF"}]
+            ),
+            "etf_daily": _Collection(
+                [
+                    {
+                        "ts_code": "510300.SH",
+                        "trade_date": "20260630",
+                        "open": 1.230,
+                        "high": 1.240,
+                        "low": 1.228,
+                        "close": 1.229,
+                        "vol": 100,
+                    },
+                    {
+                        "ts_code": "510300.SH",
+                        "trade_date": "20260701",
+                        "open": 1.231,
+                        "high": 1.238,
+                        "low": 1.229,
+                        "close": 1.234,
+                        "vol": 200,
+                    },
+                ]
+            ),
+            "sw_index_member": _Collection([]),
+            "minute_bars": _ExplodingCollection([]),
+        },
+    )
+
+    response = user_watchlist.get_user_watchlist_realtime({"id": "u1"})
+
+    assert response["success"] is True
+    row = response["data"][0]
+    assert row["asset_type"] == "etf"
+    assert row["price"] == 1.234
+    assert row["open"] == 1.231
+    assert row["high"] == 1.238
+    assert row["low"] == 1.229
+    assert row["change"] == 0.005
+    assert row["change_pct"] == 0.41
+
+
+def test_watchlist_realtime_stock_uses_latest_daily_bar_on_weekend(monkeypatch):
+    monkeypatch.setattr(user_watchlist, "_cn_calendar_today_yyyymmdd", lambda: "20260905")
+    monkeypatch.setattr(
+        user_watchlist,
+        "get_db_collections",
+        lambda: {
+            "user_watchlists": _Collection(
+                [{"user_id": "u1", "symbols": ["000001.SZ"]}]
+            )
+        },
+    )
+    monkeypatch.setattr(
+        user_watchlist,
+        "get_data_db",
+        lambda: {
+            "volume_price": _Collection(
+                [
+                    {
+                        "symbol": "000001.SZ",
+                        "ts_code": "000001.SZ",
+                        "trade_date": "20260904",
+                        "source": "tushare_daily",
+                        "open": 10.1,
+                        "high": 10.8,
+                        "low": 10.0,
+                        "close": 10.5,
+                        "pre_close": 10.0,
+                        "change": 0.5,
+                        "pct_chg": 5.0,
+                        "vol": 12345,
+                    }
+                ]
+            ),
+            "stock_info": _Collection(
+                [{"symbol": "000001.SZ", "name": "平安银行", "industry": "银行"}]
+            ),
+            "etf_basic": _Collection([]),
+            "etf_daily": _Collection([]),
+            "sw_index_member": _Collection([]),
+            "minute_bars": _ExplodingCollection([]),
+        },
+    )
+
+    response = user_watchlist.get_user_watchlist_realtime({"id": "u1"})
+
+    assert response["success"] is True
+    assert response["data"] == [
+        {
+            "symbol": "000001.SZ",
+            "name": "平安银行",
+            "industry": "银行",
+            "sw_industry": None,
+            "asset_type": "stock",
+            "price": 10.5,
+            "open": 10.1,
+            "high": 10.8,
+            "low": 10.0,
+            "volume": 12345,
+            "change": 0.5,
+            "change_pct": 5.0,
+            "update_time": "2026-09-04",
+        }
+    ]
+

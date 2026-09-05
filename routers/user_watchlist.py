@@ -38,7 +38,7 @@ def _trade_date_match_today(today_yyyymmdd: str) -> Any:
 
 
 def _trade_date_match_recent(today_yyyymmdd: str, max_days: int = 15) -> Any:
-    """返回最近若干自然日的常见 ``trade_date`` 写法，用于约束快照 fallback 扫描范围。"""
+    """返回最近若干自然日的常见 ``trade_date`` 写法，用于约束最新日线扫描范围。"""
     vals: List[Any] = []
     try:
         today = datetime.strptime(today_yyyymmdd, "%Y%m%d").date()
@@ -72,17 +72,22 @@ def _norm_trade_date_to_yyyymmdd(td: Any) -> Optional[str]:
     return None
 
 
-def _eastmoney_trade_date_within_lookback(doc_td: str, today: str, max_days: int = 15) -> bool:
-    """东财快照的 ``trade_date`` 可早于上海日历「今日」（周末/长假），在间隔内仍用于展示 OHLC。"""
-    try:
-        d_doc = datetime.strptime(doc_td, "%Y%m%d").date()
-        d_today = datetime.strptime(today, "%Y%m%d").date()
-    except ValueError:
-        return False
-    delta = (d_today - d_doc).days
-    if delta < 0:
-        return False
-    return delta <= max_days
+# volume_price.source：盘中 miniQMT（及旧 Tushare rt_k），再日终 Tushare；东财快照仅兜底。
+_VP_SOURCE_RANK = {
+    "miniqmt": 0,
+    "tushare_rt_k": 1,
+    "tushare_daily": 2,
+    "eastmoney_snapshot": 90,
+}
+
+
+def _vp_source_rank(doc: Optional[Dict[str, Any]]) -> int:
+    src = str((doc or {}).get("source") or "").strip().lower()
+    if src in _VP_SOURCE_RANK:
+        return _VP_SOURCE_RANK[src]
+    if src.startswith("tushare"):
+        return 2
+    return 50
 
 
 def _volume_price_symbol_filter(variants: List[str]) -> Dict[str, Any]:
@@ -134,6 +139,76 @@ def _safe_round_price(val: Any, ndigits: int = 2) -> Optional[float]:
         return round(x, ndigits)
     except (TypeError, ValueError):
         return None
+
+
+def _price_ndigits(asset_type: Any) -> int:
+    """A-share stocks tick 0.01; listed ETFs tick 0.001."""
+    return 3 if str(asset_type or "").strip().lower() == "etf" else 2
+
+
+def _bar_volume(doc: Optional[Dict[str, Any]]) -> Any:
+    """Daily bars often store ``vol``; eastmoney snapshots use ``volume``."""
+    if not doc:
+        return None
+    vol = doc.get("volume")
+    if vol is None:
+        vol = doc.get("vol")
+    return vol
+
+
+def _bar_update_time(doc: Optional[Dict[str, Any]]) -> Optional[str]:
+    formatted = _format_vp_update_time(doc)
+    if formatted:
+        return formatted
+    if not doc:
+        return None
+    td = _norm_trade_date_to_yyyymmdd(doc.get("trade_date"))
+    if not td:
+        return None
+    return f"{td[0:4]}-{td[4:6]}-{td[6:8]}"
+
+
+def _realtime_row_from_bar(
+    *,
+    symbol: str,
+    name: str,
+    industry: str,
+    sw_industry: Any,
+    asset_type: str,
+    bar: Dict[str, Any],
+) -> Dict[str, Any]:
+    close = bar.get("close")
+    pre = bar.get("pre_close")
+    ch = bar.get("change")
+    pct = bar.get("pct_chg")
+    if ch is None and close is not None and pre is not None:
+        try:
+            ch = float(close) - float(pre)
+        except (TypeError, ValueError):
+            ch = None
+    if pct is None and ch is not None:
+        try:
+            pre_f = float(pre) if pre is not None else 0.0
+            pct = (float(ch) / pre_f * 100.0) if pre_f else 0.0
+        except (TypeError, ValueError):
+            pct = None
+    nd = _price_ndigits(asset_type)
+    vol = _bar_volume(bar)
+    return {
+        "symbol": symbol,
+        "name": name,
+        "industry": industry,
+        "sw_industry": sw_industry,
+        "asset_type": asset_type,
+        "price": _safe_round_price(close, nd),
+        "open": _safe_round_price(bar.get("open"), nd),
+        "high": _safe_round_price(bar.get("high"), nd),
+        "low": _safe_round_price(bar.get("low"), nd),
+        "volume": _safe_round_price(vol, 2) if vol is not None else None,
+        "change": _safe_round_price(ch, nd),
+        "change_pct": _safe_round_price(pct, 2),
+        "update_time": _bar_update_time(bar),
+    }
 
 
 # 辅助函数
@@ -551,7 +626,7 @@ def _merge_variants(*groups: List[str]) -> List[str]:
 
 
 def _pick_latest_vp_doc(docs: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    """按规范化 trade_date 取最新 ``volume_price`` 文档。"""
+    """按规范化 trade_date 取最新 ``volume_price`` 文档；同日优先 miniQMT / Tushare。"""
     if not docs:
         return None
 
@@ -559,7 +634,11 @@ def _pick_latest_vp_doc(docs: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
         t = _norm_trade_date_to_yyyymmdd(d.get("trade_date"))
         return t or ""
 
-    return sorted(docs, key=_td_sort_key, reverse=True)[0]
+    return sorted(
+        docs,
+        key=lambda d: (_td_sort_key(d), -_vp_source_rank(d)),
+        reverse=True,
+    )[0]
 
 
 def _batch_etf_ts_code_map(etf_basic_col, symbols: List[str]) -> Dict[str, Optional[str]]:
@@ -650,6 +729,15 @@ def _batch_latest_volume_price_map(
         "trade_date": 1,
         "close": 1,
         "pre_close": 1,
+        "open": 1,
+        "high": 1,
+        "low": 1,
+        "change": 1,
+        "pct_chg": 1,
+        "vol": 1,
+        "volume": 1,
+        "update_time": 1,
+        "synced_at": 1,
         "source": 1,
     }
     try:
@@ -686,7 +774,11 @@ def _batch_latest_etf_daily_close_map(
     symbols: List[str],
     sym_ctx: Dict[str, Dict[str, Any]],
 ) -> Dict[str, Any]:
-    """批量读取 ETF 最新收盘价，补足 volume_price 无昨收的情况。"""
+    """批量读取 ETF 最新收盘价，补足 volume_price 无昨收的情况。
+
+    每个 ``ts_code`` 只取最新一根日线，避免把该 ETF 的全部历史
+    ``etf_daily`` 拉进内存。
+    """
     out: Dict[str, Any] = {}
     if etf_daily_col is None:
         return out
@@ -701,25 +793,21 @@ def _batch_latest_etf_daily_close_map(
     if not ts_codes:
         return out
 
+    latest_by_ts: Dict[str, Dict[str, Any]] = {}
     try:
-        docs = list(
-            etf_daily_col.find(
-                {"ts_code": {"$in": ts_codes}},
-                {"ts_code": 1, "trade_date": 1, "close": 1},
-            ).sort([("ts_code", 1), ("trade_date", -1)])
-        )
+        for ts_code in ts_codes:
+            doc = etf_daily_col.find_one(
+                {"ts_code": ts_code},
+                sort=[("trade_date", -1)],
+            )
+            if doc:
+                latest_by_ts[str(ts_code)] = doc
     except Exception:
         return out
 
-    latest_by_ts: Dict[str, Dict[str, Any]] = {}
-    for doc in docs:
-        ts_code = str(doc.get("ts_code") or "").strip()
-        if ts_code and ts_code not in latest_by_ts:
-            latest_by_ts[ts_code] = doc
-
     for symbol in symbols:
         etf_ts = sym_ctx[symbol].get("etf_ts")
-        doc = latest_by_ts.get(etf_ts)
+        doc = latest_by_ts.get(str(etf_ts) if etf_ts else "")
         if doc and doc.get("close") is not None:
             out[symbol] = doc.get("close")
     return out
@@ -775,31 +863,10 @@ def _vp_docs_index_by_norm(docs: List[Dict[str, Any]]) -> Dict[str, List[Dict[st
 
 
 def _pick_best_intraday_from_today_docs(cands: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    """同一标的当日多条：优先 eastmoney_snapshot。"""
-    for c in cands:
-        if c.get("source") == "eastmoney_snapshot":
-            return c
-    return cands[0] if cands else None
-
-
-def _pick_fallback_eastmoney_doc(
-    docs: List[Dict[str, Any]], today: str
-) -> Optional[Dict[str, Any]]:
-    """仅东财快照；按 trade_date 降序取第一条满足当日或 lookback 的文档。"""
-    if not docs:
+    """同一标的当日多条：优先 miniQMT，其次 Tushare，东财快照仅作兜底。"""
+    if not cands:
         return None
-
-    def _td_sort_key(d: Dict[str, Any]) -> str:
-        t = _norm_trade_date_to_yyyymmdd(d.get("trade_date"))
-        return t or ""
-
-    for d in sorted(docs, key=_td_sort_key, reverse=True):
-        doc_td = _norm_trade_date_to_yyyymmdd(d.get("trade_date"))
-        if doc_td is None:
-            continue
-        if doc_td == today or _eastmoney_trade_date_within_lookback(doc_td, today):
-            return d
-    return None
+    return min(cands, key=_vp_source_rank)
 
 
 def _format_vp_update_time(vp: Optional[Dict[str, Any]]) -> Optional[str]:
@@ -830,7 +897,7 @@ def _batch_intraday_volume_price_map(
     sym_ctx: Dict[str, Dict[str, Any]],
     today: str,
 ) -> Dict[str, Optional[Dict[str, Any]]]:
-    """一次（或两次）查询 Mongo，按自选 ``symbol`` 映射最佳当日 / 近日 ``volume_price`` 文档。"""
+    """查询当日 ``volume_price``，按自选 ``symbol`` 映射最佳文档（miniQMT / Tushare 优先）。"""
     all_variants: List[str] = []
     seen: set[str] = set()
     for s in symbols:
@@ -852,55 +919,6 @@ def _batch_intraday_volume_price_map(
         nid = remove_exchange_suffix(sym)
         cands = by_norm_today.get(nid, [])
         out[sym] = _pick_best_intraday_from_today_docs(cands)
-
-    need_fb = [sym for sym in symbols if out.get(sym) is None]
-    if need_fb:
-        fb_variants = list(
-            dict.fromkeys(v for sym in need_fb for v in sym_ctx[sym]["variants"])
-        )
-        recent_td_key = _trade_date_match_recent(today)
-        fb_docs: List[Dict[str, Any]] = []
-        projection = {
-            "symbol": 1,
-            "ts_code": 1,
-            "trade_date": 1,
-            "source": 1,
-            "open": 1,
-            "high": 1,
-            "low": 1,
-            "close": 1,
-            "pre_close": 1,
-            "change": 1,
-            "pct_chg": 1,
-            "volume": 1,
-            "update_time": 1,
-            "synced_at": 1,
-        }
-        fb_docs.extend(
-            volume_price_col.find(
-                {
-                    "source": "eastmoney_snapshot",
-                    "symbol": {"$in": fb_variants},
-                    "trade_date": recent_td_key,
-                },
-                projection,
-            ).sort([("symbol", 1), ("trade_date", -1)])
-        )
-        fb_docs.extend(
-            volume_price_col.find(
-                {
-                    "source": "eastmoney_snapshot",
-                    "ts_code": {"$in": fb_variants},
-                    "trade_date": recent_td_key,
-                },
-                projection,
-            ).sort([("ts_code", 1), ("trade_date", -1)])
-        )
-        by_norm_fb = _vp_docs_index_by_norm(fb_docs)
-        for sym in need_fb:
-            nid = remove_exchange_suffix(sym)
-            out[sym] = _pick_fallback_eastmoney_doc(by_norm_fb.get(nid, []), today)
-
     return out
 
 
@@ -910,12 +928,13 @@ def _batch_intraday_volume_price_map(
 def get_user_watchlist_realtime(current_user: dict = Depends(get_current_active_user)):
     """获取当前用户自选股的实时数据。
 
-    股票：优先当日 ``volume_price``（东财 ``eastmoney_snapshot`` 快照），若日历「今日」
-    尚无记录，可用最近若干自然日内的东财快照；再回退到最近 ``volume_price`` 收盘价。
+    股票：读 ``volume_price``。当日有盘中 bar 时优先 ``source=miniqmt``（其次旧
+    ``tushare_rt_k``、日终 ``tushare_daily``）；``eastmoney_snapshot`` 只在没有上述
+    来源时才用。日历「今日」没有当日 bar（周末 / 长假 / 盘前）则回退最近一根完整日线
+    （通常是 Tushare ``run_stock_daily``），不要只吐收盘价。
     ``trade_date`` 与「今天」按 **Asia/Shanghai** 对齐，并兼容多种存法。
 
-    ETF：东财 ulist 与自选轮询 **仅覆盖带交易所后缀的 ts_code**（裸代码不会进东财任务），
-    故在快照不可用时回退到 **``etf_daily``**（优先当日已同步的 Tushare 日线，否则最新一根日线，
+    ETF：在快照不可用时回退到 **``etf_daily``**（优先当日已同步的 Tushare 日线，否则最新一根日线，
     涨跌相对前一交易日收盘）。**非交易时段 / 日线未落地时 ETF 仍可能只有昨收级别数据。**
     """
     try:
@@ -996,40 +1015,16 @@ def get_user_watchlist_realtime(current_user: dict = Depends(get_current_active_
 
             vp = vp_batch.get(symbol)
             if vp and vp.get("close") is not None:
-                close = float(vp.get("close"))
-                pre = vp.get("pre_close")
-                if pre is not None:
-                    pre = float(pre)
-                ch = vp.get("change")
-                if ch is not None:
-                    ch = float(ch)
-                elif pre is not None:
-                    ch = close - pre
-                else:
-                    ch = 0.0
-                pct = vp.get("pct_chg")
-                if pct is not None:
-                    pct = float(pct)
-                elif pre:
-                    pct = (ch / pre * 100.0) if pre else 0.0
-                else:
-                    pct = 0.0
-                vol = vp.get("volume")
-                result.append({
-                    "symbol": symbol,
-                    "name": name,
-                    "industry": industry,
-                    "sw_industry": sw_industry,
-                    "asset_type": asset_type,
-                    "price": _safe_round_price(close),
-                    "open": _safe_round_price(vp.get("open")),
-                    "high": _safe_round_price(vp.get("high")),
-                    "low": _safe_round_price(vp.get("low")),
-                    "volume": _safe_round_price(vol, 2) if vol is not None else None,
-                    "change": _safe_round_price(ch, 2),
-                    "change_pct": _safe_round_price(pct, 2),
-                    "update_time": _format_vp_update_time(vp),
-                })
+                result.append(
+                    _realtime_row_from_bar(
+                        symbol=symbol,
+                        name=name,
+                        industry=industry,
+                        sw_industry=sw_industry,
+                        asset_type=asset_type,
+                        bar=vp,
+                    )
+                )
                 continue
 
             if etf_ts and etf_daily_col is not None:
@@ -1053,45 +1048,47 @@ def get_user_watchlist_realtime(current_user: dict = Depends(get_current_active_
                             if prev_c not in (None, 0)
                             else 0.0
                         )
-                        vol = row.get("vol")
-                        if vol is None:
-                            vol = row.get("volume")
+                        bar = dict(row)
+                        bar["close"] = close
+                        bar["pre_close"] = prev_c
+                        bar["change"] = ch
+                        bar["pct_chg"] = pct
                         result.append(
-                            {
-                                "symbol": symbol,
-                                "name": name,
-                                "industry": industry,
-                                "sw_industry": sw_industry,
-                                "asset_type": asset_type,
-                                "price": round(close, 2),
-                                "open": round(row["open"], 2)
-                                if row.get("open") is not None
-                                else None,
-                                "high": round(row["high"], 2)
-                                if row.get("high") is not None
-                                else None,
-                                "low": round(row["low"], 2)
-                                if row.get("low") is not None
-                                else None,
-                                "volume": round(float(vol), 2)
-                                if vol is not None
-                                else None,
-                                "change": round(ch, 2),
-                                "change_pct": round(pct, 2),
-                                "update_time": None,
-                            }
+                            _realtime_row_from_bar(
+                                symbol=symbol,
+                                name=name,
+                                industry=industry,
+                                sw_industry=sw_industry,
+                                asset_type=asset_type,
+                                bar=bar,
+                            )
                         )
                         continue
 
+            latest_record = latest_vp_map.get(symbol)
+            if latest_record and latest_record.get("close") is not None:
+                result.append(
+                    _realtime_row_from_bar(
+                        symbol=symbol,
+                        name=name,
+                        industry=industry,
+                        sw_industry=sw_industry,
+                        asset_type=asset_type,
+                        bar=latest_record,
+                    )
+                )
+                continue
+
             yesterday_close = yesterday_close_map.get(symbol)
             if yesterday_close:
+                nd = _price_ndigits(asset_type)
                 result.append({
                     "symbol": symbol,
                     "name": name,
                     "industry": industry,
                     "sw_industry": sw_industry,
                     "asset_type": asset_type,
-                    "price": round(yesterday_close, 2),
+                    "price": _safe_round_price(yesterday_close, nd),
                     "open": None,
                     "high": None,
                     "low": None,
