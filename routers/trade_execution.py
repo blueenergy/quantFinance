@@ -6,6 +6,14 @@ from utils.stock_utils import serialize_doc
 from utils.symbol_utils import normalize_symbol, strip_exchange_suffix
 from utils.time_display import add_display_time_fields
 from auth import get_current_active_user
+from services.intraday_kline import (
+    SOURCE_1M_CAP,
+    build_intraday_gs_bars,
+    compact_day,
+    intraday_query_windows,
+    minute_trade_date_bound,
+)
+from stock_data_access.indicators.intraday_resample import normalize_intraday_tf
 from services.trade_ledger import (
     compute_realized_pnl_for_group,
     group_executions_by_order,
@@ -640,78 +648,73 @@ def get_minute_bars(
     start_date: Optional[str] = Query(None, description="开始日期 (YYYYMMDD或YYYYMMDDHHMM)"),
     end_date: Optional[str] = Query(None, description="结束日期 (YYYYMMDD或YYYYMMDDHHMM)"),
     limit: int = Query(500, description="返回记录数量限制", ge=1, le=2000),
+    tf: str = Query("1m", description="K线周期: 1m / 30m / 60m"),
     current_user: dict = Depends(get_current_active_user),
 ):
-    """获取股票分钟K线数据，用于绘制分钟图
-    
-    Args:
-        symbol: 股票代码（如 600391 或 600391.SH）
-        start_date: 开始日期，支持 YYYYMMDD 或 YYYYMMDDHHMM 格式
-        end_date: 结束日期，支持 YYYYMMDD 或 YYYYMMDDHHMM 格式
-        limit: 返回记录数量
-    
-    Returns:
-        {
-            "success": True,
-            "data": [
-                {
-                    "trade_date": "202412201030",
-                    "open": 26.35,
-                    "high": 26.50,
-                    "low": 26.30,
-                    "close": 26.45,
-                    "volume": 12500
-                },
-                ...
-            ],
-            "count": 240
-        }
-    """
+    """获取股票分钟K线。``tf=30m|60m`` 从 1m 按 A 股时段聚合并贴 decision_gs_v1。"""
+    try:
+        normalized_tf = normalize_intraday_tf(tf)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    query_start = start_date
+    query_end = end_date
+    visible_start = compact_day(start_date)
+    visible_end = compact_day(end_date)
+    source_limit = limit
+    if normalized_tf in ("30m", "60m"):
+        windows = intraday_query_windows(normalized_tf, start_date, end_date)
+        query_start = windows.source_start
+        query_end = windows.source_end
+        visible_start = windows.visible_start
+        visible_end = windows.visible_end
+        source_limit = SOURCE_1M_CAP
+
     try:
         data_collections = get_data_db()
         minute_bars_coll = data_collections["minute_bars"]
-        
-        # 规范化symbol（处理带后缀和不带后缀的情况）
+
         symbol_normalized = normalize_symbol(symbol)
         symbol_stripped = strip_exchange_suffix(symbol)
-        
-        # 构建查询条件
+
         query: Dict[str, Any] = {
             "$or": [
                 {"symbol": symbol_normalized},
-                {"symbol": symbol_stripped}
+                {"symbol": symbol_stripped},
             ]
         }
-        
-        # 添加日期范围筛选
-        if start_date or end_date:
+
+        if query_start or query_end:
             date_query: Dict[str, Any] = {}
-            if start_date:
-                # 支持 YYYYMMDD 或 YYYYMMDDHHMM 格式
-                if len(start_date) == 8:  # YYYYMMDD
-                    date_query["$gte"] = start_date + "0000"  # 转为当天00:00
-                else:
-                    date_query["$gte"] = start_date
-            
-            if end_date:
-                if len(end_date) == 8:  # YYYYMMDD
-                    date_query["$lte"] = end_date + "2359"  # 转为当天23:59
-                else:
-                    date_query["$lte"] = end_date
-            
+            lower = minute_trade_date_bound(query_start, end=False)
+            upper = minute_trade_date_bound(query_end, end=True)
+            if lower:
+                date_query["$gte"] = lower
+            if upper:
+                date_query["$lte"] = upper
             if date_query:
                 query["trade_date"] = date_query
-        
-        # 查询并排序（时间升序，方便前端绘制）
-        cursor = minute_bars_coll.find(query).sort("trade_date", 1).limit(limit)
+
+        cursor = minute_bars_coll.find(query).sort("trade_date", 1).limit(source_limit)
         bars = [serialize_doc(doc) for doc in cursor]
-        
+        if normalized_tf in ("30m", "60m"):
+            bars = build_intraday_gs_bars(
+                bars,
+                normalized_tf,
+                start_date=visible_start,
+                end_date=visible_end,
+                limit=limit,
+            )
+
         return {
             "success": True,
+            "tf": normalized_tf,
             "data": bars,
-            "count": len(bars)
+            "count": len(bars),
         }
-        
+
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"查询分钟K线失败: {str(e)}")
 
