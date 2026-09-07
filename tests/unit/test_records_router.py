@@ -57,6 +57,11 @@ def empty_etf_collections(monkeypatch):
     monkeypatch.setattr(records, 'etf_adj_collection', FakeCollection([]))
 
 
+@pytest.fixture(autouse=True)
+def empty_stock_info(monkeypatch):
+    monkeypatch.setattr(records, 'stock_info_collection', FakeCollection([]))
+
+
 @pytest.mark.unit
 def test_get_records_and_project(monkeypatch, empty_adj):
     docs = [
@@ -218,7 +223,7 @@ def test_include_scores_false_skips_stock_scores_lookup(monkeypatch, empty_adj):
     client = TestClient(app)
     resp = client.get('/api/records/?symbol=000001&limit=1&include_scores=false')
     assert resp.status_code == 200
-    assert _lookup_sources(coll.pipelines[0]) == ['stock_info']
+    assert _lookup_sources(coll.pipelines[0]) == []
 
 
 @pytest.mark.unit
@@ -242,6 +247,45 @@ def test_include_scores_default_still_looks_up_stock_scores(monkeypatch, empty_a
     assert resp.status_code == 200
     assert 'stock_scores' in _lookup_sources(coll.pipelines[0])
     assert 'stock_info' in _lookup_sources(coll.pipelines[0])
+
+
+class CountingStockInfo(FakeCollection):
+    def __init__(self, docs=None):
+        super().__init__(docs)
+        self.find_one_calls = 0
+
+    def find_one(self, query=None, projection=None, sort=None):
+        self.find_one_calls += 1
+        return super().find_one(query, projection, sort)
+
+
+@pytest.mark.unit
+def test_include_scores_false_stamps_name_once(monkeypatch, empty_adj):
+    class TrackingCollection(FakeCollection):
+        def __init__(self, docs=None):
+            super().__init__(docs)
+            self.pipelines = []
+
+        def aggregate(self, pipeline):
+            self.pipelines.append(pipeline)
+            return super().aggregate(pipeline)
+
+    coll = TrackingCollection([
+        {'_id': '000000000000000000000001', 'symbol': '000001', 'trade_date': '20250920', 'open': 10, 'close': 12},
+        {'_id': '000000000000000000000002', 'symbol': '000001', 'trade_date': '20250921', 'open': 11, 'close': 13},
+    ])
+    info = CountingStockInfo([{'symbol': '000001', 'name': '平安银行'}])
+    monkeypatch.setattr(records, 'collection', coll)
+    monkeypatch.setattr(records, 'stock_info_collection', info)
+
+    client = TestClient(app)
+    resp = client.get('/api/records/?symbol=000001&limit=2&include_scores=false')
+    assert resp.status_code == 200
+    payload = resp.json()
+    assert _lookup_sources(coll.pipelines[0]) == []
+    assert info.find_one_calls == 1
+    assert payload[0]['name'] == '平安银行'
+    assert payload[1]['name'] == '平安银行'
 
 
 @pytest.mark.unit

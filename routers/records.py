@@ -52,6 +52,7 @@ adj_collection = data_collections["stock_adj_factor"]  # type: ignore
 etf_basic_collection = data_collections.get("etf_basic")
 etf_daily_collection = data_collections.get("etf_daily")
 etf_adj_collection = data_collections.get("etf_adj_factor")
+stock_info_collection = data_collections.get("stock_info")
 
 _PRICE_COLS = ("open", "high", "low", "close")
 
@@ -320,6 +321,42 @@ _RECORDS_PROJECT_KLINE = {
     }
 }
 
+
+def _lookup_stock_name(symbol: Optional[str]) -> str:
+    """One indexed find_one; K-line browse must not $lookup stock_info per bar."""
+    if not symbol or stock_info_collection is None:
+        return ""
+    variants = symbol_variants(symbol)
+    if not variants:
+        return ""
+    query = {"$or": [{"symbol": {"$in": variants}}, {"ts_code": {"$in": variants}}]}
+    doc = None
+    try:
+        doc = stock_info_collection.find_one(query, {"_id": 0, "name": 1})
+    except TypeError:
+        try:
+            doc = stock_info_collection.find_one(query)
+        except Exception:
+            doc = None
+    except Exception:
+        log.exception("stock_info name lookup failed for %s", symbol)
+        return ""
+    if not doc:
+        return ""
+    return str(doc.get("name") or "").strip()
+
+
+def _stamp_kline_name(docs: List[Dict[str, Any]], symbol: Optional[str]) -> List[Dict[str, Any]]:
+    if not docs:
+        return docs
+    name = _lookup_stock_name(symbol)
+    if not name:
+        return docs
+    for row in docs:
+        if not row.get("name"):
+            row["name"] = name
+    return docs
+
 _RECORDS_PROJECT_WITH_SCORES = {
     "$project": {
         **_RECORDS_PROJECT_KLINE["$project"],
@@ -371,7 +408,7 @@ def get_records(
     adjust: str = Query("qfq", description="复权口径: none/hfq/qfq，K线默认前复权"),
     include_scores: bool = Query(
         True,
-        description="是否关联 stock_scores；自选股 K 线浏览应关以降低延迟",
+        description="是否关联 stock_scores 并按根 $lookup stock_info；自选股 K 线浏览应关",
     ),
 ):
     etf_docs = _etf_records_or_none(symbol, limit, start_date, end_date, adjust)
@@ -427,12 +464,16 @@ def get_records(
     if include_scores:
         # $expr lookup cannot use indexes well; skip this for K-line browsing.
         pipeline.extend(_STOCK_SCORE_LOOKUP_STAGES)
+        pipeline.extend(_STOCK_INFO_LOOKUP_STAGES)
+        pipeline.append(_RECORDS_PROJECT_WITH_SCORES)
+    else:
+        # Name is stamped once via find_one; per-bar $lookup repeats the same doc.
+        pipeline.append(_RECORDS_PROJECT_KLINE)
 
-    pipeline.extend(_STOCK_INFO_LOOKUP_STAGES)
-    pipeline.append(_RECORDS_PROJECT_WITH_SCORES if include_scores else _RECORDS_PROJECT_KLINE)
-    
     docs = [serialize_doc(doc) for doc in collection.aggregate(pipeline)]
     docs = _apply_records_adjustment(docs, adjust, adj_collection)
+    if not include_scores:
+        docs = _stamp_kline_name(docs, symbol)
     return _attach_decision_gs_fields(docs)
 
 
