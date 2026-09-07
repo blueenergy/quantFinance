@@ -76,7 +76,7 @@ jobs:
           NEW_SHA: ${{ github.sha }}
           APP_REPO_DIR: ${{ github.workspace }}
           INFRA_DIR: ${{ github.workspace }}/infra
-          SERVICES: quant-api, quant-scheduler
+          SERVICES: quant-api, quant-scheduler, quant-mcp-read, quant-mcp-actions
         run: bash infra/scripts/bump-versions-env.sh
 
       - name: Trigger centralized deploy
@@ -84,13 +84,13 @@ jobs:
           INFRA_REPO_TOKEN: ${{ secrets.INFRA_REPO_TOKEN }}
           TAG: ${{ steps.tag.outputs.tag }}
         run: |
-          # MCP containers are defined in quant-infrastructure behind the "mcp"
-          # profile and are intentionally not deployed by the default CI path.
+          # MCP shares QUANT_API_IMAGE_TAG. deploy.sh starts those containers
+          # everywhere except COMPOSE_HOST_PROFILE=115 (profile stripped there).
           curl -fsSL -X POST \
             -H "Authorization: Bearer ${INFRA_REPO_TOKEN}" \
             -H "Accept: application/vnd.github+json" \
             https://api.github.com/repos/blueenergy/quant-infrastructure/dispatches \
-            -d "{\"event_type\":\"deploy\",\"client_payload\":{\"services\":\"quant-api quant-scheduler\",\"tag\":\"${TAG}\"}}"
+            -d "{\"event_type\":\"deploy\",\"client_payload\":{\"services\":\"quant-api quant-scheduler quant-mcp-read quant-mcp-actions\",\"tag\":\"${TAG}\"}}"
 
   notify-dingtalk:
     name: Notify DingTalk on failure
