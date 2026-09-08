@@ -12,6 +12,7 @@ from services.intraday_kline import (
     compact_day,
     intraday_query_windows,
     minute_trade_date_bound,
+    resolve_1m_query_day,
 )
 from stock_data_access.indicators.intraday_resample import normalize_intraday_tf
 from services.trade_ledger import (
@@ -684,6 +685,23 @@ def get_minute_bars(
             ]
         }
 
+        if normalized_tf == "1m" and not compact_day(query_start) and not compact_day(query_end):
+            latest = minute_bars_coll.find_one(
+                query,
+                sort=[("trade_date", -1)],
+                projection={"trade_date": 1},
+            )
+            pinned_day = resolve_1m_query_day(
+                query_start,
+                query_end,
+                (latest or {}).get("trade_date"),
+            )
+            if pinned_day:
+                query_start = pinned_day
+                query_end = pinned_day
+                visible_start = pinned_day
+                visible_end = pinned_day
+
         if query_start or query_end:
             date_query: Dict[str, Any] = {}
             lower = minute_trade_date_bound(query_start, end=False)
@@ -706,12 +724,17 @@ def get_minute_bars(
                 limit=limit,
             )
 
-        return {
+        payload: Dict[str, Any] = {
             "success": True,
             "tf": normalized_tf,
             "data": bars,
             "count": len(bars),
         }
+        if normalized_tf == "1m":
+            payload["day"] = visible_end or compact_day(
+                bars[0].get("trade_date") if bars else ""
+            )
+        return payload
 
     except HTTPException:
         raise

@@ -23,7 +23,7 @@ class IntradayWindows(NamedTuple):
     visible_end: str
 
 
-def compact_day(value: Optional[str]) -> str:
+def compact_day(value: Optional[Any]) -> str:
     digits = "".join(ch for ch in str(value or "") if ch.isdigit())
     return digits[:8] if len(digits) >= 8 else ""
 
@@ -62,6 +62,18 @@ def minute_trade_date_bound(value: Optional[str], *, end: bool) -> Optional[str]
     if len(digits) >= 12:
         return digits[:12]
     return day + ("2359" if end else "0000")
+
+
+def resolve_1m_query_day(
+    start_date: Optional[str],
+    end_date: Optional[str],
+    latest_trade_date: Optional[Any] = None,
+) -> Optional[str]:
+    """Pin undated 1m requests to the latest stored session, not the oldest bars."""
+    if compact_day(start_date) or compact_day(end_date):
+        return None
+    day = compact_day(latest_trade_date)
+    return day or None
 
 
 def build_intraday_gs_bars(
