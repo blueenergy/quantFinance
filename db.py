@@ -112,6 +112,8 @@ def get_db_collections() -> Dict[str, Collection]:
         "app_settings": db["app_settings"],  # 全局可配置项（如主导航按等级可见性）
         # 评分等仍落在主库；AI/分析结果请用 get_analyzer_db()
         "stock_scores": db["stock_scores"],
+        # Stored-vs-live score self-audit queue; drained by quant-scorer.
+        "score_audit_jobs": db["score_audit_jobs"],
         # details/strategy_scores split out of stock_scores: 93% of the bytes,
         # read only by the per-stock detail page
         "stock_score_details": db["stock_score_details"],
