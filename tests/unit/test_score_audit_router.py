@@ -78,6 +78,18 @@ def test_create_job_normalizes_dates_and_params(monkeypatch):
     assert collections["score_audit_jobs"].docs[0]["job_id"] == job["job_id"]
 
 
+def test_create_raises_step_for_multi_year_window(monkeypatch):
+    collections = _collections()
+    response = _create(
+        monkeypatch,
+        collections,
+        start_date="20210101",
+        end_date="20231229",
+        step=2,
+    )
+    assert response["data"]["params"]["step"] >= 18
+
+
 def test_create_rejects_inverted_window(monkeypatch):
     collections = _collections()
     with pytest.raises(HTTPException) as exc:

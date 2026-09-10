@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
+from math import ceil
 from typing import Any, Dict, List, Literal, Optional
 
 from bson import ObjectId
@@ -56,7 +57,7 @@ class CreateScoreAuditJobRequest(BaseModel):
     start_date: str
     end_date: str
     universe_index: UniverseIndex = Field(default="csi1000")
-    step: int = Field(default=2, ge=1, le=40)
+    step: int = Field(default=2, ge=1, le=80)
     sample: int = Field(default=12, ge=0, le=50)
     max_dates: int = Field(default=40, ge=1, le=80)
     symbols: Optional[List[str]] = Field(default=None, max_length=80)
@@ -89,6 +90,15 @@ def _normalize_date(value: str) -> str:
     raise HTTPException(status_code=400, detail=f"invalid date: {value}")
 
 
+def _suggested_step(start_date: str, end_date: str, max_dates: int, step: int) -> int:
+    start = datetime.strptime(start_date, "%Y%m%d")
+    end = datetime.strptime(end_date, "%Y%m%d")
+    calendar_days = (end - start).days + 1
+    approx_trading = max(1, ceil(calendar_days * 243 / 365))
+    need = max(1, ceil(approx_trading / max(1, max_dates)))
+    return max(int(step), need)
+
+
 def _ensure_indexes(collections: Dict[str, Any]) -> None:
     jobs = collections["score_audit_jobs"]
     jobs.create_index([("job_id", ASCENDING)], unique=True)
@@ -106,11 +116,12 @@ def _build_job_document(user_id: str, request: CreateScoreAuditJobRequest) -> Di
     if start_date > end_date:
         raise HTTPException(status_code=400, detail="start_date must be <= end_date")
     symbols = [str(sym).strip() for sym in (request.symbols or []) if str(sym).strip()]
+    step = _suggested_step(start_date, end_date, request.max_dates, request.step)
     params = {
         "start_date": start_date,
         "end_date": end_date,
         "universe_index": request.universe_index,
-        "step": request.step,
+        "step": step,
         "sample": request.sample,
         "max_dates": request.max_dates,
         "seed": 42,
