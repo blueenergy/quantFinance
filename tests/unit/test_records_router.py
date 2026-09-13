@@ -62,6 +62,13 @@ def empty_stock_info(monkeypatch):
     monkeypatch.setattr(records, 'stock_info_collection', FakeCollection([]))
 
 
+@pytest.fixture(autouse=True)
+def stub_finance_stock_scores(monkeypatch):
+    # Default include_scores=true attaches finance.stock_scores in-app.
+    # CI has no Mongo; leave an empty fake so tests do not hit localhost:27017.
+    monkeypatch.setattr(records, '_finance_stock_scores', lambda: FakeCollection([]))
+
+
 @pytest.mark.unit
 def test_get_records_and_project(monkeypatch, empty_adj):
     docs = [
