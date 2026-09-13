@@ -305,15 +305,17 @@ def _attach_finance_scores(docs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     dates = list(dict.fromkeys(dates))
     found: Dict[tuple, Dict[str, Any]] = {}
     if symbols and dates:
+        query = {"symbol": {"$in": symbols}, "score_date": {"$in": dates}}
+        projection = {field: 1 for field in ("symbol",) + _SCORE_ATTACH_FIELDS}
         try:
-            cursor = scores.find(
-                {"symbol": {"$in": symbols}, "score_date": {"$in": dates}},
-                {field: 1 for field in ("symbol",) + _SCORE_ATTACH_FIELDS},
-            )
-        except TypeError:
-            cursor = scores.find({"symbol": {"$in": symbols}, "score_date": {"$in": dates}})
-        for row in cursor:
-            found[(str(row.get("symbol") or ""), str(row.get("score_date") or ""))] = row
+            try:
+                cursor = scores.find(query, projection)
+            except TypeError:
+                cursor = scores.find(query)
+            for row in cursor:
+                found[(str(row.get("symbol") or ""), str(row.get("score_date") or ""))] = row
+        except Exception:
+            log.exception("finance stock_scores lookup failed")
     for row in docs:
         date = _normalize_trade_date(row.get("trade_date_str") or row.get("trade_date"))
         hit = None
