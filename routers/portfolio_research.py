@@ -357,8 +357,9 @@ def _latest_stock_score_date(stock_scores: Any, job: Dict[str, Any]) -> Optional
         return None
     query: Dict[str, Any] = {"score_date": {"$lte": end_date}}
     universes = _as_list(params.get("universe_index") or job.get("universe_index"))
-    if universes:
-        query["index_codes"] = {"$in": universes}
+    if not universes:
+        return None
+    query["index_codes"] = {"$in": universes}
     row = stock_scores.find_one(query, {"_id": 0, "score_date": 1}, sort=[("score_date", DESCENDING)])
     return str(row["score_date"]) if row and row.get("score_date") else None
 

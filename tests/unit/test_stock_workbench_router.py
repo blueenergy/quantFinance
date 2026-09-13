@@ -1727,7 +1727,7 @@ def test_refresh_stock_workbench_internal_signals_enqueues_rule_task(monkeypatch
     )
     monkeypatch.setattr(
         "routers.stock_workbench._latest_score",
-        lambda symbol: {"score_date": "20260710"},
+        lambda symbol, index_code=None: {"score_date": "20260710"},
     )
     monkeypatch.setattr(
         "routers.stock_workbench.internal_signal_enabled",
@@ -1745,6 +1745,7 @@ def test_refresh_stock_workbench_internal_signals_enqueues_rule_task(monkeypatch
     assert task["type"] == "internal_signal_refresh"
     assert task["params"]["symbol"] == "300196.SZ"
     assert task["params"]["score_date"] == "20260710"
+    assert task["params"]["index_code"] is None
     assert task["params"]["force"] is True
     assert task["operation_type"] == "workbench_internal_signal_refresh"
 

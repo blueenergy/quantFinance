@@ -37,6 +37,7 @@ from services.score_detail_meta import (
     get_strategy_recommendations,
     load_score_details,
 )
+from stock_data_access.score_query import merge_score_scope
 try:
     from stock_data_access.evidence_fingerprint import normalize_url
     from stock_data_access.indicators.decision_gs import attach_decision_gs
@@ -229,22 +230,22 @@ def _find_first(collection, candidates: List[str], projection: Optional[Dict[str
     return None
 
 
-def _latest_score(symbol: str) -> Optional[Dict[str, Any]]:
+def _latest_score(symbol: str, index_code=None) -> Optional[Dict[str, Any]]:
     collections = get_db_collections()
     candidates = _symbol_candidates(symbol)
     return collections["stock_scores"].find_one(
-        {"symbol": {"$in": candidates}},
+        merge_score_scope({"symbol": {"$in": candidates}}, index_code),
         # Keep the sort covered by (symbol, score_date). Adding _id here forces
         # MongoDB to fetch and sort every score document for a cold symbol.
         sort=[("score_date", -1)],
     )
 
 
-def _score_history(symbol: str, limit: int = 60) -> List[Dict[str, Any]]:
+def _score_history(symbol: str, limit: int = 60, index_code=None) -> List[Dict[str, Any]]:
     collections = get_db_collections()
     candidates = _symbol_candidates(symbol)
     cursor = collections["stock_scores"].find(
-        {"symbol": {"$in": candidates}},
+        merge_score_scope({"symbol": {"$in": candidates}}, index_code),
         SCORE_HISTORY_PROJECTION,
         # See _latest_score: the deployed compound index does not include _id.
         sort=[("score_date", -1)],
@@ -2019,12 +2020,13 @@ def _fund_inventory_section(symbol: str) -> Dict[str, Any]:
 @router.get("/{symbol}/workbench")
 def get_stock_workbench(
     symbol: str,
+    index_code: Optional[str] = Query(None, description="宽基 scope；不传则显式取该票全局最新"),
     current_user: Dict[str, Any] = Depends(get_current_active_user),
 ):
     """Single-stock research workbench payload."""
     stock = _stock_identity(symbol)
     quote = _latest_quote(symbol)
-    score = _latest_score(symbol)
+    score = _latest_score(symbol, index_code)
 
     data_status = {
         "stock_found": bool(stock),
@@ -2145,11 +2147,12 @@ def get_stock_workbench_nine_turn(
 def get_stock_workbench_scores(
     symbol: str,
     strategy: str = Query("balanced", description="综合分策略，用于 recommendations"),
+    index_code: Optional[str] = Query(None, description="宽基 scope；不传则显式取该票全局最新"),
     current_user: Dict[str, Any] = Depends(get_current_active_user),
 ):
     """Quant score section for the single-stock research workbench."""
-    score = _latest_score(symbol)
-    history = _score_history(symbol)
+    score = _latest_score(symbol, index_code)
+    history = _score_history(symbol, index_code=index_code)
     recommendations = None
     if score:
         blocks = load_score_details(get_db_collections(), score)
@@ -2279,6 +2282,7 @@ def get_stock_workbench_signals(
 def refresh_stock_workbench_internal_signals(
     symbol: str,
     request: RefreshInternalSignalsRequest,
+    index_code: Optional[str] = Query(None, description="宽基 scope；不传则显式取该票全局最新"),
     current_user: Dict[str, Any] = Depends(get_current_active_user),
 ):
     """Enqueue deterministic Strength/Weakness analysis for one symbol."""
@@ -2311,12 +2315,15 @@ def refresh_stock_workbench_internal_signals(
             },
         }
 
-    score = _latest_score(canonical) or {}
+    if not isinstance(index_code, str):
+        index_code = None
+    score = _latest_score(canonical, index_code) or {}
     score_date = str(score.get("score_date") or datetime.utcnow().strftime("%Y%m%d"))
     run_id = str(uuid.uuid4())
     params = {
         "symbol": canonical,
         "score_date": score_date,
+        "index_code": index_code,
         "run_id": run_id,
         "force": request.force,
         "options": {"force": request.force},

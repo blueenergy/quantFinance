@@ -1599,7 +1599,7 @@ def test_get_portfolio_plan_generation_watermark_uses_strategy_universe(monkeypa
     assert response["data"]["latest_available_score_scope"] == "index_codes"
 
 
-def test_get_portfolio_plan_generation_watermark_falls_back_to_global_scores(monkeypatch):
+def test_get_portfolio_plan_generation_watermark_does_not_fall_back_to_global_scores(monkeypatch):
     collections = _collections()
     scoring_runs = _Collection()
     stock_scores = _Collection(
@@ -1621,9 +1621,9 @@ def test_get_portfolio_plan_generation_watermark_falls_back_to_global_scores(mon
     )
 
     assert response["data"]["target_scoring_run"] is None
-    assert response["data"]["latest_available_score_date"] == "20250107"
-    assert response["data"]["latest_available_score_count"] == 2
-    assert response["data"]["latest_available_score_scope"] == "global"
+    assert response["data"]["latest_available_score_date"] is None
+    assert response["data"]["latest_available_score_count"] == 0
+    assert response["data"]["latest_available_score_scope"] == "index_codes"
 
 
 def test_plan_execution_context_derives_phase_and_stamps_sell_settled():

@@ -1193,18 +1193,13 @@ def _reviewer(current_user: Dict[str, Any]) -> str:
 def _latest_available_score_watermark(stock_scores, universe_index: str) -> Dict[str, Any]:
     query: Dict[str, Any] = {"index_codes": universe_index}
     row = stock_scores.find_one(query, sort=[("score_date", -1)], projection={"_id": 0, "score_date": 1})
-    source_scope = "index_codes"
-    if not row:
-        query = {}
-        row = stock_scores.find_one(query, sort=[("score_date", -1)], projection={"_id": 0, "score_date": 1})
-        source_scope = "global"
     score_date = str(row.get("score_date")) if row and row.get("score_date") else None
     count = stock_scores.count_documents({**query, "score_date": score_date}) if score_date else 0
     return {
         "latest_available_score_date": score_date,
         "latest_available_score_count": count,
         "latest_available_score_source": "stock_scores",
-        "latest_available_score_scope": source_scope,
+        "latest_available_score_scope": "index_codes",
     }
 
 
@@ -1258,12 +1253,7 @@ def _resolve_plan_score_date(plan: Dict[str, Any], universe_index: str) -> Optio
     )
     if row and row.get("score_date"):
         return str(row["score_date"])
-    row = finance_db["stock_scores"].find_one(
-        {"score_date": {"$lte": base_date}},
-        sort=[("score_date", -1)],
-        projection={"_id": 0, "score_date": 1},
-    )
-    return str(row["score_date"]) if row and row.get("score_date") else None
+    return None
 
 
 def _normalized_plan_params_from_snapshot(params_snapshot: Dict[str, Any]) -> Dict[str, Any]:
@@ -1387,14 +1377,18 @@ def _score_symbol_meta(
     stock_scores,
     score_date: str,
     symbols,
+    universe_index: Optional[str] = None,
 ) -> Dict[str, Dict[str, Any]]:
     """name/industry for a small display set, keyed by suffix-insensitive symbol."""
     meta: Dict[str, Dict[str, Any]] = {}
     variants = sorted({v for sym in symbols for v in _symbol_query_values(sym) if v})
     if not variants:
         return meta
+    query: Dict[str, Any] = {"score_date": score_date, "symbol": {"$in": variants}}
+    if universe_index:
+        query["index_codes"] = universe_index
     for row in stock_scores.find(
-        {"score_date": score_date, "symbol": {"$in": variants}},
+        query,
         {"_id": 0, "symbol": 1, "name": 1, "industry": 1},
     ):
         meta[_symbol_key(row.get("symbol"))] = row
@@ -1515,17 +1509,10 @@ def _enrich_plan_items_with_score_snapshot(
             key = _symbol_key(row.get("symbol"))
             if key and key not in score_rows:
                 score_rows[key] = row
-        missing_variants = sorted(
-            {
-                value
-                for symbol in symbols
-                if _symbol_key(symbol) not in score_rows
-                for value in _symbol_query_values(symbol)
-            }
-        )
-        if missing_variants:
+        unresolved = [value for value in all_variants if _symbol_key(value) not in score_rows]
+        if unresolved:
             for row in stock_scores.find(
-                {"score_date": score_date, "symbol": {"$in": missing_variants}},
+                {"score_date": score_date, "symbol": {"$in": unresolved}},
                 score_projection,
             ):
                 key = _symbol_key(row.get("symbol"))
@@ -1994,7 +1981,9 @@ def _build_plan_bench_payload(
     # name/industry are not carried on the ranked universe (fetching them for all
     # ~1100 rows cost seconds in prod); resolve them only for displayed symbols.
     display_symbols = {starter["symbol"] for starter in starters} | set(bench_symbols)
-    score_meta_by_key = _score_symbol_meta(finance_db["stock_scores"], score_date, display_symbols)
+    score_meta_by_key = _score_symbol_meta(
+        finance_db["stock_scores"], score_date, display_symbols, universe_index
+    )
     for starter in starters:
         meta = score_meta_by_key.get(_symbol_key(starter["symbol"])) or {}
         if not starter["name"]:

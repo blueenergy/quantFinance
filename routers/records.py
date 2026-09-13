@@ -10,7 +10,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 
 from auth import get_current_active_user
-from db import get_data_db
+from db import get_data_db, get_db_collections
 from services.etf_kline import load_etf_kline_rows
 from utils.stock_utils import serialize_doc
 
@@ -251,45 +251,87 @@ class RecordResponseModel(BaseModel):
     adjust: Optional[str] = None
     adj_degraded: Optional[bool] = None
 
-_STOCK_SCORE_LOOKUP_STAGES = [
-    {
-        "$lookup": {
-            "from": "stock_scores",
-            "let": {"symbol": "$symbol", "trade_date_str": "$trade_date_str"},
-            "pipeline": [
-                {"$match": {"$expr": {"$and": [
-                    {"$eq": ["$symbol", "$$symbol"]},
-                    {"$eq": ["$score_date", "$$trade_date_str"]}
-                ]}}}
-            ],
-            "as": "score_docs"
-        }
-    },
-    {"$addFields": {
-        "score_doc": {"$arrayElemAt": ["$score_docs", 0]}
-    }},
-    {"$addFields": {
-        "composite_score": {"$ifNull": ["$score_doc.composite_score", None]},
-        "cycle_score": {"$ifNull": ["$score_doc.cycle_score", None]},
-        "growth_score": {"$ifNull": ["$score_doc.growth_score", None]},
-        "fundamental_score": {"$ifNull": ["$score_doc.fundamental_score", None]},
-        "value_score": {"$ifNull": ["$score_doc.value_score", None]},
-        "technical_score": {"$ifNull": ["$score_doc.technical_score", None]},
-        "money_flow_score": {"$ifNull": ["$score_doc.money_flow_score", None]},
-        "score_date": {"$ifNull": ["$score_doc.score_date", None]}
-    }},
-    {
-        "$addFields": {
-            "composite_score": {
-                "$cond": [
-                    {"$eq": [{"$type": "$composite_score"}, "object"]},
-                    "$composite_score.balanced",
-                    "$composite_score"
-                ]
-            }
-        }
-    },
-]
+_SCORE_ATTACH_FIELDS = (
+    "composite_score",
+    "cycle_score",
+    "growth_score",
+    "fundamental_score",
+    "value_score",
+    "technical_score",
+    "money_flow_score",
+    "score_date",
+)
+
+
+def _finance_stock_scores():
+    """``stock_scores`` lives in ``finance``, not ``quant_data``. Same-db $lookup cannot join it."""
+    try:
+        return get_db_collections().get("stock_scores")
+    except Exception:
+        log.exception("finance stock_scores collection unavailable")
+        return None
+
+
+def _balanced_composite(value: Any) -> Any:
+    if isinstance(value, dict):
+        return value.get("balanced")
+    return value
+
+
+def _attach_finance_scores(docs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Attach ``finance.stock_scores`` fields in the app layer (explicit unscoped).
+
+    K-line is per symbol/date, so this does not filter ``index_codes``.
+    """
+    if not docs:
+        return docs
+    scores = _finance_stock_scores()
+    if scores is None:
+        for row in docs:
+            for field in _SCORE_ATTACH_FIELDS:
+                row.setdefault(field, None)
+        return docs
+    symbols: List[str] = []
+    dates: List[str] = []
+    for row in docs:
+        symbol = str(row.get("symbol") or "")
+        for variant in symbol_variants(symbol):
+            if variant:
+                symbols.append(variant)
+        date = _normalize_trade_date(row.get("trade_date_str") or row.get("trade_date"))
+        if date:
+            dates.append(date)
+    symbols = list(dict.fromkeys(symbols))
+    dates = list(dict.fromkeys(dates))
+    found: Dict[tuple, Dict[str, Any]] = {}
+    if symbols and dates:
+        try:
+            cursor = scores.find(
+                {"symbol": {"$in": symbols}, "score_date": {"$in": dates}},
+                {field: 1 for field in ("symbol",) + _SCORE_ATTACH_FIELDS},
+            )
+        except TypeError:
+            cursor = scores.find({"symbol": {"$in": symbols}, "score_date": {"$in": dates}})
+        for row in cursor:
+            found[(str(row.get("symbol") or ""), str(row.get("score_date") or ""))] = row
+    for row in docs:
+        date = _normalize_trade_date(row.get("trade_date_str") or row.get("trade_date"))
+        hit = None
+        for variant in symbol_variants(str(row.get("symbol") or "")):
+            hit = found.get((variant, date))
+            if hit:
+                break
+        if hit:
+            row["composite_score"] = _balanced_composite(hit.get("composite_score"))
+            for field in _SCORE_ATTACH_FIELDS:
+                if field == "composite_score":
+                    continue
+                row[field] = hit.get(field)
+            row["score_date"] = hit.get("score_date")
+        else:
+            for field in _SCORE_ATTACH_FIELDS:
+                row.setdefault(field, None)
+    return docs
 
 _STOCK_INFO_LOOKUP_STAGES = [
     {
@@ -462,17 +504,19 @@ def get_records(
         pipeline.append({"$sort": {field: direction}})
     pipeline.append({"$limit": limit})
     if include_scores:
-        # $expr lookup cannot use indexes well; skip this for K-line browsing.
-        pipeline.extend(_STOCK_SCORE_LOOKUP_STAGES)
+        # stock_info is in quant_data (same db as volume_price). stock_scores is
+        # in finance, so scores are attached after this aggregation.
         pipeline.extend(_STOCK_INFO_LOOKUP_STAGES)
-        pipeline.append(_RECORDS_PROJECT_WITH_SCORES)
+        pipeline.append(_RECORDS_PROJECT_KLINE)
     else:
         # Name is stamped once via find_one; per-bar $lookup repeats the same doc.
         pipeline.append(_RECORDS_PROJECT_KLINE)
 
     docs = [serialize_doc(doc) for doc in collection.aggregate(pipeline)]
     docs = _apply_records_adjustment(docs, adjust, adj_collection)
-    if not include_scores:
+    if include_scores:
+        docs = _attach_finance_scores(docs)
+    if not include_scores or not any(row.get("name") for row in docs):
         docs = _stamp_kline_name(docs, symbol)
     return _attach_decision_gs_fields(docs)
 

@@ -12,6 +12,11 @@ from stock_data_access.score_utils import (
     extract_strategy_score,
     weighted_dimension_score,
 )
+from stock_data_access.score_query import (
+    merge_score_scope,
+    score_scope_filter,
+    tagged_index_codes_filter,
+)
 from typing import Optional, List, Any, cast, Dict, Tuple, Set
 from pydantic import BaseModel
 from datetime import datetime, timedelta
@@ -198,15 +203,24 @@ SCORE_SORT_FIELDS: Dict[str, str] = {
 }
 
 
-def _latest_score_date(stock_scores: Any) -> Optional[str]:
-    """Latest ``score_date`` across the whole ``stock_scores`` collection.
+def _latest_score_date(stock_scores: Any, index_code=None) -> Optional[str]:
+    """Latest ``score_date`` for the given scope.
 
-    Backed by the ``(score_date -1, index_codes 1)`` compound index (score_date
-    is the prefix), so this is a single indexed lookup instead of scanning or
-    grouping the full history.
+    ``index_code`` is required in spirit: pass ``None`` for an explicit
+    unscoped read. Unscoped reads prefer a tagged row so a later untagged
+    partial write cannot pin the market snapshot date.
     """
+    query = dict(score_scope_filter(index_code))
+    if index_code is None:
+        tagged = stock_scores.find_one(
+            tagged_index_codes_filter(),
+            {"score_date": 1, "_id": 0},
+            sort=[("score_date", -1)],
+        )
+        if tagged and tagged.get("score_date"):
+            return tagged.get("score_date")
     latest_doc = stock_scores.find_one(
-        {},
+        query,
         {"score_date": 1, "_id": 0},
         sort=[("score_date", -1)],
     )
@@ -220,7 +234,7 @@ def _latest_index_score_date(stock_scores: Any, index_code: str) -> Optional[str
     a single indexed lookup instead of scanning history.
     """
     latest_doc = stock_scores.find_one(
-        {"index_codes": index_code},
+        score_scope_filter(index_code),
         {"score_date": 1, "_id": 0},
         sort=[("score_date", -1)],
     )
@@ -394,12 +408,15 @@ def _chunk_list(items: List[str], chunk_size: int) -> List[List[str]]:
     return [items[i : i + chunk_size] for i in range(0, len(items), chunk_size)]
 
 
-def _aggregate_latest_score_doc_per_symbol(stock_scores: Any, symbols_in: List[str]) -> List[dict]:
+def _aggregate_latest_score_doc_per_symbol(
+    stock_scores: Any, symbols_in: List[str], index_code=None
+) -> List[dict]:
     """按 symbol 取 score_date 最新的一条；避免 $push 全历史；$project 减少网卡与 BSON 解码量。"""
     if not symbols_in:
         return []
+    match = merge_score_scope({"symbol": {"$in": symbols_in}}, index_code)
     pipeline = [
-        {"$match": {"symbol": {"$in": symbols_in}}},
+        {"$match": match},
         {"$sort": {"symbol": 1, "score_date": -1}},
         {"$group": {"_id": "$symbol", "doc": {"$first": "$$ROOT"}}},
         {"$replaceRoot": {"newRoot": "$doc"}},
@@ -411,12 +428,15 @@ def _aggregate_latest_score_doc_per_symbol(stock_scores: Any, symbols_in: List[s
         return []
 
 
-def _find_latest_per_symbol_fallback(stock_scores: Any, symbols_in: List[str]) -> List[dict]:
+def _find_latest_per_symbol_fallback(
+    stock_scores: Any, symbols_in: List[str], index_code=None
+) -> List[dict]:
     """主聚合异常时的备用路径：仍用 $group+$first，禁止无 projection 的 find 拉回全历史。"""
     if not symbols_in:
         return []
+    match = merge_score_scope({"symbol": {"$in": symbols_in}}, index_code)
     pipeline = [
-        {"$match": {"symbol": {"$in": symbols_in}}},
+        {"$match": match},
         {"$sort": {"score_date": -1}},
         {"$group": {"_id": "$symbol", "doc": {"$first": "$$ROOT"}}},
         {"$replaceRoot": {"newRoot": "$doc"}},
@@ -452,10 +472,12 @@ def _requested_symbol_for_db_row(db_symbol: Optional[str], requested: List[str])
 
 
 def _find_one_stock_score(
-    stock_scores: Any, symbol: str, score_date: str
+    stock_scores: Any, symbol: str, score_date: str, index_code=None
 ) -> Optional[dict]:
     for k in _symbol_key_variants(symbol):
-        doc = stock_scores.find_one({"symbol": k, "score_date": score_date})
+        doc = stock_scores.find_one(
+            merge_score_scope({"symbol": k, "score_date": score_date}, index_code)
+        )
         if doc:
             return doc
     return None
@@ -1568,6 +1590,10 @@ async def get_stock_rankings(
         None,
         description="sort_by=weighted 时使用，如 growth:0.6,cycle:0.4；权重自动归一化",
     ),
+    index_code: Optional[str] = Query(
+        None,
+        description="宽基 scope；不传则显式全市场（最新日优先取已打标行）",
+    ),
 ):
     """
     获取股票评分排行榜 - 每只股票只显示最新一天的评分（简洁实现）
@@ -1587,6 +1613,7 @@ async def get_stock_rankings(
             effective_strategy,
             sort_key,
             _weights_cache_key(weighted_weights),
+            str(index_code or ""),
         )
         cached_payload = _ranking_cache_get(cache_key)
         if cached_payload is not None:
@@ -1603,11 +1630,12 @@ async def get_stock_rankings(
         # avoid the full-collection $sort + $group over all history.
         # Semantics: a symbol scored only on an earlier date (e.g. halted on the
         # latest day) is dropped rather than backfilled with its stale score.
-        effective_date = date or _latest_score_date(stock_scores)
+        effective_date = date or _latest_score_date(stock_scores, index_code)
         if not effective_date:
             all_stocks = []
         else:
-            match_stage = {"$match": {"score_date": effective_date}}
+            match_query = merge_score_scope({"score_date": effective_date}, index_code)
+            match_stage = {"$match": match_query}
             if min_score is not None:
                 match_stage["$match"].update({"composite_score": {"$gte": min_score}})
             pipeline = [
@@ -1632,7 +1660,7 @@ async def get_stock_rankings(
                 all_stocks = list(stock_scores.aggregate(pipeline))
             except Exception:
                 # Fallback: simple find with sorting if aggregation fails
-                base_query: Dict[str, Any] = {"score_date": effective_date}
+                base_query: Dict[str, Any] = merge_score_scope({"score_date": effective_date}, index_code)
                 if min_score is not None:
                     base_query["composite_score"] = {"$gte": min_score}
                 all_stocks = list(stock_scores.find(base_query).sort("composite_score", -1).limit(limit * 2))
@@ -1720,7 +1748,8 @@ async def get_single_score_detail(
     symbol: str = Query(..., description="股票代码"),
     category: str = Query(..., description="评分类别: composite|cycle|value|fundamental|growth|technical|money_flow|industry_rs"),
     score_date: Optional[str] = Query(None, description="评分日期 YYYYMMDD, 为空则取最新"),
-    strategy: str = Query('balanced', description="策略: balanced|aggressive|conservative 等，与文档中 strategy_scores 对应")
+    index_code: Optional[str] = Query(None, description="宽基 scope；不传则显式取该票全局最新"),
+    strategy: str = Query('balanced', description="策略: balanced|aggressive|conservative 等，与文档中 strategy_scores 对应"),
 ):
     """返回指定股票某一评分类别的详情字段。
 
@@ -1748,7 +1777,7 @@ async def get_single_score_detail(
             raise HTTPException(status_code=400, detail=f"不支持的评分类别: {category}")
         db = get_db_collections_from_request(request)
         stock_scores = db['stock_scores']
-        query = {"symbol": symbol}
+        query = merge_score_scope({"symbol": symbol}, index_code)
         if score_date:
             query["score_date"] = score_date
             doc = stock_scores.find_one(query)
@@ -1901,14 +1930,15 @@ async def get_stock_score_history(
     request: Request,
     symbol: str,
     days: int = Query(30, ge=1, le=365),
-    date: Optional[str] = Query(None, description="截止日期 YYYYMMDD,默认为昨天")
+    date: Optional[str] = Query(None, description="截止日期 YYYYMMDD,默认为昨天"),
+    index_code: Optional[str] = Query(None, description="宽基 scope；不传则显式全量"),
 ):
     """获取股票评分历史记录（直接查数据库）"""
     try:
         db = get_db_collections_from_request(request)
         stock_scores = db['stock_scores']
         # 构建查询条件
-        query = {"symbol": symbol}
+        query = merge_score_scope({"symbol": symbol}, index_code)
         if date:
             score_date_filter = {"$lte": date}
             query["score_date"] = cast(Any, score_date_filter)
@@ -1973,16 +2003,17 @@ async def get_score_categories():
 @router.get("/statistics")
 async def get_scoring_statistics(
     request: Request,
-    date: Optional[str] = Query(None, description="指定日期 YYYYMMDD, 默认为昨天")
+    date: Optional[str] = Query(None, description="指定日期 YYYYMMDD, 不传则用该 scope 最新评分日"),
+    index_code: Optional[str] = Query(None, description="宽基 scope；不传则显式全市场最新日"),
 ):
     """获取评分统计信息（直接查数据库）"""
     try:
         db = get_db_collections_from_request(request)
         stock_scores = db['stock_scores']
-        # 构建查询条件
-        match_query = {}
-        if date:
-            match_query["score_date"] = date
+        effective_date = date or _latest_score_date(stock_scores, index_code)
+        match_query = merge_score_scope({}, index_code)
+        if effective_date:
+            match_query["score_date"] = effective_date
         # 统计各分数段的股票数量
         pipeline = [
             {"$match": match_query},
@@ -2017,7 +2048,7 @@ async def get_scoring_statistics(
                 "total_stocks": total_stocks,
                 "average_score": round(avg_score, 2),
                 "score_distribution": score_distribution,
-                "query_date": date if date else "",
+                "query_date": effective_date or "",
                 "last_update": datetime.now().isoformat()
             },
             "message": "获取评分统计成功"
@@ -2042,16 +2073,19 @@ async def get_current_date():
     }
 
 @router.get("/stock-dates")
-async def get_stock_dates(request: Request, symbol: str = Query(..., description="股票代码，例如 000001")):
+async def get_stock_dates(
+    request: Request,
+    symbol: str = Query(..., description="股票代码，例如 000001"),
+    index_code: Optional[str] = Query(None, description="宽基 scope；不传则显式全量"),
+):
     """
     返回指定股票历史存在评分的所有日期（降序）
     """
     try:
         db = get_db_collections_from_request(request)
         stock_scores = db['stock_scores']
-        # 使用聚合获取该 symbol 的所有 distinct score_date 并按降序排序
         pipeline = [
-            {"$match": {"symbol": symbol}},
+            {"$match": merge_score_scope({"symbol": symbol}, index_code)},
             {"$group": {"_id": "$score_date"}},
             {"$sort": {"_id": -1}}
         ]
@@ -2111,6 +2145,7 @@ async def get_selected_stock_rankings(
         le=500,
         description="分页：本页条数；不传则返回全部（兼容旧客户端）",
     ),
+    index_code: Optional[str] = Query(None, description="宽基 scope；不传则显式全量"),
 ):
     """
     获取指定股票的评分 - 每只股票只显示最新一天的评分（直接查数据库）
@@ -2140,6 +2175,7 @@ async def get_selected_stock_rankings(
             None if page_size is None else int(page_size),
             bool(getattr(body, "index_mode", False)),
             getattr(body, "skip_return_since", None),
+            str(index_code or ""),
         )
         cached_payload = _ranking_cache_get(cache_key)
         if cached_payload is not None:
@@ -2197,7 +2233,7 @@ async def get_selected_stock_rankings(
                         }
                         per_date_prior_3m_return[d] = dict(PRIOR_3M_EMPTY)
                         per_date_future_return[d] = dict(FUTURE_RETURN_EMPTY)
-                    doc = _find_one_stock_score(stock_scores, sym, d)
+                    doc = _find_one_stock_score(stock_scores, sym, d, index_code)
                     if doc:
                         latest_any = latest_any or doc
                         cs = doc.get('composite_score')
@@ -2289,7 +2325,7 @@ async def get_selected_stock_rankings(
                     exp = _expanded_query_symbols(batch)
                     if not exp:
                         continue
-                    q = {"symbol": {"$in": exp}, "score_date": date}
+                    q = merge_score_scope({"symbol": {"$in": exp}, "score_date": date}, index_code)
                     selected_stocks.extend(
                         list(stock_scores.find(q, _STOCK_SCORE_LIST_PROJECTION))
                     )
@@ -2298,9 +2334,9 @@ async def get_selected_stock_rankings(
                     exp = _expanded_query_symbols(batch)
                     if not exp:
                         continue
-                    part = _aggregate_latest_score_doc_per_symbol(stock_scores, exp)
+                    part = _aggregate_latest_score_doc_per_symbol(stock_scores, exp, index_code)
                     if not part:
-                        part = _find_latest_per_symbol_fallback(stock_scores, exp)
+                        part = _find_latest_per_symbol_fallback(stock_scores, exp, index_code)
                     selected_stocks.extend(part)
         # 同一标的若库中多条键（极少见），按请求侧 symbol 去重并保留当前策略下分更高的一条
         if selected_stocks:

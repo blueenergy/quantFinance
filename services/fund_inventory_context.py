@@ -4,6 +4,8 @@ from __future__ import annotations
 from datetime import date
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
+from stock_data_access.score_query import merge_score_scope
+
 
 def _as_float(value: Any) -> Optional[float]:
     if value is None or value == "":
@@ -29,7 +31,7 @@ def _latest_scores(collection: Any, symbols: Sequence[str]) -> Dict[str, Dict[st
     if collection is None or not symbols:
         return {}
     pipeline = [
-        {"$match": {"symbol": {"$in": list(symbols)}}},
+        {"$match": merge_score_scope({"symbol": {"$in": list(symbols)}}, None)},
         {"$sort": {"symbol": 1, "score_date": -1}},
         {"$group": {"_id": "$symbol", "doc": {"$first": "$$ROOT"}}},
         {

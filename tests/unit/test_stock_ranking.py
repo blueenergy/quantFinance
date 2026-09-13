@@ -29,6 +29,14 @@ class FakeCollection:
             if k == "symbol" and isinstance(v, dict) and "$in" in v:
                 if d.get("symbol") not in v["$in"]:
                     return False
+            elif k == "index_codes.0":
+                ic = d.get("index_codes")
+                exists = isinstance(ic, list) and len(ic) > 0
+                if isinstance(v, dict) and "$exists" in v:
+                    if bool(v["$exists"]) != exists:
+                        return False
+                else:
+                    return False
             elif k == "index_codes":
                 want = v
                 ic = d.get("index_codes")
@@ -400,6 +408,28 @@ def test_stock_rankings_no_date_uses_latest_score_date_snapshot(monkeypatch):
     data = resp.json()['data']
     assert [row['symbol'] for row in data] == ['NEW.SH']
     assert data[0]['composite_score']['balanced'] == 60
+
+
+@pytest.mark.unit
+def test_stock_rankings_no_date_prefers_tagged_score_date(monkeypatch):
+    docs = [
+        {'symbol': 'LATE.SH', 'composite_score': {'balanced': 99}, 'cycle_score': 1, 'value_score': 1, 'fundamental_score': 1, 'growth_score': 1, 'technical_score': 1, 'money_flow_score': 1, 'score_date': '20250922', 'index_codes': []},
+        {'symbol': 'TAGGED.SH', 'composite_score': {'balanced': 60}, 'cycle_score': 1, 'value_score': 1, 'fundamental_score': 1, 'growth_score': 1, 'technical_score': 1, 'money_flow_score': 1, 'score_date': '20250921', 'index_codes': ['csi1000']},
+    ]
+    info_docs = [{'symbol': 'LATE.SH', 'name': 'Late'}, {'symbol': 'TAGGED.SH', 'name': 'Tagged'}]
+    fake_db = FakeDB(stock_scores_docs=docs, stock_info_docs=info_docs)
+    monkeypatch.setattr(stock_ranking, 'get_db_collections', lambda: fake_db)
+    monkeypatch.setattr(
+        stock_ranking,
+        'get_data_db',
+        lambda: {'volume_price': FakeVolumePriceCollection([])},
+    )
+
+    client = TestClient(app)
+    resp = client.get('/api/stock-rankings?limit=10&strategy=balanced')
+    assert resp.status_code == 200
+    data = resp.json()['data']
+    assert [row['symbol'] for row in data] == ['TAGGED.SH']
 
 
 @pytest.mark.unit

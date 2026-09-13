@@ -227,26 +227,38 @@ def test_include_scores_false_skips_stock_scores_lookup(monkeypatch, empty_adj):
 
 
 @pytest.mark.unit
-def test_include_scores_default_still_looks_up_stock_scores(monkeypatch, empty_adj):
+def test_include_scores_default_attaches_finance_stock_scores(monkeypatch, empty_adj):
     class TrackingCollection(FakeCollection):
         def __init__(self, docs=None):
             super().__init__(docs)
             self.pipelines = []
+            self.find_queries = []
 
         def aggregate(self, pipeline):
             self.pipelines.append(pipeline)
             return super().aggregate(pipeline)
 
+        def find(self, query=None, projection=None, sort=None):
+            self.find_queries.append(query or {})
+            return super().find(query, projection, sort)
+
     coll = TrackingCollection([
         {'_id': '000000000000000000000001', 'symbol': '000001', 'trade_date': '20250920', 'open': 10, 'close': 12},
     ])
+    scores = TrackingCollection([
+        {'symbol': '000001', 'score_date': '20250920', 'composite_score': {'balanced': 66.5}, 'growth_score': 70},
+    ])
     monkeypatch.setattr(records, 'collection', coll)
+    monkeypatch.setattr(records, '_finance_stock_scores', lambda: scores)
 
     client = TestClient(app)
     resp = client.get('/api/records/?symbol=000001&limit=1')
     assert resp.status_code == 200
-    assert 'stock_scores' in _lookup_sources(coll.pipelines[0])
-    assert 'stock_info' in _lookup_sources(coll.pipelines[0])
+    assert 'stock_scores' not in _lookup_sources(coll.pipelines[0])
+    body = resp.json()[0]
+    assert body['composite_score'] == 66.5
+    assert body['growth_score'] == 70
+    assert body['score_date'] == '20250920'
 
 
 class CountingStockInfo(FakeCollection):

@@ -2935,6 +2935,7 @@ async def stock_industry_comparison(
 @router.get("/stock/score-detail", operation_id="stock_score_detail", tags=[MCP_READ_TAG])
 async def stock_score_detail(
     symbol: str = Query(..., description="股票代码，如 600519"),
+    index_code: Optional[str] = Query(None, description="宽基 scope；不传则显式取该票全局最新"),
     _: bool = Depends(require_hermes_quant_internal_key),
 ):
     """
@@ -2943,9 +2944,13 @@ async def stock_score_detail(
     返回字段：综合评分（balanced/aggressive/conservative 三策略）及
     cycle/value/fundamental/growth/technical/money_flow 六维子评分。
     """
+    from stock_data_access.score_query import merge_score_scope
     from stock_data_access.score_utils import safe_round
     db = get_db_collections()
-    doc = db["stock_scores"].find_one({"symbol": symbol}, sort=[("score_date", -1)])
+    doc = db["stock_scores"].find_one(
+        merge_score_scope({"symbol": symbol}, index_code),
+        sort=[("score_date", -1)],
+    )
     if not doc:
         return {"success": False, "error": f"未找到 {symbol} 的评分数据"}
 
@@ -3563,6 +3568,7 @@ async def user_watchlist_stocks(
     strat = strat_map.get(strategy, "balanced")
 
     pipeline = [
+        # Watchlists span indexes; this is an explicit unscoped latest-per-symbol read.
         {"$match": {"symbol": {"$in": symbols}}},
         {"$sort": {"score_date": -1}},
         {"$group": {"_id": "$symbol", "doc": {"$first": "$$ROOT"}}},

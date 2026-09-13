@@ -4,6 +4,7 @@ from datetime import date, datetime
 from statistics import median
 from typing import Any, Dict, List, Optional, Tuple
 
+from stock_data_access.score_query import merge_score_scope
 
 VALUATION_SOURCE = "quant_data.financial_daily_basic + financial_balance + financial_* + financial_dividend + finance.stock_scores"
 
@@ -100,12 +101,12 @@ def _recent_docs(
     return []
 
 
-def _latest_score(finance_db: Any, candidates: List[str]) -> Optional[Dict[str, Any]]:
+def _latest_score(finance_db: Any, candidates: List[str], index_code=None) -> Optional[Dict[str, Any]]:
     collection = _collection(finance_db, "stock_scores")
     if collection is None:
         return None
     return collection.find_one(
-        {"symbol": {"$in": candidates}},
+        merge_score_scope({"symbol": {"$in": candidates}}, index_code),
         {"_id": 0, "symbol": 1, "score_date": 1, "value_score": 1},
         sort=[("score_date", -1), ("_id", -1)],
     )
@@ -1647,7 +1648,7 @@ def build_stock_valuation(
         valuation_config,
         indicators=indicators,
     )
-    score = _latest_score(finance_db, candidates)
+    score = _latest_score(finance_db, candidates, None)
     suitability = _model_suitability(stock, indicators, dcf, market, relative, ddm)
     valuation_confidence = _valuation_confidence(
         dcf=dcf,
