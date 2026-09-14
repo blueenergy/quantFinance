@@ -114,6 +114,8 @@ def get_db_collections() -> Dict[str, Collection]:
         "stock_scores": db["stock_scores"],
         # Stored-vs-live score self-audit queue; drained by quant-scorer.
         "score_audit_jobs": db["score_audit_jobs"],
+        # Page "确认刷本环境" queue; drained by quant-ops-launcher scratch runs.
+        "ops_repair_jobs": db["ops_repair_jobs"],
         # details/strategy_scores split out of stock_scores: 93% of the bytes,
         # read only by the per-stock detail page
         "stock_score_details": db["stock_score_details"],

@@ -25,6 +25,13 @@ router = APIRouter(prefix="/score-audit", tags=["score-audit"])
 
 UniverseIndex = Literal["hs300", "a500", "csi500", "csi1000", "star50"]
 MAX_QUEUE_ACTIVE = 3
+STALE_VERDICTS = frozenset(
+    {
+        "stored_growth_stale_vs_live",
+        "stored_cycle_stale_vs_live",
+        "stored_both_stale_vs_live",
+    }
+)
 
 JOB_LIST_PROJECTION = {
     "_id": 0,
@@ -50,6 +57,7 @@ JOB_LIST_PROJECTION = {
     "progress_stage": 1,
     "progress_message": 1,
     "worker_id": 1,
+    "repair_log": 1,
 }
 
 
@@ -62,6 +70,13 @@ class CreateScoreAuditJobRequest(BaseModel):
     max_dates: int = Field(default=40, ge=1, le=80)
     symbols: Optional[List[str]] = Field(default=None, max_length=80)
     name: str = Field(default="", max_length=200)
+
+
+class AddRepairNoteRequest(BaseModel):
+    method: str = Field(default="manual_docker_run", max_length=80)
+    container_name: str = Field(..., min_length=1, max_length=200)
+    note: str = Field(default="", max_length=500)
+    exit_code: Optional[int] = Field(default=None, ge=0)
 
 
 def _jsonable(value: Any) -> Any:
@@ -192,3 +207,34 @@ async def get_score_audit_job(job_id: str, current_user: dict = Depends(get_curr
     if not job:
         raise HTTPException(status_code=404, detail="score audit job not found")
     return {"success": True, "data": _jsonable(job)}
+
+
+@router.post("/jobs/{job_id}/repair-notes")
+async def add_score_audit_repair_note(
+    job_id: str,
+    request: AddRepairNoteRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    user_id = _current_user_id(current_user)
+    collections = get_db_collections()
+    jobs = collections["score_audit_jobs"]
+    existing = jobs.find_one({"job_id": job_id}, {"_id": 0})
+    if not existing:
+        raise HTTPException(status_code=404, detail="score audit job not found")
+    entry = {
+        "at": datetime.utcnow(),
+        "method": str(request.method or "manual_docker_run").strip() or "manual_docker_run",
+        "container_name": str(request.container_name).strip(),
+        "start": existing.get("start_date"),
+        "end": existing.get("end_date"),
+        "exit_code": request.exit_code,
+        "note": str(request.note or "").strip(),
+        "user_id": user_id,
+    }
+    result = jobs.update_one(
+        {"job_id": job_id},
+        {"$push": {"repair_log": entry}, "$set": {"updated_at": datetime.utcnow()}},
+    )
+    if int(getattr(result, "matched_count", 0) or 0) == 0:
+        raise HTTPException(status_code=404, detail="score audit job not found")
+    return {"success": True, "data": _jsonable(entry)}

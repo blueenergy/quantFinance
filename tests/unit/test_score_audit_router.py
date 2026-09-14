@@ -6,6 +6,8 @@ from fastapi import HTTPException
 
 from routers import score_audit
 
+pytestmark = pytest.mark.unit
+
 
 class _Cursor(list):
     def sort(self, field, direction=None):
@@ -37,6 +39,16 @@ class _Collection:
 
     def count_documents(self, query=None):
         return len(list(self.find(query)))
+
+    def update_one(self, query=None, update=None):
+        for doc in self.docs:
+            if self._matches(doc, query or {}):
+                for key, value in (update or {}).get("$set", {}).items():
+                    doc[key] = value
+                for key, value in (update or {}).get("$push", {}).items():
+                    doc.setdefault(key, []).append(value)
+                return type("Result", (), {"matched_count": 1, "modified_count": 1})()
+        return type("Result", (), {"matched_count": 0, "modified_count": 0})()
 
     def _matches(self, doc, query):
         for key, expected in (query or {}).items():
@@ -128,3 +140,41 @@ def test_list_is_environment_wide(monkeypatch):
     ids = [row["job_id"] for row in response["data"]]
     assert ids[0] == "b"
     assert "a" in ids
+
+
+def test_add_repair_note_appends_log(monkeypatch):
+    collections = _collections(
+        [{"job_id": "audit-1", "start_date": "20260801", "end_date": "20260910"}]
+    )
+    monkeypatch.setattr(score_audit, "get_db_collections", lambda: collections)
+    request = score_audit.AddRepairNoteRequest(
+        container_name="backfill-gc-x",
+        exit_code=0,
+        note="manual",
+    )
+    response = asyncio.run(
+        score_audit.add_score_audit_repair_note(
+            "audit-1",
+            request,
+            current_user={"id": "user-1"},
+        )
+    )
+    entry = response["data"]
+    assert entry["container_name"] == "backfill-gc-x"
+    assert entry["exit_code"] == 0
+    assert collections["score_audit_jobs"].docs[0]["repair_log"][0]["method"] == "manual_docker_run"
+
+
+def test_add_repair_note_missing_job(monkeypatch):
+    collections = _collections()
+    monkeypatch.setattr(score_audit, "get_db_collections", lambda: collections)
+    request = score_audit.AddRepairNoteRequest(container_name="backfill-gc-x")
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(
+            score_audit.add_score_audit_repair_note(
+                "missing",
+                request,
+                current_user={"id": "user-1"},
+            )
+        )
+    assert exc.value.status_code == 404
