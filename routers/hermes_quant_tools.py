@@ -27,6 +27,10 @@ MCP 暴露面按 route tag 拆分为 wukong-quant-read 与 wukong-quant-actions�
   GET  /hermes-tools/stock/screen            — 智能选股：多条件财务筛选 + 申万行业
   GET  /hermes-tools/stock/foreign-top10-floatholders — 外资投行进入前十大流通股东筛选
 
+  — 组合研究（参数扫描）端点（需 X-User-Token）—
+  GET  /hermes-tools/portfolio-research/jobs            — 列出组合研究任务，定位 job_id
+  GET  /hermes-tools/portfolio-research/result/{job_id} — 结果 + 按轴归因（稳定性 + 配对比较）
+
   — 个人化端点（需先 user_login 获取 token 并设置 X-User-Token header）—
   POST /hermes-tools/user/login            — 用户登录，返回 JWT token
   GET  /hermes-tools/user/profile          — 当前用户账户信息
@@ -37,20 +41,22 @@ MCP 暴露面按 route tag 拆分为 wukong-quant-read 与 wukong-quant-actions�
 """
 
 import asyncio
+import itertools
 import logging
 import os
 import re
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 from bson import ObjectId
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from auth import get_user_from_header_token, require_hermes_quant_internal_key
-from db import data_db, db, get_analyzer_db, get_db_collections
+from db import data_db, db, get_analyzer_db, get_db_collections, get_trading_db_collections
 from models.analysis_task import AnalysisMode
 from routers.market import fetch_market_analysis_result
+from routers.portfolio_research import _load_full_result_rows
 from services.analysis_history import build_user_analysis_history_payload
 from services.analysis_tasks import build_task_doc
 from services.backtest_batch_schemas import BacktestBatchCreate, BacktestCombo
@@ -4024,3 +4030,439 @@ async def hermes_backtest_sweep_wait(
             else "Batch completed"
         ),
     }
+
+
+# ---------------------------------------------------------------------------
+# 组合研究（portfolio research）结果读取与按轴归因
+#
+# 数据在 quant_trading 库（get_trading_db_collections），不是主 finance 库。
+# 结果 doc 的 rows 只存前 200 行、且已按 risk_adjusted_score 降序 —— 直接用会
+# 把按轴均值系统性高估。一律走 _load_full_result_rows 从 artifact 回填全量。
+# ---------------------------------------------------------------------------
+
+# 归因指标：指数超额（不受平均仓位影响）+ 最大回撤（风控轴要看它）。
+# 不用 cumulative_return：它与 index_excess_cumulative_return 只差整个 job 的基准
+# 收益常数（实测 delta 逐对完全相同），一起返回是纯冗余。
+_AXIS_EFFECT_METRICS: Sequence[str] = (
+    "index_excess_cumulative_return",
+    "max_drawdown",
+)
+
+# 参与"控制维度"推导的候选列。sweep_view.sweep_axes 未必列全真正被扫描的维度
+# （实测 variant 有 6 档在变却没进 sweep_axes），只按 sweep_axes 控制会把
+# variant 的差异错误归因到别的轴上。所以控制维度从真实数据推导。
+_CONTROL_CANDIDATE_KEYS: Sequence[str] = (
+    "score_variant",
+    "variant",
+    "construction_mode",
+    "selection_mode",
+    "top_n",
+    "rebalance_interval_days",
+    "max_industry_weight",
+    "trailing_stop_pct",
+    "regime_mode",
+)
+
+# 这些列不参与控制：combo_key 逐行唯一，控制它会让每组只剩一行、配对数恒为 0。
+_CONTROL_EXCLUDED_KEYS = frozenset({"combo_key"})
+
+# 精简 row 时保留的字段（指标与 sweep_view.METRIC_KEYS 一致）。
+_ROW_METRIC_KEYS: Sequence[str] = (
+    "cumulative_return",
+    "annualized_return",
+    "index_excess_cumulative_return",
+    "sharpe",
+    "max_drawdown",
+    "average_turnover",
+    "average_exposure",
+    "avg_active_share",
+    "risk_adjusted_score",
+)
+
+_ROW_IDENTITY_KEYS: Sequence[str] = (
+    "score_variant",
+    "variant",
+    "top_n",
+    "rebalance_interval_days",
+    "max_industry_weight",
+    "combo_key",
+)
+
+
+def _axis_token(value: Any) -> str:
+    """分组用的稳定取值标识。
+
+    trailing stop 的 off 在参数侧写作 0.0、个别行里可能是 None，两者必须同组；
+    数值轴同时要避免 10 与 10.0 被分到两组。
+    """
+    if value is None:
+        return "0"
+    if isinstance(value, bool):
+        return str(value)
+    if isinstance(value, (int, float)):
+        number = float(value)
+        if number == 0:
+            return "0"
+        return str(int(number)) if number.is_integer() else str(number)
+    return str(value)
+
+
+def _as_metric(row: Dict[str, Any], key: str) -> Optional[float]:
+    try:
+        value = row.get(key)
+        return float(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _median(values: Sequence[float]) -> float:
+    ordered = sorted(values)
+    mid = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[mid]
+    return (ordered[mid - 1] + ordered[mid]) / 2
+
+
+def _varying_dimensions(
+    rows: Sequence[Dict[str, Any]],
+    sweep_axes: Sequence[Dict[str, Any]],
+) -> List[str]:
+    """真实数据里确实在变的维度，用作配对的控制键。
+
+    ``sweep_view.sweep_axes`` 未必列全真正被扫描的维度：实测某次 324 组网格里
+    ``variant`` 有 6 档在变却没进 sweep_axes。只按 sweep_axes 控制，variant 的差异
+    会被错误归因到别的轴上（实测把 max_industry_weight 报出 31 个"有效配对"，
+    实际它与 variant 共线、残差里根本没有配对数）。所以控制维度从数据推导。
+    """
+    ordered: List[str] = []
+    for axis in sweep_axes:
+        key = axis.get("key")
+        if key and key not in ordered:
+            ordered.append(key)
+    for key in _CONTROL_CANDIDATE_KEYS:
+        if key not in ordered:
+            ordered.append(key)
+
+    varying: List[str] = []
+    for key in ordered:
+        if key in _CONTROL_EXCLUDED_KEYS:
+            continue
+        if len({_axis_token(row.get(key)) for row in rows if key in row}) > 1:
+            varying.append(key)
+    return varying
+
+
+def _effective_axes(
+    rows: Sequence[Dict[str, Any]],
+    sweep_axes: Sequence[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """给 agent 看的轴清单：sweep_view 声明的轴 + 数据里额外变化的维度。
+
+    补漏很重要：漏掉的维度会被 agent 误当成固定参数。标 ``source: derived``
+    的即 sweep_view 未声明、由数据发现的轴。
+    """
+    declared = {axis.get("key") for axis in sweep_axes if axis.get("key")}
+    axes: List[Dict[str, Any]] = [dict(axis) for axis in sweep_axes if axis.get("key")]
+    for key in _varying_dimensions(rows, sweep_axes):
+        if key in declared:
+            continue
+        seen: Dict[str, Any] = {}
+        for row in rows:
+            if key in row:
+                seen.setdefault(_axis_token(row.get(key)), row.get(key))
+        axes.append(
+            {
+                "key": key,
+                "label": key,
+                "values": [seen[token] for token in sorted(seen)],
+                "source": "derived",
+            }
+        )
+    return axes
+
+
+def _pairwise_axis_effects(
+    rows: Sequence[Dict[str, Any]],
+    sweep_axes: Sequence[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """固定其余**全部变化维度**，比较同一组合内单个轴两个取值的指标差。
+
+    配对比边际均值可信：边际均值会把混杂效应误读成轴效应（某轴的一档恰好都落在
+    更有利的其他轴配置上）。控制了其余维度，才敢下「没有一对反过来」这类强结论。
+
+    delta 一律为 a − b。``a_worse_count`` 是 a 更差的配对数，对两个指标同义：
+    收益上 delta<0 表示 a 收益更低；回撤上 delta<0 表示 a 的回撤更负。为 0 表示
+    a 在所有配对中都不劣于 b，等于 n_pairs 则表示 b 完胜 a。
+
+    ``n_pairs == 0`` 的轴会连 ``unpaired_reason`` 一起返回 —— 常见于该轴与别的
+    维度共线（控制之后没有残差变异），此时该轴不可单独归因，而不是"无影响"。
+    """
+    control_keys = _varying_dimensions(rows, sweep_axes)
+    effects: List[Dict[str, Any]] = []
+    for axis in _effective_axes(rows, sweep_axes):
+        axis_key = axis.get("key")
+        axis_values = list(axis.get("values") or [])
+        if not axis_key or len(axis_values) < 2:
+            continue
+        other_keys = [key for key in control_keys if key != axis_key]
+
+        grouped: Dict[tuple, List[Dict[str, Any]]] = {}
+        for row in rows:
+            if axis_key not in row:
+                continue
+            grouped.setdefault(tuple(_axis_token(row.get(key)) for key in other_keys), []).append(row)
+
+        # 组内同一轴取值出现多行 => 还有未受控维度在变，该组不可比，整组丢弃。
+        resolved: List[Dict[str, Dict[str, Any]]] = []
+        ambiguous_groups = 0
+        for group_rows in grouped.values():
+            by_token: Dict[str, Dict[str, Any]] = {}
+            duplicated = False
+            for row in group_rows:
+                token = _axis_token(row.get(axis_key))
+                if token in by_token:
+                    duplicated = True
+                by_token[token] = row
+            if duplicated:
+                ambiguous_groups += 1
+                continue
+            resolved.append(by_token)
+
+        pairs: List[Dict[str, Any]] = []
+        for value_a, value_b in itertools.combinations(axis_values, 2):
+            token_a, token_b = _axis_token(value_a), _axis_token(value_b)
+            deltas: Dict[str, List[float]] = {metric: [] for metric in _AXIS_EFFECT_METRICS}
+            for by_token in resolved:
+                row_a, row_b = by_token.get(token_a), by_token.get(token_b)
+                if row_a is None or row_b is None:
+                    continue
+                for metric in _AXIS_EFFECT_METRICS:
+                    metric_a, metric_b = _as_metric(row_a, metric), _as_metric(row_b, metric)
+                    if metric_a is not None and metric_b is not None:
+                        deltas[metric].append(metric_a - metric_b)
+            entry: Dict[str, Any] = {
+                "a": value_a,
+                "b": value_b,
+                "n_pairs": len(deltas[_AXIS_EFFECT_METRICS[0]]),
+            }
+            for metric in _AXIS_EFFECT_METRICS:
+                values = deltas[metric]
+                if not values:
+                    entry[metric] = None
+                    continue
+                worse = sum(1 for value in values if value < 0)
+                if all(value == 0 for value in values):
+                    # 逐对完全相同：没有差异，不能说成 a 完胜（a_worse_count 也是 0）。
+                    verdict = "no_difference"
+                elif worse == 0:
+                    verdict = "a_dominates"
+                elif worse == len(values):
+                    verdict = "b_dominates"
+                else:
+                    verdict = "mixed"
+                entry[metric] = {
+                    "median_delta": round(_median(values), 4),
+                    "min_delta": round(min(values), 4),
+                    "max_delta": round(max(values), 4),
+                    "a_worse_count": worse,
+                    "verdict": verdict,
+                }
+            if entry["n_pairs"]:
+                pairs.append(entry)
+
+        entry_axis: Dict[str, Any] = {
+            "axis": axis_key,
+            "label": axis.get("label") or axis_key,
+            "pairs": pairs,
+        }
+        if not pairs:
+            entry_axis["unpaired_reason"] = (
+                "ambiguous_groups" if ambiguous_groups else "collinear_with_other_axes"
+            )
+        effects.append(entry_axis)
+    return effects
+
+
+def _axis_marginals(
+    rows: Sequence[Dict[str, Any]],
+    sweep_axes: Sequence[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """每个轴取值的组内聚合并附该档行数 —— 注意这是**有偏**的边际视角。
+
+    为什么行数必须一起返回：结果 doc 只存按 risk_adjusted_score 降序的前 200 行，
+    真网格可能大得多（实测 324 组只留 200）。各档被保留的比例极不均（实测
+    regime off 67 / bull 133，真值各半），边际均值因此系统性偏向分数高的配置。
+    看均值之前先看 observations 均衡不均衡；结论强度一律以 axis_effects 的配对为准。
+
+    另注：``stability`` 字段不是边际聚合。它按**全部轴** groupby，每组只剩一个
+    combo（observations 恒为 1），只是一张换排序方式的明细表。
+    """
+    marginals: List[Dict[str, Any]] = []
+    for axis in _effective_axes(rows, sweep_axes):
+        axis_key = axis.get("key")
+        if not axis_key:
+            continue
+        buckets: Dict[str, List[Dict[str, Any]]] = {}
+        for row in rows:
+            if axis_key in row:
+                buckets.setdefault(_axis_token(row.get(axis_key)), []).append(row)
+        if len(buckets) < 2:
+            continue
+        entries: List[Dict[str, Any]] = []
+        for token in sorted(buckets):
+            group = buckets[token]
+            excess = [v for v in (_as_metric(r, "index_excess_cumulative_return") for r in group) if v is not None]
+            returns = [v for v in (_as_metric(r, "cumulative_return") for r in group) if v is not None]
+            drawdown = [v for v in (_as_metric(r, "max_drawdown") for r in group) if v is not None]
+            exposure = [v for v in (_as_metric(r, "average_exposure") for r in group) if v is not None]
+            entries.append(
+                {
+                    "value": group[0].get(axis_key),
+                    "observations": len(group),
+                    "avg_index_excess_return": round(sum(excess) / len(excess), 4) if excess else None,
+                    "min_index_excess_return": round(min(excess), 4) if excess else None,
+                    "avg_cumulative_return": round(sum(returns) / len(returns), 4) if returns else None,
+                    "worst_max_drawdown": round(min(drawdown), 4) if drawdown else None,
+                    "avg_average_exposure": round(sum(exposure) / len(exposure), 4) if exposure else None,
+                }
+            )
+        entries.sort(
+            key=lambda entry: (
+                entry["avg_index_excess_return"] is None,
+                -(entry["avg_index_excess_return"] or 0.0),
+            )
+        )
+        marginals.append(
+            {"axis": axis_key, "label": axis.get("label") or axis_key, "values": entries}
+        )
+    return marginals
+
+
+def _compact_row(row: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """只保留指标与身份字段，避免把整行 30+ 字段灌进 LLM 上下文。"""
+    if not row:
+        return None
+    keys = (*_ROW_IDENTITY_KEYS, *_ROW_METRIC_KEYS)
+    return {key: row.get(key) for key in keys if row.get(key) is not None}
+
+
+_PORTFOLIO_RESEARCH_JOB_PROJECTION = {
+    "_id": 0,
+    "job_id": 1,
+    "name": 1,
+    "status": 1,
+    "universe_index": 1,
+    "start_date": 1,
+    "end_date": 1,
+    "result_id": 1,
+    "created_at": 1,
+    "updated_at": 1,
+    "error_message": 1,
+}
+
+
+@router.get("/portfolio-research/jobs", operation_id="portfolio_research_jobs", tags=[MCP_READ_TAG])
+async def hermes_portfolio_research_jobs(
+    limit: int = Query(10, ge=1, le=50, description="返回条数"),
+    status: Optional[str] = Query(None, description="按状态过滤：pending / running / completed / failed"),
+    x_user_token: str = Header(..., alias="X-User-Token"),
+    _: bool = Depends(require_hermes_quant_internal_key),
+):
+    """列出组合研究（参数扫描）任务，用于定位要复盘的 job_id。
+
+    组合研究在 stock_scores 之上回答：因子有没有预测力、Top-N/权重/成本是否合适、
+    风控叠加能否改善回撤。返回按创建时间倒序。
+    """
+    collections = get_trading_db_collections()
+    user = _require_mcp_user_token(x_user_token)
+    query: Dict[str, Any] = {"user_id": user["id"]}
+    if status:
+        query["status"] = status
+    jobs = list(
+        collections["portfolio_research_jobs"]
+        .find(query, _PORTFOLIO_RESEARCH_JOB_PROJECTION)
+        .sort("created_at", -1)
+        .limit(limit)
+    )
+    return {
+        "success": True,
+        "total": len(jobs),
+        "jobs": jobs,
+        "attributed_to": user.get("username"),
+    }
+
+
+@router.get("/portfolio-research/result/{job_id}", operation_id="portfolio_research_result", tags=[MCP_READ_TAG])
+async def hermes_portfolio_research_result(
+    job_id: str,
+    include_rows: bool = Query(False, description="是否附带全量 combo 行（大网格很占上下文，默认关）"),
+    x_user_token: str = Header(..., alias="X-User-Token"),
+    _: bool = Depends(require_hermes_quant_internal_key),
+):
+    """读取组合研究结果，并附带按轴归因，用于分析多组参数组合的收益差异。
+
+    归因证据（可信度依次递减）：
+      - axis_effects：固定其余**全部变化维度**后的配对比较，结论强度最高
+      - axes / axis_marginals：轴清单与边际聚合。axes 除 sweep_view 声明的轴外，
+        还会补上数据里额外变化的维度（source=derived，例如 variant）；marginals
+        附每档 observations —— 行数不均是截断偏差的直接体现，看均值前先看它
+      - global_best_row：全局最优行，**带选择偏差**
+
+    注意 ``stability`` 不是边际聚合：它按全部轴 groupby，observations 恒为 1，
+    只是一张按超额排序的明细表。真正的边际聚合看 axis_marginals。
+
+    解读纪律：网格越大 max 越乐观，不要把 global_best_row 直接当推荐；累计收益
+    不可跨平均仓位直接比较（regime 空仓组约 49% 暴露 vs 满仓 100%），跨组比较
+    请用 index_excess_cumulative_return。coverage.truncated 为真时说明只拿到
+    前 200 行、边际均值有偏，结论以配对为准；n_pairs 为 0 的轴是共线不可归因，
+    不等于「无影响」。
+    """
+    collections = get_trading_db_collections()
+    user = _require_mcp_user_token(x_user_token)
+    job = collections["portfolio_research_jobs"].find_one(
+        {"job_id": job_id, "user_id": user["id"]},
+        _PORTFOLIO_RESEARCH_JOB_PROJECTION,
+    )
+    if not job:
+        raise HTTPException(status_code=404, detail="research job not found")
+    result = collections["portfolio_research_results"].find_one(
+        {"job_id": job_id, "user_id": user["id"]},
+        {"_id": 0},
+    )
+    if not result:
+        raise HTTPException(status_code=404, detail="research result not found")
+
+    rows = _load_full_result_rows(result)
+    preview_count = len(result.get("rows") or [])
+    sweep_view = result.get("sweep_view") or {}
+    sweep_axes = list(sweep_view.get("sweep_axes") or [])
+
+    row_count_total = result.get("row_count_total") or sweep_view.get("row_count") or len(rows)
+    payload: Dict[str, Any] = {
+        "success": True,
+        "job": job,
+        "result": {
+            "params": result.get("params"),
+            "sweep_axes": sweep_axes,
+            "axes": _effective_axes(rows, sweep_axes),
+            "axis_effects": _pairwise_axis_effects(rows, sweep_axes),
+            "axis_marginals": _axis_marginals(rows, sweep_axes),
+            "stability": result.get("stability") or [],
+            "global_best_row": _compact_row(result.get("best_row") or sweep_view.get("global_best_row")),
+            "metric_keys": sweep_view.get("metric_keys"),
+            "coverage": {
+                "row_count": len(rows),
+                "row_count_total": row_count_total,
+                "truncated": len(rows) < row_count_total,
+                "rows_source": "artifact_full" if len(rows) > preview_count else "mongo_preview",
+            },
+            "row_count": len(rows),
+            "row_count_total": row_count_total,
+            "rows_source": "artifact_full" if len(rows) > preview_count else "mongo_preview",
+            "data_watermark": result.get("data_watermark"),
+        },
+        "attributed_to": user.get("username"),
+    }
+    if include_rows:
+        payload["rows"] = [_compact_row(row) for row in rows]
+    return payload

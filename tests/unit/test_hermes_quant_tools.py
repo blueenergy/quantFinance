@@ -1440,3 +1440,139 @@ def test_require_mcp_user_token_accepts_real_user():
     user = {"id": "user-1", "username": "alice", "service_level": "vip"}
     with patch("routers.hermes_quant_tools.get_user_from_header_token", return_value=user):
         assert _require_mcp_user_token("token") == user
+
+
+# ---------------------------------------------------------------------------
+# 组合研究按轴归因（_effective_axes / _axis_marginals / _pairwise_axis_effects）
+# ---------------------------------------------------------------------------
+
+
+def _attr_row(**kwargs):
+    row = {
+        "index_excess_cumulative_return": 0.0,
+        "cumulative_return": 0.0,
+        "max_drawdown": -0.1,
+    }
+    row.update(kwargs)
+    return row
+
+
+@pytest.mark.unit
+def test_axis_token_groups_none_and_zero_together():
+    from routers.hermes_quant_tools import _axis_token
+
+    assert _axis_token(None) == _axis_token(0.0) == _axis_token(0) == "0"
+    assert _axis_token(10) == _axis_token(10.0)
+
+
+@pytest.mark.unit
+def test_effective_axes_surfaces_dimensions_missing_from_sweep_view():
+    """sweep_view.sweep_axes 会漏掉真正被扫描的维度，漏掉的必须补上并标 derived。"""
+    from routers.hermes_quant_tools import _effective_axes
+
+    rows = [_attr_row(variant="va", top_n=10), _attr_row(variant="vb", top_n=20)]
+    axes = {axis["key"]: axis for axis in _effective_axes(rows, [{"key": "top_n", "values": [10, 20]}])}
+    assert axes["top_n"].get("source") is None  # 声明轴
+    assert axes["variant"]["source"] == "derived"
+    assert sorted(axes["variant"]["values"]) == ["va", "vb"]
+
+
+@pytest.mark.unit
+def test_axis_effects_controls_dimensions_missing_from_sweep_axes():
+    """未声明的维度也必须控制。
+
+    variant 与 top_n 完全混杂时，控制 variant 后 top_n 没有可比配对（collinear），
+    不能让它的差异冒充 top_n 的效应 —— 这正是没有控制 variant 时会犯的错。
+    """
+    from routers.hermes_quant_tools import _pairwise_axis_effects
+
+    rows = []
+    for variant, top_n in (("va", 10), ("vb", 20)):
+        for rebalance in (10, 20):
+            rows.append(
+                _attr_row(
+                    variant=variant,
+                    top_n=top_n,
+                    rebalance_interval_days=rebalance,
+                    index_excess_cumulative_return=0.5 if variant == "va" else 0.1,
+                )
+            )
+    sweep_axes = [
+        {"key": "top_n", "values": [10, 20]},
+        {"key": "rebalance_interval_days", "values": [10, 20]},
+    ]
+    effects = {entry["axis"]: entry for entry in _pairwise_axis_effects(rows, sweep_axes)}
+
+    assert effects["top_n"]["pairs"] == []
+    assert effects["top_n"]["unpaired_reason"] == "collinear_with_other_axes"
+    # rebalance 与 variant 正交，配对正常
+    assert effects["rebalance_interval_days"]["pairs"]
+
+
+@pytest.mark.unit
+def test_axis_effects_flags_ambiguous_groups_instead_of_picking_arbitrary_rows():
+    """组内同轴取值出现两行 = 仍有未受控维度，该组不可比，丢弃而不是任取一行。"""
+    from routers.hermes_quant_tools import _pairwise_axis_effects
+
+    rows = []
+    for top_n in (10, 20):
+        for extra in ("x", "y"):
+            rows.append(_attr_row(top_n=top_n, unmapped_dim=extra))
+    sweep_axes = [{"key": "top_n", "values": [10, 20]}]
+
+    effects = {entry["axis"]: entry for entry in _pairwise_axis_effects(rows, sweep_axes)}
+
+    assert effects["top_n"]["pairs"] == []
+    assert effects["top_n"]["unpaired_reason"] == "ambiguous_groups"
+
+
+@pytest.mark.unit
+def test_axis_effects_verdicts_treat_lower_drawdown_as_better():
+    """回撤的 delta 同样是 a − b：delta < 0 表示 a 的回撤更负、即 a 更差。"""
+    from routers.hermes_quant_tools import _pairwise_axis_effects
+
+    rows = []
+    for stop in (0.08, 0.15):
+        for rebalance in (10, 20, 30):
+            rows.append(
+                _attr_row(
+                    trailing_stop_pct=stop,
+                    rebalance_interval_days=rebalance,
+                    max_drawdown=-0.10 if stop == 0.08 else -0.30,
+                    index_excess_cumulative_return=0.4,
+                )
+            )
+    sweep_axes = [
+        {"key": "trailing_stop_pct", "values": [0.08, 0.15]},
+        {"key": "rebalance_interval_days", "values": [10, 20, 30]},
+    ]
+    pair = _pairwise_axis_effects(rows, sweep_axes)[0]["pairs"][0]
+
+    assert pair["n_pairs"] == 3
+    drawdown = pair["max_drawdown"]
+    assert drawdown["a_worse_count"] == 0
+    assert drawdown["median_delta"] == pytest.approx(0.2)
+    assert drawdown["verdict"] == "a_dominates"
+    # 收益两档逐对相同 → no_difference。不能因为 a_worse_count == 0 就说成 a 完胜。
+    assert pair["index_excess_cumulative_return"]["verdict"] == "no_difference"
+    assert pair["index_excess_cumulative_return"]["median_delta"] == pytest.approx(0.0)
+
+
+@pytest.mark.unit
+def test_axis_marginals_reports_observations_so_truncation_is_visible():
+    """每档行数必须返回：截断后各档保留比例不均，均值有偏，先看得数再看均值。"""
+    from routers.hermes_quant_tools import _axis_marginals
+
+    rows = [
+        _attr_row(top_n=10, index_excess_cumulative_return=0.5),
+        _attr_row(top_n=10, index_excess_cumulative_return=0.3),
+        _attr_row(top_n=20, index_excess_cumulative_return=0.1),
+    ]
+    marginal = _axis_marginals(rows, [{"key": "top_n", "values": [10, 20]}])[0]
+    by_value = {str(entry["value"]): entry for entry in marginal["values"]}
+
+    assert by_value["10"]["observations"] == 2
+    assert by_value["10"]["avg_index_excess_return"] == pytest.approx(0.4)
+    assert by_value["20"]["observations"] == 1
+    # 按均值降序
+    assert [entry["value"] for entry in marginal["values"]] == [10, 20]
