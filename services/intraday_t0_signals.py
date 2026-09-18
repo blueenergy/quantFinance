@@ -162,8 +162,15 @@ def latest_daily_record(symbol: str, trade_date: Optional[str] = None) -> Option
 
 
 def latest_market_spectrum(trade_date: str) -> Dict[str, Any]:
+    # Two docs are written per snapshot_time (ma_period 5 and 30) with different
+    # yang_spectrum values. Pinning ma_period keeps find_one deterministic;
+    # legacy docs omit ma_period and are treated as MA5 (same convention as
+    # market.py and MARKET_INSIGHT_PRIMARY_MA_PERIOD).
     doc = get_data_db()["market_spectrum_realtime_daily"].find_one(
-        {"snapshot_trade_date": compact_trade_date(trade_date)},
+        {
+            "snapshot_trade_date": compact_trade_date(trade_date),
+            "$or": [{"ma_period": 5}, {"ma_period": {"$exists": False}}],
+        },
         {"_id": 0},
         sort=[("snapshot_time", DESCENDING)],
     )

@@ -263,3 +263,37 @@ def test_export_signals_csv(monkeypatch):
     assert "300750.SZ" in csv_text
     assert "near_intraday_high" in csv_text
     assert csv_text.splitlines()[0].startswith("trade_date,")
+
+
+@pytest.mark.unit
+def test_latest_market_spectrum_pins_ma5_when_newer_ma30_exists(monkeypatch):
+    """Realtime snapshots carry both ma_period=5 and ma_period=30 docs per
+    minute; without a pin find_one may return the MA30 doc whose yang_spectrum
+    differs wildly (0.37 vs 0.73 on 2026-09-18)."""
+    rows = [
+        {
+            "snapshot_trade_date": "20260918",
+            "snapshot_time": "202609181459",
+            "ma_period": 30,
+            "yang_spectrum": 0.3734,
+        },
+        {
+            "snapshot_trade_date": "20260918",
+            "snapshot_time": "202609181459",
+            "ma_period": 5,
+            "yang_spectrum": 0.7296,
+        },
+        # Legacy doc without ma_period must still be readable (treated as MA5).
+        {
+            "snapshot_trade_date": "20260917",
+            "snapshot_time": "202609171459",
+            "yang_spectrum": 0.55,
+        },
+    ]
+    fake_get_data_db = lambda: {"market_spectrum_realtime_daily": FakeCollection(rows)}  # noqa: E731
+    monkeypatch.setattr(t0, "get_data_db", fake_get_data_db)
+    today = t0.latest_market_spectrum("2026-09-18")
+    assert today["ma_period"] == 5
+    assert today["yang_spectrum"] == pytest.approx(0.7296)
+    legacy = t0.latest_market_spectrum("2026-09-17")
+    assert legacy["yang_spectrum"] == pytest.approx(0.55)
