@@ -524,3 +524,240 @@ def test_evaluate_writes_cost_and_net_return(monkeypatch):
     assert doc["cost_pct"] == pytest.approx(0.07)
     assert doc["net_return_pct"] == pytest.approx(0.93)
     assert doc["ref_notional"] == pytest.approx(100_000)
+
+
+# --------------------------------------------------------------------------
+# 验收口径：按 style 分离 + 票-日聚类 + 95% CI
+# --------------------------------------------------------------------------
+
+_WINDOW_END = "20260918"
+
+
+def _patch_acceptance(monkeypatch, eval_rows):
+    """验收只读评估表（不读 signals 的 reason_codes，故不复用 _patch_performance）。"""
+    monkeypatch.setattr(
+        t0,
+        "get_db_collections",
+        lambda: {"intraday_t0_signal_evaluations": FakeCollection(eval_rows)},
+    )
+    # _INDEXES_READY 是 intraday_t0_signals 的模块全局，patch 这里才对
+    monkeypatch.setattr(t0, "_INDEXES_READY", True)
+
+
+def _eval(trade_date, symbol, signal_type, horizon, ret, net, signal_id="s"):
+    return {
+        "user_id": "u1",
+        "signal_id": signal_id,
+        "symbol": symbol,
+        "trade_date": trade_date,
+        "signal_type": signal_type,
+        "horizon": horizon,
+        "return_pct": ret,
+        "net_return_pct": net,
+    }
+
+
+def _acceptance(monkeypatch, rows, **kwargs):
+    _patch_acceptance(monkeypatch, rows)
+    kwargs.setdefault("lookback_days", 10)
+    kwargs.setdefault("trade_date", _WINDOW_END)
+    return t0.acceptance_summary("u1", **kwargs)
+
+
+@pytest.mark.unit
+def test_is_win_is_direction_aware():
+    """判据只此一份：BUY 看涨、SELL 看跌。曾经手写统一 `v>0` 把 SELL 方向算反。"""
+    assert t0._is_win("BUY_WATCH", 0.1) is True
+    assert t0._is_win("BUY_WATCH", -0.1) is False
+    assert t0._is_win("SELL_WATCH", -0.1) is True
+    assert t0._is_win("SELL_WATCH", 0.1) is False
+
+
+@pytest.mark.unit
+def test_summary_reports_clusters_not_just_rows(monkeypatch):
+    """count 是行数；同一 (symbol, trade_date) 的多条信号只算一个簇。"""
+    _patch_performance(
+        monkeypatch,
+        eval_rows=[
+            _eval("20260918", "300750.SZ", "BUY_WATCH", "15m", 1.0, 0.9, f"s{i}")
+            for i in range(3)
+        ],
+        signal_rows=[],
+    )
+    row = t0.performance_summary("u1", trade_date=None)["data"][0]
+    assert row["count"] == 3
+    assert row["clusters"] == 1
+    assert row["days"] == 1
+
+
+@pytest.mark.unit
+def test_clustered_mean_ci_matches_hand_computed_ddof1():
+    """把 ddof=1 钉死：换成 ddof=0（pstdev）这个用例立刻红。"""
+    stats = t0._clustered_mean_ci([0.0, 0.5, 1.0])
+    assert stats["mean"] == pytest.approx(0.5)
+    assert stats["n"] == 3
+    assert stats["cluster_rate_sd"] == pytest.approx(0.5)
+    assert stats["ci_half_width"] == pytest.approx(1.96 * 0.5 / (3 ** 0.5))
+    assert stats["ci_low"] == pytest.approx(-0.06580, abs=1e-4)
+    assert stats["ci_high"] == pytest.approx(1.06580, abs=1e-4)
+
+
+@pytest.mark.unit
+def test_clustered_mean_ci_degenerate_cases():
+    """簇数 < 2 无簇间离散度可言：报均值、**不报** CI 键（键缺失才是 "-"）。"""
+    empty = t0._clustered_mean_ci([])
+    assert empty["mean"] is None and empty["n"] == 0
+    assert "ci_low" not in empty
+
+    single = t0._clustered_mean_ci([0.42])
+    assert single["mean"] == pytest.approx(0.42)
+    assert single["n"] == 1
+    # ddof=0 会在这里给出 sd=0 → 零宽 CI，是比宽区间更危险的假精确
+    assert "cluster_rate_sd" not in single
+    assert "ci_low" not in single
+    assert "ci_high" not in single
+
+
+@pytest.mark.unit
+def test_acceptance_clusters_are_symbol_date_not_rows(monkeypatch):
+    """核心用例：行数冒充样本数会怎样。
+
+    簇 A 1 行全胜 → 1.0；簇 B 3 行 1 胜 → 0.333。簇等权 0.667，
+    而行级池化只有 0.5 —— 差异全部来自「3 行的簇被数了 3 遍」。
+    """
+    rows = [
+        _eval(_WINDOW_END, "300750.SZ", "BUY_WATCH", "15m", 1.0, 1.0, "a1"),
+        _eval(_WINDOW_END, "600000.SH", "BUY_WATCH", "15m", 1.0, 1.0, "b1"),
+        _eval(_WINDOW_END, "600000.SH", "BUY_WATCH", "15m", -1.0, -1.0, "b2"),
+        _eval(_WINDOW_END, "600000.SH", "BUY_WATCH", "15m", -1.0, -1.0, "b3"),
+    ]
+    result = _acceptance(monkeypatch, rows)
+    row = next(r for r in result["data"] if r["horizon"] == "15m")
+    assert row["rows"] == 4
+    assert row["clusters"] == 2
+    assert row["days"] == 1
+    assert row["net_win_rate"] == pytest.approx(2 / 3)
+    assert row["pooled_net_win_rate"] == pytest.approx(0.5)
+
+
+@pytest.mark.unit
+def test_acceptance_ci_is_wider_under_clustering(monkeypatch):
+    """簇内高度相关时，簇稳健 CI 必须显著宽于「150 行独立」的朴素二项 CI。
+
+    这正是当前读数夸大了精度的地方：349 行看着像 ±5pp，真实是 ±14pp。
+    """
+    rows = []
+    for c in range(30):
+        outcome = 1.0 if c % 2 == 0 else -1.0
+        for j in range(5):  # 同簇 5 条，完全相关
+            rows.append(
+                _eval(_WINDOW_END, f"{c:06d}.SZ", "BUY_WATCH", "15m", outcome, outcome, f"c{c}j{j}")
+            )
+    row = next(r for r in _acceptance(monkeypatch, rows)["data"] if r["horizon"] == "15m")
+    naive_half = 1.96 * (0.25 / 150) ** 0.5  # 把 150 行当独立样本
+    assert row["clusters"] == 30
+    assert row["rows"] == 150
+    assert row["ci_half_width"] > 2 * naive_half
+
+
+@pytest.mark.unit
+def test_acceptance_flags_insufficient_sample(monkeypatch):
+    """门槛是标签不是闸门：不够格时数照报、CI 照给。"""
+
+    def rows_for(n):
+        return [
+            _eval(_WINDOW_END, f"{i:06d}.SZ", "BUY_WATCH", "15m", 1.0, 1.0, f"x{i}")
+            for i in range(n)
+        ]
+
+    below = next(r for r in _acceptance(monkeypatch, rows_for(29))["data"] if r["horizon"] == "15m")
+    assert below["clusters"] == 29
+    assert below["sufficient_sample"] is False
+    assert "ci_low" in below  # 可算就该给
+
+    at = next(r for r in _acceptance(monkeypatch, rows_for(30))["data"] if r["horizon"] == "15m")
+    assert at["clusters"] == 30
+    assert at["sufficient_sample"] is True
+
+
+@pytest.mark.unit
+def test_acceptance_single_cluster_has_no_ci(monkeypatch):
+    rows = [
+        _eval(_WINDOW_END, "300750.SZ", "BUY_WATCH", "15m", 1.0, 1.0, f"s{i}")
+        for i in range(4)
+    ]
+    row = next(r for r in _acceptance(monkeypatch, rows)["data"] if r["horizon"] == "15m")
+    assert row["clusters"] == 1
+    assert row["net_win_rate"] == pytest.approx(1.0)
+    assert "ci_low" not in row and "ci_high" not in row
+    assert row["sufficient_sample"] is False
+
+
+@pytest.mark.unit
+def test_acceptance_excludes_t1_max(monkeypatch):
+    """t1_max 是次日 high，t1_open 的上包络、不可成交 —— 不进任何口径。"""
+    rows = [
+        _eval(_WINDOW_END, "300750.SZ", "BUY_WATCH", "15m", 0.1, 0.03, "a"),
+        _eval(_WINDOW_END, "300750.SZ", "BUY_WATCH", "t1_max", 9.9, 9.83, "a"),
+    ]
+    result = _acceptance(monkeypatch, rows)
+    assert [r["horizon"] for r in result["data"]] == ["15m"]
+    assert all(r["horizon"] != "t1_max" for r in result["overnight"])
+    # 不静默丢弃：存在且被有意排除，评审看得见
+    assert result["excluded_horizons"] == ["t1_max"]
+    assert "t1_max" in result["horizons_seen"]
+
+
+@pytest.mark.unit
+def test_acceptance_separates_overnight_from_intraday(monkeypatch):
+    """t1_open 隔夜持有已不是 T+0，不能和日内 horizon 并列在同一张表。"""
+    rows = [
+        _eval(_WINDOW_END, "300750.SZ", "BUY_WATCH", "15m", 0.1, 0.03, "a"),
+        _eval(_WINDOW_END, "300750.SZ", "BUY_WATCH", "t1_open", 2.0, 1.93, "a"),
+    ]
+    result = _acceptance(monkeypatch, rows)
+    assert [r["horizon"] for r in result["data"]] == ["15m"]
+    assert [r["horizon"] for r in result["overnight"]] == ["t1_open"]
+
+
+@pytest.mark.unit
+def test_acceptance_does_not_mix_styles(monkeypatch):
+    """BUY / SELL 各自成行、绝不合并 —— 混算等于拿好腿补坏腿。"""
+    rows = [
+        _eval(_WINDOW_END, "300750.SZ", "BUY_WATCH", "15m", 1.0, 0.93, "a"),
+        _eval(_WINDOW_END, "600000.SH", "SELL_WATCH", "15m", -1.0, -1.07, "b"),
+        # HOLD 无方向，不进验收表
+        _eval(_WINDOW_END, "000001.SZ", "HOLD", "15m", -1.0, -1.07, "c"),
+    ]
+    result = _acceptance(monkeypatch, rows)
+    assert sorted(r["signal_type"] for r in result["data"]) == ["BUY_WATCH", "SELL_WATCH"]
+
+
+@pytest.mark.unit
+def test_acceptance_uses_net_not_gross(monkeypatch):
+    """毛 +0.03% 算赢、扣 0.07% 成本后净 -0.04% —— 判据读净口径。"""
+    rows = [
+        _eval(_WINDOW_END, "600000.SH", "BUY_WATCH", "15m", 0.03, -0.04, "a"),
+        _eval(_WINDOW_END, "300750.SZ", "BUY_WATCH", "15m", 0.03, -0.04, "b"),
+    ]
+    row = next(r for r in _acceptance(monkeypatch, rows)["data"] if r["horizon"] == "15m")
+    assert row["win_rate"] == pytest.approx(1.0)  # 毛：对照
+    assert row["net_win_rate"] == pytest.approx(0.0)  # 净：判据
+    assert row["avg_net_return_pct"] == pytest.approx(-0.04)
+
+
+@pytest.mark.unit
+def test_acceptance_window_limits_dates(monkeypatch):
+    """滚动窗口只取最近 N 个有评估的交易日，且可复现（trade_date 为结束日）。"""
+    rows = [
+        _eval(f"202609{d:02d}", f"{d:06d}.SZ", "BUY_WATCH", "15m", 1.0, 1.0, f"s{d}")
+        for d in range(1, 13)
+    ]
+    result = _acceptance(monkeypatch, rows, lookback_days=10)
+    assert result["window_end"] == "20260912"
+    assert result["window_start"] == "20260903"
+    assert len(result["dates"]) == 10
+    assert result["raw_count"] == 12
+    assert result["window_count"] == 10
+    row = next(r for r in result["data"] if r["horizon"] == "15m")
+    assert row["rows"] == 10 and row["days"] == 10

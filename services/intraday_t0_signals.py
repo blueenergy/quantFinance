@@ -19,6 +19,19 @@ WATCH_SIGNAL_TYPES = {"BUY_WATCH", "SELL_WATCH"}
 DEFAULT_COOLDOWN_MINUTES = int(os.getenv("INTRADAY_T0_COOLDOWN_MINUTES", "15"))
 DEFAULT_PRICE_RESET_PCT = float(os.getenv("INTRADAY_T0_COOLDOWN_PRICE_RESET_PCT", "1.0"))
 
+# 验收口径（出处：llm-wiki projects/trading/t0-cross-day-improvement-plan.md）
+ACCEPTANCE_LOOKBACK_DAYS = 10
+ACCEPTANCE_MIN_CLUSTERS = 30
+# t1_max 取的是**次日 high**，是 t1_open 的上包络、实盘不可成交，不进验收口径
+ACCEPTANCE_EXCLUDED_HORIZONS = ("t1_max",)
+# t1_open 隔夜持有已不是 T+0，单列一档，不与日内 horizon 混在一张表里
+ACCEPTANCE_OVERNIGHT_HORIZONS = ("t1_open",)
+Z_95 = 1.96
+
+# 评估样本：(毛收益%, 净收益%, 股票, 交易日)。后两项是**聚类键** —— 同一
+# (股票, 交易日) 会产生多条信号，行数远大于独立样本数，胜率的置信区间必须按簇算。
+EvalSample = Tuple[float, Optional[float], str, str]
+
 _INDEXES_READY = False
 
 
@@ -914,38 +927,68 @@ def evaluate_signals_for_user(user_id: str, trade_date: Optional[str] = None) ->
     }
 
 
+def _is_win(signal_type: str, value: float) -> bool:
+    """方向感知的「赢」：BUY_WATCH 先买后卖（涨才算赢），SELL_WATCH 反之（跌才算赢）。
+
+    毛口径、净口径、验收口径**共用这一份判据**。曾经另写过一份统一 `v>0` 的聚合，
+    把 SELL_WATCH 方向算反、净胜率虚高到 78%。判据只留一处，谁都别复刻。
+    """
+    return value > 0 if signal_type == "BUY_WATCH" else value < 0
+
+
 def _summarize_return_values(
     signal_type: str,
-    values: List[Tuple[float, Optional[float]]],
+    values: List[Tuple[float, Optional[float], str, str]],
 ) -> Dict[str, Any]:
-    """values 是 (gross_return_pct, net_return_pct) 对的列表（net 可能缺失）。
+    """values 是 (gross_return_pct, net_return_pct, symbol, trade_date) 的列表。
 
     毛口径字段（avg_return_pct / win_rate）保持原义不变，便于与历史读数比较；
     净口径另给 avg_net_return_pct / net_win_rate —— 成本是收益的一阶项
     （本账户往返 0.07%），毛口径达标完全可能净亏，验收须读净口径。
+
+    ``count`` 是**行数**，不是样本数：同一 (symbol, trade_date) 会产生多条信号，
+    5m/15m/30m/60m 多个 horizon 也互相重叠。``clusters`` / ``days`` 才是真实规模
+    —— 实测 BUY_WATCH 15m 的 349 行只落在 50 个簇上。读 win_rate 前先看它们。
     """
     if not values:
-        return {"count": 0, "avg_return_pct": 0.0, "win_rate": 0.0}
-    is_buy = signal_type == "BUY_WATCH"
-    gross = [g for g, _ in values]
-    wins = [v for v in gross if (v > 0 if is_buy else v < 0)]
+        return {
+            "count": 0,
+            "clusters": 0,
+            "days": 0,
+            "avg_return_pct": 0.0,
+            "win_rate": 0.0,
+        }
+    gross = [v[0] for v in values]
+    wins = [v for v in gross if _is_win(signal_type, v)]
     summary: Dict[str, Any] = {
         "count": len(gross),
+        "clusters": len({(v[2], v[3]) for v in values}),
+        "days": len({v[3] for v in values}),
         "avg_return_pct": sum(gross) / len(gross),
         "win_rate": len(wins) / len(gross),
     }
-    net = [n for _, n in values if n is not None]
+    net = [v[1] for v in values if v[1] is not None]
     if net:
-        net_wins = [v for v in net if (v > 0 if is_buy else v < 0)]
+        net_wins = [v for v in net if _is_win(signal_type, v)]
         summary["avg_net_return_pct"] = sum(net) / len(net)
         summary["net_win_rate"] = len(net_wins) / len(net)
     return summary
 
 
+def _eval_sample(row: Dict[str, Any], ret: float) -> EvalSample:
+    """把一条评估行压成 (毛收益%, 净收益%, 股票, 交易日)。后两项是聚类键。"""
+    return (
+        ret,
+        to_float(row.get("net_return_pct")),
+        str(row.get("symbol") or "").strip(),
+        str(row.get("trade_date") or ""),
+    )
+
+
 def _group_evaluations_by_signal_horizon(
     rows: Iterable[Dict[str, Any]],
-) -> Dict[Tuple[str, ...], List[Tuple[float, Optional[float]]]]:
-    grouped: Dict[Tuple[str, ...], List[Tuple[float, Optional[float]]]] = {}
+) -> Dict[Tuple[str, ...], List[EvalSample]]:
+    grouped: Dict[Tuple[str, ...], List[EvalSample]] = {}
     for row in rows:
         ret = to_float(row.get("return_pct"))
         if ret is None:
@@ -954,14 +997,14 @@ def _group_evaluations_by_signal_horizon(
             str(row.get("signal_type") or "UNKNOWN"),
             str(row.get("horizon") or "unknown"),
         )
-        grouped.setdefault(key, []).append((ret, to_float(row.get("net_return_pct"))))
+        grouped.setdefault(key, []).append(_eval_sample(row, ret))
     return grouped
 
 
 def _group_evaluations_by_symbol_horizon(
     rows: Iterable[Dict[str, Any]],
-) -> Dict[Tuple[str, ...], List[Tuple[float, Optional[float]]]]:
-    grouped: Dict[Tuple[str, ...], List[Tuple[float, Optional[float]]]] = {}
+) -> Dict[Tuple[str, ...], List[EvalSample]]:
+    grouped: Dict[Tuple[str, ...], List[EvalSample]] = {}
     for row in rows:
         ret = to_float(row.get("return_pct"))
         symbol = str(row.get("symbol") or "").strip()
@@ -972,7 +1015,7 @@ def _group_evaluations_by_symbol_horizon(
             str(row.get("signal_type") or "UNKNOWN"),
             str(row.get("horizon") or "unknown"),
         )
-        grouped.setdefault(key, []).append((ret, to_float(row.get("net_return_pct"))))
+        grouped.setdefault(key, []).append(_eval_sample(row, ret))
     return grouped
 
 
@@ -980,7 +1023,7 @@ def _group_evaluations_by_reason_horizon(
     user_id: str,
     trade_date: Optional[str],
     evaluation_rows: Iterable[Dict[str, Any]],
-) -> Dict[Tuple[str, ...], List[float]]:
+) -> Dict[Tuple[str, ...], List[EvalSample]]:
     signal_query: Dict[str, Any] = {
         "user_id": user_id,
         "signal_type": {"$in": sorted(WATCH_SIGNAL_TYPES)},
@@ -994,7 +1037,7 @@ def _group_evaluations_by_reason_horizon(
         )
     )
     reason_by_signal = {str(doc["_id"]): doc for doc in signals}
-    grouped: Dict[Tuple[str, ...], List[Tuple[float, Optional[float]]]] = {}
+    grouped: Dict[Tuple[str, ...], List[EvalSample]] = {}
     for row in evaluation_rows:
         ret = to_float(row.get("return_pct"))
         signal_id = str(row.get("signal_id") or "")
@@ -1012,7 +1055,7 @@ def _group_evaluations_by_reason_horizon(
             if not reason_code:
                 continue
             grouped.setdefault((reason_code, signal_type, horizon), []).append(
-                (ret, to_float(row.get("net_return_pct")))
+                _eval_sample(row, ret)
             )
     return grouped
 
@@ -1063,6 +1106,181 @@ def performance_summary(user_id: str, trade_date: Optional[str] = None) -> Dict[
         "by_symbol": by_symbol,
         "by_reason": by_reason,
         "raw_count": len(rows),
+    }
+
+
+def _clustered_mean_ci(cluster_rates: List[float]) -> Dict[str, Any]:
+    """簇统计量的均值 + 近似 95% CI（簇被当作独立单位）。
+
+    先算「簇内一个数」、再跨簇等权平均，簇内相关性就被这一步平均吸收，
+    于是 ``se = sd/√n`` 即聚类稳健标准误，不是简化。
+
+    ``ddof=1`` 有两个理由：与 factor 侧的 ``ic.std(ddof=1)`` 一致；且 n=1 时
+    它天然未定义，正好逼出「不报 CI」—— 若用 ddof=0 会得到 sd=0 的**零宽区间**，
+    那比宽区间更骗人（假装精确）。
+
+    区间**不截断到 [0,1]**：下界为负的准确含义是「不能排除零胜率」，
+    是该被看见的信息，截断会把它化妆成 0%。
+
+    簇数 < 2 时**不返回 CI 键**（而非置 None）—— 前端 ``percent()`` 走
+    ``Number(v)``，``Number(null)=0`` 会渲染成 "0.0%" 继续骗人，键缺失才是 "-"。
+    """
+    n = len(cluster_rates)
+    if n < 2:
+        return {"mean": cluster_rates[0] if n else None, "n": n}
+    mean = sum(cluster_rates) / n
+    var = sum((v - mean) ** 2 for v in cluster_rates) / (n - 1)
+    sd = math.sqrt(max(var, 0.0))  # max 防浮点 -0.0
+    half = Z_95 * sd / math.sqrt(n)
+    return {
+        "mean": mean,
+        "n": n,
+        "cluster_rate_sd": sd,
+        "ci_low": mean - half,
+        "ci_high": mean + half,
+        "ci_half_width": half,
+    }
+
+
+def _acceptance_row(
+    signal_type: str,
+    horizon: str,
+    samples: List[EvalSample],
+    min_clusters: int,
+) -> Optional[Dict[str, Any]]:
+    """一个 (style, horizon) 的验收行：簇等权净胜率 + 95% CI + 真实样本规模。"""
+    net_samples = [s for s in samples if s[1] is not None]
+    if not net_samples:
+        return None
+    by_cluster: Dict[Tuple[str, str], List[float]] = {}
+    for _gross, net, symbol, td in net_samples:
+        by_cluster.setdefault((symbol, td), []).append(net)
+    cluster_rates = [
+        sum(1 for v in values if _is_win(signal_type, v)) / len(values)
+        for values in by_cluster.values()
+    ]
+    stats = _clustered_mean_ci(cluster_rates)
+    gross = [s[0] for s in samples]
+    row: Dict[str, Any] = {
+        "signal_type": signal_type,
+        "horizon": horizon,
+        "rows": len(samples),
+        "clusters": len(by_cluster),
+        "days": len({s[3] for s in samples}),
+        "net_win_rate": stats["mean"],
+        # 行级池化净胜率，仅供诊断：与簇等权口径差距大 = 结果被信号多的簇主导
+        "pooled_net_win_rate": (
+            sum(1 for _g, net, _s, _d in net_samples if _is_win(signal_type, net))
+            / len(net_samples)
+        ),
+        "avg_net_return_pct": sum(s[1] for s in net_samples) / len(net_samples),
+        "win_rate": (
+            sum(1 for v in gross if _is_win(signal_type, v)) / len(gross) if gross else None
+        ),
+        # 门槛只是**标签**，不是闸门：不够格时数照报、CI 照给，够不够由人看
+        "sufficient_sample": len(by_cluster) >= min_clusters,
+    }
+    for key in ("cluster_rate_sd", "ci_low", "ci_high", "ci_half_width"):
+        if key in stats:
+            row[key] = stats[key]
+    return row
+
+
+def acceptance_summary(
+    user_id: str,
+    lookback_days: int = ACCEPTANCE_LOOKBACK_DAYS,
+    trade_date: Optional[str] = None,
+    min_clusters: int = ACCEPTANCE_MIN_CLUSTERS,
+) -> Dict[str, Any]:
+    """Phase 1 验收口径：按 style 分离、按 (股票, 交易日) 聚类的净胜率 + 95% CI。
+
+    **只报数，不判「通过/不通过」**：实测 32–50 个簇时 CI 半宽 **±8.5 ～ ±14pp**，
+    且真实区间还要更宽（同日各票共享大盘 beta，簇之间不独立）。这种宽度上做
+    自动结论是假精确；够不够格由人看着 CI 决定。
+
+    与 ``performance_summary`` 的三点不同：
+
+    1. **窗口是滚动的**（默认最近 10 个有评估的交易日），不是单日 —— 单日读数
+       实测在 33%–67% 之间跳。``trade_date`` 是窗口**结束日**（含），传它可复现。
+    2. **行数不是样本数**：``rows`` 是行数，``clusters`` 才是独立单位数
+       （实测 BUY_WATCH 15m 的 349 行只落在 50 个簇上）。
+    3. **排除 ``t1_max``**（次日 high，是 ``t1_open`` 的上包络、不可成交）；
+       ``t1_open`` 隔夜持有已不是 T+0，单独放 ``overnight``。
+
+    BUY / SELL 各自成行、绝不合并 —— 两条腿质量不对称（实测 BUY_WATCH 日内毛
+    胜率 45–47% vs SELL_WATCH 54–58%），混算等于拿好腿补坏腿。
+    """
+    ensure_intraday_t0_indexes()
+    # 刻意不用 distinct() / $lte：测试用的 FakeCollection 两者都不支持，
+    # 且缺字段的行会在 `None <= str` 上抛 TypeError。取回后在 Python 里切窗口
+    # （与 performance_summary 的无界查询同形，无新增性能风险）。
+    rows = list(
+        get_db_collections()["intraday_t0_signal_evaluations"].find(
+            {"user_id": user_id}, {"_id": 0}
+        )
+    )
+    end = compact_trade_date(trade_date) if trade_date else compact_trade_date()
+    all_dates = sorted(
+        {d for d in (str(r.get("trade_date") or "") for r in rows) if d and d <= end}
+    )
+    dates = all_dates[-max(int(lookback_days), 1):]
+    window = set(dates)
+    scoped = [r for r in rows if str(r.get("trade_date") or "") in window]
+
+    intraday: Dict[Tuple[str, str], List[EvalSample]] = {}
+    overnight: Dict[Tuple[str, str], List[EvalSample]] = {}
+    horizons_seen = set()
+    for row in scoped:
+        signal_type = str(row.get("signal_type") or "")
+        horizon = str(row.get("horizon") or "")
+        if horizon:
+            horizons_seen.add(horizon)
+        # HOLD 没有方向：`v<0` 算赢会把「跌了」读成高胜率（20260910 事故），
+        # 验收表里绝不能出现这种行。
+        if signal_type not in WATCH_SIGNAL_TYPES:
+            continue
+        if horizon in ACCEPTANCE_EXCLUDED_HORIZONS:
+            continue
+        ret = to_float(row.get("return_pct"))
+        if ret is None:
+            continue
+        bucket = overnight if horizon in ACCEPTANCE_OVERNIGHT_HORIZONS else intraday
+        bucket.setdefault((signal_type, horizon), []).append(_eval_sample(row, ret))
+
+    def _build(source: Dict[Tuple[str, str], List[EvalSample]]) -> List[Dict[str, Any]]:
+        built = []
+        for (signal_type, horizon), samples in sorted(source.items()):
+            built_row = _acceptance_row(signal_type, horizon, samples, min_clusters)
+            if built_row:
+                built.append(built_row)
+        return built
+
+    return {
+        "success": True,
+        "data": _build(intraday),
+        "overnight": _build(overnight),
+        "lookback_days": int(lookback_days),
+        "window_start": dates[0] if dates else None,
+        "window_end": dates[-1] if dates else None,
+        "dates": dates,
+        "min_clusters": min_clusters,
+        "excluded_horizons": list(ACCEPTANCE_EXCLUDED_HORIZONS),
+        "horizons_seen": sorted(horizons_seen),
+        "raw_count": len(rows),
+        "window_count": len(scoped),
+        "generated_at": now_ts(),
+        "notes": [
+            "`net_win_rate` = 簇内先算胜率、再跨簇等权平均；簇 = (股票, 交易日)。"
+            "`pooled_net_win_rate` 是行级池化口径，**仅供诊断**：两者差距大 = "
+            "结果被「信号多的簇」主导，此时期望值应以簇等权为准。",
+            "CI 是簇稳健的近似 95% 区间，**不截断到 [0,1]**：下界为负的含义是"
+            "「不能排除零胜率」，不是算错了。",
+            "⚠️ 同一天各票共享大盘 beta，簇之间并不独立 → 有效自由度低于簇数，"
+            "**真实区间比这里更宽**。故 `days` 必须与 `clusters` 一起读。",
+            "BUY / SELL 分别成行、绝不合并；HOLD 无方向不进此表。",
+            "t1_max（次日 high，t1_open 的上包络、不可成交）已排除；"
+            "t1_open 隔夜持有已不是 T+0，单列 overnight。",
+        ],
     }
 
 

@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field
 from auth import get_current_active_user, require_hermes_quant_internal_key
 from db import get_db_collections
 from services.intraday_t0_signals import (
+    acceptance_summary,
     create_mock_positions_from_watchlist,
     ensure_intraday_t0_indexes,
     evaluate_signals_for_user,
@@ -297,6 +298,26 @@ def get_signal_performance(
         return performance_summary(_user_id(current_user), trade_date=trade_date)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"获取日内T+0表现统计失败: {exc}")
+
+
+@router.get("/signals/acceptance")
+def get_signal_acceptance(
+    lookback_days: int = Query(10, ge=1, le=60),
+    trade_date: Optional[str] = Query(
+        None, description="窗口**结束日**（含）YYYYMMDD or YYYY-MM-DD；留空取今天"
+    ),
+    current_user: dict = Depends(get_current_active_user),
+):
+    """T+0 验收口径：按 style 分离、按 (股票, 交易日) 聚类的净胜率 + 95% CI。
+
+    只报数，不判通过/不通过 —— 簇数少时 CI 很宽，够不够格由人看着 CI 定。
+    """
+    try:
+        return acceptance_summary(
+            _user_id(current_user), lookback_days=lookback_days, trade_date=trade_date
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"获取日内T+0验收统计失败: {exc}")
 
 
 @router.get("/signals/export")
