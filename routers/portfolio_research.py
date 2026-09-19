@@ -634,6 +634,15 @@ def _load_full_result_rows(result: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 
 def _params_hash(params: Dict[str, Any]) -> str:
+    """Preset hash: 16 hex chars over ``PRESET_PARAM_KEYS`` (24 keys).
+
+    Not the lineage hash. ``plan_params_hash`` in stock-scoring-system's
+    ``shared/strategies.py`` is 12 chars over ``PLAN_PARAM_KEYS`` (10 keys)
+    and normalizes first, so this one carries ``trailing_stop_pct`` /
+    ``initial_capital`` / fee rates / ``regime_*`` that the lineage hash
+    deliberately drops. The preset field this feeds is also called
+    ``params_hash`` -- same name, different namespace, never compare the two.
+    """
     payload = json.dumps(params, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
