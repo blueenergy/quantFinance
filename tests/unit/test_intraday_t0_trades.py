@@ -652,3 +652,80 @@ def test_day_close_check_alerts_carryover_pair_with_no_legs_today(monkeypatch):
     assert result["alert_count"] == 1
     assert result["alerts"][0]["code"] == "uncovered_sell"
     assert result["alerts"][0]["pair_id"] == "pair-old"
+
+
+_FEE_MODEL = {
+    "buy_commission_rate": 0.0001,
+    "sell_commission_rate": 0.0001,
+    "min_commission": 5,
+    "stamp_tax_rate": 0.0005,
+    "transfer_fee_rate": 0.00001,
+}
+
+
+@pytest.mark.unit
+def test_calc_trade_fees():
+    # 卖出 100 股 @200：佣金 max(2, 5)=5，印花税 10，过户费 0.2 → 15.2
+    assert trades.calc_trade_fees("sell", 100, 200.0, _FEE_MODEL) == pytest.approx(15.2)
+    # 买入 100 股 @200：佣金 5，无印花税，过户费 0.2 → 5.2
+    assert trades.calc_trade_fees("buy", 100, 200.0, _FEE_MODEL) == pytest.approx(5.2)
+    # 小额买入 100 股 @10：佣金 max(0.1, 5)=5，过户费 0.01 → 5.01
+    assert trades.calc_trade_fees("buy", 100, 10.0, _FEE_MODEL) == pytest.approx(5.01)
+    # 无费率模型 → 0.0（保持 gross==net 的旧行为并告警）
+    assert trades.calc_trade_fees("sell", 100, 200.0, {}) == 0.0
+    # 无效输入不崩
+    assert trades.calc_trade_fees("sell", 0, 200.0, _FEE_MODEL) == 0.0
+    assert trades.calc_trade_fees("sell", 100, 0.0, _FEE_MODEL) == 0.0
+
+
+@pytest.mark.unit
+def test_record_trade_computes_fees_when_not_provided(monkeypatch):
+    """fees 缺省时从 securities_accounts 费率自动计算；显式传 fees 仍被尊重。"""
+    trade_rows = []
+
+    class _InsertCollection(FakeCollection):
+        def insert_one(self, doc):
+            doc = dict(doc)
+            doc["_id"] = ObjectId()
+            self.rows.append(doc)
+
+            class _Result:
+                inserted_id = doc["_id"]
+
+            return _Result()
+
+    monkeypatch.setattr(
+        trades,
+        "get_db_collections",
+        lambda: {
+            "intraday_t0_trades": _InsertCollection(trade_rows),
+            "intraday_t0_signals": FakeCollection([]),
+            "trader_positions": FakeCollection(
+                [{"user_id": "u1", "symbol": "300750.SZ", "available_qty": 200}]
+            ),
+            "trade_signals": FakeCollection([]),
+            "securities_accounts": FakeCollection(
+                [{"fee_model": _FEE_MODEL, "live_trading_enabled": True}]
+            ),
+        },
+    )
+    monkeypatch.setattr(trades, "ensure_intraday_t0_trade_indexes", lambda: None)
+
+    auto = trades.record_trade(
+        "u1",
+        {"symbol": "300750.SZ", "leg": "buy", "quantity": 100, "price": 200.0},
+    )
+    assert auto["data"]["fees"] == pytest.approx(5.2)
+
+    manual = trades.record_trade(
+        "u1",
+        {
+            "symbol": "300750.SZ",
+            "leg": "sell",
+            "quantity": 100,
+            "price": 200.0,
+            "pair_id": auto["data"]["pair_id"],
+            "fees": 7.5,
+        },
+    )
+    assert manual["data"]["fees"] == pytest.approx(7.5)

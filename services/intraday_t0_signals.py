@@ -544,7 +544,6 @@ def classify_signal(position: Dict[str, Any], features: Dict[str, Any], snapshot
     bucket = features.get("time_of_day")
 
     intraday_pos = to_float(features.get("intraday_position"))
-    pnl_pct = to_float(features.get("pnl_pct"))
     imbalance = to_float(features.get("bid_ask_imbalance"))
     market_yang = to_float(features.get("market_yang_spectrum"))
     sector_positive = to_float(features.get("sector_positive_ratio"))
@@ -554,9 +553,11 @@ def classify_signal(position: Dict[str, Any], features: Dict[str, Any], snapshot
     if intraday_pos is not None and intraday_pos >= 0.78:
         score_sell += 22
         sell_reasons.append("near_intraday_high")
-    if pnl_pct is not None and pnl_pct >= 1.0:
+    # 日内涨幅基准（pct_chg = (close - pre_close) / pre_close）。不能用持仓成本的 pnl_pct：
+    # 浮盈票会恒 +16 卖压、套牢票永远拿不到分，形成成本锚定偏差（评审 P0-1）
+    if pct_chg is not None and pct_chg >= 1.0:
         score_sell += 16
-        sell_reasons.append("position_has_profit")
+        sell_reasons.append("intraday_gain_1pct")
     if imbalance is not None and imbalance <= -0.18:
         score_sell += 18
         sell_reasons.append("ask_pressure_stronger")

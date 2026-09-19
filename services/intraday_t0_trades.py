@@ -305,6 +305,49 @@ def preview_trade_from_signal(
     }
 
 
+def _t0_fee_model() -> Dict[str, Any]:
+    """从 securities_accounts 读费率模型（无 user 维度；优先 live 账户）。"""
+    accounts = get_db_collections().get("securities_accounts")
+    if accounts is None:
+        return {}
+    docs = list(accounts.find({}, {"fee_model": 1, "live_trading_enabled": 1}).limit(10))
+    for doc in docs:
+        if doc.get("fee_model") and doc.get("live_trading_enabled"):
+            return doc["fee_model"]
+    for doc in docs:
+        if doc.get("fee_model"):
+            return doc["fee_model"]
+    return {}
+
+
+def calc_trade_fees(leg: str, quantity: int, price: float, fee_model: Dict[str, Any]) -> float:
+    """单腿 A 股费用估算：佣金（含最低佣金兜底）+ 卖方印花税 + 双边过户费。
+
+    费率均为小数（万1 = 0.0001，印花税 0.0005），与 UserProfile 表单一致。
+    """
+    if not fee_model:
+        return 0.0
+    notional = to_float(price) * to_int(quantity)
+    if notional <= 0:
+        return 0.0
+    is_sell = str(leg or "").lower() == "sell"
+    commission = 0.0
+    raw_rate = fee_model.get("sell_commission_rate" if is_sell else "buy_commission_rate")
+    rate = to_float(raw_rate) if raw_rate is not None else None
+    if rate is not None:
+        commission = notional * rate
+        min_commission = to_float(fee_model.get("min_commission"))
+        if min_commission is not None and commission < min_commission:
+            commission = min_commission
+    stamp = 0.0
+    if is_sell and fee_model.get("stamp_tax_rate") is not None:
+        stamp = notional * to_float(fee_model["stamp_tax_rate"])
+    transfer = 0.0
+    if fee_model.get("transfer_fee_rate") is not None:
+        transfer = notional * to_float(fee_model["transfer_fee_rate"])
+    return round(commission + stamp + transfer, 2)
+
+
 def record_trade(user_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     ensure_intraday_t0_trade_indexes()
     leg = str(payload.get("leg") or "").lower().strip()
@@ -320,7 +363,15 @@ def record_trade(user_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     if price is None or price <= 0:
         raise ValueError("price must be positive")
     trade_date = compact_trade_date(payload.get("trade_date"))
-    fees = to_float(payload.get("fees"), 0.0) or 0.0
+    fees = to_float(payload.get("fees"))
+    if fees is None:
+        fee_model = _t0_fee_model()
+        if not fee_model:
+            log.warning(
+                "no fee_model in securities_accounts; recording t0 trade %s with fees=0 (net==gross)",
+                symbol,
+            )
+        fees = calc_trade_fees(leg, quantity, price, fee_model)
     signal_id = str(payload.get("signal_id") or "").strip() or None
     pair_id = str(payload.get("pair_id") or "").strip() or None
     notes = str(payload.get("notes") or "").strip()

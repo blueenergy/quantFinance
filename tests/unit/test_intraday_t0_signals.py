@@ -52,14 +52,15 @@ def test_calc_helpers_return_none_when_data_missing():
 
 @pytest.mark.unit
 def test_classify_signal_emits_sell_watch_near_high():
+    # pnl_pct=-5.0（深套）也不影响卖出评分：+16 卖压来自日内涨幅 pct_chg，不是持仓成本（P0-1）
     features = {
         "intraday_position": 0.85,
-        "pnl_pct": 2.0,
+        "pnl_pct": -5.0,
         "bid_ask_imbalance": -0.25,
         "sector_positive_ratio": 0.30,
         "market_yang_spectrum": 0.35,
         "time_of_day": "14:00-14:30",
-        "pct_chg": -0.5,
+        "pct_chg": 2.0,
         "avg_trade_size_yuan": 25000,
     }
     signal_type, score, reasons = t0.classify_signal({}, features, "202608201420")
@@ -67,6 +68,8 @@ def test_classify_signal_emits_sell_watch_near_high():
     assert score >= 58
     assert "near_intraday_high" in reasons
     assert "ask_pressure_stronger" in reasons
+    assert "intraday_gain_1pct" in reasons
+    assert "position_has_profit" not in reasons
 
 
 @pytest.mark.unit

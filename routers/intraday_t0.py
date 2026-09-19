@@ -92,7 +92,7 @@ class RecordTradePayload(BaseModel):
     quantity: int = Field(..., gt=0)
     price: float = Field(..., gt=0)
     trade_date: Optional[str] = None
-    fees: float = Field(0.0, ge=0)
+    fees: Optional[float] = Field(None, ge=0)
     signal_id: Optional[str] = None
     pair_id: Optional[str] = Field(
         None,

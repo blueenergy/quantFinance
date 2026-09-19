@@ -514,7 +514,6 @@ def sync_execution_trade_leg(
                 "quantity": quantity,
                 "price": price,
                 "trade_date": trade_date,
-                "fees": 0.0,
                 "signal_id": signal_id or None,
                 "pair_id": intent.get("pair_id"),
                 "notes": "auto_sync_from_execution" if auto else "sync_from_execution",
