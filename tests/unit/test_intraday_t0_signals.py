@@ -300,3 +300,227 @@ def test_latest_market_spectrum_pins_ma5_when_newer_ma30_exists(monkeypatch):
     assert today["yang_spectrum"] == pytest.approx(0.7296)
     legacy = t0.latest_market_spectrum("2026-09-17")
     assert legacy["yang_spectrum"] == pytest.approx(0.55)
+
+
+# 生产 securities_accounts 的费率：万1 双边 + 最低 5 元 + 卖方印花税 0.05%
+FEE_MODEL = {
+    "buy_commission_rate": 0.0001,
+    "sell_commission_rate": 0.0001,
+    "min_commission": 5.0,
+    "stamp_tax_rate": 0.0005,
+    "transfer_fee_rate": 0.0,
+}
+
+
+@pytest.mark.unit
+def test_round_trip_cost_pct_includes_min_commission_step():
+    # ≥5 万：佣金不被最低值顶掉，往返 0.07%
+    assert t0.round_trip_cost_pct(FEE_MODEL, 100_000) == pytest.approx(0.07)
+    # 1 万：最低佣金 5 元咬住，成本升到 0.15% —— 成本不是定值
+    assert t0.round_trip_cost_pct(FEE_MODEL, 10_000) == pytest.approx(0.15)
+    # 没有费率模型时不假装有成本
+    assert t0.round_trip_cost_pct({}, 100_000) == 0.0
+
+
+@pytest.mark.unit
+def test_net_return_pct_signs_cost_by_direction():
+    """成本要按方向折：BUY 直接扣，SELL 是"要多跌一个成本"。
+
+    一律写 return - cost 会让 SELL_WATCH 净胜率虚高（实测 59% → 78%）。
+    """
+    assert t0.net_return_pct(0.03, 0.07, "BUY_WATCH") == pytest.approx(-0.04)
+    # 跌了 0.30%：超过成本，先卖后买仍然赚
+    assert t0.net_return_pct(-0.30, 0.07, "SELL_WATCH") == pytest.approx(-0.23)
+    # 只跌 0.02%：毛算赢，但没跌够成本 → 实际亏
+    assert t0.net_return_pct(-0.02, 0.07, "SELL_WATCH") == pytest.approx(0.05)
+    # 无方向（HOLD）：保守按成本是拖累
+    assert t0.net_return_pct(0.10, 0.07, "HOLD") == pytest.approx(0.03)
+
+
+@pytest.mark.unit
+def test_reference_notional_uses_median_position_value(monkeypatch):
+    monkeypatch.setattr(
+        t0,
+        "get_user_positions",
+        lambda uid, trade_date=None: (
+            "auto",
+            [
+                {"quantity": 100, "current_price": 10.0},  # 1,000
+                {"quantity": 1000, "current_price": 10.0},  # 10,000
+                {"quantity": 10000, "current_price": 10.0},  # 100,000
+            ],
+        ),
+    )
+    assert t0._reference_notional("u1", "20260820") == pytest.approx(10_000)
+
+
+@pytest.mark.unit
+def test_reference_notional_falls_back_without_positions(monkeypatch):
+    monkeypatch.setattr(t0, "get_user_positions", lambda uid, trade_date=None: ("auto", []))
+    assert t0._reference_notional("u1", "20260820") == t0.REFERENCE_NOTIONAL_FALLBACK
+
+
+def _patch_performance(monkeypatch, eval_rows, signal_rows):
+    monkeypatch.setattr(
+        t0,
+        "get_db_collections",
+        lambda: {
+            "intraday_t0_signal_evaluations": FakeCollection(eval_rows),
+            "intraday_t0_signals": FakeCollection(signal_rows),
+        },
+    )
+    monkeypatch.setattr(t0, "_INDEXES_READY", True)
+
+
+@pytest.mark.unit
+def test_performance_summary_omits_win_rate_for_hold(monkeypatch):
+    """HOLD 无方向：`v<0` 算赢会把“跌了”读成高胜率，故该行不带 win_rate。
+
+    删键而非置 None —— 前端 percent() 走 Number(v)，Number(null)=0 会渲染成
+    “0.0%”，键缺失才是 “-”。
+    """
+    _patch_performance(
+        monkeypatch,
+        eval_rows=[
+            {
+                "user_id": "u1",
+                "signal_id": "s1",
+                "symbol": "300750.SZ",
+                "signal_type": "HOLD",
+                "horizon": "5m",
+                "return_pct": -1.0,
+                "net_return_pct": -1.07,
+            },
+            {
+                "user_id": "u1",
+                "signal_id": "s2",
+                "symbol": "600000.SH",
+                "signal_type": "BUY_WATCH",
+                "horizon": "5m",
+                "return_pct": 0.2,
+                "net_return_pct": 0.13,
+            },
+        ],
+        signal_rows=[
+            {"_id": "s1", "user_id": "u1", "signal_type": "HOLD", "reason_codes": []},
+            {"_id": "s2", "user_id": "u1", "signal_type": "BUY_WATCH", "reason_codes": []},
+        ],
+    )
+    result = t0.performance_summary("u1", trade_date=None)
+    hold_row = next(r for r in result["data"] if r["signal_type"] == "HOLD")
+    assert "win_rate" not in hold_row
+    assert "net_win_rate" not in hold_row
+    assert hold_row["count"] == 1
+    assert hold_row["avg_return_pct"] == pytest.approx(-1.0)
+    buy_row = next(r for r in result["data"] if r["signal_type"] == "BUY_WATCH")
+    assert buy_row["win_rate"] == 1.0
+    assert buy_row["net_win_rate"] == 1.0
+
+
+@pytest.mark.unit
+def test_net_win_rate_exposes_cost_that_gross_win_rate_hides(monkeypatch):
+    """毛 +0.03% 算赢，扣掉往返 0.07% 后净 -0.04% —— 实际是亏的。
+
+    这正是 Phase 1 验收只看毛 win_rate 会读错的地方。
+    """
+    _patch_performance(
+        monkeypatch,
+        eval_rows=[
+            {
+                "user_id": "u1",
+                "signal_id": "s1",
+                "symbol": "600000.SH",
+                "signal_type": "BUY_WATCH",
+                "horizon": "15m",
+                "return_pct": 0.03,
+                "net_return_pct": -0.04,
+            }
+        ],
+        signal_rows=[
+            {"_id": "s1", "user_id": "u1", "signal_type": "BUY_WATCH", "reason_codes": []}
+        ],
+    )
+    row = t0.performance_summary("u1", trade_date=None)["data"][0]
+    assert row["win_rate"] == 1.0
+    assert row["net_win_rate"] == 0.0
+    assert row["avg_net_return_pct"] == pytest.approx(-0.04)
+
+
+@pytest.mark.unit
+def test_sell_watch_cost_makes_net_win_harder(monkeypatch):
+    """SELL_WATCH 的对称面：跌了 0.02% 毛算赢，但没跌够 0.07% 成本 → 净是亏的。
+
+    net_return_pct 存的是价格变动空间（-0.02 + 0.07 = +0.05），
+    故 win 判据（<0）此时为假。
+    """
+    _patch_performance(
+        monkeypatch,
+        eval_rows=[
+            {
+                "user_id": "u1",
+                "signal_id": "s1",
+                "symbol": "300750.SZ",
+                "signal_type": "SELL_WATCH",
+                "horizon": "15m",
+                "return_pct": -0.02,
+                "net_return_pct": 0.05,
+            }
+        ],
+        signal_rows=[
+            {"_id": "s1", "user_id": "u1", "signal_type": "SELL_WATCH", "reason_codes": []}
+        ],
+    )
+    row = t0.performance_summary("u1", trade_date=None)["data"][0]
+    assert row["win_rate"] == 1.0
+    assert row["net_win_rate"] == 0.0
+
+
+@pytest.mark.unit
+def test_evaluate_writes_cost_and_net_return(monkeypatch):
+    """评估落库时带上成本假设，验收才能读净口径。"""
+    signals = FakeCollection(
+        [
+            {
+                "_id": "s1",
+                "user_id": "u1",
+                "symbol": "300750.SZ",
+                "trade_date": "20260820",
+                "snapshot_time": "202608201030",
+                "price": 100.0,
+                "signal_type": "BUY_WATCH",
+            }
+        ]
+    )
+    evals = FakeCollection([])
+    monkeypatch.setattr(
+        t0,
+        "get_db_collections",
+        lambda: {
+            "intraday_t0_signals": signals,
+            "intraday_t0_signal_evaluations": evals,
+        },
+    )
+    monkeypatch.setattr(t0, "_INDEXES_READY", True)
+    monkeypatch.setattr(
+        t0,
+        "_snapshot_after",
+        lambda uid, symbol, target: {"price": 101.0, "snapshot_time": "202608201035"},
+    )
+    monkeypatch.setattr(t0, "latest_daily_record", lambda symbol, trade_date=None: None)
+    monkeypatch.setattr(t0, "_next_daily", lambda symbol, trade_date: None)
+    monkeypatch.setattr(
+        t0,
+        "get_user_positions",
+        lambda uid, trade_date=None: ("auto", [{"quantity": 10000, "current_price": 10.0}]),
+    )
+    monkeypatch.setattr("services.intraday_t0_trades._t0_fee_model", lambda: FEE_MODEL)
+
+    result = t0.evaluate_signals_for_user("u1", "20260820")
+    assert result["ref_notional"] == pytest.approx(100_000)
+    assert result["cost_pct"] == pytest.approx(0.07)
+    assert result["evaluations_written"] == 4  # 四个分钟级 horizon；close/t1 无数据
+    doc = evals.upserts[0][1]["$set"]
+    assert doc["return_pct"] == pytest.approx(1.0)
+    assert doc["cost_pct"] == pytest.approx(0.07)
+    assert doc["net_return_pct"] == pytest.approx(0.93)
+    assert doc["ref_notional"] == pytest.approx(100_000)

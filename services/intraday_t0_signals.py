@@ -737,10 +737,72 @@ def _next_daily(symbol: str, trade_date: str) -> Optional[Dict[str, Any]]:
     )
 
 
+REFERENCE_NOTIONAL_FALLBACK = 100_000.0
+
+
+def round_trip_cost_pct(fee_model: Dict[str, Any], notional: float) -> float:
+    """一次回转（买+卖各一腿）的费用百分比，复用交易侧同一套费用模型。"""
+    from services.intraday_t0_trades import calc_trade_fees  # 模块级 import 会循环
+
+    if not fee_model or notional <= 0:
+        return 0.0
+    fees = calc_trade_fees("buy", 1, notional, fee_model) + calc_trade_fees(
+        "sell", 1, notional, fee_model
+    )
+    return fees / notional * 100.0
+
+
+def _reference_notional(user_id: str, trade_date: str) -> float:
+    """参考名义金额 = 当日各持仓市值的中位数（取不到则回落常量）。
+
+    成本百分比**不是定值**：最低佣金 5 元在名义金额 5 万以下会咬（1 万 → 0.15%，
+    ≥5 万 → 0.07%）。所以把假设显式化，并把用到的 ref_notional 写进每条评估。
+    """
+    values: List[float] = []
+    try:
+        for position in get_user_positions(user_id, trade_date=trade_date)[1]:
+            qty = to_float(position.get("quantity"))
+            price = to_float(position.get("current_price"))
+            if qty and price:
+                values.append(qty * price)
+    except Exception:
+        return REFERENCE_NOTIONAL_FALLBACK
+    values = [v for v in values if v > 0]
+    if not values:
+        return REFERENCE_NOTIONAL_FALLBACK
+    values.sort()
+    mid = len(values) // 2
+    return values[mid] if len(values) % 2 else (values[mid - 1] + values[mid]) / 2.0
+
+
+def net_return_pct(
+    return_pct: Optional[float],
+    cost_pct: float,
+    signal_type: Optional[str],
+) -> float:
+    """把往返成本折进**价格变动空间**（与 return_pct 同一坐标系）。
+
+    - BUY_WATCH（先买后卖）：成本直接从收益里扣 → `return - cost`
+    - SELL_WATCH（先卖后买）：要赚回来价格得**多跌**一个成本 → `return + cost`
+
+    两种风格都保持「net 与 win 判据同向」（BUY 看 >0、SELL 看 <0）。
+    若一律写 `return - cost`，SELL_WATCH 会把"价格几乎没跌"也判成赢，
+    净胜率反而虚高 —— 实测确实出现过（59% → 78%）。
+    """
+    value = to_float(return_pct) or 0.0
+    if str(signal_type or "") == "SELL_WATCH":
+        return value + cost_pct
+    return value - cost_pct
+
+
 def evaluate_signals_for_user(user_id: str, trade_date: Optional[str] = None) -> Dict[str, Any]:
     ensure_intraday_t0_indexes()
     td = compact_trade_date(trade_date)
     cols = get_db_collections()
+    from services.intraday_t0_trades import _t0_fee_model  # 同上，避免循环 import
+
+    ref_notional = _reference_notional(user_id, td)
+    cost_pct = round_trip_cost_pct(_t0_fee_model(), ref_notional)
     signals = list(cols["intraday_t0_signals"].find({"user_id": user_id, "trade_date": td}))
     eval_coll = cols["intraday_t0_signal_evaluations"]
     written = 0
@@ -831,30 +893,59 @@ def evaluate_signals_for_user(user_id: str, trade_date: Optional[str] = None) ->
                     }
                 )
         for doc in docs:
+            doc["ref_notional"] = ref_notional
+            doc["cost_pct"] = cost_pct
+            doc["net_return_pct"] = net_return_pct(
+                doc.get("return_pct"), cost_pct, doc.get("signal_type")
+            )
             eval_coll.update_one(
                 {"signal_id": doc["signal_id"], "horizon": doc["horizon"]},
                 {"$set": doc},
                 upsert=True,
             )
             written += 1
-    return {"success": True, "trade_date": td, "signals_count": len(signals), "evaluations_written": written}
+    return {
+        "success": True,
+        "trade_date": td,
+        "signals_count": len(signals),
+        "evaluations_written": written,
+        "ref_notional": ref_notional,
+        "cost_pct": cost_pct,
+    }
 
 
-def _summarize_return_values(signal_type: str, values: List[float]) -> Dict[str, Any]:
+def _summarize_return_values(
+    signal_type: str,
+    values: List[Tuple[float, Optional[float]]],
+) -> Dict[str, Any]:
+    """values 是 (gross_return_pct, net_return_pct) 对的列表（net 可能缺失）。
+
+    毛口径字段（avg_return_pct / win_rate）保持原义不变，便于与历史读数比较；
+    净口径另给 avg_net_return_pct / net_win_rate —— 成本是收益的一阶项
+    （本账户往返 0.07%），毛口径达标完全可能净亏，验收须读净口径。
+    """
     if not values:
         return {"count": 0, "avg_return_pct": 0.0, "win_rate": 0.0}
-    wins = [v for v in values if (v > 0 if signal_type == "BUY_WATCH" else v < 0)]
-    return {
-        "count": len(values),
-        "avg_return_pct": sum(values) / len(values),
-        "win_rate": len(wins) / len(values),
+    is_buy = signal_type == "BUY_WATCH"
+    gross = [g for g, _ in values]
+    wins = [v for v in gross if (v > 0 if is_buy else v < 0)]
+    summary: Dict[str, Any] = {
+        "count": len(gross),
+        "avg_return_pct": sum(gross) / len(gross),
+        "win_rate": len(wins) / len(gross),
     }
+    net = [n for _, n in values if n is not None]
+    if net:
+        net_wins = [v for v in net if (v > 0 if is_buy else v < 0)]
+        summary["avg_net_return_pct"] = sum(net) / len(net)
+        summary["net_win_rate"] = len(net_wins) / len(net)
+    return summary
 
 
 def _group_evaluations_by_signal_horizon(
     rows: Iterable[Dict[str, Any]],
-) -> Dict[Tuple[str, ...], List[float]]:
-    grouped: Dict[Tuple[str, ...], List[float]] = {}
+) -> Dict[Tuple[str, ...], List[Tuple[float, Optional[float]]]]:
+    grouped: Dict[Tuple[str, ...], List[Tuple[float, Optional[float]]]] = {}
     for row in rows:
         ret = to_float(row.get("return_pct"))
         if ret is None:
@@ -863,14 +954,14 @@ def _group_evaluations_by_signal_horizon(
             str(row.get("signal_type") or "UNKNOWN"),
             str(row.get("horizon") or "unknown"),
         )
-        grouped.setdefault(key, []).append(ret)
+        grouped.setdefault(key, []).append((ret, to_float(row.get("net_return_pct"))))
     return grouped
 
 
 def _group_evaluations_by_symbol_horizon(
     rows: Iterable[Dict[str, Any]],
-) -> Dict[Tuple[str, ...], List[float]]:
-    grouped: Dict[Tuple[str, ...], List[float]] = {}
+) -> Dict[Tuple[str, ...], List[Tuple[float, Optional[float]]]]:
+    grouped: Dict[Tuple[str, ...], List[Tuple[float, Optional[float]]]] = {}
     for row in rows:
         ret = to_float(row.get("return_pct"))
         symbol = str(row.get("symbol") or "").strip()
@@ -881,7 +972,7 @@ def _group_evaluations_by_symbol_horizon(
             str(row.get("signal_type") or "UNKNOWN"),
             str(row.get("horizon") or "unknown"),
         )
-        grouped.setdefault(key, []).append(ret)
+        grouped.setdefault(key, []).append((ret, to_float(row.get("net_return_pct"))))
     return grouped
 
 
@@ -903,7 +994,7 @@ def _group_evaluations_by_reason_horizon(
         )
     )
     reason_by_signal = {str(doc["_id"]): doc for doc in signals}
-    grouped: Dict[Tuple[str, ...], List[float]] = {}
+    grouped: Dict[Tuple[str, ...], List[Tuple[float, Optional[float]]]] = {}
     for row in evaluation_rows:
         ret = to_float(row.get("return_pct"))
         signal_id = str(row.get("signal_id") or "")
@@ -920,12 +1011,14 @@ def _group_evaluations_by_reason_horizon(
             reason_code = str(reason or "").strip()
             if not reason_code:
                 continue
-            grouped.setdefault((reason_code, signal_type, horizon), []).append(ret)
+            grouped.setdefault((reason_code, signal_type, horizon), []).append(
+                (ret, to_float(row.get("net_return_pct")))
+            )
     return grouped
 
 
 def _rows_from_grouped(
-    grouped: Dict[Tuple[str, ...], List[float]],
+    grouped: Dict[Tuple[str, ...], List[Tuple[float, Optional[float]]]],
     field_names: List[str],
 ) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
@@ -934,6 +1027,14 @@ def _rows_from_grouped(
         stats = _summarize_return_values(signal_type, values)
         row = dict(zip(field_names, key))
         row.update(stats)
+        if signal_type not in WATCH_SIGNAL_TYPES:
+            # HOLD/UNKNOWN 没有方向：沿用 `v<0` 算赢会把"跌了"读成高胜率
+            # （20260910 HOLD 5m avg=-1.029% 却显示 win=83%）。
+            # 这里**删键**而不是置 None —— 前端 percent() 是 Number(v)，
+            # Number(null)=0 会渲染成 "0.0%"（继续骗人），键缺失才是 "-"。
+            # count / 均值仍有信息量，保留。
+            row.pop("win_rate", None)
+            row.pop("net_win_rate", None)
         rows.append(row)
     return rows
 
@@ -1043,6 +1144,9 @@ def export_evaluations_csv(user_id: str, trade_date: Optional[str] = None) -> st
         "future_snapshot_time",
         "future_trade_date",
         "return_pct",
+        "cost_pct",
+        "net_return_pct",
+        "ref_notional",
         "evaluated_at",
     ]
     lines = [",".join(headers)]
