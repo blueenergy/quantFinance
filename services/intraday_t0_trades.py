@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import uuid
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from bson import ObjectId
 from pymongo import ASCENDING, DESCENDING
@@ -345,14 +345,14 @@ def record_trade(user_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
                 if quantity > max_qty:
                     raise ValueError(f"sell quantity exceeds close limit ({max_qty})")
             else:
-                open_pair = find_open_pair_for_symbol(user_id, symbol, trade_date=trade_date)
+                open_pair = find_open_pair_for_symbol(user_id, symbol)
                 if open_pair:
                     raise ValueError("open pair exists — close it before opening a new sell_first pair")
                 available = _broker_available_qty(user_id, symbol)
                 if available > 0 and quantity > available:
                     raise ValueError(f"quantity exceeds available_qty ({available})")
         else:
-            open_pair = find_open_pair_for_symbol(user_id, symbol, trade_date=trade_date)
+            open_pair = find_open_pair_for_symbol(user_id, symbol)
             if open_pair:
                 raise ValueError("open pair exists — close it before opening a new sell_first pair")
             pair_id = str(uuid.uuid4())
@@ -371,7 +371,7 @@ def record_trade(user_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
                 if quantity > uncovered:
                     raise ValueError(f"buy quantity exceeds uncovered sell qty ({uncovered})")
             else:
-                open_pair = find_open_pair_for_symbol(user_id, symbol, trade_date=trade_date)
+                open_pair = find_open_pair_for_symbol(user_id, symbol)
                 if open_pair:
                     raise ValueError("open pair exists — close it before opening a new buy_first pair")
                 capacity = _buy_first_open_capacity(user_id, symbol)
@@ -380,7 +380,7 @@ def record_trade(user_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
                 if quantity > capacity:
                     raise ValueError(f"buy quantity exceeds buy_first capacity ({capacity})")
         else:
-            open_pair = find_open_pair_for_symbol(user_id, symbol, trade_date=trade_date)
+            open_pair = find_open_pair_for_symbol(user_id, symbol)
             if open_pair:
                 raise ValueError("open pair exists — close it before opening a new buy_first pair")
             capacity = _buy_first_open_capacity(user_id, symbol)
@@ -441,12 +441,10 @@ def list_trades(
     return [serialize_doc(doc) for doc in rows]
 
 
-def _aggregate_pairs(user_id: str, trade_date: Optional[str] = None) -> List[Dict[str, Any]]:
-    query: Dict[str, Any] = {"user_id": user_id}
-    if trade_date:
-        query["trade_date"] = compact_trade_date(trade_date)
+def _pairs_from_rows(rows: Iterable[Dict[str, Any]], user_id: str) -> List[Dict[str, Any]]:
+    """Bucket trade rows by pair_id and compute pair state from the GIVEN rows."""
     buckets: Dict[str, Dict[str, Any]] = {}
-    for row in _trades_coll().find(query).sort([("created_at", ASCENDING)]):
+    for row in rows:
         pair_id = str(row.get("pair_id") or "")
         if not pair_id:
             continue
@@ -531,6 +529,49 @@ def _aggregate_pairs(user_id: str, trade_date: Optional[str] = None) -> List[Dic
     return pairs
 
 
+def _aggregate_pairs(user_id: str, trade_date: Optional[str] = None) -> List[Dict[str, Any]]:
+    # Rows are always loaded across ALL dates (no trade_date filter in the
+    # query): a cross-day pair whose opening leg is on day N and closing leg
+    # on N+1 must be aggregated from both legs, otherwise the N+1 view treats
+    # the closing leg as a phantom new pair of the mirrored style and the pair
+    # never shows "closed" on any date-scoped view.
+    #
+    # trade_date scoping then has two parts:
+    # - membership: keep pairs that have at least one leg ON that date
+    # - as-of: state/style/PnL is computed from legs up to AND INCLUDING that
+    #   date, so a pair opened on N shows open on N, and its PnL lands on the
+    #   closing day N+1 instead of being booked back onto the opening day.
+    rows = list(_trades_coll().find({"user_id": user_id}).sort([("created_at", ASCENDING)]))
+    td = compact_trade_date(trade_date) if trade_date else None
+    if td:
+        on_td = {
+            str(row.get("pair_id") or "")
+            for row in rows
+            if str(row.get("trade_date") or "") == td
+        }
+        rows = [
+            row
+            for row in rows
+            if str(row.get("trade_date") or "") and str(row.get("trade_date")) <= td
+        ]
+        return [p for p in _pairs_from_rows(rows, user_id) if p.get("pair_id") in on_td]
+    return _pairs_from_rows(rows, user_id)
+
+
+def _open_pairs_as_of(user_id: str, trade_date: str) -> List[Dict[str, Any]]:
+    """Open pairs at the close of trade_date — INCLUDING carry-overs whose
+    opening leg is on an earlier date (they hold overnight risk too, and the
+    date-scoped day_summary omits them because they have no leg on that day)."""
+    rows = list(_trades_coll().find({"user_id": user_id}).sort([("created_at", ASCENDING)]))
+    td = compact_trade_date(trade_date)
+    rows = [
+        row
+        for row in rows
+        if str(row.get("trade_date") or "") and str(row.get("trade_date")) <= td
+    ]
+    return [p for p in _pairs_from_rows(rows, user_id) if p.get("status") == "open"]
+
+
 def list_open_pairs(user_id: str, trade_date: Optional[str] = None) -> List[Dict[str, Any]]:
     return [p for p in _aggregate_pairs(user_id, trade_date) if p.get("status") == "open"]
 
@@ -573,8 +614,11 @@ def day_summary(user_id: str, trade_date: Optional[str] = None) -> Dict[str, Any
 
 def day_close_check(user_id: str, trade_date: Optional[str] = None) -> Dict[str, Any]:
     summary = day_summary(user_id, trade_date)
+    # Alerts come from the as-of open list (legs <= trade_date), not from the
+    # summary: carry-over pairs opened on earlier days hold overnight risk on
+    # this day too, but they have no leg on it and so are absent from summary.
     alerts: List[Dict[str, Any]] = []
-    for pair in summary.get("open_pair_details") or []:
+    for pair in _open_pairs_as_of(user_id, summary.get("trade_date") or ""):
         uncovered = to_int(pair.get("uncovered_qty"))
         if uncovered <= 0:
             continue

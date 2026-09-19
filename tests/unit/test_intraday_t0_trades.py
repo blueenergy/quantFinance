@@ -487,3 +487,168 @@ def test_available_qty_yields_to_in_flight_sells(monkeypatch):
     preview = trades.preview_trade_from_signal("u1", signal_id)
     assert preview["available_qty"] == 200
     assert preview["suggested_qty"] == 100
+
+
+@pytest.mark.unit
+def _cross_day_pair_rows():
+    return [
+        {
+            "_id": ObjectId(),
+            "user_id": "u1",
+            "trade_date": "20260820",
+            "symbol": "300750.SZ",
+            "pair_id": "pair-x",
+            "leg": "sell",
+            "quantity": 100,
+            "price": 200.0,
+            "fees": 0,
+            "created_at": "2026-08-20T14:30:00",
+        },
+        {
+            "_id": ObjectId(),
+            "user_id": "u1",
+            "trade_date": "20260821",
+            "symbol": "300750.SZ",
+            "pair_id": "pair-x",
+            "leg": "buy",
+            "quantity": 100,
+            "price": 198.5,
+            "fees": 10.0,
+            "created_at": "2026-08-21T09:35:00",
+        },
+    ]
+
+
+@pytest.mark.unit
+def test_cross_day_pair_open_on_opening_day(monkeypatch):
+    trades_coll = FakeCollection(_cross_day_pair_rows())
+    monkeypatch.setattr(
+        trades, "get_db_collections", lambda: {"intraday_t0_trades": trades_coll}
+    )
+    monkeypatch.setattr(trades, "ensure_intraday_t0_trade_indexes", lambda: None)
+    pairs = trades.list_open_pairs("u1", trade_date="20260820")
+    assert len(pairs) == 1
+    assert pairs[0]["pair_id"] == "pair-x"
+    assert pairs[0]["style"] == "sell_first"
+    assert pairs[0]["uncovered_qty"] == 100
+
+
+@pytest.mark.unit
+def test_cross_day_pair_closed_on_closing_day_without_phantom(monkeypatch):
+    trades_coll = FakeCollection(_cross_day_pair_rows())
+    monkeypatch.setattr(
+        trades, "get_db_collections", lambda: {"intraday_t0_trades": trades_coll}
+    )
+    monkeypatch.setattr(trades, "ensure_intraday_t0_trade_indexes", lambda: None)
+    summary = trades.day_summary("u1", trade_date="20260821")
+    assert summary["closed_pairs"] == 1
+    assert summary["open_pairs"] == 0
+    # PnL closes fully on the closing day, computed across both legs.
+    assert summary["total_gross_pnl"] == pytest.approx(150.0)
+    assert summary["total_net_pnl"] == pytest.approx(140.0)
+    # No phantom pair: the closing leg alone must not become a mirrored pair.
+    open_pairs = trades.list_open_pairs("u1", trade_date="20260821")
+    assert open_pairs == []
+
+
+@pytest.mark.unit
+def test_cross_day_pair_aggregates_once_without_date(monkeypatch):
+    trades_coll = FakeCollection(_cross_day_pair_rows())
+    monkeypatch.setattr(
+        trades, "get_db_collections", lambda: {"intraday_t0_trades": trades_coll}
+    )
+    monkeypatch.setattr(trades, "ensure_intraday_t0_trade_indexes", lambda: None)
+    pairs = trades._aggregate_pairs("u1")
+    assert len(pairs) == 1
+    assert pairs[0]["pair_id"] == "pair-x"
+    assert pairs[0]["status"] == "closed"
+    assert pairs[0]["sell_qty"] == 100
+    assert pairs[0]["buy_qty"] == 100
+
+
+@pytest.mark.unit
+def test_day_close_check_no_false_alert_for_closed_cross_day_pair(monkeypatch):
+    trades_coll = FakeCollection(_cross_day_pair_rows())
+    monkeypatch.setattr(
+        trades, "get_db_collections", lambda: {"intraday_t0_trades": trades_coll}
+    )
+    monkeypatch.setattr(trades, "ensure_intraday_t0_trade_indexes", lambda: None)
+    result = trades.day_close_check("u1", trade_date="20260821")
+    assert result["requires_action"] is False
+    assert result["alert_count"] == 0
+
+
+@pytest.mark.unit
+def test_record_trade_blocked_by_previous_day_open_pair(monkeypatch):
+    """A cross-day open pair must block same-direction manual entry the way
+    the auto-execution path already does."""
+    trades_coll = FakeCollection(
+        [
+            {
+                "_id": ObjectId(),
+                "user_id": "u1",
+                "trade_date": "20260820",
+                "symbol": "300750.SZ",
+                "pair_id": "pair-x",
+                "leg": "sell",
+                "quantity": 100,
+                "price": 200.0,
+                "fees": 0,
+                "created_at": "2026-08-20T14:30:00",
+            }
+        ]
+    )
+    monkeypatch.setattr(
+        trades,
+        "get_db_collections",
+        lambda: {
+            "intraday_t0_trades": trades_coll,
+            "intraday_t0_signals": FakeCollection([]),
+            "trader_positions": FakeCollection([]),
+            "trade_signals": FakeCollection([]),
+        },
+    )
+    monkeypatch.setattr(trades, "ensure_intraday_t0_trade_indexes", lambda: None)
+    with pytest.raises(ValueError, match="open pair exists"):
+        trades.record_trade(
+            "u1",
+            {
+                "symbol": "300750.SZ",
+                "leg": "sell",
+                "quantity": 50,
+                "price": 200.0,
+                "trade_date": "20260821",
+            },
+        )
+
+
+@pytest.mark.unit
+def test_day_close_check_alerts_carryover_pair_with_no_legs_today(monkeypatch):
+    """A pair opened two days ago and still uncovered must be flagged by
+    today's close check even though it has no legs on today's date (the
+    date-scoped day_summary omits it)."""
+    trades_coll = FakeCollection(
+        [
+            {
+                "_id": ObjectId(),
+                "user_id": "u1",
+                "trade_date": "20260819",
+                "symbol": "300750.SZ",
+                "pair_id": "pair-old",
+                "leg": "sell",
+                "quantity": 100,
+                "price": 200.0,
+                "fees": 0,
+                "created_at": "2026-08-19T14:30:00",
+            }
+        ]
+    )
+    monkeypatch.setattr(
+        trades, "get_db_collections", lambda: {"intraday_t0_trades": trades_coll}
+    )
+    monkeypatch.setattr(trades, "ensure_intraday_t0_trade_indexes", lambda: None)
+    result = trades.day_close_check("u1", trade_date="20260820")
+    assert result["requires_action"] is True
+    assert result["alert_count"] == 1
+    assert result["alerts"][0]["code"] == "uncovered_sell"
+    assert result["alerts"][0]["pair_id"] == "pair-old"
