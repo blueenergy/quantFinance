@@ -82,6 +82,15 @@ def test_record_sell_and_buy_pair(monkeypatch):
     assert summary["open_pairs"] == 0
     assert summary["total_gross_pnl"] == pytest.approx(150.0)
     assert summary["total_net_pnl"] == pytest.approx(140.0)
+    assert summary["closed_same_day_pairs"] == 1
+    assert summary["closed_cross_day_pairs"] == 0
+    assert summary["same_day_gross_pnl"] == pytest.approx(150.0)
+    assert summary["same_day_net_pnl"] == pytest.approx(140.0)
+    assert summary["cross_day_gross_pnl"] == 0.0
+    assert summary["cross_day_net_pnl"] == 0.0
+    closed = summary["closed_pair_details"][0]
+    assert closed["open_trade_date"] == "20260820"
+    assert closed["close_trade_date"] == "20260820"
 
 
 @pytest.mark.unit
@@ -531,6 +540,12 @@ def test_cross_day_pair_open_on_opening_day(monkeypatch):
     assert pairs[0]["pair_id"] == "pair-x"
     assert pairs[0]["style"] == "sell_first"
     assert pairs[0]["uncovered_qty"] == 100
+    assert pairs[0]["open_trade_date"] == "20260820"
+    assert pairs[0]["close_trade_date"] is None
+    summary = trades.day_summary("u1", trade_date="20260820")
+    assert summary["closed_pairs"] == 0
+    assert summary["closed_same_day_pairs"] == 0
+    assert summary["closed_cross_day_pairs"] == 0
 
 
 @pytest.mark.unit
@@ -546,6 +561,15 @@ def test_cross_day_pair_closed_on_closing_day_without_phantom(monkeypatch):
     # PnL closes fully on the closing day, computed across both legs.
     assert summary["total_gross_pnl"] == pytest.approx(150.0)
     assert summary["total_net_pnl"] == pytest.approx(140.0)
+    assert summary["closed_same_day_pairs"] == 0
+    assert summary["closed_cross_day_pairs"] == 1
+    assert summary["same_day_gross_pnl"] == 0.0
+    assert summary["same_day_net_pnl"] == 0.0
+    assert summary["cross_day_gross_pnl"] == pytest.approx(150.0)
+    assert summary["cross_day_net_pnl"] == pytest.approx(140.0)
+    closed = summary["closed_pair_details"][0]
+    assert closed["open_trade_date"] == "20260820"
+    assert closed["close_trade_date"] == "20260821"
     # No phantom pair: the closing leg alone must not become a mirrored pair.
     open_pairs = trades.list_open_pairs("u1", trade_date="20260821")
     assert open_pairs == []

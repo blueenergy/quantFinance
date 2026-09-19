@@ -475,6 +475,56 @@ class TestMarketInsightFocusReviewSchedule:
 
 
 @pytest.mark.unit
+class TestT0SignalEvaluationSchedule:
+    def test_task_map_registers_t0_signal_evaluation_job(self):
+        import scheduler as sched_mod
+
+        assert "t0_signal_evaluation" in sched_mod.TASK_MAP
+        config = sched_mod.DEFAULT_SCHEDULES["t0_signal_evaluation"]
+        assert config["type"] == "cron"
+        assert config["hour"] == 16
+        assert config["minute"] == 15
+        assert config["day_of_week"] == "mon-fri"
+        assert config["is_active"] is True
+
+    def test_t0_signal_evaluation_task_looks_back_and_evaluates(self, monkeypatch):
+        import scheduler as sched_mod
+        from services import intraday_t0_signals as t0
+
+        calls = []
+
+        class _Signals:
+            def distinct(self, field):
+                assert field == "trade_date"
+                return ["20260901", "20260918", "20260919", "20260922"]
+
+        monkeypatch.setattr(sched_mod, "_acquire_scheduler_job_lock", lambda *a, **k: True)
+        monkeypatch.setattr(sched_mod, "_release_scheduler_job_lock", lambda *a, **k: None)
+        monkeypatch.setattr("db.get_db_collections", lambda: {"intraday_t0_signals": _Signals()})
+        monkeypatch.setattr(t0, "compact_trade_date", lambda raw=None: "20260919")
+        monkeypatch.setattr(t0, "iter_users_with_intraday_positions", lambda: ["u1"])
+
+        def fake_eval(user_id, td):
+            calls.append((user_id, td))
+            return {"evaluations_written": 3}
+
+        monkeypatch.setattr(t0, "evaluate_signals_for_user", fake_eval)
+        sched_mod.t0_signal_evaluation_task()
+        # 20260922 is after "today" and dropped; remaining dates are evaluated.
+        assert calls == [("u1", "20260901"), ("u1", "20260918"), ("u1", "20260919")]
+
+    def test_t0_signal_evaluation_task_skips_without_lock(self, monkeypatch):
+        import scheduler as sched_mod
+        from services import intraday_t0_signals as t0
+
+        evaluate = MagicMock()
+        monkeypatch.setattr(t0, "evaluate_signals_for_user", evaluate)
+        monkeypatch.setattr(sched_mod, "_acquire_scheduler_job_lock", lambda *a, **k: False)
+        sched_mod.t0_signal_evaluation_task()
+        evaluate.assert_not_called()
+
+
+@pytest.mark.unit
 class TestTriggerMarketAnalysis:
     """Tests for routers.market.trigger_market_analysis effective date handling."""
 

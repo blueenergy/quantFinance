@@ -339,6 +339,45 @@ def market_insight_focus_review_task():
         _release_scheduler_job_lock(job_id)
 
 
+def t0_signal_evaluation_task():
+    """盘后评估 T+0 信号（5/15/30/60m、close、t1_open/t1_max，幂等 upsert）。
+
+    回看最近 N 个有信号的交易日：次日运行时重算前一天可以补上 t1 字段，
+    也顺带为 Phase 1 验收（15m/30m win_rate）积累历史基线（评审 P0-0b）。
+    """
+    from db import get_db_collections
+    from services.intraday_t0_signals import (
+        compact_trade_date,
+        evaluate_signals_for_user,
+        iter_users_with_intraday_positions,
+    )
+
+    lookback_dates = 10
+    job_id = "t0_signal_evaluation"
+    if not _acquire_scheduler_job_lock(job_id, ttl_seconds=600):
+        log.info("[T0Eval] Another scheduler instance owns the lock, skipping.")
+        return
+    try:
+        today = compact_trade_date()
+        dates = sorted(
+            {
+                str(d)
+                for d in get_db_collections()["intraday_t0_signals"].distinct("trade_date")
+                if str(d) <= today
+            }
+        )[-lookback_dates:]
+        users = list(iter_users_with_intraday_positions())
+        written = 0
+        for user_id in users:
+            for td in dates:
+                written += evaluate_signals_for_user(user_id, td).get("evaluations_written", 0)
+        log.info("[T0Eval] users=%s dates=%s evaluations_written=%s", len(users), dates, written)
+    except Exception as exc:
+        log.error("[T0Eval] failed: %s", exc, exc_info=True)
+    finally:
+        _release_scheduler_job_lock(job_id)
+
+
 def equity_snapshot_eod_task():
     """Persist account-level and live plan-level EOD equity snapshots."""
     from db import get_data_db, get_db_collections, get_trading_db_collections
@@ -497,6 +536,7 @@ TASK_MAP = {
     ),
     'market_insight_focus_review_1530': market_insight_focus_review_task,
     'strategy_lab_loop_tick': strategy_lab_loop_tick_task,
+    't0_signal_evaluation': t0_signal_evaluation_task,
     'equity_snapshot_eod': equity_snapshot_eod_task,
     'live_snapshot_intraday': live_snapshot_intraday_task,
     'live_snapshot_reconcile_intraday': live_snapshot_reconcile_task,
@@ -578,6 +618,14 @@ DEFAULT_SCHEDULES = {
         'name': "Strategy Lab 自动迭代推进",
         'type': "interval",
         'seconds': 45,
+        'is_active': True,
+    },
+    't0_signal_evaluation': {
+        'name': "T+0 信号盘后评估 (16:15)",
+        'type': "cron",
+        'hour': 16,
+        'minute': 15,
+        'day_of_week': 'mon-fri',
         'is_active': True,
     },
     'equity_snapshot_eod': {

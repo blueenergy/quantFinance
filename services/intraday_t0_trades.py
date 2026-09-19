@@ -562,6 +562,19 @@ def _pairs_from_rows(rows: Iterable[Dict[str, Any]], user_id: str) -> List[Dict[
             status = "closed"
         else:
             status = "open"
+        trade_rows = bucket.get("trade_rows") or []
+        opening_dates = [
+            str(row.get("trade_date") or "")
+            for row in trade_rows
+            if row.get("leg") == opening_leg and row.get("trade_date")
+        ]
+        all_dates = [
+            str(row.get("trade_date") or "")
+            for row in trade_rows
+            if row.get("trade_date")
+        ]
+        open_trade_date = min(opening_dates) if opening_dates else (min(all_dates) if all_dates else None)
+        close_trade_date = max(all_dates) if status == "closed" and all_dates else None
         pairs.append(
             {
                 **{k: v for k, v in bucket.items() if k != "trade_rows"},
@@ -574,6 +587,8 @@ def _pairs_from_rows(rows: Iterable[Dict[str, Any]], user_id: str) -> List[Dict[
                 "gross_pnl": gross_pnl,
                 "net_pnl": net_pnl,
                 "status": status,
+                "open_trade_date": open_trade_date,
+                "close_trade_date": close_trade_date,
             }
         )
     pairs.sort(key=lambda p: (p.get("trade_date", ""), p.get("symbol", ""), p.get("pair_id", "")), reverse=True)
@@ -636,6 +651,22 @@ def day_summary(user_id: str, trade_date: Optional[str] = None) -> Dict[str, Any
     net_values = [v for v in net_values if v is not None]
     gross_values = [to_float(p.get("gross_pnl")) for p in closed]
     gross_values = [v for v in gross_values if v is not None]
+    # 同日/跨日分解：rotation（日内回转）vs carry（隔夜/多日持有）分开统计，
+    # 跨日 pair 的收益只在 close 日计入（as-of 语义）。open/close 日期在
+    # _pairs_from_rows 里的 pair 上。
+    same_day = [
+        p for p in closed
+        if p.get("close_trade_date") and p.get("close_trade_date") == p.get("open_trade_date")
+    ]
+    cross_day = [
+        p for p in closed
+        if p.get("close_trade_date") and p.get("close_trade_date") != p.get("open_trade_date")
+    ]
+
+    def _pnl_sum(subset: List[Dict[str, Any]], field: str) -> float:
+        values = [to_float(p.get(field)) for p in subset]
+        values = [v for v in values if v is not None]
+        return sum(values) if values else 0.0
     naked_sell_qty = sum(
         to_int(p.get("uncovered_qty"))
         for p in open_pairs
@@ -658,6 +689,13 @@ def day_summary(user_id: str, trade_date: Optional[str] = None) -> Dict[str, Any
         "total_gross_pnl": sum(gross_values) if gross_values else 0.0,
         "total_net_pnl": sum(net_values) if net_values else 0.0,
         "total_fees": sum(to_float(p.get("fees"), 0.0) or 0.0 for p in pairs),
+        # PnL 分解：日内回转 vs 隔夜/跨日 carry
+        "closed_same_day_pairs": len(same_day),
+        "closed_cross_day_pairs": len(cross_day),
+        "same_day_gross_pnl": _pnl_sum(same_day, "gross_pnl"),
+        "same_day_net_pnl": _pnl_sum(same_day, "net_pnl"),
+        "cross_day_gross_pnl": _pnl_sum(cross_day, "gross_pnl"),
+        "cross_day_net_pnl": _pnl_sum(cross_day, "net_pnl"),
         "open_pair_details": open_pairs,
         "closed_pair_details": closed,
     }
