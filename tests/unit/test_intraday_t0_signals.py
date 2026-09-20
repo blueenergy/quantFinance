@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import datetime
+
 import pytest
 
 from services import intraday_t0_signals as t0
@@ -504,7 +506,10 @@ def test_evaluate_writes_cost_and_net_return(monkeypatch):
     monkeypatch.setattr(
         t0,
         "_snapshot_after",
-        lambda uid, symbol, target: {"price": 101.0, "snapshot_time": "202608201035"},
+        lambda uid, symbol, target, trade_date: {
+            "price": 101.0,
+            "snapshot_time": "202608201035",
+        },
     )
     monkeypatch.setattr(t0, "latest_daily_record", lambda symbol, trade_date=None: None)
     monkeypatch.setattr(t0, "_next_daily", lambda symbol, trade_date: None)
@@ -524,6 +529,43 @@ def test_evaluate_writes_cost_and_net_return(monkeypatch):
     assert doc["cost_pct"] == pytest.approx(0.07)
     assert doc["net_return_pct"] == pytest.approx(0.93)
     assert doc["ref_notional"] == pytest.approx(100_000)
+
+
+@pytest.mark.unit
+def test_snapshot_after_never_crosses_the_day(monkeypatch):
+    """尾盘信号的 forward 跨过收盘：当日取不到快照就必须返回 None，不能跨日取。
+
+    曾经只有 $gte 下界，14:30 的 60m 信号在当日没有对应快照时取到了下一个交易日的价格，
+    把隔夜跳空记成了「60m」收益 —— 实测 60m 档 21%、30m 档 10% 的行中招。
+    """
+    snapshots = FakeCollection(
+        [
+            {
+                "user_id": "u1",
+                "symbol": "300750.SZ",
+                "snapshot_time": "202608201435",
+                "price": 101.0,
+            },
+            # 次日第一条快照 —— 没有上界时会被误取成「60m 后」的价格
+            {
+                "user_id": "u1",
+                "symbol": "300750.SZ",
+                "snapshot_time": "202608210930",
+                "price": 130.0,
+            },
+        ]
+    )
+    monkeypatch.setattr(
+        t0, "get_db_collections", lambda: {"intraday_t0_position_snapshots": snapshots}
+    )
+
+    # 当日 14:35 之后已无快照 ⇒ 该 horizon 不存在（修复前这里会返回次日那条）
+    assert t0._snapshot_after("u1", "300750.SZ", datetime(2026, 8, 20, 15, 30), "20260820") is None
+    # 收盘后的当日快照也不算日内
+    assert t0._snapshot_after("u1", "300750.SZ", datetime(2026, 8, 20, 15, 5), "20260820") is None
+    # 当日 14:35 那条仍然正常取到
+    got = t0._snapshot_after("u1", "300750.SZ", datetime(2026, 8, 20, 14, 30), "20260820")
+    assert got is not None and got["price"] == 101.0
 
 
 # --------------------------------------------------------------------------

@@ -734,10 +734,21 @@ def _parse_snapshot_time(snapshot_time: str) -> Optional[datetime]:
         return None
 
 
-def _snapshot_after(user_id: str, symbol: str, target_time: datetime) -> Optional[Dict[str, Any]]:
+def _snapshot_after(
+    user_id: str, symbol: str, target_time: datetime, trade_date: str
+) -> Optional[Dict[str, Any]]:
+    """取目标时刻之后、**同一交易日内**的第一条快照；当日没有则返回 None。
+
+    上界不可省：尾盘信号（如 14:30 + 60m）的 forward 跨过收盘，当日没有对应快照，
+    只有下界时会跨日取到下一个交易日的价格 —— 那是隔夜跳空，不是这个 horizon 的结果。
+    """
     target = target_time.strftime("%Y%m%d%H%M")
     return get_db_collections()["intraday_t0_position_snapshots"].find_one(
-        {"user_id": user_id, "symbol": symbol, "snapshot_time": {"$gte": target}},
+        {
+            "user_id": user_id,
+            "symbol": symbol,
+            "snapshot_time": {"$gte": target, "$lte": f"{trade_date}1500"},
+        },
         sort=[("snapshot_time", ASCENDING)],
     )
 
@@ -831,7 +842,9 @@ def evaluate_signals_for_user(user_id: str, trade_date: Optional[str] = None) ->
         symbol = signal.get("symbol")
         docs: List[Dict[str, Any]] = []
         for minutes in horizons:
-            snap = _snapshot_after(user_id, symbol, signal_dt + timedelta(minutes=minutes))
+            snap = _snapshot_after(
+                user_id, symbol, signal_dt + timedelta(minutes=minutes), td
+            )
             if not snap:
                 continue
             future_price = to_float(snap.get("price"))
