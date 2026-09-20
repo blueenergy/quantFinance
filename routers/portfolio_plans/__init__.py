@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Literal, Optional, Tuple
 import functools
 import logging
 import math
@@ -329,6 +329,16 @@ class LiveRebalanceRequest(BaseModel):
     # strategy rebalance does not buy them back.
     exclude_after: bool = Field(default=False)
     dry_run: bool = Field(default=False)
+    # Which book the absolute ``targets`` are read against.
+    # "lineage" (default) nets only this plan's params_hash lineage — the
+    # original behaviour, and what a human one-click rebalance wants.
+    # "account" nets every live fill under the securities account, i.e. the
+    # union of all that account's lineages. Purely manual broker positions
+    # carry no executions, so they fall outside both.
+    # Intraday T+0 passes "account" so its execution basis matches the broker
+    # positions its signals were generated from; reading a single lineage
+    # there both hid symbols and drifted the ledger on every leg.
+    basis: Literal["lineage", "account"] = Field(default="lineage")
     # When set, published trade_signals carry t0_signal_id and
     # order_remark=t0:{id} so quantTrader fills can update the T+0 ledger.
     t0_signal_id: Optional[str] = Field(default=None)

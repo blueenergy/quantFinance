@@ -449,9 +449,22 @@ async def live_rebalance_portfolio(
     if not strategy_template_id:
         raise HTTPException(status_code=400, detail="plan is missing strategy_template_id")
 
-    holdings = _pp._lineage_live_holdings(
-        trading_collections, finance_collections, data_collections, plan, user_id
-    )
+    # Resolved here rather than after the loop below: an "account"-basis read
+    # needs the account up front. Callers that derived their absolute targets
+    # from a broker-side position (intraday T+0) must be read back the same
+    # way, or the expected_current_shares guard 409s on every single leg.
+    securities_account_id = str(account.get("_id") or request.securities_account_id)
+    if request.basis == "account":
+        holdings = _pp._account_level_live_holdings(
+            finance_collections,
+            data_collections,
+            user_id=user_id,
+            securities_account_id=securities_account_id,
+        )
+    else:
+        holdings = _pp._lineage_live_holdings(
+            trading_collections, finance_collections, data_collections, plan, user_id
+        )
     current_by_key: Dict[str, Dict[str, Any]] = {}
     for row in holdings:
         current_by_key[_symbol_key(row.get("symbol"))] = row
@@ -488,7 +501,6 @@ async def live_rebalance_portfolio(
             },
         )
 
-    securities_account_id = str(account.get("_id") or request.securities_account_id)
     account_positions_by_key, account_positions_synced = _pp._account_positions_by_symbol(
         finance_collections,
         user_id=user_id,
@@ -578,6 +590,27 @@ async def live_rebalance_portfolio(
                         symbol,
                         "normalized_to_no_change",
                         "requested change did not survive lot-size normalization",
+                        current_shares=current_shares,
+                        requested_target_shares=_int_value(request.targets[symbol]),
+                        account_current_shares=account_current_shares,
+                        account_available_shares=account_available_shares,
+                        blockers=blockers,
+                        sellable_observability=sellable_meta,
+                    )
+                )
+            elif symbol_key not in current_by_key:
+                # The basis holds no position for this symbol at all, so every
+                # absolute target collapses to a zero delta. That is what a
+                # target derived from the *broker* book looks like when those
+                # shares never entered the ledger — a purely manual holding,
+                # say. Without this record the publish returned an empty
+                # dropped_targets list and read as "already in place" instead
+                # of "I cannot see this symbol".
+                dropped_targets.append(
+                    _dropped_target_record(
+                        symbol,
+                        "not_in_basis",
+                        "symbol has no live position in the basis this publish reads",
                         current_shares=current_shares,
                         requested_target_shares=_int_value(request.targets[symbol]),
                         account_current_shares=account_current_shares,

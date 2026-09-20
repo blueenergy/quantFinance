@@ -5816,6 +5816,99 @@ def test_live_rebalance_reports_partially_dropped_reduction(monkeypatch):
     assert data_out["plan"]["summary"]["skip_count"] == 1
 
 
+def test_live_rebalance_records_symbol_absent_from_the_basis(monkeypatch):
+    """A target for a symbol the basis cannot see must not read as "no change".
+
+    This is the shape a broker-derived target takes when those shares never
+    entered the ledger: current_shares is 0, so the absolute target collapses
+    to a zero delta. Recording it is what lets the resulting 400 name the
+    symbol instead of reporting an empty dropped list.
+    """
+    cols, fin, data = _live_rebalance_env()
+    _patch_lineage_live_env(monkeypatch, cols, fin, data)
+
+    resp = asyncio.run(
+        portfolio_plans.live_rebalance_portfolio(
+            "pla",
+            portfolio_plans.LiveRebalanceRequest(
+                securities_account_id="acct-1",
+                targets={"600000.SH": 0, "000001.SZ": 0},
+                dry_run=True,
+            ),
+            current_user={"id": "user-1"},
+        )
+    )
+
+    data_out = resp["data"]
+    # The symbol the basis does know still trades normally; the publish is not
+    # aborted by the unknown one.
+    assert data_out["changed_symbols"] == ["600000.SH"]
+    dropped = data_out["dropped_targets"]
+    assert len(dropped) == 1
+    assert dropped[0]["symbol"] == "000001.SZ"
+    assert dropped[0]["reason_code"] == "not_in_basis"
+    assert dropped[0]["current_shares"] == 0
+    assert dropped[0]["requested_target_shares"] == 0
+    # skipped_items subsumes dropped targets so existing consumers see them too.
+    assert any(row.get("reason_code") == "not_in_basis" for row in data_out["skipped_items"])
+
+
+def test_live_rebalance_basis_account_spans_lineages(monkeypatch):
+    """basis="account" nets every lineage of the account; the default does not.
+
+    Intraday T+0 sizes its legs off broker positions, so it publishes with
+    basis="account". Reading a single lineage there left symbols it could
+    plainly see untradeable.
+    """
+    cols, fin, data = _live_rebalance_env()
+    data["volume_price_realtime_latest"].docs.extend(
+        [
+            {"symbol": "000001", "close": 10.0, "trade_date": "20250131"},
+            {"symbol": "000001.SZ", "close": 10.0, "trade_date": "20250131"},
+        ]
+    )
+    # Production execution rows carry their account; the fixture's do not.
+    for row in fin["trade_executions"].docs:
+        row["securities_account_id"] = "acct-1"
+    # A second lineage's fill on the same account, under a plan that is not in
+    # pla's lineage, so the lineage read cannot reach it.
+    fin["trade_signals"].docs.append(
+        {"order_id": "o-buy-2", "user_id": "user-1", "mode": "live", "plan_id": "other-plan", "symbol": "000001.SZ", "name": "平安银行", "created_at": 1}
+    )
+    fin["trade_executions"].docs.append(
+        {"order_id": "o-buy-2", "user_id": "user-1", "securities_account_id": "acct-1", "symbol": "000001.SZ", "side": "BUY", "status": "filled", "filled_size": 300, "filled_price": 9.0, "timestamp": 2.0}
+    )
+    fin["trader_positions"].docs.append(
+        {"user_id": "user-1", "securities_account_id": "acct-1", "symbol": "000001.SZ", "qty": 300, "can_use_volume": 300}
+    )
+    _patch_lineage_live_env(monkeypatch, cols, fin, data)
+
+    request = {"securities_account_id": "acct-1", "targets": {"000001.SZ": 0}, "dry_run": True}
+
+    # Lineage basis: the symbol is invisible, so nothing can be published -- and
+    # the 400 now says which symbol and why.
+    with pytest.raises(portfolio_plans.HTTPException) as excinfo:
+        asyncio.run(
+            portfolio_plans.live_rebalance_portfolio(
+                "pla", portfolio_plans.LiveRebalanceRequest(**request), current_user={"id": "user-1"}
+            )
+        )
+    assert excinfo.value.status_code == 400
+    assert excinfo.value.detail["dropped_targets"][0]["reason_code"] == "not_in_basis"
+
+    # Account basis: the other lineage's 300 shares are in scope and sellable.
+    resp = asyncio.run(
+        portfolio_plans.live_rebalance_portfolio(
+            "pla",
+            portfolio_plans.LiveRebalanceRequest(basis="account", **request),
+            current_user={"id": "user-1"},
+        )
+    )
+    data_out = resp["data"]
+    assert data_out["changed_symbols"] == ["000001.SZ"]
+    assert [signal["size"] for signal in data_out["signals"]] == [300]
+
+
 def test_live_rebalance_publish_flags_capped_sell_in_operation_log(monkeypatch):
     cols, fin, data = _live_rebalance_env()
     fin["trader_positions"].docs = [

@@ -203,14 +203,25 @@ def _resolve_account_plan(
     return {"plan_id": resolved_plan, "securities_account_id": resolved_account}
 
 
-def _lineage_shares(user_id: str, plan_id: str, symbol: str, current_user: Dict[str, Any]) -> int:
+def _basis_shares(user_id: str, securities_account_id: str, symbol: str) -> int:
+    """Live shares for a symbol under the account-wide ledger basis.
+
+    Deliberately the same basis ``live_rebalance_portfolio`` reads when T+0
+    publishes (``basis="account"``). The absolute target derived from this
+    number is re-derived there from the same book, and the two must agree or
+    the expected_current_shares guard rejects the leg. Reading one lineage
+    here instead sized legs against a slice the broker never had.
+    """
     import routers.portfolio_plans as pp
 
-    trading = pp.get_trading_db_collections()
     finance = pp.get_db_collections()
     data = pp.get_data_db()
-    plan = pp._require_plan(trading, plan_id, current_user)
-    holdings = pp._lineage_live_holdings(trading, finance, data, plan, user_id)
+    holdings = pp._account_level_live_holdings(
+        finance,
+        data,
+        user_id=user_id,
+        securities_account_id=securities_account_id,
+    )
     symbol_key = pp._symbol_key(symbol)
     for row in holdings:
         if pp._symbol_key(row.get("symbol")) == symbol_key:
@@ -328,7 +339,7 @@ def build_execution_intent(
         buy_first_enabled=buy_first_enabled,
     )
 
-    current_shares = _lineage_shares(user_id, accounts["plan_id"], symbol, current_user)
+    current_shares = _basis_shares(user_id, accounts["securities_account_id"], symbol)
 
     if action == "sell" and pair_style == "sell_first":
         available = to_int(trade_preview.get("available_qty"))
@@ -430,6 +441,7 @@ async def preview_execution_async(
         securities_account_id=intent["securities_account_id"],
         targets={intent["symbol"]: intent["target_shares"]},
         expected_current_shares={intent["symbol"]: intent["current_shares"]},
+        basis="account",
         plan_type=PLAN_TYPE_INTRADAY_T0,
         t0_signal_id=signal_id,
         exclude_after=False,
@@ -764,9 +776,13 @@ async def submit_execution_async(
     request = LiveRebalanceRequest(
         securities_account_id=intent["securities_account_id"],
         targets={intent["symbol"]: intent["target_shares"]},
-        # target_shares was derived from intent's current_shares; if the lineage
-        # moved since, the absolute target would sell the wrong quantity.
+        # target_shares was derived from intent's current_shares, which is read
+        # off the account ledger; if that book moved since, the absolute target
+        # would trade the wrong quantity.
         expected_current_shares={intent["symbol"]: intent["current_shares"]},
+        # Must match the book _basis_shares read, or the guard above would see
+        # a basis mismatch on every leg and reject it as stale.
+        basis="account",
         # Keeps T+0 legs out of the strategy's cadence anchor query, which
         # matches plan_type == "rebalance" without excluding manual origin.
         plan_type=PLAN_TYPE_INTRADAY_T0,

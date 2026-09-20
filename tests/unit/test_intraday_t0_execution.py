@@ -86,7 +86,7 @@ def test_build_sell_intent(monkeypatch):
             "warnings": [],
         },
     )
-    monkeypatch.setattr(execution, "_lineage_shares", lambda *_a, **_k: 500)
+    monkeypatch.setattr(execution, "_basis_shares", lambda *_a, **_k: 500)
     monkeypatch.setattr(execution, "find_open_pair_for_symbol", lambda *_a, **_k: None)
     monkeypatch.setattr(execution, "list_open_pairs", lambda *_a, **_k: [])
 
@@ -132,7 +132,7 @@ def test_build_buy_intent_rejected_when_buy_first_disabled(monkeypatch):
         "preview_trade_from_signal",
         lambda *_a, **_k: {"available_qty": 400, "suggested_qty": 200, "warnings": []},
     )
-    monkeypatch.setattr(execution, "_lineage_shares", lambda *_a, **_k: 300)
+    monkeypatch.setattr(execution, "_basis_shares", lambda *_a, **_k: 300)
     monkeypatch.setattr(execution, "find_open_pair_for_symbol", lambda *_a, **_k: None)
 
     with pytest.raises(ValueError, match="buy_first disabled"):
@@ -188,7 +188,7 @@ def test_build_buy_first_open_intent(monkeypatch):
             "pair_style": "buy_first",
         },
     )
-    monkeypatch.setattr(execution, "_lineage_shares", lambda *_a, **_k: 500)
+    monkeypatch.setattr(execution, "_basis_shares", lambda *_a, **_k: 500)
     monkeypatch.setattr(execution, "find_open_pair_for_symbol", lambda *_a, **_k: None)
     monkeypatch.setattr(execution, "list_open_pairs", lambda *_a, **_k: [])
     monkeypatch.setattr(execution, "_buy_first_open_capacity", lambda *_a, **_k: 400)
@@ -239,7 +239,7 @@ def test_build_sell_first_buy_back_intent(monkeypatch):
         "preview_trade_from_signal",
         lambda *_a, **_k: {"available_qty": 0, "suggested_qty": 100, "warnings": []},
     )
-    monkeypatch.setattr(execution, "_lineage_shares", lambda *_a, **_k: 400)
+    monkeypatch.setattr(execution, "_basis_shares", lambda *_a, **_k: 400)
     monkeypatch.setattr(execution, "find_open_pair_for_symbol", lambda *_a, **_k: open_pair)
     monkeypatch.setattr(execution, "list_open_pairs", lambda *_a, **_k: [open_pair])
 
@@ -293,7 +293,7 @@ def test_build_buy_first_close_intent(monkeypatch):
         "preview_trade_from_signal",
         lambda *_a, **_k: {"available_qty": 300, "suggested_qty": 100, "warnings": []},
     )
-    monkeypatch.setattr(execution, "_lineage_shares", lambda *_a, **_k: 600)
+    monkeypatch.setattr(execution, "_basis_shares", lambda *_a, **_k: 600)
     monkeypatch.setattr(execution, "find_open_pair_for_symbol", lambda *_a, **_k: open_pair)
     monkeypatch.setattr(execution, "list_open_pairs", lambda *_a, **_k: [open_pair])
     monkeypatch.setattr(execution, "_broker_available_qty", lambda *_a, **_k: 300)
