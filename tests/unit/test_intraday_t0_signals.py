@@ -532,6 +532,80 @@ def test_evaluate_writes_cost_and_net_return(monkeypatch):
 
 
 @pytest.mark.unit
+def test_signal_spread_cost_pct_uses_whole_spread():
+    """回转跨两次价差，各吃半个 ⇒ 合计一个完整价差，不再乘系数。"""
+    assert t0.signal_spread_cost_pct({"features": {"spread_pct": 0.05}}) == pytest.approx(0.05)
+    assert t0.signal_spread_cost_pct({"features": {"spread_pct": 0}}) == pytest.approx(0.0)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "signal,expected",
+    [
+        ({}, 0.0),                                          # 老信号没有 features
+        ({"features": None}, 0.0),
+        ({"features": {}}, 0.0),                            # 字段缺失
+        ({"features": {"spread_pct": None}}, 0.0),
+        ({"features": {"spread_pct": -0.01}}, 0.0),         # 负值当取不到
+        ({"features": {"spread_pct": "0.05"}}, 0.05),       # 字符串也认
+    ],
+)
+def test_signal_spread_cost_pct_falls_back_to_zero(signal, expected):
+    """取不到就退化成旧口径 —— 宁可低估，也不静默放大成本。"""
+    assert t0.signal_spread_cost_pct(signal) == pytest.approx(expected)
+
+
+@pytest.mark.unit
+def test_evaluate_adds_spread_to_cost(monkeypatch):
+    """cost_pct = 费用（日级）+ 价差（逐信号）；价差随信号变化，费用不随。"""
+    signals = FakeCollection(
+        [
+            {
+                "_id": "s1", "user_id": "u1", "symbol": "300750.SZ",
+                "trade_date": "20260820", "snapshot_time": "202608201030",
+                "price": 100.0, "signal_type": "BUY_WATCH",
+                "features": {"spread_pct": 0.05},
+            },
+            {
+                "_id": "s2", "user_id": "u1", "symbol": "600428.SH",
+                "trade_date": "20260820", "snapshot_time": "202608201031",
+                "price": 100.0, "signal_type": "SELL_WATCH",
+                "features": {"spread_pct": 0.01},
+            },
+        ]
+    )
+    evals = FakeCollection([])
+    monkeypatch.setattr(
+        t0, "get_db_collections",
+        lambda: {"intraday_t0_signals": signals, "intraday_t0_signal_evaluations": evals},
+    )
+    monkeypatch.setattr(t0, "_INDEXES_READY", True)
+    monkeypatch.setattr(
+        t0, "_snapshot_after",
+        lambda uid, symbol, target, trade_date: {"price": 101.0, "snapshot_time": "202608201035"},
+    )
+    monkeypatch.setattr(t0, "latest_daily_record", lambda symbol, trade_date=None: None)
+    monkeypatch.setattr(t0, "_next_daily", lambda symbol, trade_date: None)
+    monkeypatch.setattr(
+        t0, "get_user_positions",
+        lambda uid, trade_date=None: ("auto", [{"quantity": 10000, "current_price": 10.0}]),
+    )
+    monkeypatch.setattr("services.intraday_t0_trades._t0_fee_model", lambda: FEE_MODEL)
+
+    result = t0.evaluate_signals_for_user("u1", "20260820")
+    assert result["fee_cost_pct"] == pytest.approx(0.07)      # 费用部分不受价差影响
+    assert result["cost_pct"] == pytest.approx(0.10)          # 中位：(0.12 + 0.08) / 2
+
+    by_signal = {u[1]["$set"]["signal_id"]: u[1]["$set"] for u in evals.upserts}
+    assert by_signal["s1"]["cost_pct"] == pytest.approx(0.12)
+    assert by_signal["s1"]["spread_pct"] == pytest.approx(0.05)
+    assert by_signal["s1"]["net_return_pct"] == pytest.approx(1.0 - 0.12)
+    assert by_signal["s2"]["cost_pct"] == pytest.approx(0.08)
+    # SELL_WATCH 是「要赚回来价格得再跌一个成本」 ⇒ 方向感知地加
+    assert by_signal["s2"]["net_return_pct"] == pytest.approx(1.0 + 0.08)
+
+
+@pytest.mark.unit
 def test_snapshot_after_never_crosses_the_day(monkeypatch):
     """尾盘信号的 forward 跨过收盘：当日取不到快照就必须返回 None，不能跨日取。
 

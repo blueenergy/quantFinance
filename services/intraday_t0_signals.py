@@ -776,6 +776,25 @@ def round_trip_cost_pct(fee_model: Dict[str, Any], notional: float) -> float:
     return fees / notional * 100.0
 
 
+def signal_spread_cost_pct(signal: Dict[str, Any]) -> float:
+    """信号时刻的买卖价差成本（%）：**一次回转吃掉一个完整价差**。
+
+    `features.spread_pct` 是 `(ask - bid) / close`，即**整个**价差。回转要跨两次：
+    卖出落在买一（中间价下方半个价差）、买回落在卖一（上方半个价差），
+    两半合起来正好一个价差 —— 所以直接用整值，不再乘系数。
+
+    取不到时（老信号 / 字段缺失）返回 0.0，**退化成只算费用的旧口径**：
+    宁可低估，也不静默放大成本。
+    """
+    features = signal.get("features")
+    if not isinstance(features, dict):
+        return 0.0
+    value = to_float(features.get("spread_pct"))
+    if value is None or value < 0:
+        return 0.0
+    return value
+
+
 def _reference_notional(user_id: str, trade_date: str) -> float:
     """参考名义金额 = 当日各持仓市值的中位数（取不到则回落常量）。
 
@@ -826,7 +845,11 @@ def evaluate_signals_for_user(user_id: str, trade_date: Optional[str] = None) ->
     from services.intraday_t0_trades import _t0_fee_model  # 同上，避免循环 import
 
     ref_notional = _reference_notional(user_id, td)
-    cost_pct = round_trip_cost_pct(_t0_fee_model(), ref_notional)
+    # 成本 = 费用（日级：取决于参考名义金额）+ 价差（逐信号：取决于该时刻的盘口）。
+    # 两者必须分开 —— 费用对当日所有信号是同一个数，价差不是。
+    # 只算费用的旧口径会低估约 40%（实测中位价差 0.0385%，费用部分 0.0700%）。
+    fee_cost_pct = round_trip_cost_pct(_t0_fee_model(), ref_notional)
+    day_cost_pcts: List[float] = []
     signals = list(cols["intraday_t0_signals"].find({"user_id": user_id, "trade_date": td}))
     eval_coll = cols["intraday_t0_signal_evaluations"]
     written = 0
@@ -840,6 +863,9 @@ def evaluate_signals_for_user(user_id: str, trade_date: Optional[str] = None) ->
             continue
         signal_id = str(signal["_id"])
         symbol = signal.get("symbol")
+        spread_pct = signal_spread_cost_pct(signal)
+        cost_pct = fee_cost_pct + spread_pct
+        day_cost_pcts.append(cost_pct)
         docs: List[Dict[str, Any]] = []
         for minutes in horizons:
             snap = _snapshot_after(
@@ -920,6 +946,8 @@ def evaluate_signals_for_user(user_id: str, trade_date: Optional[str] = None) ->
                 )
         for doc in docs:
             doc["ref_notional"] = ref_notional
+            doc["fee_cost_pct"] = fee_cost_pct
+            doc["spread_pct"] = spread_pct
             doc["cost_pct"] = cost_pct
             doc["net_return_pct"] = net_return_pct(
                 doc.get("return_pct"), cost_pct, doc.get("signal_type")
@@ -930,13 +958,26 @@ def evaluate_signals_for_user(user_id: str, trade_date: Optional[str] = None) ->
                 upsert=True,
             )
             written += 1
+    day_cost_pcts.sort()
+    mid = len(day_cost_pcts) // 2
+    if day_cost_pcts:
+        median_cost_pct = (
+            day_cost_pcts[mid]
+            if len(day_cost_pcts) % 2
+            else (day_cost_pcts[mid - 1] + day_cost_pcts[mid]) / 2.0
+        )
+    else:
+        median_cost_pct = fee_cost_pct
     return {
         "success": True,
         "trade_date": td,
         "signals_count": len(signals),
         "evaluations_written": written,
         "ref_notional": ref_notional,
-        "cost_pct": cost_pct,
+        # cost_pct 现在是**当日各信号总成本的中位数**（费用 + 价差），
+        # 不再是单一定值 —— 价差逐信号变化。fee_cost_pct 是其中的费用部分。
+        "cost_pct": median_cost_pct,
+        "fee_cost_pct": fee_cost_pct,
     }
 
 
