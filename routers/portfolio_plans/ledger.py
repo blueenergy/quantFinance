@@ -18,6 +18,7 @@ from fastapi import APIRouter, Depends
 
 from auth import get_current_user
 from services.portfolio_live_snapshot import overlay_account_positions
+from services.portfolio_record_kind import RECORD_KIND_TRADE_PLAN
 
 import routers.portfolio_plans as _pp
 from . import _offload
@@ -33,6 +34,11 @@ router = APIRouter()
 _INFLIGHT_SIGNAL_STATUSES = frozenset(
     {"pending", "retry_pending", "submitted", "partial_filled", "cancel_requested"}
 )
+
+# Execution sources that are manual by construction: a discretionary broker-side
+# fill recorded after the fact, or an in-app chase order. A record carrying one
+# of these never makes the strategy the owner of the shares.
+_MANUAL_EXECUTION_SOURCES = frozenset({"external_manual_record", "chase_manual"})
 
 
 def _account_level_live_holdings(
@@ -176,6 +182,104 @@ def _settling_symbol_keys(
     return settling
 
 
+def _strategy_attributable_symbol_keys(
+    trading_collections: Dict[str, Any],
+    finance_collections: Dict[str, Any],
+    *,
+    user_id: str,
+    securities_account_id: str,
+) -> set:
+    """Symbols whose live records trace back to a strategy-generated plan.
+
+    Manual holdings share the brokerage account with the strategy, so ledger and
+    broker legitimately disagree on them. A symbol counts as manual only when
+    every live record for it is provably not a strategy decision -- a manual
+    execution source, or a plan that fails ``is_strategy_decision`` -- or when it
+    has no records at all. Records we cannot attribute (a dangling ``plan_id``)
+    keep the symbol strategy-attributable, so an unrecorded strategy fill still
+    raises the banner instead of being silently written off as manual.
+    """
+    projection = {"_id": 0, "symbol": 1, "source": 1, "plan_id": 1, "order_id": 1}
+    signals: List[Dict[str, Any]] = []
+    signals_col = finance_collections.get("trade_signals")
+    if signals_col is not None:
+        signals = list(
+            signals_col.find(
+                {
+                    "user_id": user_id,
+                    "mode": "live",
+                    "securities_account_id": securities_account_id,
+                },
+                projection,
+            )
+        )
+    executions: List[Dict[str, Any]] = []
+    executions_col = finance_collections.get("trade_executions")
+    if executions_col is not None:
+        executions = list(
+            executions_col.find(
+                {"user_id": user_id, "securities_account_id": securities_account_id},
+                projection,
+            )
+        )
+        if not executions:
+            # Legacy execution rows may lack securities_account_id. Fall back to
+            # the signal join so attribution covers the same rows as the ledger.
+            order_ids = [row.get("order_id") for row in signals if row.get("order_id")]
+            if order_ids:
+                executions = list(
+                    executions_col.find(
+                        {"user_id": user_id, "order_id": {"$in": order_ids}},
+                        projection,
+                    )
+                )
+
+    plan_ids: set = set()
+    keys_by_plan: Dict[Any, set] = {}
+    strategy_keys: set = set()
+    for row in [*signals, *executions]:
+        key = _symbol_key(row.get("symbol"))
+        if not key:
+            continue
+        if str(row.get("source") or "") in _MANUAL_EXECUTION_SOURCES:
+            continue
+        plan_id = row.get("plan_id")
+        if not plan_id:
+            strategy_keys.add(key)
+            continue
+        plan_ids.add(plan_id)
+        keys_by_plan.setdefault(plan_id, set()).add(key)
+
+    plans_col = trading_collections.get("portfolio_trade_plans")
+    if plans_col is None or not plan_ids:
+        return strategy_keys | {key for keys in keys_by_plan.values() for key in keys}
+
+    # Resolve every plan_id once, then apply the ``strategy_decision_mongo_filter``
+    # predicate in Python. Doing it in two passes is what makes a plan that exists
+    # but is not a strategy decision (a manual rebalance, an observation) separable
+    # from a plan_id that does not resolve at all -- only the latter is treated as
+    # unproven, and unproven means strategy so a real gap still alarms.
+    resolved: set = set()
+    for doc in plans_col.find(
+        {"plan_id": {"$in": list(plan_ids)}},
+        {"_id": 0, "plan_id": 1, "origin": 1, "record_kind": 1},
+    ):
+        pid = doc.get("plan_id")
+        resolved.add(pid)
+        if str(doc.get("origin") or "") == "manual":
+            continue
+        kind = doc.get("record_kind")
+        if kind is not None and kind != RECORD_KIND_TRADE_PLAN:
+            continue
+        strategy_keys.update(keys_by_plan.get(pid, set()))
+
+    for pid, keys in keys_by_plan.items():
+        if pid not in resolved:
+            strategy_keys.update(keys)
+
+    return strategy_keys
+
+
 def _reconcile_live_holdings(
     trading_collections: Dict[str, Any],
     finance_collections: Dict[str, Any],
@@ -196,6 +300,11 @@ def _reconcile_live_holdings(
     broker's last position sync) are reported separately and excluded from the
     ``in_sync`` verdict, so an in-app add/reduce does not flash a false mismatch
     during the fill -> position-sync window.
+
+    A positive gap on a symbol that no strategy decision accounts for is a manual
+    position sitting in the same brokerage account. It is reported separately in
+    ``manual_positions`` and is likewise excluded from ``in_sync``: the strategy
+    never owned those shares, so there is nothing to re-sync.
     """
     lineage_control = _pp._get_lineage_control_doc(
         trading_collections,
@@ -272,9 +381,16 @@ def _reconcile_live_holdings(
         securities_account_id=account_id,
         account_synced_at=synced_at,
     )
+    strategy_keys = _strategy_attributable_symbol_keys(
+        trading_collections,
+        finance_collections,
+        user_id=user_id,
+        securities_account_id=account_id,
+    )
 
     diffs: List[Dict[str, Any]] = []
     settling_diffs: List[Dict[str, Any]] = []
+    manual_positions: List[Dict[str, Any]] = []
     for key in sorted({*ledger_by_key, *account_by_key}):
         ledger_row = ledger_by_key.get(key) or {}
         account_row = account_by_key.get(key)
@@ -287,16 +403,19 @@ def _reconcile_live_holdings(
         if ledger_shares == account_shares:
             continue
         symbol = ledger_row.get("symbol") or (account_row or {}).get("symbol") or key
+        gap = account_shares - ledger_shares
         entry = {
             "symbol": symbol,
             "name": ledger_row.get("name") or (account_row or {}).get("name") or "",
             "ledger_shares": ledger_shares,
             "account_shares": account_shares,
-            "diff": account_shares - ledger_shares,
+            "diff": gap,
         }
         if key in settling_keys:
             entry["settling"] = True
             settling_diffs.append(entry)
+        elif gap > 0 and key not in strategy_keys:
+            manual_positions.append(entry)
         else:
             diffs.append(entry)
 
@@ -307,6 +426,7 @@ def _reconcile_live_holdings(
         "account_synced_at": synced_at,
         "diffs": diffs,
         "settling_diffs": settling_diffs,
+        "manual_positions": manual_positions,
     }
 
 

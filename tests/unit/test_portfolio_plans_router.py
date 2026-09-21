@@ -6956,8 +6956,12 @@ def test_reconcile_portfolio_holdings_flags_mismatch(monkeypatch):
     assert diff_by_symbol["600000.SH"]["ledger_shares"] == 1000
     assert diff_by_symbol["600000.SH"]["account_shares"] == 0
     assert diff_by_symbol["600000.SH"]["diff"] == -1000
-    # 000002 only on the broker side -> also a divergence to flag.
-    assert diff_by_symbol["000002.SZ"]["account_shares"] == 500
+    # 000002 is broker-only and the strategy never traded it -> a manual position
+    # in the same account, reported separately rather than as drift to re-sync.
+    assert "000002.SZ" not in diff_by_symbol
+    manual_by_symbol = {row["symbol"]: row for row in data["manual_positions"]}
+    assert manual_by_symbol["000002.SZ"]["ledger_shares"] == 0
+    assert manual_by_symbol["000002.SZ"]["account_shares"] == 500
 
 
 def test_reconcile_portfolio_holdings_in_sync(monkeypatch):
@@ -7385,6 +7389,248 @@ def test_reconcile_live_holdings_ignores_stale_snapshot_ledger(monkeypatch):
     assert result["applicable"] is True
     assert result["in_sync"] is True
     assert result["diffs"] == []
+
+
+def test_reconcile_live_holdings_reports_pure_manual_position(monkeypatch):
+    # A discretionary holding bought directly in miniQMT: the broker has the
+    # shares, the system has no record of the symbol at all. That is a manual
+    # position sitting in the same account, not a drift to re-sync, so it must be
+    # reported separately instead of raising the mismatch banner.
+    cols, fin, data = _reconcile_shared_account_fixtures()
+    fin["trade_signals"].docs = [
+        {
+            "order_id": "oa",
+            "user_id": "user-1",
+            "mode": "live",
+            "plan_id": "plan-a",
+            "securities_account_id": "acct-1",
+            "symbol": "000001.SZ",
+            "status": "filled",
+            "created_at": 1,
+        },
+    ]
+    fin["trade_executions"].docs = [
+        {
+            "order_id": "oa",
+            "user_id": "user-1",
+            "securities_account_id": "acct-1",
+            "symbol": "000001.SZ",
+            "side": "BUY",
+            "filled_size": 100,
+            "filled_price": 10.0,
+            "timestamp": 1.0,
+        },
+    ]
+    fin["trader_positions"].docs = [
+        {
+            "user_id": "user-1",
+            "securities_account_id": "acct-1",
+            "symbol": "000001.SZ",
+            "volume": 100,
+            "synced_at": 1700.0,
+        },
+        {
+            "user_id": "user-1",
+            "securities_account_id": "acct-1",
+            "symbol": "300655.SZ",
+            "volume": 13000,
+            "synced_at": 1700.0,
+        },
+    ]
+    _patch_lineage_live_env(monkeypatch, cols, fin, data)
+    plan = cols["portfolio_trade_plans"].find_one({"plan_id": "plan-a"})
+
+    result = portfolio_plans._reconcile_live_holdings(cols, fin, data, plan, "user-1")
+
+    assert result["applicable"] is True
+    assert result["in_sync"] is True
+    assert result["diffs"] == []
+    manual_by_symbol = {row["symbol"]: row for row in result["manual_positions"]}
+    assert manual_by_symbol["300655.SZ"]["ledger_shares"] == 0
+    assert manual_by_symbol["300655.SZ"]["account_shares"] == 13000
+    assert manual_by_symbol["300655.SZ"]["diff"] == 13000
+
+
+def test_reconcile_live_holdings_manual_plan_fill_is_manual(monkeypatch):
+    # 002050 case: the symbol does have ledger fills, but they all trace to a plan
+    # that is not a strategy decision (origin=manual). Those shares are
+    # discretionary, so the excess the broker holds is still a manual position.
+    cols, fin, data = _reconcile_shared_account_fixtures()
+    cols["portfolio_trade_plans"].docs.append(
+        {
+            "plan_id": "manual-plan",
+            "strategy_template_id": "stx",
+            "user_id": "user-1",
+            "base_date": "20260908",
+            "status": "executed_live",
+            "params_hash": "hash-a",
+            "origin": "manual",
+            "record_kind": "trade_plan",
+        }
+    )
+    fin["trade_signals"].docs = [
+        {
+            "order_id": "oa",
+            "user_id": "user-1",
+            "mode": "live",
+            "plan_id": "plan-a",
+            "securities_account_id": "acct-1",
+            "symbol": "000001.SZ",
+            "status": "filled",
+            "created_at": 1,
+        },
+    ]
+    fin["trade_executions"].docs = [
+        {
+            "order_id": "oa",
+            "user_id": "user-1",
+            "securities_account_id": "acct-1",
+            "symbol": "000001.SZ",
+            "side": "BUY",
+            "filled_size": 100,
+            "filled_price": 10.0,
+            "timestamp": 1.0,
+        },
+        {
+            "order_id": "om",
+            "user_id": "user-1",
+            "securities_account_id": "acct-1",
+            "plan_id": "manual-plan",
+            "symbol": "002050.SZ",
+            "side": "BUY",
+            "filled_size": 7400,
+            "filled_price": 36.24,
+            "timestamp": 2.0,
+        },
+    ]
+    fin["trader_positions"].docs = [
+        {
+            "user_id": "user-1",
+            "securities_account_id": "acct-1",
+            "symbol": "000001.SZ",
+            "volume": 100,
+            "synced_at": 1700.0,
+        },
+        {
+            "user_id": "user-1",
+            "securities_account_id": "acct-1",
+            "symbol": "002050.SZ",
+            "volume": 22200,
+            "synced_at": 1700.0,
+        },
+    ]
+    _patch_lineage_live_env(monkeypatch, cols, fin, data)
+    plan = cols["portfolio_trade_plans"].find_one({"plan_id": "plan-a"})
+
+    result = portfolio_plans._reconcile_live_holdings(cols, fin, data, plan, "user-1")
+
+    assert result["in_sync"] is True
+    assert result["diffs"] == []
+    manual_by_symbol = {row["symbol"]: row for row in result["manual_positions"]}
+    assert manual_by_symbol["002050.SZ"]["ledger_shares"] == 7400
+    assert manual_by_symbol["002050.SZ"]["account_shares"] == 22200
+    assert manual_by_symbol["002050.SZ"]["diff"] == 14800
+
+
+def test_reconcile_live_holdings_unrecorded_strategy_fill_still_alarms(monkeypatch):
+    # The manual bucket must not swallow a genuine strategy problem: a strategy
+    # signal exists for the symbol but its fill never reached the ledger. The
+    # strategy thinks it owns fewer shares than it does, so this stays a real diff.
+    cols, fin, data = _reconcile_shared_account_fixtures()
+    fin["trade_signals"].docs = [
+        {
+            "order_id": "oa",
+            "user_id": "user-1",
+            "mode": "live",
+            "plan_id": "plan-a",
+            "securities_account_id": "acct-1",
+            "symbol": "002050.SZ",
+            "status": "filled",
+            "created_at": 1,
+        },
+    ]
+    fin["trade_executions"].docs = []
+    fin["trader_positions"].docs = [
+        {
+            "user_id": "user-1",
+            "securities_account_id": "acct-1",
+            "symbol": "002050.SZ",
+            "volume": 22200,
+            "synced_at": 1700.0,
+        },
+    ]
+    _patch_lineage_live_env(monkeypatch, cols, fin, data)
+    plan = cols["portfolio_trade_plans"].find_one({"plan_id": "plan-a"})
+
+    result = portfolio_plans._reconcile_live_holdings(cols, fin, data, plan, "user-1")
+
+    assert result["in_sync"] is False
+    assert {row["symbol"] for row in result["diffs"]} == {"002050.SZ"}
+    assert result["manual_positions"] == []
+
+
+def test_reconcile_live_holdings_dangling_plan_id_keeps_alarm(monkeypatch):
+    # A plan_id we cannot resolve is not proof of a manual buy, so the symbol
+    # stays strategy-attributable and the gap keeps raising the banner.
+    cols, fin, data = _reconcile_shared_account_fixtures()
+    fin["trade_signals"].docs = [
+        {
+            "order_id": "oa",
+            "user_id": "user-1",
+            "mode": "live",
+            "plan_id": "plan-a",
+            "securities_account_id": "acct-1",
+            "symbol": "000001.SZ",
+            "status": "filled",
+            "created_at": 1,
+        },
+        {
+            "order_id": "og",
+            "user_id": "user-1",
+            "mode": "live",
+            "plan_id": "ghost-plan",
+            "securities_account_id": "acct-1",
+            "symbol": "002050.SZ",
+            "status": "filled",
+            "created_at": 2,
+        },
+    ]
+    fin["trade_executions"].docs = [
+        {
+            "order_id": "oa",
+            "user_id": "user-1",
+            "securities_account_id": "acct-1",
+            "symbol": "000001.SZ",
+            "side": "BUY",
+            "filled_size": 100,
+            "filled_price": 10.0,
+            "timestamp": 1.0,
+        },
+    ]
+    fin["trader_positions"].docs = [
+        {
+            "user_id": "user-1",
+            "securities_account_id": "acct-1",
+            "symbol": "000001.SZ",
+            "volume": 100,
+            "synced_at": 1700.0,
+        },
+        {
+            "user_id": "user-1",
+            "securities_account_id": "acct-1",
+            "symbol": "002050.SZ",
+            "volume": 22200,
+            "synced_at": 1700.0,
+        },
+    ]
+    _patch_lineage_live_env(monkeypatch, cols, fin, data)
+    plan = cols["portfolio_trade_plans"].find_one({"plan_id": "plan-a"})
+
+    result = portfolio_plans._reconcile_live_holdings(cols, fin, data, plan, "user-1")
+
+    assert result["in_sync"] is False
+    assert {row["symbol"] for row in result["diffs"]} == {"002050.SZ"}
+    assert result["manual_positions"] == []
 
 
 def test_force_rebalance_enqueues_rebalance_task_with_lineage_params(monkeypatch):
