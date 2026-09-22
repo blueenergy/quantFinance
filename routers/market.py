@@ -734,8 +734,10 @@ def fetch_market_analysis_result(
             "user_tip": "今日不是交易日，系统不会生成新大盘分析。"
         }
 
-    # 交易日：若分析未产出，明确提示预计时间，不做回退以免误导用户
-    schedule_text = "10:00 / 11:30 / 15:30"
+    # 交易日：若分析未产出，明确提示预计时间，不做回退以免误导用户。
+    # 以 scheduler.DEFAULT_SCHEDULES 为准：market_analysis_1000 默认 is_active=False
+    # （省 token），且没有 15:30 的 job —— 对用户承诺 10:00/15:30 是两张空头支票。
+    schedule_text = "11:30 / 16:30"
     print(f"[Market Analysis] {today_str} trading-day analysis not ready")
     message_date = "今日" if target_day == date.today() and not is_explicit_date else today_str
     # Surface available slots even when the requested slot is missing, so the UI can
@@ -749,7 +751,7 @@ def fetch_market_analysis_result(
         "error": f"{message_date} 的大盘分析尚未生成",
         "is_trading_day": True,
         "is_expected": True,
-        "expected_schedule": ["10:00", "11:30", "15:30"],
+        "expected_schedule": ["11:30", "16:30"],
         "available_slots": slots_today,
         "user_tip": f"系统会在交易日 {schedule_text} 自动更新，请稍后刷新查看。"
     }
