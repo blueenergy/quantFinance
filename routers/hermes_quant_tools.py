@@ -378,16 +378,24 @@ async def hermes_market_summary(
     """
     获取 AI 大盘分析结果（市场总结）。
 
-    包含：市场情绪、板块轮动、资金流向、风险提示、操作建议。
-    数据由系统在交易日 10:00 / 11:30 / 15:30 自动生成，读取缓存不触发 LLM 调用。
+    包含：市场情绪、市场概览、宏观驱动、量能/板块、资金面（北向/两融）、关键要点、
+    市场展望、风险等级与风险提示、仓位档位与操作倾向、事件观察点。
+    数据由系统在交易日 11:30 / 16:30 自动生成，读取缓存不触发 LLM 调用。
     """
     result = fetch_market_analysis_result(date)
-    # 精简返回，去掉 home_summary 等前端专用字段
+    # 精简返回，去掉 home_summary / iv_snapshot 等前端与快照专用字段。
+    # 注意：这里必须是 prompts.yaml 的 market_analysis_prompt schema 里真实存在的 key
+    # （2026-09-23 之前列了 8 个早已不存在的字段，且漏掉了 riskNote/outlook/keyPoints，
+    #  导致钉钉推送只拿得到 summary 一个正文字段）。
     keys = [
         "success", "analysis_date", "notice", "user_tip", "error",
-        "market_sentiment", "sector_rotation", "fund_flow",
-        "risk_warning", "operation_suggestion", "summary",
-        "overall_trend", "key_stocks", "market_overview",
+        "mood", "summary", "keyPoints",
+        "macroDrivers", "volumeAnalysis", "sectorPerformance",
+        "northboundFlow", "marginFlow", "capitalFlowInsight", "sectorFundFlow",
+        "outlook", "riskLevel", "riskNote",
+        "positionLevel", "operationBias",
+        "ladderInsight", "mainlineAnalysis", "abnormalStockInsight",
+        "next_trading_days", "industry_signals", "event_watch",
     ]
     return {k: result[k] for k in keys if k in result}
 
