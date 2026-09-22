@@ -48,6 +48,11 @@ jobs:
     name: Bump image tag in quant-infrastructure & trigger deploy
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     runs-on: ubuntu-latest
+    # Checkout, wait for the relay, bump, one dispatch POST. The wait has its
+    # own 45-minute ceiling (the ghcr->ACR relay sweeps on a timer and a cold
+    # cross-border pull is slow), so the job ceiling sits above it. A healthy
+    # run is about a minute.
+    timeout-minutes: 50
     needs: [test-build, docker]
     steps:
       - name: Compute image tag
@@ -66,6 +71,21 @@ jobs:
           ref: main
           token: ${{ secrets.INFRA_REPO_TOKEN }}
           path: infra
+
+      - name: Wait for the tag to reach ACR
+        # CI publishes to ghcr only. host/mirror_to_acr.sh on the host relays
+        # each sha-* tag into ACR, and the deploy targets pull from there, so
+        # the bump below must not happen until the tag is actually readable.
+        # Failing here is deliberate: a relay that has stopped working has to
+        # surface as a red run and a DingTalk alert, not as a deploy that
+        # quietly cannot pull its image.
+        env:
+          ACR_REGISTRY: crpi-gv3f6mfcrw75qane.cn-hangzhou.personal.cr.aliyuncs.com
+          ACR_REPO: wukongquant/quant-api
+          TAG: ${{ steps.tag.outputs.tag }}
+          ALIYUN_USER: ${{ secrets.ALIYUN_USER }}
+          ALIYUN_TOKEN: ${{ secrets.ALIYUN_TOKEN }}
+        run: bash infra/scripts/wait-for-acr-tag.sh
 
       - name: Bump versions.env with release notes
         env:
@@ -105,17 +125,21 @@ jobs:
       needs_json: ${{ toJSON(needs) }}
 
   docker:
-    name: Build & Push Docker image (ghcr.io + ACR)
+    name: Build & Push Docker image (ghcr.io)
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     runs-on: ubuntu-latest
+    # A registry push has no timeout of its own. On 2026-09-21 a sibling repo
+    # lost 3h36m to one that stalled after the build had finished, and a
+    # stalled job here blocks release (needs: below) the same way. The ACR leg
+    # no longer runs in CI (host/mirror_to_acr.sh relays instead), so this
+    # guards the ghcr leg. A healthy cold build is ~10 min and a warm one ~2,
+    # so 20 fails fast without false alarms.
+    timeout-minutes: 20
     steps:
       - name: Checkout
         uses: actions/checkout@v6
         with:
           submodules: recursive
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v4
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
@@ -127,20 +151,12 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Log in to Aliyun Container Registry
-        uses: docker/login-action@v4
-        with:
-          registry: crpi-gv3f6mfcrw75qane.cn-hangzhou.personal.cr.aliyuncs.com
-          username: ${{ secrets.ALIYUN_USER }}
-          password: ${{ secrets.ALIYUN_TOKEN }}
-
       - name: Extract metadata
         id: meta
         uses: docker/metadata-action@v6
         with:
           images: |
             ghcr.io/blueenergy/quant-api
-            crpi-gv3f6mfcrw75qane.cn-hangzhou.personal.cr.aliyuncs.com/wukongquant/quant-api
           tags: |
             type=sha,prefix=sha-,format=short
             type=raw,value=latest
@@ -150,7 +166,9 @@ jobs:
         with:
           context: .
           file: Dockerfile.backend
-          platforms: linux/amd64,linux/arm64
+          # arm64 had no consumer: nothing in quant-infrastructure pins a
+          # platform, every target is x86_64, and the relay only mirrors amd64.
+          platforms: linux/amd64
           push: true
           provenance: false
           tags: ${{ steps.meta.outputs.tags }}
