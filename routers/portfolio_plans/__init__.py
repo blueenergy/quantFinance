@@ -200,6 +200,7 @@ PLAN_PARAM_KEYS = {
     "score_column",
     "growth_weight",
     "cycle_weight",
+    "score_weights",
     "top_n",
     "rebalance_days",
     "construction_mode",
@@ -1231,6 +1232,25 @@ def _weighted_growth_cycle_score(
     return weighted_sum / available_weight
 
 
+def _weighted_score_from_stock_row(score_weights: Any, row: Dict[str, Any]) -> Optional[float]:
+    """Raw blend over atomic ``{dimension}_score`` columns with available-weight
+    renormalization. Mirrors stock-scoring-system ``compute_score_series``
+    (``weighted_score`` branch, non rank-based)."""
+    if not isinstance(score_weights, dict) or not score_weights:
+        return None
+    available_weight = 0.0
+    weighted_sum = 0.0
+    for dimension, weight in score_weights.items():
+        value = _optional_float(row.get(f"{dimension}_score"))
+        if value is None:
+            continue
+        available_weight += float(weight)
+        weighted_sum += value * float(weight)
+    if available_weight <= 0:
+        return None
+    return weighted_sum / available_weight
+
+
 def _score_value_from_stock_row(row: Dict[str, Any], config: Dict[str, Any]) -> Optional[float]:
     score_type = str(config.get("score_type") or "growth_cycle_weighted")
     if score_type == "growth_cycle_weighted":
@@ -1240,6 +1260,8 @@ def _score_value_from_stock_row(row: Dict[str, Any], config: Dict[str, Any]) -> 
             config.get("growth_weight", 0.3),
             config.get("cycle_weight", 0.7),
         )
+    if score_type == "weighted_score":
+        return _weighted_score_from_stock_row(config.get("score_weights"), row)
     score_column = str(config.get("score_column") or "")
     if score_column.startswith("composite_score."):
         key = score_column.split(".", 1)[1]
@@ -1378,6 +1400,9 @@ def _ranked_score_projection(config: Dict[str, Any]) -> Dict[str, int]:
     if score_type == "growth_cycle_weighted":
         projection["growth_score"] = 1
         projection["cycle_score"] = 1
+    elif score_type == "weighted_score":
+        for dimension in (config.get("score_weights") or {}):
+            projection[f"{dimension}_score"] = 1
     else:
         projection["composite_score"] = 1
     return projection
@@ -1418,6 +1443,10 @@ def _ranked_universe_cache_key(score_date: str, universe_index: str, config: Dic
         str(config.get("growth_weight", 0.3)),
         str(config.get("cycle_weight", 0.7)),
         str(config.get("score_column") or ""),
+        # weighted_score presets share score_type but differ by recipe; the
+        # weights must be part of the key or two presets would collide on
+        # the same cached ranking.
+        repr(sorted((config.get("score_weights") or {}).items())),
     )
 
 

@@ -946,7 +946,44 @@ def test_publish_portfolio_research_result_rejects_dynamic_selection(monkeypatch
     assert collections["portfolio_strategy_param_presets"].docs == []
 
 
-def test_publish_portfolio_research_result_rejects_generic_score(monkeypatch):
+def test_publish_portfolio_research_result_publishes_weighted_score(monkeypatch):
+    collections = _collections()
+    monkeypatch.setattr(portfolio_research, "get_trading_db_collections", lambda: collections)
+    collections["portfolio_research_jobs"].insert_one(
+        {"job_id": "job-1", "user_id": "user-1", "status": "completed", "created_at": datetime.utcnow()}
+    )
+    collections["portfolio_research_results"].insert_one(
+        {
+            "result_id": "result-1",
+            "job_id": "job-1",
+            "user_id": "user-1",
+            "candidate_strategy_config": {
+                "preset_id": "generic-score",
+                "strategy_template_id": "growth_cycle_index_enhanced",
+                "name": "Generic Weighted",
+                "score_type": "weighted_score",
+                "score_weights": {"fundamental": 0.6, "value": 0.4},
+                "top_n": 10,
+                "rebalance_days": 20,
+            },
+        }
+    )
+
+    response = asyncio.run(
+        portfolio_research.publish_portfolio_research_result(
+            "result-1",
+            portfolio_research.PublishResearchResultRequest(status="draft"),
+            current_user={"id": "user-1", "username": "alice"},
+        )
+    )
+
+    assert response["success"] is True
+    preset = collections["portfolio_strategy_param_presets"].find_one({"preset_id": "generic-score"})
+    assert preset["params"]["score_type"] == "weighted_score"
+    assert preset["params"]["score_weights"] == {"fundamental": 0.6, "value": 0.4}
+
+
+def test_publish_portfolio_research_result_rejects_unknown_weighted_dimension(monkeypatch):
     collections = _collections()
     monkeypatch.setattr(portfolio_research, "get_trading_db_collections", lambda: collections)
     collections["portfolio_research_jobs"].insert_one(
@@ -961,7 +998,40 @@ def test_publish_portfolio_research_result_rejects_generic_score(monkeypatch):
                 "preset_id": "generic-score",
                 "strategy_template_id": "growth_cycle_index_enhanced",
                 "score_type": "weighted_score",
-                "score_weights": {"fundamental": 0.6, "value": 0.4},
+                "score_weights": {"fundamental": 0.5, "sentiment": 0.5},
+            },
+        }
+    )
+
+    with pytest.raises(portfolio_research.HTTPException) as exc:
+        asyncio.run(
+            portfolio_research.publish_portfolio_research_result(
+                "result-1",
+                portfolio_research.PublishResearchResultRequest(status="draft"),
+                current_user={"id": "user-1"},
+            )
+        )
+
+    assert exc.value.status_code == 400
+    assert "sentiment" in exc.value.detail
+
+
+def test_publish_portfolio_research_result_rejects_score_column(monkeypatch):
+    collections = _collections()
+    monkeypatch.setattr(portfolio_research, "get_trading_db_collections", lambda: collections)
+    collections["portfolio_research_jobs"].insert_one(
+        {"job_id": "job-1", "user_id": "user-1", "status": "completed"}
+    )
+    collections["portfolio_research_results"].insert_one(
+        {
+            "result_id": "result-1",
+            "job_id": "job-1",
+            "user_id": "user-1",
+            "candidate_strategy_config": {
+                "preset_id": "generic-score",
+                "strategy_template_id": "growth_cycle_index_enhanced",
+                "score_type": "score_column",
+                "score_column": "composite_score.value_oriented",
             },
         }
     )

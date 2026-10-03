@@ -6434,6 +6434,22 @@ def test_weighted_growth_cycle_score_partial_weights():
     assert portfolio_plans._weighted_growth_cycle_score(80.0, 60.0, 0.3, 0.7) == pytest.approx(66.0)
 
 
+def test_weighted_score_from_stock_row():
+    row = {"value_score": 40.0, "fundamental_score": 80.0, "growth_score": None}
+    weights = {"value": 0.5, "fundamental": 0.5, "growth": 0.25}
+    # missing growth renormalizes onto the available weight
+    assert portfolio_plans._weighted_score_from_stock_row(weights, row) == pytest.approx(60.0)
+    assert portfolio_plans._weighted_score_from_stock_row({}, row) is None
+    assert portfolio_plans._weighted_score_from_stock_row(None, row) is None
+    assert portfolio_plans._weighted_score_from_stock_row(weights, {"value_score": None, "fundamental_score": None}) is None
+
+
+def test_score_value_from_stock_row_weighted_score(monkeypatch):
+    row = {"value_score": 20.0, "fundamental_score": 100.0}
+    config = {"score_type": "weighted_score", "score_weights": {"value": 0.5, "fundamental": 0.5}}
+    assert portfolio_plans._score_value_from_stock_row(row, config) == pytest.approx(60.0)
+
+
 def test_get_portfolio_plan_bench_splits_starters_and_bench(monkeypatch):
     cols = _collections()
     data = _data_collections()

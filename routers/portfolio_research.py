@@ -468,9 +468,28 @@ PRESET_PARAM_KEYS = {
     "initial_capital",
     "trailing_stop_pct",
     "candidate_pool_enabled",
+    # weighted_score recipes (dimension -> weight). Added 2026-10-03 when
+    # weighted publish was productized; existing growth_cycle presets never
+    # carry this key, so their params_hash is unchanged.
+    "score_weights",
     "industry_l1",
     "regime_cash",
     "regime_rule",
+}
+
+# Score dimensions whose live stock_scores rows carry an atomic
+# ``{dimension}_score`` column (canonical list lives in
+# stock-scoring-system analysis/core/score_spec.py). Weighted recipes over
+# these dimensions can be published: both live ranking paths (portfolio
+# construction worker and the plans router) derive the blend from the atomic
+# columns, so a recipe over any other dimension would silently rank on NaN.
+LIVE_ATOMIC_SCORE_DIMENSIONS = {
+    "growth",
+    "cycle",
+    "value",
+    "fundamental",
+    "technical",
+    "money_flow",
 }
 
 
@@ -634,10 +653,10 @@ def _load_full_result_rows(result: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 
 def _params_hash(params: Dict[str, Any]) -> str:
-    """Preset hash: 16 hex chars over ``PRESET_PARAM_KEYS`` (24 keys).
+    """Preset hash: 16 hex chars over ``PRESET_PARAM_KEYS`` (25 keys).
 
     Not the lineage hash. ``plan_params_hash`` in stock-scoring-system's
-    ``shared/strategies.py`` is 12 chars over ``PLAN_PARAM_KEYS`` (10 keys)
+    ``shared/strategies.py`` is 12 chars over ``PLAN_PARAM_KEYS`` (11 keys)
     and normalizes first, so this one carries ``trailing_stop_pct`` /
     ``initial_capital`` / fee rates / ``regime_*`` that the lineage hash
     deliberately drops. The preset field this feeds is also called
@@ -1247,19 +1266,48 @@ async def publish_portfolio_research_result(
             ),
         )
     candidate_score_type = candidate.get("score_type")
-    if candidate_score_type and candidate_score_type != "growth_cycle_weighted":
+    score_weights = candidate.get("score_weights")
+    if candidate_score_type and candidate_score_type not in ("growth_cycle_weighted", "weighted_score"):
         raise HTTPException(
             status_code=409,
             detail=(
-                "Only growth_cycle_weighted research results can be published. "
-                "Generic score-column and weighted-score construction templates "
-                "are not productized yet."
+                "Only growth_cycle_weighted and weighted_score research results "
+                "can be published. Score-column construction templates are not "
+                "productized yet."
             ),
         )
-    if candidate.get("score_weights"):
+    if candidate_score_type == "weighted_score":
+        if not isinstance(score_weights, dict) or not score_weights:
+            raise HTTPException(
+                status_code=400,
+                detail="weighted_score requires a non-empty score_weights mapping.",
+            )
+        unknown = [dimension for dimension in score_weights if dimension not in LIVE_ATOMIC_SCORE_DIMENSIONS]
+        if unknown:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unknown score dimensions in score_weights: {', '.join(map(str, unknown))}",
+            )
+        invalid = []
+        for dimension, weight in score_weights.items():
+            try:
+                weight_value = float(weight)
+            except (TypeError, ValueError):
+                weight_value = -1.0
+            if weight_value <= 0:
+                invalid.append(dimension)
+        if invalid:
+            raise HTTPException(
+                status_code=400,
+                detail=f"score_weights entries must be positive numbers: {', '.join(map(str, invalid))}",
+            )
+    elif score_weights:
         raise HTTPException(
-            status_code=409,
-            detail="Generic weighted-score research results cannot be published yet.",
+            status_code=400,
+            detail=(
+                "score_weights requires score_type weighted_score; "
+                "growth_cycle_weighted recipes use growth_weight/cycle_weight."
+            ),
         )
 
     now = datetime.utcnow()
