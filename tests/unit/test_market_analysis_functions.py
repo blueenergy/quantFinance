@@ -104,7 +104,8 @@ class TestFetchMarketAnalysisResult:
         assert result["error"] == "今日 的大盘分析尚未生成"
         assert result["is_trading_day"] is True
         assert result["is_expected"] is True
-        assert result["expected_schedule"] == ["10:00", "11:30", "15:30"]
+        # 以 scheduler.DEFAULT_SCHEDULES 为准：1000 默认关闭，无 15:30 job（2809e70）
+        assert result["expected_schedule"] == ["11:30", "16:30"]
 
     def test_non_trading_day_with_latest_analysis(self, monkeypatch):
         """No cache for calendar today → fall back to latest trading day analysis."""
