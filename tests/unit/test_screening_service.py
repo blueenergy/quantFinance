@@ -586,6 +586,77 @@ def test_latest_period_considers_express_but_not_forecast():
     assert provider.resolve_period(spec_no_express) == "20260630"
 
 
+def _revision_provider(express=(), forecast=()):
+    """只装多版本公告的 provider；正式财报留空，断言不掺 YoY 基数。"""
+    from services.screening.providers.financial import FinancialMetricProvider
+
+    return FinancialMetricProvider(
+        _FakeDb(
+            {
+                "earnings_express": _Collection(list(express)),
+                "earnings_forecast": _Collection(list(forecast)),
+            }
+        )
+    )
+
+
+# 同一 (ts_code, end_date) 可以有首次公告 + 修正公告多条版本。读侧一旦退回
+# ``out[ts] = ...``（谁最后被迭代到谁胜出），修正就会随机丢掉 —— find() 顺序无承诺。
+# 两个方向都跑一遍：只放「新的在前」挡不住「第一条胜出」这种等价错误。
+@pytest.mark.parametrize("newest_first", [True, False])
+def test_express_revision_keeps_latest_ann_date(newest_first):
+    revised = {
+        "ts_code": "600002.SH",
+        "end_date": "20260630",
+        "ann_date": "20260820",
+        "revenue": 350_000_000,
+        "n_income": 35_000_000,
+    }
+    original = {
+        "ts_code": "600002.SH",
+        "end_date": "20260630",
+        "ann_date": "20260715",
+        "revenue": 300_000_000,
+        "n_income": 30_000_000,
+    }
+    rows = [revised, original] if newest_first else [original, revised]
+
+    loaded = _revision_provider(express=rows)._load_express(["600002.SH"], "20260630")
+
+    assert loaded["600002.SH"]["ann_date"] == "20260820"
+    assert loaded["600002.SH"]["values"]["revenue"] == 350_000_000
+    assert loaded["600002.SH"]["values"]["n_income_attr_p"] == 35_000_000
+
+
+@pytest.mark.parametrize("newest_first", [True, False])
+def test_forecast_revision_keeps_latest_ann_date(newest_first):
+    """首亏 → 预减 的翻转必须取修正值（000007.SZ / 20251231 实测案例）。"""
+    revised = {
+        "ts_code": "000007.SZ",
+        "end_date": "20251231",
+        "ann_date": "20260422",
+        "type": "预减",
+        "net_profit_min": 130,
+        "net_profit_max": 190,
+    }
+    original = {
+        "ts_code": "000007.SZ",
+        "end_date": "20251231",
+        "ann_date": "20260128",
+        "type": "首亏",
+        "net_profit_min": -550,
+        "net_profit_max": -370,
+    }
+    rows = [revised, original] if newest_first else [original, revised]
+
+    loaded = _revision_provider(forecast=rows)._load_forecast(["000007.SZ"], "20251231")
+
+    # 预告区间单位是万元
+    assert loaded["000007.SZ"]["ann_date"] == "20260422"
+    assert loaded["000007.SZ"]["forecast_type"] == "预减"
+    assert loaded["000007.SZ"]["values"]["n_income_attr_p"] == pytest.approx(1_600_000)
+
+
 def _yoy_quality_db():
     """去年同期分别为：正常、转正前亏损、持续亏损、微利。"""
     prior = {
