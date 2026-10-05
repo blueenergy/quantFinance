@@ -39,8 +39,15 @@ async def get_earnings_hunter_signals(
     ).sort("ann_date", -1))
     
     # Process forecasts
+    # 同一报告期可能有首次预告 + 修正公告多条，已按 ann_date 倒序，
+    # 每 (ts_code, end_date) 只保留最新一条，避免同一只票重复出现。
+    seen_periods = set()
     for f in forecasts:
         ts_code = f.get("ts_code")
+        period_key = (ts_code, f.get("end_date"))
+        if period_key in seen_periods:
+            continue
+        seen_periods.add(period_key)
         stock = stock_basic_col.find_one({"ts_code": ts_code})
         if not stock: continue
         

@@ -148,6 +148,7 @@ class FinancialMetricProvider:
         for src_field in EXPRESS_FIELD_MAP.values():
             proj[src_field] = 1
 
+        # 同一 (ts_code, end_date) 可能有多条公告版本（快报修正），取 ann_date 最新的一条。
         out: Dict[str, Dict[str, Any]] = {}
         for d in self.express.find(query, proj):
             ts = d.get("ts_code")
@@ -158,8 +159,13 @@ class FinancialMetricProvider:
                 for target, src in EXPRESS_FIELD_MAP.items()
                 if d.get(src) is not None
             }
-            if values:
-                out[ts] = {"values": values, "ann_date": d.get("ann_date")}
+            if not values:
+                continue
+            ann = str(d.get("ann_date") or "")
+            prev = out.get(ts)
+            if prev is not None and str(prev.get("ann_date") or "") > ann:
+                continue
+            out[ts] = {"values": values, "ann_date": d.get("ann_date")}
         return out
 
     def _load_forecast(
@@ -177,6 +183,7 @@ class FinancialMetricProvider:
             "type": 1,
         }
 
+        # 同一 (ts_code, end_date) 可能有多条公告版本（预告修正），取 ann_date 最新的一条。
         out: Dict[str, Dict[str, Any]] = {}
         for d in self.forecast.find(query, proj):
             ts = d.get("ts_code")
@@ -185,6 +192,10 @@ class FinancialMetricProvider:
                 continue
             bounds = [v for v in (lo, hi) if v is not None]
             if not bounds:
+                continue
+            ann = str(d.get("ann_date") or "")
+            prev = out.get(ts)
+            if prev is not None and str(prev.get("ann_date") or "") > ann:
                 continue
             midpoint = sum(bounds) / len(bounds) * FORECAST_UNIT_SCALE
             out[ts] = {
