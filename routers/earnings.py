@@ -25,7 +25,6 @@ async def get_earnings_hunter_signals(
     data_collections = get_data_db()
     forecast_col = data_collections["earnings_forecast"]
     express_col = data_collections["earnings_express"]
-    report_rc_col = data_collections["earnings_report_rc"]
     stock_basic_col = data_collections["stock_info"]
     
     # Calculate cutoff date
@@ -118,32 +117,6 @@ async def get_earnings_hunter_signals(
             "ai_analysis": e.get("ai_analysis")
         })
         
-    # 3. 扫描券商评级上调 (Report RC) - 卖方开始猛推
-    # 比如 op_rt 包含 "上调" 或者 rating_name 包含 "买入" 且之前没发过
-    reports = list(report_rc_col.find(
-        {"report_date": {"$gte": cutoff_date}, "op_rt": {"$in": ["首次", "调高"]}}
-    ).sort("report_date", -1))
-    
-    for r in reports:
-        ts_code = r.get("ts_code")
-        stock = stock_basic_col.find_one({"ts_code": ts_code})
-        if not stock: continue
-        
-        signals.append({
-            "id": str(r["_id"]),
-            "ts_code": ts_code,
-            "name": stock.get("name", ""),
-            "industry": stock.get("industry", ""),
-            "signal_type": "卖方研报",
-            "subtype": "评级" + r.get("op_rt", ""),
-            "date": r.get("report_date"),
-            "report_period": None,
-            "core_metric": f"[{r.get('org_name')}] {r.get('rating_name')}",
-            "title": r.get("title", ""),
-            "reason": r.get("title", ""), # Use title as reason
-            "ai_analysis": r.get("ai_analysis")
-        })
-        
     # 排序：按日期倒序
     signals.sort(key=lambda x: x["date"], reverse=True)
     
@@ -156,7 +129,7 @@ async def get_earnings_hunter_signals(
 @router.post("/hunter/analyze/{signal_id}")
 async def analyze_hunter_signal(
     signal_id: str,
-    signal_type: str = Query(..., description="信号类型：业绩预告/业绩快报/卖方研报"),
+    signal_type: str = Query(..., description="信号类型：业绩预告/业绩快报"),
     current_user: dict = Depends(get_current_active_user)
 ):
     """
@@ -173,8 +146,6 @@ async def analyze_hunter_signal(
         col = data_collections["earnings_forecast"]
     elif signal_type == "业绩快报":
         col = data_collections["earnings_express"]
-    elif signal_type == "卖方研报":
-        col = data_collections["earnings_report_rc"]
     else:
         raise HTTPException(status_code=400, detail="未知的信号类型")
         

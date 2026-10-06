@@ -572,7 +572,7 @@ async def hermes_earnings_signals(
     _: bool = Depends(require_hermes_quant_internal_key),
 ):
     """
-    财报猎手：扫描最近 N 天的业绩预告、快报和券商评级上调，
+    财报猎手：扫描最近 N 天的业绩预告和快报，
     寻找可能发生“戴维斯双击”（盈利上修 + 估值扩张）的拠点公司。
 
     返回信号列表，每条包括：股票代码、公司名、信号类型、核心指标、日期。
@@ -620,20 +620,6 @@ async def hermes_earnings_signals(
             "date": e.get("ann_date"),
             "core_metric": f"净利润同比 {yoy:.1f}%" + (f"，营收 {revenue/1e8:.1f}亿" if revenue else ""),
             "reason": "",
-        })
-
-    # 3. 券商评级上调
-    for r in data_db["earnings_report_rc"].find(
-        {"report_date": {"$gte": cutoff}, "op_rt": {"$in": ["首次", "调高"]}},
-        sort=[("report_date", -1)],
-    ):
-        signals.append({
-            "ts_code": r.get("ts_code"),
-            "signal_type": "卖方研报",
-            "subtype": "评级" + r.get("op_rt", ""),
-            "date": r.get("report_date"),
-            "core_metric": f"[{r.get('org_name')}] {r.get('rating_name')}",
-            "reason": r.get("title", ""),
         })
 
     signals.sort(key=lambda x: x["date"] or "", reverse=True)
