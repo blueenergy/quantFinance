@@ -83,6 +83,21 @@ def _normalize_regime_rule(value: Any) -> Optional[str]:
     return text
 
 
+def _normalize_regime_rules(value: Any) -> Optional[List[str]]:
+    if value is None:
+        return None
+    if not isinstance(value, list):
+        raise ValueError("regime_rules must be a list of preset ids")
+    rules: List[str] = []
+    for item in value:
+        normalized = _normalize_regime_rule(item)
+        if normalized and normalized not in rules:
+            rules.append(normalized)
+    if not rules:
+        raise ValueError("regime_rules must include at least one preset")
+    return rules
+
+
 class ColumnScoreSpec(BaseModel):
     mode: Literal["column"]
     column: str
@@ -165,6 +180,14 @@ class CreateResearchJobRequest(BaseModel):
             "Default k_slow_anchor; k_slow_anchor_with_vol_and_atr is volume-price timing."
         ),
     )
+    regime_rules: Optional[List[str]] = Field(
+        default=None,
+        min_length=1,
+        description=(
+            "Non-bull cash presets to sweep in one job (user-selected). "
+            "When set, overrides regime_rule. Does not default to all presets."
+        ),
+    )
     force: bool = Field(default=False)
 
     @field_validator("industry_l1", mode="before")
@@ -189,6 +212,13 @@ class CreateResearchJobRequest(BaseModel):
     @classmethod
     def _optional_regime_rule(cls, value: Any) -> Any:
         return _normalize_regime_rule(value)
+
+    @field_validator("regime_rules", mode="before")
+    @classmethod
+    def _optional_regime_rules(cls, value: Any) -> Any:
+        if value is None:
+            return None
+        return _normalize_regime_rules(value)
 
     @model_validator(mode="after")
     def _validate_score_inputs(self) -> "CreateResearchJobRequest":
@@ -247,6 +277,7 @@ class RerunResearchJobRequest(BaseModel):
     regime_cash: Optional[bool] = None
     regime_modes: Optional[List[RegimeMode]] = Field(default=None, min_length=1)
     regime_rule: Optional[str] = None
+    regime_rules: Optional[List[str]] = Field(default=None, min_length=1)
     force: bool = Field(default=True, description="Default true so a rerun is not skipped by cache/idempotency")
 
     @field_validator(
@@ -272,6 +303,13 @@ class RerunResearchJobRequest(BaseModel):
     @classmethod
     def _optional_regime_rule(cls, value: Any) -> Any:
         return _normalize_regime_rule(value)
+
+    @field_validator("regime_rules", mode="before")
+    @classmethod
+    def _optional_regime_rules_rerun(cls, value: Any) -> Any:
+        if value is None:
+            return None
+        return _normalize_regime_rules(value)
 
     @field_validator("rebalance_interval_days", "top_n_values", "active_caps", "trailing_stop_pcts", "regime_modes", mode="before")
     @classmethod
@@ -857,6 +895,8 @@ def _build_research_job_document(user_id: str, request: CreateResearchJobRequest
 
     now = datetime.utcnow()
     params = request.model_dump()
+    if params.get("regime_rules"):
+        params.pop("regime_rule", None)
     if request.score_specs:
         params.pop("growth_cycle_weights", None)
     params["start_date"] = start_date
