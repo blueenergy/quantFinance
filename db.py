@@ -12,6 +12,7 @@ ANALYZER_DB_NAME = os.getenv("ANALYZER_DB_NAME", "quant_analyzer")
 data_db_name = os.getenv("DATA_DB_NAME", "quant_data")
 realtime_db_name = os.getenv("REALTIME_DB_NAME", "quant_realtime")
 trading_db_name = os.getenv("TRADING_DB_NAME", "quant_trading")
+ml_db_name = os.getenv("QUANT_ML_DB", "quant_ml")
 
 # Singleton client (reuse across app). pymongo defaults to maxIdleTimeMS=None,
 # which never reclaims an idle connection, so this process would ratchet up to
@@ -34,6 +35,7 @@ data_db = client[data_db_name]
 realtime_db = client[realtime_db_name]
 # Separate DB for execution-domain strategy plans and paper trading.
 trading_db = client[trading_db_name]
+ml_db = client[ml_db_name]
 
 import logging as _logging
 _logging.getLogger(__name__).info(
@@ -316,6 +318,18 @@ def get_data_db():
         # US Treasury rates (written by run_us_rates_sync)
         "us_rates_daily": data_db["us_rates_daily"],
     }
+
+def get_ml_db_collections() -> Dict[str, Collection]:
+    """quant_ml database: model training jobs, results, and shadow predictions."""
+    return {
+        "model_training_jobs": ml_db["model_training_jobs"],
+        "model_training_results": ml_db["model_training_results"],
+        "dataset_manifests": ml_db["dataset_manifests"],
+        "model_predictions": ml_db["model_predictions"],
+        "model_shadow_jobs": ml_db["model_shadow_jobs"],
+        "model_training_worker_status": ml_db["model_training_worker_status"],
+    }
+
 
 def close_db():
     """Close the MongoDB connection (if needed)."""
