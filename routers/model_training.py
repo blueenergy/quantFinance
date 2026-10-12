@@ -19,12 +19,14 @@ logger = logging.getLogger(__name__)
 
 UniverseIndex = Literal["hs300", "a500", "csi1000", "csi2000"]
 ModelKind = Literal["rule_baseline", "ridge", "elasticnet", "lightgbm"]
+DataSource = Literal["synthetic", "production_scores"]
 
 
 class CreateModelTrainingJobRequest(BaseModel):
     name: str = Field(default="ML训练", max_length=200)
     index_code: UniverseIndex = Field(default="csi1000")
     model_kind: ModelKind = Field(default="ridge")
+    data_source: DataSource = Field(default="synthetic")
     start_date: Optional[str] = None
     end_date: Optional[str] = None
     parquet_path: Optional[str] = None
