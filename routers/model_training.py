@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
-from pymongo import ASCENDING, DESCENDING
+from pymongo import DESCENDING
 
 from auth import get_current_user
 from db import get_ml_db_collections
@@ -54,6 +54,57 @@ def create_model_training_job(
     }
     collections["model_training_jobs"].insert_one(doc)
     return {"data": {"job_id": job_id, "status": "pending"}}
+
+
+def _snapshot_parquet_path(doc: Dict[str, Any]) -> Optional[str]:
+    path = doc.get("parquet_path") or doc.get("parquet_uri")
+    if not path:
+        return None
+    text = str(path).strip()
+    return text or None
+
+
+def _serialize_snapshot_row(doc: Dict[str, Any]) -> Dict[str, Any]:
+    created = doc.get("created_at")
+    if isinstance(created, datetime):
+        created_at = created.isoformat() + "Z"
+    else:
+        created_at = created
+    parquet_path = _snapshot_parquet_path(doc)
+    return {
+        "snapshot_id": doc.get("snapshot_id"),
+        "index_code": doc.get("index_code"),
+        "start_date": doc.get("start_date"),
+        "end_date": doc.get("end_date"),
+        "row_count": doc.get("row_count"),
+        "parquet_path": parquet_path,
+        "created_at": created_at,
+    }
+
+
+@router.get("/snapshots")
+def list_dataset_snapshots(
+    index_code: Optional[UniverseIndex] = Query(default=None),
+    limit: int = Query(default=50, ge=1, le=200),
+    current_user: dict = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """Registered Parquet manifests from quant_ml.dataset_manifests (materialize job)."""
+    collections = get_ml_db_collections()
+    query: Dict[str, Any] = {"snapshot_id": {"$exists": True, "$ne": None}}
+    if index_code:
+        query["index_code"] = index_code
+    cursor = (
+        collections["dataset_manifests"]
+        .find(query, {"_id": 0})
+        .sort("created_at", DESCENDING)
+        .limit(limit)
+    )
+    rows: List[Dict[str, Any]] = []
+    for doc in cursor:
+        row = _serialize_snapshot_row(doc)
+        if row.get("snapshot_id") and row.get("parquet_path"):
+            rows.append(row)
+    return {"data": rows}
 
 
 @router.get("/jobs")
