@@ -93,3 +93,47 @@ def test_list_dataset_snapshots(monkeypatch):
     assert len(resp["data"]) == 1
     assert resp["data"][0]["snapshot_id"] == "a"
     assert resp["data"][0]["parquet_path"].endswith("a.parquet")
+
+
+def test_promotion_context_endpoint(monkeypatch):
+    jobs = _Collection()
+    results = _Collection()
+    params = {
+        "index_code": "hs300",
+        "model_kind": "ridge",
+        "train_days": 60,
+        "test_days": 20,
+        "purge_days": 60,
+    }
+    jobs.docs = [
+        {
+            "job_id": "j1",
+            "user_id": "u1",
+            "status": "completed",
+            "result_id": "r1",
+            "params": params,
+        }
+    ]
+    fold = [{"fold_id": i, "model": {"mean_ic": 0.05}, "baseline": {"mean_ic": 0.01}} for i in range(4)]
+    results.docs = [
+        {
+            "result_id": "r1",
+            "code_version": "0.1.0",
+            "fold_reports": fold,
+            "baseline_ic": {"mean_ic": 0.03},
+            "permutation_p": 0.02,
+            "promotion": {"passed": False, "reason": "insufficient_universes"},
+        }
+    ]
+    monkeypatch.setattr(
+        model_training,
+        "get_ml_db_collections",
+        lambda: {
+            "model_training_jobs": jobs,
+            "model_training_results": results,
+            "dataset_manifests": _Collection(),
+        },
+    )
+    resp = model_training.get_model_training_promotion_context("j1", current_user={"id": "u1"})
+    assert resp["data"]["single_pool"]["passed"] is True
+    assert resp["data"]["group"]["passed_pool_count"] == 1

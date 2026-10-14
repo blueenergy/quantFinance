@@ -13,6 +13,11 @@ from pymongo import DESCENDING
 
 from auth import get_current_user
 from db import get_ml_db_collections
+from services.model_training_promotion import (
+    build_promotion_context,
+    find_recipe_sibling_jobs,
+    recipe_fingerprint,
+)
 
 router = APIRouter(prefix="/model-training", tags=["model-training"])
 logger = logging.getLogger(__name__)
@@ -133,6 +138,46 @@ def get_model_training_job(job_id: str, current_user: dict = Depends(get_current
     if not doc:
         raise HTTPException(status_code=404, detail="job not found")
     return {"data": doc}
+
+
+@router.get("/jobs/{job_id}/promotion-context")
+def get_model_training_promotion_context(
+    job_id: str,
+    current_user: dict = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """Single-pool vs recipe-matched multi-pool promotion (cross-job, same user)."""
+    collections = get_ml_db_collections()
+    user_id = str(current_user.get("id") or "")
+    job = collections["model_training_jobs"].find_one(
+        {"job_id": job_id, "user_id": user_id},
+        {"_id": 0},
+    )
+    if not job:
+        raise HTTPException(status_code=404, detail="job not found")
+    result: Optional[Dict[str, Any]] = None
+    result_id = job.get("result_id")
+    if result_id:
+        result = collections["model_training_results"].find_one({"result_id": result_id}, {"_id": 0})
+    params = job.get("params") or {}
+    fingerprint = recipe_fingerprint(params, code_version=(result or {}).get("code_version"))
+    siblings = find_recipe_sibling_jobs(
+        collections,
+        user_id=user_id,
+        fingerprint=fingerprint,
+        code_version=(result or {}).get("code_version"),
+    )
+    if not any(j.get("job_id") == job_id for j in siblings):
+        siblings = [job] + [j for j in siblings if j.get("job_id") != job_id]
+    sibling_results: Dict[str, Dict[str, Any]] = {}
+    for sib in siblings:
+        rid = sib.get("result_id")
+        if not rid:
+            continue
+        doc = collections["model_training_results"].find_one({"result_id": rid}, {"_id": 0})
+        if doc and sib.get("job_id"):
+            sibling_results[str(sib["job_id"])] = doc
+    ctx = build_promotion_context(job, result, siblings, sibling_results)
+    return {"data": ctx}
 
 
 @router.get("/jobs/{job_id}/results")
