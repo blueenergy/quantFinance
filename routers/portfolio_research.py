@@ -20,7 +20,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 from pymongo import ASCENDING, DESCENDING
 
 from auth import get_current_user
-from db import get_db_collections, get_trading_db_collections
+from db import get_db_collections, get_ml_db_collections, get_trading_db_collections
 from services import portfolio_research_s3 as research_s3
 
 
@@ -69,6 +69,14 @@ def _blank_to_none(value: Any) -> Any:
     if value == "" or value is None:
         return None
     return value
+
+
+def _strip_to_none(value: Any) -> Any:
+    """Trim free-form identifiers and treat whitespace-only values as unset."""
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
 
 
 def _normalize_regime_rule(value: Any) -> Optional[str]:
@@ -143,6 +151,13 @@ class CreateResearchJobRequest(BaseModel):
     start_date: str
     end_date: str
     score_column: str = Field(default="composite_growth_cycle_score")
+    model_id: Optional[str] = Field(
+        default=None,
+        description=(
+            "quant_ml.model_predictions model_id. Forces score_column=model_score; "
+            "mutually exclusive with score_specs / growth_cycle_weights."
+        ),
+    )
     growth_cycle_weights: List[str] = Field(default_factory=lambda: ["30:70"])
     score_specs: Optional[List[ScoreSpec]] = None
     top_n_values: List[int] = Field(default_factory=lambda: [10, 20, 50])
@@ -195,6 +210,11 @@ class CreateResearchJobRequest(BaseModel):
     def _optional_industry_blank(cls, value: Any) -> Any:
         return _blank_to_none(value)
 
+    @field_validator("model_id", mode="before")
+    @classmethod
+    def _optional_model_id(cls, value: Any) -> Any:
+        return _strip_to_none(value)
+
     @field_validator(
         "buy_commission_rate",
         "sell_commission_rate",
@@ -224,6 +244,15 @@ class CreateResearchJobRequest(BaseModel):
     def _validate_score_inputs(self) -> "CreateResearchJobRequest":
         if self.score_specs and "growth_cycle_weights" in self.model_fields_set and self.growth_cycle_weights:
             raise ValueError("score_specs and growth_cycle_weights are mutually exclusive")
+        if self.model_id:
+            if self.score_specs is not None:
+                raise ValueError("model_id cannot be combined with score_specs")
+            if "growth_cycle_weights" in self.model_fields_set and self.growth_cycle_weights:
+                raise ValueError("model_id cannot be combined with growth_cycle_weights")
+            if "score_column" in self.model_fields_set and self.score_column != "model_score":
+                raise ValueError("model_id requires score_column='model_score'")
+        elif "score_column" in self.model_fields_set and self.score_column == "model_score":
+            raise ValueError("score_column='model_score' requires model_id")
         if self.selection_mode == "dynamic_score_threshold":
             if len(self.top_n_values) != 1 or self.top_n_values[0] <= 0:
                 raise ValueError("dynamic_score_threshold requires top_n_values to contain exactly one positive integer")
@@ -253,6 +282,7 @@ class RerunResearchJobRequest(BaseModel):
     start_date: Optional[str] = None
     end_date: Optional[str] = None
     score_column: Optional[str] = None
+    model_id: Optional[str] = None
     growth_cycle_weights: Optional[List[str]] = None
     score_specs: Optional[List[ScoreSpec]] = None
     top_n_values: Optional[List[int]] = None
@@ -298,6 +328,11 @@ class RerunResearchJobRequest(BaseModel):
     @classmethod
     def _optional_blank(cls, value: Any) -> Any:
         return _blank_to_none(value)
+
+    @field_validator("model_id", mode="before")
+    @classmethod
+    def _optional_model_id(cls, value: Any) -> Any:
+        return _strip_to_none(value)
 
     @field_validator("regime_rule", mode="before")
     @classmethod
@@ -887,14 +922,64 @@ async def create_portfolio_research_job(request: CreateResearchJobRequest, curre
     return {"success": True, "data": _jsonable(job)}
 
 
+def _validate_model_id_coverage(model_id: str, start_date: str, end_date: str) -> None:
+    """Reject ML jobs whose model has no predictions in the requested window.
+
+    Without this check ``merge_model_score_into_dataset`` returns an all-NaN
+    model_score for an unknown / out-of-range model_id, and the worker completes
+    the job with no signal. Fail at submission instead.
+    """
+    predictions = get_ml_db_collections()["model_predictions"]
+    projection = {"_id": 0, "trade_date": 1}
+    first = predictions.find_one({"model_id": model_id}, projection, sort=[("trade_date", 1)])
+    last = predictions.find_one({"model_id": model_id}, projection, sort=[("trade_date", -1)])
+    if not first or not last:
+        raise HTTPException(
+            status_code=422,
+            detail=f"unknown model_id: {model_id} (no rows in quant_ml.model_predictions)",
+        )
+    first_date = str(first.get("trade_date") or "")
+    last_date = str(last.get("trade_date") or "")
+    if not first_date or not last_date:
+        raise HTTPException(status_code=422, detail=f"model_id {model_id} has no trade_date coverage")
+    if last_date < start_date or first_date > end_date:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"model_id {model_id} predictions cover {first_date}..{last_date}, "
+                f"no overlap with requested {start_date}..{end_date}"
+            ),
+        )
+    in_range = predictions.find_one(
+        {"model_id": model_id, "trade_date": {"$gte": start_date, "$lte": end_date}},
+        projection,
+    )
+    if in_range is None:
+        raise HTTPException(
+            status_code=422,
+            detail=f"model_id {model_id} has no predictions between {start_date} and {end_date}",
+        )
+
+
 def _build_research_job_document(user_id: str, request: CreateResearchJobRequest) -> Dict[str, Any]:
     start_date = _normalize_date(request.start_date)
     end_date = _normalize_date(request.end_date)
     if start_date > end_date:
         raise HTTPException(status_code=400, detail="start_date must be <= end_date")
 
+    model_id = str(request.model_id or "").strip()
+    if model_id:
+        _validate_model_id_coverage(model_id, start_date, end_date)
+
     now = datetime.utcnow()
     params = request.model_dump()
+    if model_id:
+        # model_id is the single source of truth for the ranking column. Clear
+        # rule-score inputs so a stale default cannot silently win downstream.
+        params["model_id"] = model_id
+        params["score_column"] = "model_score"
+        params.pop("score_specs", None)
+        params.pop("growth_cycle_weights", None)
     if params.get("regime_rules"):
         params.pop("regime_rule", None)
     if request.score_specs:
@@ -918,7 +1003,9 @@ def _build_research_job_document(user_id: str, request: CreateResearchJobRequest
         "user_id": user_id,
         "name": request.name,
         "strategy_family": (
-            "weighted_score"
+            "model_score"
+            if model_id
+            else "weighted_score"
             if request.score_specs and any(spec.mode == "weighted" for spec in request.score_specs)
             else "score_column"
             if request.score_specs or not request.growth_cycle_weights
@@ -963,10 +1050,27 @@ def _create_request_from_job(
     payload = {key: params[key] for key in field_names if key in params and params[key] is not None}
 
     overrides = options.model_dump(exclude_unset=True)
+    if overrides.get("model_id") and (
+        overrides.get("score_specs") or overrides.get("growth_cycle_weights")
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail="model_id cannot be combined with score_specs or growth_cycle_weights",
+        )
     if overrides.get("score_specs"):
         payload.pop("growth_cycle_weights", None)
     if overrides.get("growth_cycle_weights"):
         payload.pop("score_specs", None)
+    if overrides.get("model_id"):
+        # Switching a rule-score job onto a model: drop the source's rule inputs.
+        payload.pop("score_specs", None)
+        payload.pop("growth_cycle_weights", None)
+        payload.pop("score_column", None)
+    if overrides.get("score_specs") or overrides.get("growth_cycle_weights"):
+        # Switching a model job back onto rule scores: drop the model selection.
+        payload.pop("model_id", None)
+    if overrides.get("score_column") and overrides["score_column"] != "model_score":
+        payload.pop("model_id", None)
     for key, value in overrides.items():
         if key == "force":
             continue

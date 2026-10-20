@@ -112,6 +112,82 @@ def list_dataset_snapshots(
     return {"data": rows}
 
 
+def _serialize_prediction_model_row(doc: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "model_id": doc.get("_id"),
+        "index_code": doc.get("index_code"),
+        "first_trade_date": doc.get("first_trade_date"),
+        "last_trade_date": doc.get("last_trade_date"),
+        "date_count": int(doc.get("date_count") or 0),
+        "prediction_count": int(doc.get("prediction_count") or 0),
+        "research": bool(doc.get("research")),
+        "shadow": bool(doc.get("shadow")),
+        "source": doc.get("source"),
+        "window": doc.get("window"),
+    }
+
+
+@router.get("/prediction-models")
+def list_prediction_models(
+    index_code: Optional[UniverseIndex] = Query(default=None),
+    kind: Literal["all", "research", "shadow"] = Query(default="all"),
+    limit: int = Query(default=100, ge=1, le=500),
+    current_user: dict = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """Model ids available in ``quant_ml.model_predictions`` with date coverage.
+
+    Portfolio research selects a model by ``model_id``; listing training jobs is
+    not enough because only materialised / shadowed models have prediction rows,
+    and the coverage decides whether a requested backtest window is usable.
+    """
+    collections = get_ml_db_collections()
+    match: Dict[str, Any] = {"model_id": {"$exists": True, "$nin": [None, ""]}}
+    if index_code:
+        match["index_code"] = index_code
+    if kind == "research":
+        match["research"] = True
+    elif kind == "shadow":
+        match["shadow"] = True
+
+    pipeline = [
+        {"$match": match},
+        # First collapse to (model, date) so date_count is exact without
+        # materialising a large set of dates in memory.
+        {
+            "$group": {
+                "_id": {"model_id": "$model_id", "trade_date": "$trade_date"},
+                "prediction_count": {"$sum": 1},
+                "index_code": {"$max": "$index_code"},
+                "research": {"$max": "$research"},
+                "shadow": {"$max": "$shadow"},
+                "source": {"$max": "$source"},
+                "window": {"$max": "$window"},
+            }
+        },
+        {
+            "$group": {
+                "_id": "$_id.model_id",
+                "first_trade_date": {"$min": "$_id.trade_date"},
+                "last_trade_date": {"$max": "$_id.trade_date"},
+                "date_count": {"$sum": 1},
+                "prediction_count": {"$sum": "$prediction_count"},
+                "index_code": {"$max": "$index_code"},
+                "research": {"$max": "$research"},
+                "shadow": {"$max": "$shadow"},
+                "source": {"$max": "$source"},
+                "window": {"$max": "$window"},
+            }
+        },
+        {"$sort": {"last_trade_date": DESCENDING, "_id": 1}},
+        {"$limit": limit},
+    ]
+    rows = [
+        _serialize_prediction_model_row(doc)
+        for doc in collections["model_predictions"].aggregate(pipeline)
+    ]
+    return {"data": rows}
+
+
 @router.get("/jobs")
 def list_model_training_jobs(
     status: Optional[str] = Query(default=None),

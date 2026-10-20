@@ -137,3 +137,100 @@ def test_promotion_context_endpoint(monkeypatch):
     resp = model_training.get_model_training_promotion_context("j1", current_user={"id": "u1"})
     assert resp["data"]["single_pool"]["passed"] is True
     assert resp["data"]["group"]["passed_pool_count"] == 1
+
+
+class _AggregateCollection:
+    def __init__(self, rows=None):
+        self.rows = list(rows or [])
+        self.pipelines = []
+
+    def aggregate(self, pipeline):
+        self.pipelines.append(pipeline)
+        return iter(self.rows)
+
+
+def test_list_prediction_models_serializes_coverage(monkeypatch):
+    predictions = _AggregateCollection([
+        {
+            "_id": "research-rolling500-hs300",
+            "index_code": "hs300",
+            "first_trade_date": "20170424",
+            "last_trade_date": "20260909",
+            "date_count": 115,
+            "prediction_count": 34500,
+            "research": True,
+            "shadow": False,
+            "source": "factor_incremental_experiment",
+            "window": "rolling_500",
+        },
+        {
+            "_id": "legacy",
+            "first_trade_date": "20200102",
+            "last_trade_date": "20200131",
+            "date_count": 20,
+            "prediction_count": 3000,
+        },
+    ])
+    monkeypatch.setattr(
+        model_training,
+        "get_ml_db_collections",
+        lambda: {"model_predictions": predictions},
+    )
+
+    response = model_training.list_prediction_models(
+        index_code=None,
+        kind="all",
+        limit=100,
+        current_user={"id": "u1"},
+    )
+
+    assert response["data"][0] == {
+        "model_id": "research-rolling500-hs300",
+        "index_code": "hs300",
+        "first_trade_date": "20170424",
+        "last_trade_date": "20260909",
+        "date_count": 115,
+        "prediction_count": 34500,
+        "research": True,
+        "shadow": False,
+        "source": "factor_incremental_experiment",
+        "window": "rolling_500",
+    }
+    # Missing flags mean neither research nor shadow, not None.
+    assert response["data"][1]["research"] is False
+    assert response["data"][1]["shadow"] is False
+
+    pipeline = predictions.pipelines[0]
+    assert pipeline[0]["$match"] == {"model_id": {"$exists": True, "$nin": [None, ""]}}
+    assert pipeline[-1] == {"$limit": 100}
+
+
+def test_list_prediction_models_applies_kind_and_index_filters(monkeypatch):
+    predictions = _AggregateCollection([])
+    monkeypatch.setattr(
+        model_training,
+        "get_ml_db_collections",
+        lambda: {"model_predictions": predictions},
+    )
+
+    model_training.list_prediction_models(
+        index_code="hs300",
+        kind="research",
+        limit=5,
+        current_user={"id": "u1"},
+    )
+    research_match = predictions.pipelines[0][0]["$match"]
+    assert research_match["index_code"] == "hs300"
+    assert research_match["research"] is True
+    assert "shadow" not in research_match
+
+    model_training.list_prediction_models(
+        index_code=None,
+        kind="shadow",
+        limit=5,
+        current_user={"id": "u1"},
+    )
+    shadow_match = predictions.pipelines[1][0]["$match"]
+    assert shadow_match["shadow"] is True
+    assert "research" not in shadow_match
+    assert "index_code" not in shadow_match

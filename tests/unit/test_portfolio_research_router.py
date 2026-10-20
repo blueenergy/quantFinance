@@ -3,6 +3,7 @@ import json
 from datetime import datetime
 
 import pytest
+from fastapi import HTTPException
 
 from routers import portfolio_research
 
@@ -79,6 +80,10 @@ class _Collection:
                     elif value not in expected["$in"]:
                         return False
                     continue
+                if "$gte" in expected and str(value or "") < str(expected["$gte"]):
+                    return False
+                if "$lte" in expected and str(value or "") > str(expected["$lte"]):
+                    return False
                 if any(op.startswith("$") for op in expected):
                     continue
                 if value != expected:
@@ -1398,3 +1403,183 @@ def test_create_portfolio_research_job_with_industry_l1_sets_benchmark(monkeypat
     job = collections["portfolio_research_jobs"].docs[0]
     assert job["params"]["industry_l1"] == "801730.SI"
     assert job["params"]["index_benchmark_symbol"] == "801730.SI"
+
+
+def _ml_predictions(rows):
+    return {"model_predictions": _Collection(rows)}
+
+
+@pytest.mark.unit
+def test_create_model_score_job_forces_model_column(monkeypatch):
+    collections = _collections()
+    predictions = _ml_predictions([
+        {"model_id": "research-test-hs300", "trade_date": "20250102", "ts_code": "000001.SZ", "score": 0.1},
+        {"model_id": "research-test-hs300", "trade_date": "20250131", "ts_code": "000001.SZ", "score": 0.2},
+    ])
+    monkeypatch.setattr(portfolio_research, "get_trading_db_collections", lambda: collections)
+    monkeypatch.setattr(portfolio_research, "get_ml_db_collections", lambda: predictions)
+
+    response = asyncio.run(
+        portfolio_research.create_portfolio_research_job(
+            portfolio_research.CreateResearchJobRequest(
+                name="model smoke",
+                universe_index="hs300",
+                start_date="2025-01-01",
+                end_date="2025-01-31",
+                model_id="research-test-hs300",
+            ),
+            current_user={"id": "user-1"},
+        )
+    )
+
+    job = collections["portfolio_research_jobs"].docs[0]
+    assert response["success"] is True
+    assert job["strategy_family"] == "model_score"
+    assert job["params"]["model_id"] == "research-test-hs300"
+    # model_id wins even though score_column kept its rule-score default.
+    assert job["params"]["score_column"] == "model_score"
+    assert "score_specs" not in job["params"]
+    assert "growth_cycle_weights" not in job["params"]
+
+
+@pytest.mark.unit
+def test_model_id_rejects_conflicting_score_inputs():
+    base = {
+        "start_date": "20250101",
+        "end_date": "20250131",
+        "model_id": "research-test-hs300",
+    }
+    with pytest.raises(ValueError, match="model_id cannot be combined with score_specs"):
+        portfolio_research.CreateResearchJobRequest(
+            **base,
+            score_specs=[{"mode": "column", "column": "value_score"}],
+        )
+    with pytest.raises(ValueError, match="model_id cannot be combined with growth_cycle_weights"):
+        portfolio_research.CreateResearchJobRequest(**base, growth_cycle_weights=["30:70"])
+    with pytest.raises(ValueError, match="model_id requires score_column"):
+        portfolio_research.CreateResearchJobRequest(**base, score_column="value_score")
+    with pytest.raises(ValueError, match="requires model_id"):
+        portfolio_research.CreateResearchJobRequest(
+            start_date="20250101",
+            end_date="20250131",
+            score_column="model_score",
+        )
+
+
+@pytest.mark.unit
+def test_create_model_score_job_rejects_unknown_model(monkeypatch):
+    monkeypatch.setattr(portfolio_research, "get_ml_db_collections", lambda: _ml_predictions([]))
+
+    with pytest.raises(HTTPException) as exc:
+        portfolio_research._build_research_job_document(
+            "user-1",
+            portfolio_research.CreateResearchJobRequest(
+                start_date="20250101",
+                end_date="20250131",
+                model_id="missing-model",
+            ),
+        )
+
+    assert exc.value.status_code == 422
+    assert "unknown model_id" in exc.value.detail
+
+
+@pytest.mark.unit
+def test_create_model_score_job_rejects_no_overlap(monkeypatch):
+    predictions = _ml_predictions([
+        {"model_id": "research-test-hs300", "trade_date": "20240102", "ts_code": "000001.SZ", "score": 0.1},
+        {"model_id": "research-test-hs300", "trade_date": "20241231", "ts_code": "000001.SZ", "score": 0.2},
+    ])
+    monkeypatch.setattr(portfolio_research, "get_ml_db_collections", lambda: predictions)
+
+    with pytest.raises(HTTPException) as exc:
+        portfolio_research._build_research_job_document(
+            "user-1",
+            portfolio_research.CreateResearchJobRequest(
+                start_date="20250101",
+                end_date="20250131",
+                model_id="research-test-hs300",
+            ),
+        )
+
+    assert exc.value.status_code == 422
+    assert "no overlap" in exc.value.detail
+
+
+@pytest.mark.unit
+def test_rerun_model_job_keeps_model_id_and_switches_modes(monkeypatch):
+    source = {
+        "name": "model job",
+        "universe_index": "hs300",
+        "start_date": "20250101",
+        "end_date": "20250131",
+        "params": {
+            "model_id": "research-test-hs300",
+            "score_column": "model_score",
+            "start_date": "20250101",
+            "end_date": "20250131",
+        },
+    }
+
+    same_model = portfolio_research._create_request_from_job(source)
+    assert same_model.model_id == "research-test-hs300"
+    assert same_model.score_column == "model_score"
+
+    # Switching to a rule column must clear model_id instead of tripping validation.
+    rule_request = portfolio_research._create_request_from_job(
+        source,
+        options=portfolio_research.RerunResearchJobRequest(score_column="value_score"),
+    )
+    assert rule_request.model_id is None
+    assert rule_request.score_column == "value_score"
+
+    # Switching a rule job onto a model must drop the source's rule inputs.
+    rule_source = {
+        "name": "rule job",
+        "universe_index": "hs300",
+        "start_date": "20250101",
+        "end_date": "20250131",
+        "params": {
+            "score_column": "composite_growth_cycle_score",
+            "growth_cycle_weights": ["30:70"],
+            "start_date": "20250101",
+            "end_date": "20250131",
+        },
+    }
+    monkeypatch.setattr(
+        portfolio_research,
+        "get_ml_db_collections",
+        lambda: _ml_predictions([
+            {"model_id": "research-test-hs300", "trade_date": "20250102"},
+            {"model_id": "research-test-hs300", "trade_date": "20250131"},
+        ]),
+    )
+    model_request = portfolio_research._create_request_from_job(
+        rule_source,
+        options=portfolio_research.RerunResearchJobRequest(model_id="research-test-hs300"),
+    )
+    job = portfolio_research._build_research_job_document("user-1", model_request)
+    assert job["strategy_family"] == "model_score"
+    assert job["params"]["score_column"] == "model_score"
+    assert "growth_cycle_weights" not in job["params"]
+
+
+@pytest.mark.unit
+def test_rerun_rejects_model_id_with_rule_inputs():
+    source = {
+        "name": "rule job",
+        "universe_index": "hs300",
+        "start_date": "20250101",
+        "end_date": "20250131",
+        "params": {"start_date": "20250101", "end_date": "20250131"},
+    }
+    with pytest.raises(HTTPException) as exc:
+        portfolio_research._create_request_from_job(
+            source,
+            options=portfolio_research.RerunResearchJobRequest(
+                model_id="research-test-hs300",
+                growth_cycle_weights=["30:70"],
+            ),
+        )
+    assert exc.value.status_code == 422
+    assert "model_id cannot be combined" in exc.value.detail
