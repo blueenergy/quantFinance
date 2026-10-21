@@ -162,6 +162,7 @@ def get_trading_db_collections() -> Dict[str, Collection]:
         "factor_backtest_results": trading_db["factor_backtest_results"],
         "factor_catalog": trading_db["factor_catalog"],
         "portfolio_lineage_controls": trading_db["portfolio_lineage_controls"],
+        "portfolio_strategy_activations": trading_db["portfolio_strategy_activations"],
         "portfolio_trailing_stop_runs": trading_db["portfolio_trailing_stop_runs"],
         "portfolio_live_snapshots": trading_db["portfolio_live_snapshots"],
     }

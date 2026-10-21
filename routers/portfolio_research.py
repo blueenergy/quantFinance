@@ -7,7 +7,7 @@ import json
 import logging
 import re
 import shutil
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Annotated, Any, Dict, List, Literal, Optional, Union
 import os
@@ -301,6 +301,35 @@ class LivePreviewRequest(BaseModel):
     )
 
 
+class ActivateResearchComboRequest(BaseModel):
+    """Schedule a research combo to replace the live book at a rebalance date."""
+
+    execution_venue: Literal["paper", "live"] = Field(
+        default="paper",
+        description="paper keeps the rollout simulated; live publishes real signals.",
+    )
+    effective_date: Optional[str] = Field(
+        default=None,
+        description="YYYYMMDD switch date; defaults to the next rebalance date of the active lineage.",
+    )
+    admin_override: bool = Field(
+        default=False,
+        description="Allow activation despite unexplained research/live parity differences.",
+    )
+    name: Optional[str] = None
+    comment: str = ""
+
+    @field_validator("effective_date")
+    @classmethod
+    def _validate_effective_date(cls, value: Optional[str]) -> Optional[str]:
+        if value in (None, ""):
+            return None
+        normalized = _normalize_date(str(value))
+        if not normalized:
+            raise ValueError("effective_date must be YYYYMMDD")
+        return normalized
+
+
 class PublishResearchResultRequest(BaseModel):
     status: str = Field(default="draft", pattern="^(draft|enabled)$")
     preset_id: Optional[str] = None
@@ -469,6 +498,9 @@ def _ensure_research_indexes(collections: Dict[str, Any]) -> None:
     collections["portfolio_strategy_param_presets"].create_index(
         [("user_id", ASCENDING), ("strategy_template_id", ASCENDING), ("params_hash", ASCENDING), ("status", ASCENDING)]
     )
+    collections["portfolio_strategy_activations"].create_index([("activation_id", ASCENDING)], unique=True)
+    collections["portfolio_strategy_activations"].create_index([("status", ASCENDING), ("effective_date", ASCENDING)])
+    collections["portfolio_strategy_activations"].create_index([("user_id", ASCENDING), ("created_at", DESCENDING)])
 
 
 def _as_list(value: Any) -> List[str]:
@@ -737,6 +769,141 @@ def _candidate_strategy_config_from_row(job: Dict[str, Any], row: Dict[str, Any]
     return candidate
 
 
+def _assert_live_candidate(candidate: Dict[str, Any], job_params: Optional[Dict[str, Any]] = None) -> None:
+    """Reject research configs the live construction path cannot reproduce."""
+    job_params = job_params or {}
+    if (
+        (candidate.get("selection_mode") or "fixed_top_n") == "dynamic_score_threshold"
+        or job_params.get("selection_mode") == "dynamic_score_threshold"
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Dynamic score-threshold research results cannot be activated because "
+                "live portfolio construction does not support dynamic_score_threshold yet."
+            ),
+        )
+    candidate_score_type = candidate.get("score_type")
+    score_weights = candidate.get("score_weights")
+    if candidate_score_type and candidate_score_type not in ("growth_cycle_weighted", "weighted_score"):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Only growth_cycle_weighted and weighted_score research results "
+                "can be activated. Score-column construction templates are not "
+                "productized yet."
+            ),
+        )
+    if candidate_score_type == "weighted_score":
+        if not isinstance(score_weights, dict) or not score_weights:
+            raise HTTPException(
+                status_code=400,
+                detail="weighted_score requires a non-empty score_weights mapping.",
+            )
+        unknown = [dimension for dimension in score_weights if dimension not in LIVE_ATOMIC_SCORE_DIMENSIONS]
+        if unknown:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unknown score dimensions in score_weights: {', '.join(map(str, unknown))}",
+            )
+        invalid = []
+        for dimension, weight in score_weights.items():
+            try:
+                weight_value = float(weight)
+            except (TypeError, ValueError):
+                weight_value = -1.0
+            if weight_value <= 0:
+                invalid.append(dimension)
+        if invalid:
+            raise HTTPException(
+                status_code=400,
+                detail=f"score_weights entries must be positive numbers: {', '.join(map(str, invalid))}",
+            )
+    elif score_weights:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "score_weights requires score_type weighted_score; "
+                "growth_cycle_weighted recipes use growth_weight/cycle_weight."
+            ),
+        )
+
+
+def _load_combo_payload(artifact: Dict[str, Any], combo_key: str) -> Optional[Dict[str, Any]]:
+    """Load one combo detail JSON from the local artifact mount or S3."""
+    entry = next(
+        (item for item in (artifact.get("combos") or []) if item.get("combo_key") == combo_key),
+        None,
+    )
+    if not entry:
+        return None
+    path = _resolve_combo_file(artifact.get("combos_dir"), entry.get("file"))
+    if path is not None:
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+    if research_s3.artifact_uses_s3(artifact):
+        try:
+            body = research_s3.fetch_combo_bytes(artifact, combo_key, entry.get("file"))
+        except research_s3.ArtifactStorageUnavailable:
+            return None
+        if body:
+            try:
+                return json.loads(body.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                return None
+    return None
+
+
+def _research_parity_inputs(
+    payload: Optional[Dict[str, Any]],
+    *,
+    max_periods: int = 5,
+) -> Dict[str, Any]:
+    """Compact holdings/trades for the worker's research-vs-live parity check.
+
+    Passing only the last few periods keeps the task document small; the worker
+    recomputes live selection by itself.
+    """
+    if not payload:
+        return {"research_periods": [], "research_trades": []}
+    periods = list(payload.get("periods") or [])
+    trades = list(payload.get("trades") or [])
+    symbols_by_date: Dict[str, set] = {}
+    for trade in trades:
+        score_date = str(trade.get("score_date") or "").strip()
+        symbol = str(trade.get("symbol") or "").strip()
+        if score_date and symbol:
+            symbols_by_date.setdefault(score_date, set()).add(symbol)
+    selected_dates = []
+    for period in periods:
+        score_date = str(period.get("score_date") or "").strip()
+        if not score_date:
+            continue
+        if symbols_by_date.get(score_date) or str(period.get("regime_action") or "") == "cash":
+            selected_dates.append(score_date)
+    selected_dates = sorted(set(selected_dates))[-max(1, int(max_periods)) :]
+    selected = set(selected_dates)
+    compact_periods = [
+        {
+            "score_date": str(period.get("score_date") or ""),
+            "regime_action": period.get("regime_action"),
+            "regime_label": period.get("regime_label"),
+            "selected_count": period.get("selected_count"),
+            "portfolio_exposure": period.get("portfolio_exposure"),
+        }
+        for period in periods
+        if str(period.get("score_date") or "") in selected
+    ]
+    compact_trades = [
+        {"score_date": str(trade.get("score_date") or ""), "symbol": str(trade.get("symbol") or "")}
+        for trade in trades
+        if str(trade.get("score_date") or "") in selected and trade.get("symbol")
+    ]
+    return {"research_periods": compact_periods, "research_trades": compact_trades}
+
+
 def _load_full_result_rows(result: Dict[str, Any]) -> List[Dict[str, Any]]:
     preview_rows = list(result.get("rows") or [])
     json_path = (result.get("artifact") or {}).get("json_path")
@@ -793,6 +960,133 @@ def _params_hash(params: Dict[str, Any]) -> str:
     """
     payload = json.dumps(params, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+# Mirror of stock-scoring-system shared.strategies.PLAN_PARAM_KEYS. The live
+# lineage hash is 12 hex chars over these keys; it is NOT the 16-char preset
+# hash above (different key set and namespace).
+LINEAGE_PARAM_KEYS = {
+    "universe_index",
+    "index_benchmark_symbol",
+    "score_type",
+    "score_column",
+    "growth_weight",
+    "cycle_weight",
+    "score_weights",
+    "top_n",
+    "rebalance_days",
+    "construction_mode",
+    "max_industry_weight",
+}
+
+
+def _lineage_params_hash(config: Dict[str, Any]) -> str:
+    payload = {
+        key: config.get(key) for key in sorted(LINEAGE_PARAM_KEYS) if key in config
+    }
+    encoded = json.dumps(
+        payload, sort_keys=True, default=str, separators=(",", ":"), ensure_ascii=False
+    )
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:12]
+
+
+def _committed_plan(plan: Dict[str, Any]) -> bool:
+    return str(plan.get("status") or "") in {"executed_paper", "partially_executed"} or bool(
+        plan.get("live_signals_published_at")
+    )
+
+
+def _activation_replaces(
+    collections: Dict[str, Any],
+    *,
+    user_id: str,
+    strategy_template_id: str,
+    params_hash: str,
+    base_date: str,
+    lookback_days: int = 120,
+) -> List[Dict[str, str]]:
+    """Live lineages the activation takes over, mirroring the auto scheduler."""
+    try:
+        cutoff = (
+            datetime.strptime(base_date, "%Y%m%d") - timedelta(days=abs(int(lookback_days)))
+        ).strftime("%Y%m%d")
+    except (TypeError, ValueError):
+        cutoff = ""
+    query: Dict[str, Any] = {
+        "user_id": user_id,
+        "strategy_template_id": strategy_template_id,
+    }
+    if cutoff:
+        query["base_date"] = {"$gte": cutoff}
+    latest: Dict[tuple, Dict[str, Any]] = {}
+    for plan in collections["portfolio_trade_plans"].find(
+        query,
+        {
+            "_id": 0,
+            "strategy_template_id": 1,
+            "params_hash": 1,
+            "base_date": 1,
+            "status": 1,
+            "live_signals_published_at": 1,
+        },
+    ):
+        if not _committed_plan(plan):
+            continue
+        key = (plan.get("strategy_template_id"), plan.get("params_hash"))
+        existing = latest.get(key)
+        if existing is None or str(plan.get("base_date") or "") > str(existing.get("base_date") or ""):
+            latest[key] = plan
+    replaces = []
+    for (template, lineage_hash), plan in latest.items():
+        if not template or not lineage_hash or lineage_hash == params_hash:
+            continue
+        replaces.append({"strategy_template_id": str(template), "params_hash": str(lineage_hash)})
+    return replaces
+
+
+def _unsupported_research_features(
+    task: Dict[str, Any],
+    job_params: Optional[Dict[str, Any]] = None,
+) -> List[str]:
+    """Research features the live construction path does not implement.
+
+    Parity compares holdings at rebalance dates only, so a one-way intra-period
+    cash exit or a path gate can be invisible there while still changing the
+    live book's risk. Activation blocks these unless an admin overrides.
+    """
+    features = task.get("research_features") or {}
+    params = job_params if job_params is not None else (features.get("params") or {})
+    unsupported: List[str] = []
+    if bool(features.get("intra_period_cash") or params.get("intra_period_cash")):
+        unsupported.append("intra_period_cash")
+    path_gate = str(features.get("path_gate") or params.get("path_gate") or "off").strip().lower()
+    if path_gate not in ("", "off", "none"):
+        unsupported.append(f"path_gate:{path_gate}")
+    volatility_mode = str(
+        features.get("volatility_mode") or params.get("volatility_mode") or "off"
+    ).strip().lower()
+    if volatility_mode not in ("", "off", "none"):
+        unsupported.append(f"volatility_mode:{volatility_mode}")
+    variant = str(features.get("variant") or "").strip().lower()
+    if re.search(r"(^|_)(vol|cycle)\d", variant) or variant.startswith(("hipos", "distrib")):
+        unsupported.append(f"entry_filter:{variant}")
+    crowd_exit_k = int(features.get("crowd_exit_k") or params.get("crowd_exit_k") or 0)
+    if crowd_exit_k > 0:
+        unsupported.append(f"crowd_exit_k:{crowd_exit_k}")
+    return unsupported
+
+
+def _compact_parity(parity: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    if not parity:
+        return {"status": "unavailable", "checked_dates": 0, "unexplained_dates": 0, "unexplained": []}
+    return {
+        "status": parity.get("status") or "unavailable",
+        "checked_dates": parity.get("checked_dates") or 0,
+        "matched_dates": parity.get("matched_dates") or 0,
+        "backfilled_dates": parity.get("backfilled_dates") or 0,
+        "unexplained_dates": parity.get("unexplained_dates") or 0,
+        "unexplained": parity.get("unexplained") or [],
+    }
 
 
 def _research_evidence(job: Dict[str, Any], result: Dict[str, Any], status: str, comment: str) -> Dict[str, Any]:
@@ -1336,6 +1630,9 @@ async def create_portfolio_research_live_preview(
         )
 
     candidate = _candidate_strategy_config_from_row(job, row)
+    artifact = result.get("artifact") or {}
+    combo_payload = _load_combo_payload(artifact, combo_key) if combo_key else None
+    parity_inputs = _research_parity_inputs(combo_payload)
     base_date = _normalize_date(request.as_of_date or datetime.utcnow().strftime("%Y%m%d"))
     now = datetime.utcnow()
     task = {
@@ -1349,6 +1646,17 @@ async def create_portfolio_research_live_preview(
         "force": False,
         "preset_id": None,
         "params_override": candidate,
+        "selected_row": row,
+        "research_job_id": job.get("job_id"),
+        "research_combo_key": combo_key or None,
+        "research_features": {
+            "intra_period_cash": bool((job.get("params") or {}).get("intra_period_cash")),
+            "path_gate": row.get("path_gate"),
+            "volatility_mode": row.get("volatility_mode"),
+            "variant": row.get("variant"),
+            "crowd_exit_k": row.get("crowd_exit_k"),
+        },
+        **parity_inputs,
         "source": "research_live_preview",
         "auto": False,
         "status": "pending",
@@ -1387,8 +1695,483 @@ async def get_portfolio_research_live_preview(
             "status": task.get("status"),
             "error_message": task.get("error_message"),
             "result": task.get("result"),
+            "research_features": task.get("research_features") or {},
+            "unsupported_features": _unsupported_research_features(task),
+            "activation_id": task.get("activation_id"),
+            "activation_status": task.get("activation_status"),
         },
     }
+
+
+def _pause_activation_lineages(
+    collections: Dict[str, Any],
+    replaces: List[Dict[str, str]],
+    *,
+    user_id: str,
+    acted_by: str,
+    now: datetime,
+) -> List[Dict[str, str]]:
+    paused: List[Dict[str, str]] = []
+    for replaced in replaces:
+        strategy_template_id = str(replaced.get("strategy_template_id") or "")
+        params_hash = str(replaced.get("params_hash") or "")
+        if not strategy_template_id or not params_hash:
+            continue
+        collections["portfolio_lineage_controls"].update_one(
+            {
+                "strategy_template_id": strategy_template_id,
+                "params_hash": params_hash,
+                "user_id": user_id,
+            },
+            {
+                "$set": {
+                    "strategy_template_id": strategy_template_id,
+                    "params_hash": params_hash,
+                    "user_id": user_id,
+                    "paused": True,
+                    "paused_at": now,
+                    "paused_by": acted_by,
+                    "paused_reason": "replaced_by_activation",
+                    "updated_at": now,
+                },
+                "$unset": {"resumed_at": ""},
+            },
+            upsert=True,
+        )
+        paused.append(
+            {"strategy_template_id": strategy_template_id, "params_hash": params_hash}
+        )
+    return paused
+
+
+def _set_activation_lineage_venue(
+    collections: Dict[str, Any],
+    *,
+    user_id: str,
+    strategy_template_id: str,
+    params_hash: str,
+    execution_venue: str,
+    activation_id: str,
+    now: datetime,
+) -> None:
+    collections["portfolio_lineage_controls"].update_one(
+        {
+            "strategy_template_id": strategy_template_id,
+            "params_hash": params_hash,
+            "user_id": user_id,
+        },
+        {
+            "$set": {
+                "strategy_template_id": strategy_template_id,
+                "params_hash": params_hash,
+                "user_id": user_id,
+                "execution_venue": execution_venue,
+                "activation_id": activation_id,
+                "updated_at": now,
+            },
+            "$setOnInsert": {"paused": False, "excluded_symbols": []},
+        },
+        upsert=True,
+    )
+
+
+def _enqueue_activation_task(
+    collections: Dict[str, Any],
+    *,
+    activation: Dict[str, Any],
+    base_date: str,
+    now: datetime,
+) -> Optional[str]:
+    existing = collections["portfolio_plan_generation_tasks"].find_one(
+        {
+            "task_type": "generate_portfolio_plan",
+            "activation_id": activation["activation_id"],
+            "strategy_template_id": activation["strategy_template_id"],
+            "params_hash": activation["params_hash"],
+            "user_id": activation["user_id"],
+            "base_date": base_date,
+            "status": {"$in": ["pending", "waiting_for_scores", "running", "completed"]},
+        },
+        {"_id": 0, "task_id": 1},
+    )
+    if existing:
+        return existing.get("task_id")
+    task_id = str(uuid.uuid4())
+    params_override = dict(activation.get("params_override") or {})
+    params_override["capital_basis"] = (
+        "rolling_paper" if activation.get("execution_venue") == "paper" else "account_equity"
+    )
+    collections["portfolio_plan_generation_tasks"].insert_one(
+        {
+            "task_id": task_id,
+            "task_type": "generate_portfolio_plan",
+            "user_id": activation["user_id"],
+            "strategy_template_id": activation["strategy_template_id"],
+            "params_hash": activation["params_hash"],
+            "base_date": base_date,
+            "mode": "rebalance",
+            "force": False,
+            "preset_id": activation.get("preset_id"),
+            "params_override": params_override,
+            "source": "strategy_activation",
+            "activation_id": activation["activation_id"],
+            "auto": False,
+            "status": "pending",
+            "attempts": 0,
+            "plan_id": None,
+            "error_message": None,
+            "created_at": now,
+            "updated_at": now,
+        }
+    )
+    return task_id
+
+
+@router.post("/live-preview/{task_id}/activate")
+async def activate_portfolio_research_live_preview(
+    task_id: str,
+    request: ActivateResearchComboRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    """Promote a previewed research combo into a scheduled live/paper switch.
+
+    The default blocks on unexplained research/live differences; ``admin_override``
+    records the exception on the activation and in the review log.
+    """
+    collections = get_trading_db_collections()
+    user_id = _current_user_id(current_user)
+    task = collections["portfolio_plan_generation_tasks"].find_one(
+        {
+            "task_id": task_id,
+            "user_id": user_id,
+            "task_type": "preview_portfolio_plan",
+        }
+    )
+    if not task:
+        raise HTTPException(status_code=404, detail="live preview task not found")
+    if task.get("activation_id"):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "this preview has already been activated",
+                "activation_id": task.get("activation_id"),
+            },
+        )
+    if task.get("status") != "completed":
+        raise HTTPException(status_code=409, detail="live preview is not completed")
+    preview_result = task.get("result") or {}
+    plan = preview_result.get("plan") or {}
+    candidate = dict(task.get("params_override") or {})
+    if not plan or not candidate:
+        raise HTTPException(status_code=409, detail="live preview has no candidate plan")
+    _assert_live_candidate(candidate)
+    parity_summary = _compact_parity(preview_result.get("parity"))
+    unsupported_features = _unsupported_research_features(task)
+    if (parity_summary.get("status") != "clean" or unsupported_features) and not request.admin_override:
+        message = (
+            "research uses features live construction does not implement"
+            if unsupported_features
+            else "research/live parity has unexplained differences"
+        )
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": f"{message}; pass admin_override to activate anyway",
+                "parity": parity_summary,
+                "unsupported_features": unsupported_features,
+            },
+        )
+
+    today = datetime.utcnow().strftime("%Y%m%d")
+    effective_date = _normalize_date(
+        request.effective_date
+        or preview_result.get("suggested_effective_date")
+        or plan.get("next_rebalance_date")
+        or today
+    )
+    if effective_date < today:
+        effective_date = today
+
+    strategy_template_id = str(
+        candidate.get("strategy_template_id")
+        or task.get("strategy_template_id")
+        or "growth_cycle_index_enhanced"
+    )
+    preset_params = _preset_params_from_candidate(candidate)
+    preset_params_hash = _params_hash(preset_params)
+    lineage_hash = _lineage_params_hash(candidate)
+    result_id = task.get("result_id")
+    result_doc = (
+        collections["portfolio_research_results"].find_one(
+            {"result_id": result_id, "user_id": user_id}
+        )
+        if result_id
+        else None
+    )
+    job_id = task.get("research_job_id") or (result_doc or {}).get("job_id")
+    combo_key = task.get("combo_key") or task.get("research_combo_key")
+    selected_row = task.get("selected_row") or {}
+
+    now = datetime.utcnow()
+    existing_preset = collections["portfolio_strategy_param_presets"].find_one(
+        {
+            "user_id": user_id,
+            "strategy_template_id": strategy_template_id,
+            "status": {"$in": ["draft", "enabled", "recommended"]},
+            "$or": [{"params_hash": preset_params_hash}, {"params": preset_params}],
+        }
+    )
+    if existing_preset:
+        preset_id = existing_preset["preset_id"]
+        preset_doc = existing_preset
+    else:
+        requested_id = str(
+            candidate.get("preset_id") or f"research_{str(result_id or task_id)[:8]}"
+        )
+        preset_id = _unique_preset_id(collections, requested_id, True)
+        preset_doc = {
+            "preset_id": preset_id,
+            "strategy_template_id": strategy_template_id,
+            "user_id": user_id,
+            "name": request.name or candidate.get("name") or preset_id,
+            "description": request.comment,
+            "params": preset_params,
+            "params_hash": preset_params_hash,
+            "spec_hash": lineage_hash,
+            "status": "draft",
+            "is_default": False,
+            "priority": 100,
+            "source": "portfolio_research_activation",
+            "research_job_id": job_id,
+            "research_result_id": result_id,
+            "research_combo_key": combo_key,
+            "backtest_summary": selected_row or None,
+            "execution_venue": request.execution_venue,
+            "parity_status": parity_summary.get("status"),
+            "created_by": user_id,
+            "created_at": now,
+            "updated_at": now,
+        }
+        collections["portfolio_strategy_param_presets"].insert_one(preset_doc)
+
+    replaces = _activation_replaces(
+        collections,
+        user_id=user_id,
+        strategy_template_id=strategy_template_id,
+        params_hash=lineage_hash,
+        base_date=effective_date,
+    )
+    activation = {
+        "activation_id": str(uuid.uuid4()),
+        "user_id": user_id,
+        "strategy_template_id": strategy_template_id,
+        "preset_id": preset_id,
+        "params_hash": lineage_hash,
+        "preset_params_hash": preset_params_hash,
+        "params_override": preset_params,
+        "execution_venue": request.execution_venue,
+        "effective_date": effective_date,
+        "status": "scheduled",
+        "replaces": replaces,
+        "source_result_id": result_id,
+        "source_job_id": job_id,
+        "source_combo_key": combo_key,
+        "parity_status": parity_summary.get("status"),
+        "parity": parity_summary,
+        "unsupported_features": unsupported_features,
+        "admin_override": bool(request.admin_override),
+        "requested_by": user_id,
+        "comment": request.comment,
+        "created_at": now,
+        "updated_at": now,
+    }
+    collections["portfolio_strategy_activations"].insert_one(activation)
+    collections["portfolio_strategy_param_presets"].update_one(
+        {"preset_id": preset_id, "user_id": user_id},
+        {
+            "$set": {
+                "activation_id": activation["activation_id"],
+                "activation_effective_date": effective_date,
+                "activation_execution_venue": request.execution_venue,
+                "activation_status": "scheduled",
+                "spec_hash": lineage_hash,
+                "parity_status": parity_summary.get("status"),
+                "updated_at": now,
+            }
+        },
+    )
+    collections["portfolio_plan_generation_tasks"].update_one(
+        {"task_id": task_id, "user_id": user_id},
+        {
+            "$set": {
+                "activation_id": activation["activation_id"],
+                "activation_status": "scheduled",
+                "updated_at": now,
+            }
+        },
+    )
+    if result_doc:
+        collections["portfolio_research_results"].update_one(
+            {"result_id": result_id, "user_id": user_id},
+            {
+                "$set": {
+                    "live_activation_id": activation["activation_id"],
+                    "live_activation_status": "scheduled",
+                    "live_activation_venue": request.execution_venue,
+                    "live_activation_effective_date": effective_date,
+                    "activated_preset_id": preset_id,
+                    "updated_at": now,
+                }
+            },
+        )
+    review = {
+        "review_id": str(uuid.uuid4()),
+        "job_id": job_id,
+        "research_result_id": result_id,
+        "preset_id": preset_id,
+        "activation_id": activation["activation_id"],
+        "strategy_template_id": strategy_template_id,
+        "decision": "activation_scheduled",
+        "status": "scheduled",
+        "execution_venue": request.execution_venue,
+        "effective_date": effective_date,
+        "parity_status": parity_summary.get("status"),
+        "unsupported_features": unsupported_features,
+        "admin_override": bool(request.admin_override),
+        "comment": request.comment,
+        "reviewer": _reviewer(current_user),
+        "user_id": user_id,
+        "created_at": now,
+    }
+    collections["portfolio_research_reviews"].insert_one(review)
+
+    applied_now = False
+    first_task_id = None
+    paused: List[Dict[str, str]] = []
+    if effective_date <= today:
+        applied_now = True
+        acted_by = str(user_id)
+        paused = _pause_activation_lineages(
+            collections, replaces, user_id=user_id, acted_by=acted_by, now=now
+        )
+        _set_activation_lineage_venue(
+            collections,
+            user_id=user_id,
+            strategy_template_id=strategy_template_id,
+            params_hash=lineage_hash,
+            execution_venue=request.execution_venue,
+            activation_id=activation["activation_id"],
+            now=now,
+        )
+        first_task_id = _enqueue_activation_task(
+            collections, activation=activation, base_date=effective_date, now=now
+        )
+        collections["portfolio_strategy_activations"].update_one(
+            {"activation_id": activation["activation_id"]},
+            {
+                "$set": {
+                    "status": "active",
+                    "activated_at": now,
+                    "activation_base_date": effective_date,
+                    "first_task_id": first_task_id,
+                    "paused_lineages": paused,
+                    "updated_at": now,
+                }
+            },
+        )
+        activation = {
+            **activation,
+            "status": "active",
+            "activated_at": now,
+            "first_task_id": first_task_id,
+            "paused_lineages": paused,
+        }
+        collections["portfolio_plan_generation_tasks"].update_one(
+            {"task_id": task_id, "user_id": user_id},
+            {"$set": {"activation_status": "active", "updated_at": now}},
+        )
+        if result_doc:
+            collections["portfolio_research_results"].update_one(
+                {"result_id": result_id, "user_id": user_id},
+                {"$set": {"live_activation_status": "active", "updated_at": now}},
+            )
+
+    logger.info(
+        "portfolio research activation scheduled: user=%s result=%s combo=%s venue=%s effective=%s parity=%s",
+        user_id,
+        result_id,
+        combo_key,
+        request.execution_venue,
+        effective_date,
+        parity_summary.get("status"),
+    )
+    return {
+        "success": True,
+        "data": _jsonable(
+            {
+                "activation": activation,
+                "preset": preset_doc,
+                "parity": parity_summary,
+                "unsupported_features": unsupported_features,
+                "applied_now": applied_now,
+                "first_task_id": first_task_id,
+                "paused_lineages": paused,
+                "review": review,
+            }
+        ),
+    }
+
+
+@router.post("/activations/{activation_id}/cancel")
+async def cancel_portfolio_research_activation(
+    activation_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """Cancel a scheduled activation before it switches the live book."""
+    collections = get_trading_db_collections()
+    user_id = _current_user_id(current_user)
+    activation = collections["portfolio_strategy_activations"].find_one(
+        {"activation_id": activation_id, "user_id": user_id}
+    )
+    if not activation:
+        raise HTTPException(status_code=404, detail="activation not found")
+    if activation.get("status") != "scheduled":
+        raise HTTPException(
+            status_code=409,
+            detail=f"activation is already {activation.get('status')}",
+        )
+    now = datetime.utcnow()
+    collections["portfolio_strategy_activations"].update_one(
+        {"activation_id": activation_id, "user_id": user_id, "status": "scheduled"},
+        {
+            "$set": {
+                "status": "cancelled",
+                "cancelled_at": now,
+                "cancelled_by": user_id,
+                "updated_at": now,
+            }
+        },
+    )
+    collections["portfolio_strategy_param_presets"].update_one(
+        {"preset_id": activation.get("preset_id"), "user_id": user_id},
+        {"$set": {"activation_status": "cancelled", "updated_at": now}},
+    )
+    collections["portfolio_research_reviews"].insert_one(
+        {
+            "review_id": str(uuid.uuid4()),
+            "job_id": activation.get("source_job_id"),
+            "research_result_id": activation.get("source_result_id"),
+            "preset_id": activation.get("preset_id"),
+            "activation_id": activation_id,
+            "strategy_template_id": activation.get("strategy_template_id"),
+            "decision": "activation_cancelled",
+            "status": "cancelled",
+            "reviewer": _reviewer(current_user),
+            "user_id": user_id,
+            "created_at": now,
+        }
+    )
+    return {"success": True, "data": {"activation_id": activation_id, "status": "cancelled"}}
 
 
 @router.get("/jobs/{job_id}/results/rows")
@@ -1548,62 +2331,7 @@ async def publish_portfolio_research_result(
         candidate["regime_cash"] = True
     if not candidate:
         raise HTTPException(status_code=400, detail="candidate strategy config is missing")
-    job_params = job.get("params") or {}
-    if (
-        (candidate.get("selection_mode") or "fixed_top_n") == "dynamic_score_threshold"
-        or job_params.get("selection_mode") == "dynamic_score_threshold"
-    ):
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                "Dynamic score-threshold research results cannot be published because "
-                "live portfolio construction does not support dynamic_score_threshold yet."
-            ),
-        )
-    candidate_score_type = candidate.get("score_type")
-    score_weights = candidate.get("score_weights")
-    if candidate_score_type and candidate_score_type not in ("growth_cycle_weighted", "weighted_score"):
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                "Only growth_cycle_weighted and weighted_score research results "
-                "can be published. Score-column construction templates are not "
-                "productized yet."
-            ),
-        )
-    if candidate_score_type == "weighted_score":
-        if not isinstance(score_weights, dict) or not score_weights:
-            raise HTTPException(
-                status_code=400,
-                detail="weighted_score requires a non-empty score_weights mapping.",
-            )
-        unknown = [dimension for dimension in score_weights if dimension not in LIVE_ATOMIC_SCORE_DIMENSIONS]
-        if unknown:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Unknown score dimensions in score_weights: {', '.join(map(str, unknown))}",
-            )
-        invalid = []
-        for dimension, weight in score_weights.items():
-            try:
-                weight_value = float(weight)
-            except (TypeError, ValueError):
-                weight_value = -1.0
-            if weight_value <= 0:
-                invalid.append(dimension)
-        if invalid:
-            raise HTTPException(
-                status_code=400,
-                detail=f"score_weights entries must be positive numbers: {', '.join(map(str, invalid))}",
-            )
-    elif score_weights:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "score_weights requires score_type weighted_score; "
-                "growth_cycle_weighted recipes use growth_weight/cycle_weight."
-            ),
-        )
+    _assert_live_candidate(candidate, job.get("params") or {})
 
     now = datetime.utcnow()
     strategy_template_id = str(candidate.get("strategy_template_id") or candidate.get("template_id") or "growth_cycle_index_enhanced")

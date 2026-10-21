@@ -57,13 +57,16 @@ class _Collection:
         self.docs = keep
         return type("DeleteResult", (), {"deleted_count": deleted})()
 
-    def update_one(self, query, update):
+    def update_one(self, query, update, upsert=False):
         for doc in self.docs:
             if self._matches(doc, query):
                 doc.update(update.get("$set", {}))
                 for key, value in update.get("$push", {}).items():
                     doc.setdefault(key, []).append(value)
                 return
+        if upsert:
+            new_doc = {**query, **update.get("$setOnInsert", {}), **update.get("$set", {})}
+            self.docs.append(new_doc)
 
     def _matches(self, doc, query):
         for key, expected in query.items():
@@ -115,6 +118,9 @@ def _collections():
         "portfolio_research_results": _Collection(),
         "portfolio_research_reviews": _Collection(),
         "portfolio_plan_generation_tasks": _Collection(),
+        "portfolio_lineage_controls": _Collection(),
+        "portfolio_strategy_activations": _Collection(),
+        "portfolio_trade_plans": _Collection(),
     }
 
 
@@ -1721,3 +1727,273 @@ def test_get_live_preview_returns_task_result(monkeypatch):
 
     assert response["data"]["status"] == "completed"
     assert response["data"]["result"]["plan"]["plan_id"] == "preview"
+
+
+def _activation_candidate():
+    return {
+        "strategy_template_id": "growth_cycle_index_enhanced",
+        "preset_id": "research_combo_preset",
+        "name": "combo preset",
+        "universe_index": "csi500",
+        "index_benchmark_symbol": "000905.SH",
+        "score_type": "growth_cycle_weighted",
+        "score_column": "growth_cycle_g60_c40_score",
+        "growth_weight": 0.6,
+        "cycle_weight": 0.4,
+        "score_weights": None,
+        "top_n": 20,
+        "selection_mode": "fixed_top_n",
+        "threshold_lookback_days": 10,
+        "max_positions": 20,
+        "rebalance_days": 20,
+        "construction_mode": "top_n",
+        "max_industry_weight": 30,
+        "lot_size": 100,
+        "transaction_cost": 0.0027,
+        "execution_price": "next_open",
+        "cash_buffer": 0.03,
+        "initial_capital": 1_000_000.0,
+        "trailing_stop_pct": None,
+        "candidate_pool_enabled": True,
+        "regime_cash": True,
+        "regime_rule": "k_slow_anchor",
+    }
+
+
+def _preview_task(status="completed", parity_status="clean", suggested="20991231"):
+    return {
+        "task_id": "task-activate",
+        "user_id": "user-1",
+        "task_type": "preview_portfolio_plan",
+        "base_date": "20250106",
+        "status": status,
+        "result_id": "res-1",
+        "research_job_id": "job-1",
+        "combo_key": "combo-1",
+        "params_override": _activation_candidate(),
+        "selected_row": {"combo_key": "combo-1", "top_n": 20},
+        "result": {
+            "plan": {"plan_id": "preview-plan", "next_rebalance_date": "20250203"},
+            "items": [],
+            "suggested_effective_date": suggested,
+            "parity": {
+                "status": parity_status,
+                "checked_dates": 1,
+                "matched_dates": 0 if parity_status != "clean" else 1,
+                "backfilled_dates": 0,
+                "unexplained_dates": 0 if parity_status == "clean" else 1,
+                "unexplained": [] if parity_status == "clean" else [{"score_date": "20250106"}],
+            },
+        },
+    }
+
+
+def test_create_live_preview_attaches_compact_parity_inputs(monkeypatch, tmp_path):
+    collections = _collections()
+    monkeypatch.setattr(portfolio_research, "get_trading_db_collections", lambda: collections)
+    combos_dir = tmp_path / "combos"
+    combos_dir.mkdir()
+    (combos_dir / "combo.json").write_text(
+        json.dumps(
+            {
+                "periods": [
+                    {"score_date": "20250103", "regime_action": "invest"},
+                    {"score_date": "20250106", "regime_action": "invest"},
+                    {"score_date": "20250107", "regime_action": "invest"},
+                ],
+                "trades": [
+                    {"score_date": "20250103", "symbol": "000001"},
+                    {"score_date": "20250106", "symbol": "000002"},
+                    {"score_date": "20250106", "symbol": "000003", "quantity": 100},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    collections["portfolio_research_jobs"].insert_one(
+        {
+            "job_id": "job-1",
+            "user_id": "user-1",
+            "params": {
+                "universe_index": "csi500",
+                "top_n_values": [20],
+                "horizon": 20,
+                "score_column": "growth_cycle_g60_c40_score",
+            },
+        }
+    )
+    row = {
+        "combo_key": "combo-1",
+        "score_variant": "growth_cycle_g60_c40",
+        "variant": "top_n",
+        "top_n": 20,
+        "rebalance_interval_days": 20,
+        "construction_mode": "top_n",
+        "regime_mode": "off",
+    }
+    collections["portfolio_research_results"].insert_one(
+        {
+            "result_id": "res-1",
+            "job_id": "job-1",
+            "user_id": "user-1",
+            "rows": [row],
+            "row_count_total": 1,
+            "artifact": {
+                "combos_dir": str(combos_dir),
+                "combos": [{"combo_key": "combo-1", "file": "combo.json"}],
+            },
+        }
+    )
+
+    asyncio.run(
+        portfolio_research.create_portfolio_research_live_preview(
+            "res-1",
+            portfolio_research.LivePreviewRequest(combo_key="combo-1", as_of_date="20250106"),
+            current_user={"id": "user-1"},
+        )
+    )
+
+    task = collections["portfolio_plan_generation_tasks"].docs[0]
+    assert [period["score_date"] for period in task["research_periods"]] == [
+        "20250103",
+        "20250106",
+    ]
+    assert task["research_trades"] == [
+        {"score_date": "20250103", "symbol": "000001"},
+        {"score_date": "20250106", "symbol": "000002"},
+        {"score_date": "20250106", "symbol": "000003"},
+    ]
+    assert task["selected_row"]["combo_key"] == "combo-1"
+
+
+def test_activate_live_preview_blocks_unexplained_parity(monkeypatch):
+    collections = _collections()
+    monkeypatch.setattr(portfolio_research, "get_trading_db_collections", lambda: collections)
+    collections["portfolio_plan_generation_tasks"].insert_one(
+        _preview_task(parity_status="diff")
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(
+            portfolio_research.activate_portfolio_research_live_preview(
+                "task-activate",
+                portfolio_research.ActivateResearchComboRequest(
+                    execution_venue="paper",
+                    effective_date="20991231",
+                ),
+                current_user={"id": "user-1"},
+            )
+        )
+
+    assert exc.value.status_code == 409
+    assert exc.value.detail["parity"]["status"] == "diff"
+    assert collections["portfolio_strategy_activations"].docs == []
+
+
+def test_activate_live_preview_schedules_clean_combo(monkeypatch):
+    collections = _collections()
+    monkeypatch.setattr(portfolio_research, "get_trading_db_collections", lambda: collections)
+    collections["portfolio_plan_generation_tasks"].insert_one(_preview_task())
+
+    response = asyncio.run(
+        portfolio_research.activate_portfolio_research_live_preview(
+            "task-activate",
+            portfolio_research.ActivateResearchComboRequest(
+                execution_venue="paper",
+                effective_date="20991231",
+                comment="rollout",
+            ),
+            current_user={"id": "user-1"},
+        )
+    )
+
+    data = response["data"]
+    assert data["applied_now"] is False
+    assert data["activation"]["status"] == "scheduled"
+    assert data["activation"]["effective_date"] == "20991231"
+    assert data["activation"]["params_hash"] == portfolio_research._lineage_params_hash(
+        _activation_candidate()
+    )
+    assert len(data["preset"]["spec_hash"]) == 12
+    assert data["preset"]["params"]["top_n"] == 20
+    assert collections["portfolio_strategy_activations"].docs[0]["status"] == "scheduled"
+    assert collections["portfolio_plan_generation_tasks"].docs[0]["activation_status"] == "scheduled"
+
+
+def test_activate_live_preview_admin_override_applies_now(monkeypatch):
+    collections = _collections()
+    monkeypatch.setattr(portfolio_research, "get_trading_db_collections", lambda: collections)
+    collections["portfolio_plan_generation_tasks"].insert_one(
+        _preview_task(parity_status="diff", suggested="20250106")
+    )
+    collections["portfolio_trade_plans"].insert_one(
+        {
+            "plan_id": "old-plan",
+            "user_id": "user-1",
+            "strategy_template_id": "growth_cycle_index_enhanced",
+            "params_hash": "oldhash",
+            "base_date": "20261020",
+            "status": "generated",
+            "live_signals_published_at": datetime.utcnow(),
+        }
+    )
+
+    response = asyncio.run(
+        portfolio_research.activate_portfolio_research_live_preview(
+            "task-activate",
+            portfolio_research.ActivateResearchComboRequest(
+                execution_venue="live",
+                admin_override=True,
+            ),
+            current_user={"id": "user-1"},
+        )
+    )
+
+    data = response["data"]
+    assert data["applied_now"] is True
+    assert data["activation"]["status"] == "active"
+    assert data["paused_lineages"] == [
+        {"strategy_template_id": "growth_cycle_index_enhanced", "params_hash": "oldhash"}
+    ]
+    lineage = collections["portfolio_lineage_controls"].find_one(
+        {"strategy_template_id": "growth_cycle_index_enhanced", "params_hash": "oldhash"}
+    )
+    assert lineage["paused"] is True
+    activation_task = next(
+        task
+        for task in collections["portfolio_plan_generation_tasks"].docs
+        if task.get("source") == "strategy_activation"
+    )
+    assert activation_task["mode"] == "rebalance"
+    assert activation_task["params_override"]["capital_basis"] == "account_equity"
+
+
+def test_activate_live_preview_blocks_unsupported_research_features(monkeypatch):
+    collections = _collections()
+    monkeypatch.setattr(portfolio_research, "get_trading_db_collections", lambda: collections)
+    task = _preview_task()
+    task["research_features"] = {
+        "intra_period_cash": True,
+        "variant": "vol70",
+        "volatility_mode": "off",
+    }
+    collections["portfolio_plan_generation_tasks"].insert_one(task)
+
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(
+            portfolio_research.activate_portfolio_research_live_preview(
+                "task-activate",
+                portfolio_research.ActivateResearchComboRequest(
+                    execution_venue="paper",
+                    effective_date="20991231",
+                ),
+                current_user={"id": "user-1"},
+            )
+        )
+
+    assert exc.value.status_code == 409
+    assert "intra_period_cash" in exc.value.detail["unsupported_features"]
+    assert any(
+        feature.startswith("entry_filter:") for feature in exc.value.detail["unsupported_features"]
+    )
+    assert collections["portfolio_strategy_activations"].docs == []
