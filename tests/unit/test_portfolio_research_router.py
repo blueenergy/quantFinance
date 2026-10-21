@@ -114,6 +114,7 @@ def _collections():
         "portfolio_research_jobs": _Collection(),
         "portfolio_research_results": _Collection(),
         "portfolio_research_reviews": _Collection(),
+        "portfolio_plan_generation_tasks": _Collection(),
     }
 
 
@@ -1636,3 +1637,87 @@ def test_target_vols_are_validated():
                 end_date="20250131",
                 target_vols=bad,
             )
+
+
+@pytest.mark.unit
+def test_create_live_preview_enqueues_preview_task(monkeypatch):
+    collections = _collections()
+    monkeypatch.setattr(portfolio_research, "get_trading_db_collections", lambda: collections)
+
+    job = {
+        "job_id": "job-1",
+        "user_id": "user-1",
+        "params": {
+            "universe_index": "csi500",
+            "top_n_values": [20],
+            "horizon": 20,
+            "score_column": "growth_cycle_g60_c40_score",
+            "transaction_cost": 0.0027,
+            "index_benchmark_symbol": "000905.SH",
+        },
+    }
+    row = {
+        "combo_key": "combo-1",
+        "score_variant": "growth_cycle_g60_c40",
+        "variant": "top_n",
+        "top_n": 20,
+        "rebalance_interval_days": 20,
+        "construction_mode": "top_n",
+        "max_industry_weight": 30,
+        "regime_mode": "off",
+        "trailing_stop_pct": None,
+    }
+    collections["portfolio_research_jobs"].insert_one(job)
+    collections["portfolio_research_results"].insert_one(
+        {
+            "result_id": "res-1",
+            "job_id": "job-1",
+            "user_id": "user-1",
+            "rows": [row],
+            "row_count_total": 1,
+        }
+    )
+
+    response = asyncio.run(
+        portfolio_research.create_portfolio_research_live_preview(
+            "res-1",
+            portfolio_research.LivePreviewRequest(
+                combo_key="combo-1",
+                as_of_date="20250106",
+            ),
+            current_user={"id": "user-1"},
+        )
+    )
+
+    task = collections["portfolio_plan_generation_tasks"].docs[0]
+    assert task["task_type"] == "preview_portfolio_plan"
+    assert task["base_date"] == "20250106"
+    assert task["combo_key"] == "combo-1"
+    assert task["params_override"]["top_n"] == 20
+    assert task["params_override"]["universe_index"] == "csi500"
+    assert response["data"]["task_id"] == task["task_id"]
+
+
+@pytest.mark.unit
+def test_get_live_preview_returns_task_result(monkeypatch):
+    collections = _collections()
+    monkeypatch.setattr(portfolio_research, "get_trading_db_collections", lambda: collections)
+    collections["portfolio_plan_generation_tasks"].insert_one(
+        {
+            "task_id": "task-1",
+            "user_id": "user-1",
+            "task_type": "preview_portfolio_plan",
+            "status": "completed",
+            "result": {"plan": {"plan_id": "preview"}, "items": []},
+        }
+    )
+
+    response = asyncio.run(
+        portfolio_research.get_portfolio_research_live_preview(
+            "task-1",
+            current_user={"id": "user-1"},
+        )
+    )
+
+    assert response["data"]["status"] == "completed"
+    assert response["data"]["result"]["plan"]["plan_id"] == "preview"

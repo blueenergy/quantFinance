@@ -290,6 +290,17 @@ class CreateResearchJobRequest(BaseModel):
         return self
 
 
+class LivePreviewRequest(BaseModel):
+    combo_key: Optional[str] = Field(
+        default=None,
+        description="Result row combo_key. Required when the result has multiple rows.",
+    )
+    as_of_date: Optional[str] = Field(
+        default=None,
+        description="YYYYMMDD preview date; defaults to today (UTC).",
+    )
+
+
 class PublishResearchResultRequest(BaseModel):
     status: str = Field(default="draft", pattern="^(draft|enabled)$")
     preset_id: Optional[str] = None
@@ -1283,6 +1294,101 @@ async def get_portfolio_research_results(job_id: str, current_user: dict = Depen
     if not result:
         raise HTTPException(status_code=404, detail="research result not found")
     return {"success": True, "data": _jsonable(result)}
+
+
+@router.post("/results/{result_id}/live-preview")
+async def create_portfolio_research_live_preview(
+    result_id: str,
+    request: LivePreviewRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    """Enqueue a read-only live preview of one research combo.
+
+    The portfolio worker runs the same ``generate_trade_plan`` path with
+    ``write=False``, so preview and the eventual plan share selection/execution
+    semantics (lot size, backfill, overlay, capital baseline).
+    """
+    collections = get_trading_db_collections()
+    user_id = _current_user_id(current_user)
+    result = collections["portfolio_research_results"].find_one(
+        {"result_id": result_id, "user_id": user_id}
+    )
+    if not result:
+        raise HTTPException(status_code=404, detail="research result not found")
+    job = collections["portfolio_research_jobs"].find_one(
+        {"job_id": result.get("job_id"), "user_id": user_id}
+    )
+    if not job:
+        raise HTTPException(status_code=404, detail="research job not found")
+
+    rows = _load_full_result_rows(result)
+    combo_key = str(request.combo_key or "").strip()
+    if combo_key:
+        row = next((item for item in rows if str(item.get("combo_key") or "") == combo_key), None)
+        if row is None:
+            raise HTTPException(status_code=404, detail="research combo not found")
+    elif len(rows) == 1:
+        row = rows[0]
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail="combo_key is required when the result has multiple rows",
+        )
+
+    candidate = _candidate_strategy_config_from_row(job, row)
+    base_date = _normalize_date(request.as_of_date or datetime.utcnow().strftime("%Y%m%d"))
+    now = datetime.utcnow()
+    task = {
+        "task_id": str(uuid.uuid4()),
+        "task_type": "preview_portfolio_plan",
+        "user_id": user_id,
+        "strategy_template_id": candidate.get("strategy_template_id")
+        or "growth_cycle_index_enhanced",
+        "base_date": base_date,
+        "mode": "auto",
+        "force": False,
+        "preset_id": None,
+        "params_override": candidate,
+        "source": "research_live_preview",
+        "auto": False,
+        "status": "pending",
+        "attempts": 0,
+        "plan_id": None,
+        "result_id": result_id,
+        "combo_key": combo_key or None,
+        "error_message": None,
+        "created_at": now,
+        "updated_at": now,
+    }
+    collections["portfolio_plan_generation_tasks"].insert_one(task)
+    return {"success": True, "data": {"task_id": task["task_id"], "base_date": base_date}}
+
+
+@router.get("/live-preview/{task_id}")
+async def get_portfolio_research_live_preview(
+    task_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    collections = get_trading_db_collections()
+    user_id = _current_user_id(current_user)
+    task = collections["portfolio_plan_generation_tasks"].find_one(
+        {
+            "task_id": task_id,
+            "user_id": user_id,
+            "task_type": "preview_portfolio_plan",
+        }
+    )
+    if not task:
+        raise HTTPException(status_code=404, detail="live preview task not found")
+    return {
+        "success": True,
+        "data": {
+            "task_id": task.get("task_id"),
+            "status": task.get("status"),
+            "error_message": task.get("error_message"),
+            "result": task.get("result"),
+        },
+    }
 
 
 @router.get("/jobs/{job_id}/results/rows")
