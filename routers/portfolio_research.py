@@ -2104,6 +2104,10 @@ async def activate_portfolio_research_live_preview(
             {"task_id": task_id, "user_id": user_id},
             {"$set": {"activation_status": "active", "updated_at": now}},
         )
+        collections["portfolio_strategy_param_presets"].update_one(
+            {"preset_id": preset_id, "user_id": user_id},
+            {"$set": {"activation_status": "active", "updated_at": now}},
+        )
         if result_doc:
             collections["portfolio_research_results"].update_one(
                 {"result_id": result_id, "user_id": user_id},
