@@ -1695,6 +1695,11 @@ async def get_portfolio_research_live_preview(
     )
     if not task:
         raise HTTPException(status_code=404, detail="live preview task not found")
+    activation = None
+    if task.get("activation_id"):
+        activation = collections["portfolio_strategy_activations"].find_one(
+            {"activation_id": task.get("activation_id"), "user_id": user_id}
+        )
     return {
         "success": True,
         "data": {
@@ -1706,6 +1711,7 @@ async def get_portfolio_research_live_preview(
             "unsupported_features": _unsupported_research_features(task),
             "activation_id": task.get("activation_id"),
             "activation_status": task.get("activation_status"),
+            "activation": _jsonable(activation) if activation else None,
         },
     }
 
