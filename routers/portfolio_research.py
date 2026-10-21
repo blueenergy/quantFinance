@@ -769,7 +769,12 @@ def _candidate_strategy_config_from_row(job: Dict[str, Any], row: Dict[str, Any]
     return candidate
 
 
-def _assert_live_candidate(candidate: Dict[str, Any], job_params: Optional[Dict[str, Any]] = None) -> None:
+def _assert_live_candidate(
+    candidate: Dict[str, Any],
+    job_params: Optional[Dict[str, Any]] = None,
+    *,
+    action: str = "activated",
+) -> None:
     """Reject research configs the live construction path cannot reproduce."""
     job_params = job_params or {}
     if (
@@ -779,7 +784,7 @@ def _assert_live_candidate(candidate: Dict[str, Any], job_params: Optional[Dict[
         raise HTTPException(
             status_code=409,
             detail=(
-                "Dynamic score-threshold research results cannot be activated because "
+                f"Dynamic score-threshold research results cannot be {action} because "
                 "live portfolio construction does not support dynamic_score_threshold yet."
             ),
         )
@@ -789,8 +794,8 @@ def _assert_live_candidate(candidate: Dict[str, Any], job_params: Optional[Dict[
         raise HTTPException(
             status_code=409,
             detail=(
-                "Only growth_cycle_weighted and weighted_score research results "
-                "can be activated. Score-column construction templates are not "
+                f"Only growth_cycle_weighted and weighted_score research results "
+                f"can be {action}. Score-column construction templates are not "
                 "productized yet."
             ),
         )
@@ -1654,7 +1659,9 @@ async def create_portfolio_research_live_preview(
             "path_gate": row.get("path_gate"),
             "volatility_mode": row.get("volatility_mode"),
             "variant": row.get("variant"),
-            "crowd_exit_k": row.get("crowd_exit_k"),
+            "crowd_exit_k": row.get("crowd_exit_k")
+            if row.get("crowd_exit_k") is not None
+            else (job.get("params") or {}).get("crowd_exit_k"),
         },
         **parity_inputs,
         "source": "research_live_preview",
@@ -2331,7 +2338,7 @@ async def publish_portfolio_research_result(
         candidate["regime_cash"] = True
     if not candidate:
         raise HTTPException(status_code=400, detail="candidate strategy config is missing")
-    _assert_live_candidate(candidate, job.get("params") or {})
+    _assert_live_candidate(candidate, job.get("params") or {}, action="published")
 
     now = datetime.utcnow()
     strategy_template_id = str(candidate.get("strategy_template_id") or candidate.get("template_id") or "growth_cycle_index_enhanced")
