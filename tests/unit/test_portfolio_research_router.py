@@ -1916,6 +1916,8 @@ def test_activate_live_preview_schedules_clean_combo(monkeypatch):
     )
     assert len(data["preset"]["spec_hash"]) == 12
     assert data["preset"]["params"]["top_n"] == 20
+    assert data["advisory_plan_id"] == "preview-plan"
+    assert data["activation"]["advisory_plan_snapshot"]["plan"]["plan_id"] == "preview-plan"
     assert collections["portfolio_strategy_activations"].docs[0]["status"] == "scheduled"
     assert collections["portfolio_plan_generation_tasks"].docs[0]["activation_status"] == "scheduled"
 

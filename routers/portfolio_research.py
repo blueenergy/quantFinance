@@ -1989,6 +1989,13 @@ async def activate_portfolio_research_live_preview(
         "admin_override": bool(request.admin_override),
         "requested_by": user_id,
         "comment": request.comment,
+        # Snapshot of the read-only preview so the reviewed book survives after
+        # the drawer closes; the first real plan is generated on the effective date.
+        "advisory_plan_snapshot": {
+            "plan": plan,
+            "items": preview_result.get("items") or [],
+        },
+        "advisory_plan_id": plan.get("plan_id"),
         "created_at": now,
         "updated_at": now,
     }
@@ -2121,6 +2128,8 @@ async def activate_portfolio_research_live_preview(
                 "parity": parity_summary,
                 "unsupported_features": unsupported_features,
                 "applied_now": applied_now,
+                "advisory_plan_id": plan.get("plan_id"),
+                "advisory_item_count": len(preview_result.get("items") or []),
                 "first_task_id": first_task_id,
                 "paused_lineages": paused,
                 "review": review,
