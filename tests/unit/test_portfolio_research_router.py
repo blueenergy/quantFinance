@@ -1583,3 +1583,56 @@ def test_rerun_rejects_model_id_with_rule_inputs():
         )
     assert exc.value.status_code == 422
     assert "model_id cannot be combined" in exc.value.detail
+
+
+@pytest.mark.unit
+def test_create_job_persists_volatility_sweep_params(monkeypatch):
+    collections = _collections()
+    monkeypatch.setattr(portfolio_research, "get_trading_db_collections", lambda: collections)
+
+    response = asyncio.run(
+        portfolio_research.create_portfolio_research_job(
+            portfolio_research.CreateResearchJobRequest(
+                start_date="2025-01-01",
+                end_date="2025-01-31",
+                volatility_modes=["off", "renormalize"],
+                target_vols=[0.15, 0.2],
+                volatility_column="vol_20d_annual",
+            ),
+            current_user={"id": "user-1"},
+        )
+    )
+
+    params = response["data"]["params"]
+    assert params["volatility_modes"] == ["off", "renormalize"]
+    assert params["target_vols"] == [0.15, 0.2]
+    assert params["volatility_column"] == "vol_20d_annual"
+
+    source = {
+        "name": "vol job",
+        "universe_index": "csi1000",
+        "start_date": "20250101",
+        "end_date": "20250131",
+        "params": {
+            "start_date": "20250101",
+            "end_date": "20250131",
+            "volatility_modes": ["off", "renormalize"],
+            "target_vols": [0.15, 0.2],
+            "volatility_column": "vol_20d_annual",
+        },
+    }
+    rerun = portfolio_research._create_request_from_job(source)
+    assert rerun.volatility_modes == ["off", "renormalize"]
+    assert rerun.target_vols == [0.15, 0.2]
+    assert rerun.volatility_column == "vol_20d_annual"
+
+
+@pytest.mark.unit
+def test_target_vols_are_validated():
+    for bad in ([0], [-0.1], [2.5]):
+        with pytest.raises(ValueError, match="target_vols"):
+            portfolio_research.CreateResearchJobRequest(
+                start_date="20250101",
+                end_date="20250131",
+                target_vols=bad,
+            )

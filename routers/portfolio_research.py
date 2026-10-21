@@ -167,6 +167,18 @@ class CreateResearchJobRequest(BaseModel):
     horizon: int = Field(default=20, ge=1)
     rebalance_interval_days: Optional[List[int]] = None
     active_caps: List[float] = Field(default_factory=lambda: [0.2, 0.25, 0.3, 0.4])
+    volatility_modes: Optional[List[Literal["off", "cash_drag", "renormalize"]]] = Field(
+        default=None,
+        description="Volatility sweep modes; None keeps the legacy vol_off-only path.",
+    )
+    target_vols: Optional[List[float]] = Field(
+        default=None,
+        description="Annualized target vols paired with volatility_modes, e.g. 0.15.",
+    )
+    volatility_column: Optional[str] = Field(
+        default=None,
+        description="Panel column used for volatility scaling; default vol_20d_annual.",
+    )
     transaction_cost: float = Field(default=0.001, ge=0)
     buy_commission_rate: Optional[float] = Field(default=None, ge=0)
     sell_commission_rate: Optional[float] = Field(default=None, ge=0)
@@ -214,6 +226,23 @@ class CreateResearchJobRequest(BaseModel):
     @classmethod
     def _optional_model_id(cls, value: Any) -> Any:
         return _strip_to_none(value)
+
+    @field_validator("volatility_column", mode="before")
+    @classmethod
+    def _optional_volatility_column(cls, value: Any) -> Any:
+        return _blank_to_none(value)
+
+    @field_validator("target_vols")
+    @classmethod
+    def _validate_target_vols(cls, value: Optional[List[float]]) -> Optional[List[float]]:
+        if value is None:
+            return None
+        vols = [float(item) for item in value]
+        if not vols:
+            return None
+        if any(vol <= 0 or vol > 2 for vol in vols):
+            raise ValueError("target_vols must be in (0, 2]")
+        return vols
 
     @field_validator(
         "buy_commission_rate",
@@ -292,6 +321,9 @@ class RerunResearchJobRequest(BaseModel):
     horizon: Optional[int] = Field(default=None, ge=1)
     rebalance_interval_days: Optional[List[int]] = None
     active_caps: Optional[List[float]] = None
+    volatility_modes: Optional[List[Literal["off", "cash_drag", "renormalize"]]] = None
+    target_vols: Optional[List[float]] = None
+    volatility_column: Optional[str] = None
     transaction_cost: Optional[float] = Field(default=None, ge=0)
     buy_commission_rate: Optional[float] = Field(default=None, ge=0)
     sell_commission_rate: Optional[float] = Field(default=None, ge=0)
@@ -323,11 +355,24 @@ class RerunResearchJobRequest(BaseModel):
         "trailing_stop_pct",
         "index_benchmark_symbol",
         "industry_l1",
+        "volatility_column",
         mode="before",
     )
     @classmethod
     def _optional_blank(cls, value: Any) -> Any:
         return _blank_to_none(value)
+
+    @field_validator("target_vols")
+    @classmethod
+    def _validate_target_vols(cls, value: Optional[List[float]]) -> Optional[List[float]]:
+        if value is None:
+            return None
+        vols = [float(item) for item in value]
+        if not vols:
+            return None
+        if any(vol <= 0 or vol > 2 for vol in vols):
+            raise ValueError("target_vols must be in (0, 2]")
+        return vols
 
     @field_validator("model_id", mode="before")
     @classmethod
