@@ -25,6 +25,7 @@ from services.portfolio_lineage_live_bundle import (
     fetch_account_level_executions,
     fetch_lineage_live_bundle,
 )
+from services.ops_notify import send_ops_alert
 from services.portfolio_lineage_state import lineage_key
 from services.trade_ledger import group_executions_by_order
 
@@ -855,6 +856,82 @@ def _diff_position_maps(
     return diffs
 
 
+def _persist_reconcile_alerts(
+    trading_collections: Dict[str, Any],
+    residual_diffs: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Persist ledger-vs-broker drift as durable alerts and notify on new ones.
+
+    Only ``ledger > broker`` is alerted: the system booked shares the broker
+    does not hold (an overnight rollback like 601138, or a fill the broker
+    never accepted). ``broker > ledger`` is normally a manual position sharing
+    the account, which the reconcile banner already labels; alerting on it
+    would bury the real drift.
+    """
+    coll = trading_collections.get("portfolio_reconcile_alerts")
+    if coll is None:
+        return []
+    now = datetime.utcnow()
+    seen_keys = set()
+    new_alerts: List[Dict[str, Any]] = []
+    for entry in residual_diffs:
+        account_id = str(entry.get("securities_account_id") or "")
+        for diff in entry.get("diffs") or []:
+            symbol_key = str(diff.get("symbol_key") or "")
+            if not symbol_key:
+                continue
+            gap = int(diff.get("diff") or 0)
+            if gap >= 0:
+                continue
+            key = "%s:%s" % (account_id, symbol_key)
+            seen_keys.add(key)
+            existing = coll.find_one({"_id": key}, {"status": 1})
+            is_new = not existing or existing.get("status") != "active"
+            doc = {
+                "symbol": diff.get("symbol") or symbol_key,
+                "symbol_key": symbol_key,
+                "account_id": account_id,
+                "anchor_plan_id": entry.get("anchor_plan_id"),
+                "ledger_shares": diff.get("ledger_shares"),
+                "broker_shares": diff.get("broker_shares"),
+                "diff": gap,
+                "status": "active",
+                "last_seen_at": now,
+            }
+            coll.update_one(
+                {"_id": key},
+                {"$set": doc, "$setOnInsert": {"first_seen_at": now}},
+                upsert=True,
+            )
+            if is_new:
+                new_alerts.append(doc)
+
+    stale_query: Dict[str, Any] = {"status": "active"}
+    if seen_keys:
+        stale_query["_id"] = {"$nin": list(seen_keys)}
+    for stale in coll.find(stale_query, {"_id": 1}):
+        coll.update_one(
+            {"_id": stale["_id"]},
+            {"$set": {"status": "resolved", "resolved_at": now}},
+        )
+
+    if new_alerts:
+        lines = [
+            "- %s: 账本 %s 股 / 券商 %s 股（差 %+d）"
+            % (
+                alert["symbol"],
+                alert["ledger_shares"],
+                alert["broker_shares"],
+                int(alert["diff"]),
+            )
+            for alert in new_alerts
+        ]
+        lines.append("")
+        lines.append("账本记录多于券商持仓：可能是券商侧隔夜回滚/未结转，或系统多记了成交。")
+        send_ops_alert("组合账实不符 %d 项" % len(new_alerts), lines)
+    return new_alerts
+
+
 def reconcile_live_snapshots_with_broker_positions(
     trading_collections: Dict[str, Any],
     finance_collections: Dict[str, Any],
@@ -952,6 +1029,7 @@ def reconcile_live_snapshots_with_broker_positions(
             }
         )
 
+    new_alerts = _persist_reconcile_alerts(trading_collections, residual_diffs)
     result = {
         "checked": checked,
         "rebuilt": rebuilt,
@@ -959,6 +1037,7 @@ def reconcile_live_snapshots_with_broker_positions(
         "mismatched": mismatched,
         "skipped": skipped,
         "diffs": residual_diffs,
+        "new_alerts": len(new_alerts),
     }
     status_coll = finance_collections.get("job_status")
     if status_coll is not None:
