@@ -165,6 +165,7 @@ def get_trading_db_collections() -> Dict[str, Collection]:
         "portfolio_strategy_activations": trading_db["portfolio_strategy_activations"],
         "portfolio_trailing_stop_runs": trading_db["portfolio_trailing_stop_runs"],
         "portfolio_live_snapshots": trading_db["portfolio_live_snapshots"],
+        "portfolio_reconcile_alerts": trading_db["portfolio_reconcile_alerts"],
     }
 
 def get_analyzer_db():
