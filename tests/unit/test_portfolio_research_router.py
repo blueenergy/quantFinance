@@ -575,6 +575,7 @@ def test_rerun_portfolio_research_job_clones_params_without_overwriting_source(m
         "rebalance_interval_days": [20],
         "active_caps": [0.2, 0.3],
         "transaction_cost": 0.001,
+        "intra_period_cash": True,
         "force": False,
     }
     collections["portfolio_research_jobs"].insert_one(
@@ -613,12 +614,47 @@ def test_rerun_portfolio_research_job_clones_params_without_overwriting_source(m
     assert cloned["params"]["selection_mode"] == "fixed_top_n"
     assert cloned["params"]["threshold_lookback_days"] == 10
     assert cloned["params"]["max_positions"] == 20
+    assert cloned["params"]["intra_period_cash"] is True
     assert cloned["params"]["force"] is True
 
     source = collections["portfolio_research_jobs"].find_one({"job_id": "job-source"})
     assert source["status"] == "completed"
     assert source["result_id"] == "result-source"
     assert len(collections["portfolio_research_jobs"].docs) == 2
+
+
+def test_rerun_can_override_intra_period_cash(monkeypatch):
+    collections = _collections()
+    monkeypatch.setattr(portfolio_research, "get_trading_db_collections", lambda: collections)
+    monkeypatch.setattr(portfolio_research, "get_db_collections", lambda: {"stock_scores": _Collection()})
+    collections["portfolio_research_jobs"].insert_one(
+        {
+            "job_id": "job-source-cash",
+            "user_id": "user-1",
+            "name": "cash job",
+            "universe_index": "csi500",
+            "start_date": "20250101",
+            "end_date": "20250131",
+            "params": {
+                "universe_index": "csi500",
+                "start_date": "20250101",
+                "end_date": "20250131",
+                "intra_period_cash": True,
+            },
+            "status": "completed",
+            "result_id": "result-source",
+        }
+    )
+
+    response = asyncio.run(
+        portfolio_research.rerun_portfolio_research_job(
+            "job-source-cash",
+            request=portfolio_research.RerunResearchJobRequest(intra_period_cash=False),
+            current_user={"id": "user-1"},
+        )
+    )
+
+    assert response["data"]["params"]["intra_period_cash"] is False
 
 
 @pytest.mark.unit

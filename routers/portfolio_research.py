@@ -188,6 +188,13 @@ class CreateResearchJobRequest(BaseModel):
     index_benchmark_symbol: str = Field(default="000852.SH")
     cash_buffer: float = Field(default=0.03, ge=0, le=1)
     initial_capital: float = Field(default=1_000_000.0, gt=0)
+    intra_period_cash: bool = Field(
+        default=False,
+        description=(
+            "Research-only one-way intra-period cash exit after the index turns bearish. "
+            "Live construction does not implement it; activation blocks when true."
+        ),
+    )
     trailing_stop_pct: Optional[float] = Field(default=None, ge=0, le=1)
     trailing_stop_pcts: Optional[List[float]] = None
     industry_l1: Optional[str] = Field(default=None, description="Optional Shenwan L1 code or name filter")
@@ -373,6 +380,7 @@ class RerunResearchJobRequest(BaseModel):
     index_benchmark_symbol: Optional[str] = None
     cash_buffer: Optional[float] = Field(default=None, ge=0, le=1)
     initial_capital: Optional[float] = Field(default=None, gt=0)
+    intra_period_cash: Optional[bool] = None
     trailing_stop_pct: Optional[float] = Field(default=None, ge=0, le=1)
     trailing_stop_pcts: Optional[List[float]] = None
     industry_l1: Optional[str] = None
