@@ -758,7 +758,7 @@ def sync_job(job_id, config_data):
         import functools
         
         # Pass job_id if the function expects it (by name match)
-        if "market_analysis_" in job_id or "global_analysis" in job_id:
+        if "market_analysis_" in job_id or "global_analysis" in job_id or "iv_analysis" in job_id:
             task_callable = functools.partial(task_func, job_id=job_id)
         else:
             task_callable = task_func
