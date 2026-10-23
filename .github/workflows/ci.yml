@@ -3,13 +3,21 @@ name: CI
 on:
   push:
     branches: [ main, master, develop, fix_* ]
+    paths-ignore: ['docs/**', '**/*.md']
   pull_request:
     branches: [ main, master, develop ]
+    paths-ignore: ['docs/**', '**/*.md']
   workflow_dispatch: {}
 
 permissions:
   contents: read
   packages: write   # required for ghcr.io push
+
+# Cancel superseded PR runs only. Main runs are serialized so a stale release
+# cannot overwrite a newer versions.env pointer.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   PIP_CACHE_DIR: ./.cache/pip
@@ -22,6 +30,7 @@ jobs:
   test-build:
     name: Test & Build
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - name: Checkout code
         uses: actions/checkout@v6
