@@ -9,6 +9,7 @@
   - risk_report_analysis (quant_analyzer DB)   — quantAnalyzer 写入 LLM 解读
 """
 
+import re
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
@@ -46,6 +47,19 @@ def _serialize(doc: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
 
 def _serialize_list(docs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return [_serialize(d) for d in docs if d]
+
+
+_THINK_BLOCK_RE = re.compile(r"<think(?:ing)?\b[^>]*>.*?</think(?:ing)?\s*>", re.S | re.I)
+_THINK_UNCLOSED_RE = re.compile(r"<think(?:ing)?\b[^>]*>.*\Z", re.S | re.I)
+
+
+def _strip_thinking(text: Optional[str]) -> Optional[str]:
+    """兼容历史数据：去掉 LLM 输出中的 <think> / <thinking> 块。"""
+    if not text:
+        return text
+    cleaned = _THINK_BLOCK_RE.sub("", text)
+    cleaned = _THINK_UNCLOSED_RE.sub("", cleaned).strip()
+    return cleaned or None
 
 
 # ---------------------------------------------------------------------------
@@ -374,17 +388,19 @@ async def get_us_market_daily_analysis(
 # 7. A股波动率快照 — 独立卡片数据 + LLM 解读
 # ---------------------------------------------------------------------------
 
-@router.get("/iv-snapshot", summary="获取A股最新四指数波动率快照")
+@router.get("/iv-snapshot", summary="获取A股四指数波动率快照")
 async def get_iv_snapshot(
+    date: str = Query(None, description="分析日期 YYYYMMDD，默认最新"),
     current_user: dict = Depends(get_current_active_user),
 ):
     """
-    从 MongoDB quant_analyzer.iv_analysis 读取最新波动率快照与LLM解读。
+    从 MongoDB quant_analyzer.iv_analysis 读取波动率快照与LLM解读。
     数据由 quantAnalyzer iv_analysis 任务异步生产（Tushare + LLM），
     本接口只做纯读操作，无跨包依赖。
 
     返回格式：{iv_snapshot, snapshot_date, snapshot_source, interpretation, interpreted_at}
     snapshot_source: "db_cache"（iv_analysis集合）| "market_daily_fallback"（旧 risk_report_analysis 兜底）
+    传 date 时读取该日期的历史记录；不传时取最新一条。
     """
     iv_coll = get_analyzer_db()["iv_analysis"]
     iv_snap: Optional[Dict[str, Any]] = None
@@ -395,17 +411,30 @@ async def get_iv_snapshot(
     snapshot_source = "db_cache"
 
     # ── 1. quant_analyzer.iv_analysis（主数据源）─────────────────────────
-    doc = iv_coll.find_one(
-        {"iv_snapshot.available": True},
-        {"_id": 0},
-        sort=[("generated_at", -1)],
-    )
+    if date:
+        doc = iv_coll.find_one({"analysis_date": date}, {"_id": 0})
+    else:
+        doc = iv_coll.find_one(
+            {"iv_snapshot.available": True},
+            {"_id": 0},
+            sort=[("generated_at", -1)],
+        )
     if doc:
         iv_snap = doc.get("iv_snapshot")
         scan_date = doc.get("analysis_date")
-        interpretation = doc.get("interpretation")
+        interpretation = _strip_thinking(doc.get("interpretation"))
         interpreted_at = doc.get("interpreted_at")
         alert = doc.get("alert")
+    if date and not iv_snap:
+        # 指定日期无记录时不要回退到最新，避免历史选择器显示错日期的数据。
+        return {
+            "iv_snapshot": None,
+            "snapshot_date": date,
+            "snapshot_source": "none",
+            "interpretation": None,
+            "interpreted_at": None,
+            "alert": None,
+        }
 
     # ── 2. 旧 risk_report_analysis.market_daily 兜底（向后兼容）──────────
     if not iv_snap:
@@ -427,6 +456,48 @@ async def get_iv_snapshot(
         "interpreted_at":  interpreted_at,
         "alert":           alert,
     }
+
+
+@router.get("/iv-snapshot/history", summary="获取A股波动率历史分析列表")
+async def get_iv_snapshot_history(
+    limit: int = Query(30, ge=1, le=180, description="最多返回条数"),
+    current_user: dict = Depends(get_current_active_user),
+):
+    """返回按分析日期倒序的历史记录摘要，供前端历史选择器使用。"""
+    iv_coll = get_analyzer_db()["iv_analysis"]
+    docs = list(
+        iv_coll.find(
+            {"iv_snapshot.available": True},
+            {
+                "_id": 0,
+                "analysis_date": 1,
+                "generated_at": 1,
+                "interpreted_at": 1,
+                "model": 1,
+                "iv_snapshot.iv_30": 1,
+                "iv_snapshot.level": 1,
+                "iv_snapshot.level_zh": 1,
+                "iv_snapshot.underlying": 1,
+                "interpretation": 1,
+            },
+        ).sort([("analysis_date", -1)]).limit(limit)
+    )
+    items = []
+    for raw in docs:
+        d = _serialize(raw) or {}
+        snap = d.get("iv_snapshot") or {}
+        items.append({
+            "analysis_date": d.get("analysis_date"),
+            "generated_at": d.get("generated_at"),
+            "interpreted_at": d.get("interpreted_at"),
+            "model": d.get("model"),
+            "iv_30": snap.get("iv_30"),
+            "level": snap.get("level"),
+            "level_zh": snap.get("level_zh"),
+            "underlying": snap.get("underlying"),
+            "has_interpretation": bool(_strip_thinking(d.get("interpretation"))),
+        })
+    return {"items": items}
 
 
 @router.post("/iv-snapshot/interpret", summary="触发A股波动率分析任务（Tushare + LLM解读）")
