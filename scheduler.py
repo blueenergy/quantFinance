@@ -299,6 +299,58 @@ def generate_global_analysis_task(job_id: str):
         log.error(f"[Global Analysis] Scheduling failed: {e}", exc_info=True)
 
 
+def generate_iv_analysis_task(job_id: str):
+    """Schedule daily IV analysis (Runs at 15:10 after A-share close)."""
+    from db import get_data_db, get_db_collections
+    from services.analysis_tasks import build_task_doc
+
+    try:
+        today_ymd = datetime.now().strftime('%Y%m%d')
+        cal = get_data_db()["trade_calendar"].find_one(
+            {"exchange": "SSE", "trade_date": today_ymd, "is_open": 1}
+        )
+        if not cal:
+            log.info(f"[IV Analysis] {today_ymd} is not an SSE trading day, skipping.")
+            return
+
+        collections = get_db_collections()
+        tasks_col = collections["analysis_tasks"]
+        users_coll = collections["users"]
+
+        admin_user = users_coll.find_one({"username": "admin", "is_admin": True})
+        user_id = str(admin_user["_id"]) if admin_user else "system"
+
+        existing = tasks_col.find_one({
+            "type": "iv_analysis",
+            "params.date": today_ymd,
+            "params.job_id": job_id,
+            "status": {"$in": ["pending", "processing"]}
+        })
+        if existing:
+            log.info(f"[IV Analysis] Task '{job_id}' already pending for {today_ymd}, skipping.")
+            return
+
+        task_doc = build_task_doc(
+            current_user={
+                "id": user_id,
+                "username": "system" if user_id == "system" else "admin",
+            },
+            task_type="iv_analysis",
+            priority=3,
+            params={
+                "date": today_ymd,
+                "with_llm": True,
+                "job_id": job_id,
+            },
+            source="scheduler",
+        )
+        result = tasks_col.insert_one(task_doc)
+        log.info(f"[IV Analysis] Scheduled task {result.inserted_id} for {today_ymd}")
+
+    except Exception as e:
+        log.error(f"[IV Analysis] Scheduling failed: {e}", exc_info=True)
+
+
 def strategy_lab_loop_tick_task():
     """Advance Strategy Lab auto-iteration loops (batch → review → rerun)."""
     from services.strategy_lab_loop import advance_all_running_loops
@@ -526,6 +578,7 @@ TASK_MAP = {
     'market_analysis_1130': generate_market_analysis_task,
     'market_analysis_1630': generate_market_analysis_task,
     'global_analysis_0830': generate_global_analysis_task,
+    'iv_analysis_1510': generate_iv_analysis_task,
     'hot_stock_poll_ths': lambda: hot_stock_poll_task('ths'),
     'hot_stock_poll_dc': lambda: hot_stock_poll_task('dc'),
     'theme_lag_validation_subscribe_1530': lambda: theme_lag_validation_subscription_scan_task(
@@ -573,6 +626,14 @@ DEFAULT_SCHEDULES = {
         'hour': 8,
         'minute': 30,
         'day_of_week': 'mon-fri'
+    },
+    'iv_analysis_1510': {
+        'name': "A股波动率分析 (15:10)",
+        'type': "cron",
+        'hour': 15,
+        'minute': 10,
+        'day_of_week': 'mon-fri',
+        'is_active': True,
     },
     'hot_stock_poll_ths': {
         'name': "同花顺热股每日分析 (23:05)",
