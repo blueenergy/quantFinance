@@ -30,6 +30,8 @@ VALID_SECTORS = {
     "us_semicon", "us_tech", "us_macro",
 }
 
+A_SHARE_SECTORS = sorted(s for s in VALID_SECTORS if not s.startswith("us_"))
+
 
 def _serialize(doc: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     if not doc:
@@ -78,7 +80,21 @@ async def get_overview(
     ]
     # 按得分降序，高风险在前
     result.sort(key=lambda x: x.get("overall_risk_score") or 0, reverse=True)
-    return {"scan_date": scan_date, "sectors": result}
+
+    # A 股扫描每日 19:30 才生成；盘前/盘中请求当天日期时，前端需要一个
+    # 最近可看的 A 股日期来做“查看最近扫描”入口。
+    latest_a = coll.find_one(
+        {"sector": {"$in": A_SHARE_SECTORS}, "scan_date": {"$lte": scan_date}},
+        {"scan_date": 1},
+        sort=[("scan_date", -1)],
+    )
+    latest_a_share_date = latest_a.get("scan_date") if latest_a else None
+
+    return {
+        "scan_date": scan_date,
+        "sectors": result,
+        "latest_a_share_date": latest_a_share_date,
+    }
 
 
 # ---------------------------------------------------------------------------
