@@ -425,7 +425,7 @@ _DASHBOARD_SYMBOL_NAMES: Dict[str, Dict[str, str]] = {
         "META": "Meta",
         "AMZN": "Amazon",
     },
-    "commodities": {"GC=F": "Gold", "SI=F": "Silver", "CL=F": "Crude Oil"},
+    "commodities": {"GC=F": "Gold", "SI=F": "Silver", "CL=F": "WTI Crude Oil"},
     "forex": {"DX-Y.NYB": "USD Index", "USDCNH=X": "USD/CNH (Offshore)"},
     "bonds": {"^TNX": "US 10Y Treasury Yield"},
     "crypto": {"BTC-USD": "Bitcoin", "ETH-USD": "Ethereum"},
