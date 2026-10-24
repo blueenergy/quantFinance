@@ -208,6 +208,8 @@ def test_kline_series_futures_uses_fut_daily(monkeypatch, authed_client):
                         "high": 3520.0,
                         "low": 3490.0,
                         "close": 3515.0,
+                        "pct_chg": 0.7163,
+                        "change": 25.0,
                         "vol": 1000.0,
                         "amount": 2000.0,
                         "oi": 50000.0,
@@ -235,6 +237,8 @@ def test_kline_series_futures_uses_fut_daily(monkeypatch, authed_client):
     assert body["count"] == 1
     assert body["data"][0]["contract"] == "IF2401.CFX"
     assert body["data"][0]["oi"] == pytest.approx(50000.0)
+    assert body["data"][0]["pct_chg"] == pytest.approx(0.7163)
+    assert body["data"][0]["change"] == pytest.approx(25.0)
 
 
 @pytest.mark.unit

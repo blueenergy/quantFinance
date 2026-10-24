@@ -31,6 +31,8 @@ _FUT_PROJ = {
     "high": 1,
     "low": 1,
     "close": 1,
+    "pct_chg": 1,
+    "change": 1,
     "vol": 1,
     "amount": 1,
     "oi": 1,
@@ -127,6 +129,8 @@ def get_kline_series(
                     "amount": d.get("amount"),
                     "oi": d.get("oi"),
                     "contract": d.get("contract"),
+                    "pct_chg": d.get("pct_chg"),
+                    "change": d.get("change"),
                 }
                 if source == "fut_daily"
                 else {}
