@@ -24,6 +24,7 @@ from calendar import monthrange
 from bson import ObjectId
 from stock_data_access.prices import AdjustedPriceDataAccess
 from services.industry_rs import build_industry_rs_details, normalize_stored_industry_rs_details
+from services.sw_industry import load_sw_membership, sw_catalog
 from services.score_detail_meta import (
     SCORE_HISTORY_PROJECTION,
     build_score_detail_payload,
@@ -330,6 +331,139 @@ def _weighted_sort_value_from_per_date_fields(
         ),
         default=0.0,
     )
+
+
+# ==================== 申万行业维度 ====================
+# 金榜的「行业内排名」只在同一申万行业内部比较。行业归属按评分日做 PIT
+# 解析（sw_index_member 是带 in_date/out_date 的任期表），不能用今天的归属
+# 回溯历史。筛选与排名都在服务端完成，前端只消费字段。
+SW_INDUSTRY_LEVELS = ("l1", "l2")
+
+
+def _normalize_industry_level(level: Optional[str]) -> str:
+    value = (level or "l1").strip().lower()
+    if value not in SW_INDUSTRY_LEVELS:
+        raise HTTPException(
+            status_code=400,
+            detail="不支持的 industry_level: %s；允许: l1, l2" % level,
+        )
+    return value
+
+
+def _resolve_industry_selection(
+    level: str,
+    raw: Optional[str],
+    data_collections: Any,
+) -> Optional[Dict[str, str]]:
+    """Resolve an industry code/name against the SW catalog; None means no filter."""
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    catalog = sw_catalog(data_collections, level)
+    for item in catalog:
+        if text == item.get("code") or text == item.get("name"):
+            return item
+    lowered = text.lower()
+    for item in catalog:
+        if str(item.get("code") or "").lower() == lowered:
+            return item
+    raise HTTPException(status_code=400, detail="未知的申万行业: %s" % text)
+
+
+def _attach_sw_industry(
+    rows: List[dict],
+    data_collections: Any,
+    score_date: Optional[str] = None,
+) -> None:
+    """Attach SW L1/L2 labels, grouped by score date so PIT stays correct.
+
+    Ranking endpoints pass one ``score_date`` for the whole page; the
+    watchlist/selected path has per-row dates, so it omits the argument.
+    """
+    if not rows:
+        return
+    groups: Dict[str, List[dict]] = {}
+    if score_date:
+        groups[str(score_date)] = rows
+    else:
+        for row in rows:
+            groups.setdefault(str(row.get("score_date") or ""), []).append(row)
+
+    for date_key, group in groups.items():
+        symbols = [str(row.get("symbol") or "") for row in group if row.get("symbol")]
+        membership = load_sw_membership(
+            data_collections,
+            symbols,
+            as_of=date_key or None,
+        )
+        for row in group:
+            item = membership.get(str(row.get("symbol") or ""), {})
+            row["sw_l1"] = item.get("l1_name", "")
+            row["sw_l1_code"] = item.get("l1_code", "")
+            row["sw_l2"] = item.get("l2_name", "")
+            row["sw_l2_code"] = item.get("l2_code", "")
+
+
+def _filter_rows_by_sw_industry(
+    rows: List[dict],
+    level: str,
+    industry: Optional[Dict[str, str]],
+) -> List[dict]:
+    if not industry:
+        return rows
+    code_field = "sw_l2_code" if level == "l2" else "sw_l1_code"
+    code = str(industry.get("code") or "")
+    return [row for row in rows if str(row.get(code_field) or "") == code]
+
+
+def _assign_sw_industry_ranks(
+    rows: List[dict],
+    level: str,
+    sort_key: str,
+    strategy: str,
+    weights: Dict[str, float],
+) -> None:
+    """Assign competition ranks inside each industry.
+
+    ``rows`` must already be sorted by the active sort key descending; a
+    subsequence of a sorted list is still sorted, so iterating the group in
+    order yields the industry leaderboard. Ties share a rank (1,2,2,4).
+    """
+    code_field = "sw_l2_code" if level == "l2" else "sw_l1_code"
+    groups: Dict[str, List[dict]] = {}
+    for row in rows:
+        code = str(row.get(code_field) or "").strip()
+        if not code:
+            row["industry_rank"] = None
+            row["industry_total"] = None
+            continue
+        groups.setdefault(code, []).append(row)
+
+    for group in groups.values():
+        total = len(group)
+        previous_value: Any = None
+        previous_rank = 0
+        for index, row in enumerate(group, start=1):
+            value = _score_sort_value(row, sort_key, strategy, weights)
+            if index > 1 and value == previous_value:
+                rank = previous_rank
+            else:
+                rank = index
+                previous_rank = index
+            previous_value = value
+            row["industry_rank"] = rank
+            row["industry_total"] = total
+
+
+def _sw_row_fields(row: dict) -> Dict[str, Any]:
+    return {
+        "sw_l1": row.get("sw_l1", ""),
+        "sw_l1_code": row.get("sw_l1_code", ""),
+        "sw_l2": row.get("sw_l2", ""),
+        "sw_l2_code": row.get("sw_l2_code", ""),
+        "industry_rank": row.get("industry_rank"),
+        "industry_total": row.get("industry_total"),
+    }
 
 
 # using helpers from stock-scoring-system/utils/score_utils.py
@@ -1421,6 +1555,17 @@ def enrich_rows_future_returns(
         row.update(out)
 
 
+@router.get("/stock-rankings/industries")
+async def get_stock_ranking_industries():
+    """申万行业目录，供金榜 L1/L2 级联筛选使用。"""
+    data_collections = get_data_db()
+    return {
+        "success": True,
+        "l1": sw_catalog(data_collections, "l1"),
+        "l2": sw_catalog(data_collections, "l2"),
+    }
+
+
 @router.get("/stock-rankings/by-index/{index_code}")
 async def get_stock_rankings_by_index(
     request: Request,
@@ -1448,6 +1593,14 @@ async def get_stock_rankings_by_index(
     exclude_st: bool = Query(True, description="是否排除名称含 ST 的股票"),
     offset: int = Query(0, ge=0, description="分页起点"),
     page_size: int = Query(30, ge=1, le=500, description="本页条数"),
+    industry_level: str = Query(
+        "l1",
+        description="行业内排名层级：l1/l2；无行业筛选时也按该层级显示排名",
+    ),
+    industry: Optional[str] = Query(
+        None,
+        description="申万行业 code（如 801010.SI）或名称；不传则不过滤",
+    ),
 ):
     """
     按 ``stock_scores.index_codes`` 拉指数成分榜（不在库内回退 POST 全量 symbols）。
@@ -1465,6 +1618,7 @@ async def get_stock_rankings_by_index(
         sort_key = _normalize_sort_by(sort_by)
         weighted_weights = _parse_weighted_sort_weights(weights) if sort_key == "weighted" else {}
         as_of = _validated_return_as_of(return_as_of)
+        level = _normalize_industry_level(industry_level)
         cache_key = (
             "by-index",
             ic,
@@ -1476,6 +1630,8 @@ async def get_stock_rankings_by_index(
             bool(exclude_st),
             int(offset),
             int(page_size),
+            level,
+            str(industry or "").strip(),
         )
         cached_payload = _ranking_cache_get(cache_key)
         if cached_payload is not None:
@@ -1483,11 +1639,14 @@ async def get_stock_rankings_by_index(
         db = get_db_collections_from_request(request)
         stock_scores = db["stock_scores"]
         stock_info = db["stock_info"]
+        data_collections = get_data_db()
+        industry_selection = _resolve_industry_selection(level, industry, data_collections)
         raw = _aggregate_index_ranking_score_docs(stock_scores, ic, date)
         raw.sort(
             key=lambda d: _score_sort_value(d, sort_key, effective_strategy, weighted_weights),
             reverse=True,
         )
+        _attach_sw_industry(raw, data_collections)
         symbols = [s.get("symbol") for s in raw if s.get("symbol")]
         info_map: Dict[str, Any] = {}
         if symbols:
@@ -1506,6 +1665,10 @@ async def get_stock_rankings_by_index(
             if exclude_st and "ST" in (name or ""):
                 continue
             ranked.append(stock)
+        ranked = _filter_rows_by_sw_industry(ranked, level, industry_selection)
+        _assign_sw_industry_ranks(
+            ranked, level, sort_key, effective_strategy, weighted_weights
+        )
         total = len(ranked)
         page = ranked[offset : offset + page_size]
         formatted: List[dict] = []
@@ -1531,6 +1694,7 @@ async def get_stock_rankings_by_index(
                 "industry_rs_score": stock.get("industry_rs_score"),
                 "index_codes": _normalize_index_codes(stock.get("index_codes")),
                 "score_date": stock.get("score_date", ""),
+                **_sw_row_fields(stock),
             }
             if sort_key == "weighted":
                 row["weighted_score"] = _weighted_score_or_none(row, sort_key, weighted_weights)
@@ -1555,6 +1719,8 @@ async def get_stock_rankings_by_index(
             "date": date or "",
             "return_as_of": as_of or "",
             "index_code": ic,
+            "industry_level": level,
+            "industry": industry_selection.get("code") if industry_selection else "",
             "message": "按指数 %s 获取评分成功" % ic,
         }
         _ranking_cache_put(cache_key, payload)
@@ -1594,6 +1760,14 @@ async def get_stock_rankings(
         None,
         description="宽基 scope；不传则显式全市场（最新日优先取已打标行）",
     ),
+    industry_level: str = Query(
+        "l1",
+        description="行业内排名层级：l1/l2；无行业筛选时也按该层级显示排名",
+    ),
+    industry: Optional[str] = Query(
+        None,
+        description="申万行业 code（如 801010.SI）或名称；不传则不过滤",
+    ),
 ):
     """
     获取股票评分排行榜 - 每只股票只显示最新一天的评分（简洁实现）
@@ -1603,6 +1777,7 @@ async def get_stock_rankings(
         sort_key = _normalize_sort_by(sort_by)
         weighted_weights = _parse_weighted_sort_weights(weights) if sort_key == "weighted" else {}
         as_of = _validated_return_as_of(return_as_of)
+        level = _normalize_industry_level(industry_level)
         cache_key = (
             "stock-rankings",
             int(limit),
@@ -1614,6 +1789,8 @@ async def get_stock_rankings(
             sort_key,
             _weights_cache_key(weighted_weights),
             str(index_code or ""),
+            level,
+            str(industry or "").strip(),
         )
         cached_payload = _ranking_cache_get(cache_key)
         if cached_payload is not None:
@@ -1622,6 +1799,8 @@ async def get_stock_rankings(
         db = get_db_collections_from_request(request)
         stock_scores = db['stock_scores']
         stock_info = db['stock_info']
+        data_collections = get_data_db()
+        industry_selection = _resolve_industry_selection(level, industry, data_collections)
 
         # Scores are written in per-run batches sharing one score_date, so the
         # latest scored date is the current full-market snapshot. Resolve that
@@ -1665,6 +1844,8 @@ async def get_stock_rankings(
                     base_query["composite_score"] = {"$gte": min_score}
                 all_stocks = list(stock_scores.find(base_query).sort("composite_score", -1).limit(limit * 2))
 
+        _attach_sw_industry(all_stocks, data_collections, effective_date)
+
         # Batch attach basic info to avoid N+1 queries
         symbols = [s.get('symbol') for s in all_stocks if s.get('symbol')]
         info_map = {}
@@ -1683,10 +1864,15 @@ async def get_stock_rankings(
         else:
             top_stocks = all_stocks
 
+        top_stocks = _filter_rows_by_sw_industry(top_stocks, level, industry_selection)
+
         # use centralized helper to extract strategy-specific score
         top_stocks.sort(
             key=lambda s: _score_sort_value(s, sort_key, effective_strategy, weighted_weights),
             reverse=True,
+        )
+        _assign_sw_industry_ranks(
+            top_stocks, level, sort_key, effective_strategy, weighted_weights
         )
 
         formatted = []
@@ -1710,7 +1896,8 @@ async def get_stock_rankings(
                 'money_flow_score': safe_round_or_none(stock.get('money_flow_score'), 2),
                 'industry_rs_score': stock.get('industry_rs_score'),
                 'index_codes': _normalize_index_codes(stock.get('index_codes')),
-                'score_date': stock.get('score_date', '')
+                'score_date': stock.get('score_date', ''),
+                **_sw_row_fields(stock),
             }
             if sort_key == "weighted":
                 row["weighted_score"] = _weighted_score_or_none(row, sort_key, weighted_weights)
@@ -1731,6 +1918,8 @@ async def get_stock_rankings(
             "data": formatted,
             "total": len(formatted),
             "return_as_of": as_of or "",
+            "industry_level": level,
+            "industry": industry_selection.get("code") if industry_selection else "",
             "message": "获取排行榜成功"
         }
         _ranking_cache_put(cache_key, payload)
@@ -2291,6 +2480,11 @@ async def get_selected_stock_rankings(
                         else {}
                     ),
                 })
+            # 行业只做展示：指定股票/自选模式不按行业过滤，也不计算行业内排名。
+            _attach_sw_industry(formatted_stocks, get_data_db())
+            for row in formatted_stocks:
+                row.setdefault("industry_rank", None)
+                row.setdefault("industry_total", None)
             formatted_stocks.sort(
                 key=lambda row: (
                     _score_sort_value(row, sort_key, effective_strategy, weighted_weights)
@@ -2404,6 +2598,11 @@ async def get_selected_stock_rankings(
             formatted_stock.update(dict(PRIOR_3M_EMPTY))
             formatted_stock.update(dict(FUTURE_RETURN_EMPTY))
             formatted_stocks.append(formatted_stock)
+        # 行业只做展示：指定股票/自选模式不按行业过滤，也不计算行业内排名。
+        _attach_sw_industry(formatted_stocks, get_data_db())
+        for row in formatted_stocks:
+            row.setdefault("industry_rank", None)
+            row.setdefault("industry_total", None)
         total_all = len(formatted_stocks)
         if page_size is not None:
             page_rows = formatted_stocks[offset : offset + page_size]

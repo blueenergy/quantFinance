@@ -1543,3 +1543,268 @@ def test_bulk_future_windows_batches_symbols_sharing_base_date():
     assert vp.agg_calls == 1
     assert [d["close"] for d in windows[("AAA.SH", "20250101")]] == [11.0, 12.0]
     assert [d["close"] for d in windows[("BBB.SH", "20250101")]] == [22.0]
+
+
+# ---------------------------------------------------------------------------
+# 申万行业维度：筛选 + 行业内排名
+# ---------------------------------------------------------------------------
+
+class _FakeSwMemberCollection:
+    def __init__(self, docs):
+        self.docs = list(docs)
+
+    @staticmethod
+    def _matches(doc, query):
+        for key, expected in query.items():
+            if key == "$or":
+                if not any(_FakeSwMemberCollection._matches(doc, sub) for sub in expected):
+                    return False
+                continue
+            actual = doc.get(key)
+            if isinstance(expected, dict):
+                if "$in" in expected and actual not in expected["$in"]:
+                    return False
+                if "$lte" in expected and (actual is None or str(actual) > str(expected["$lte"])):
+                    return False
+                if "$gte" in expected and (actual is None or str(actual) < str(expected["$gte"])):
+                    return False
+            elif actual != expected:
+                return False
+        return True
+
+    def find(self, query=None, projection=None):
+        rows = [doc for doc in self.docs if self._matches(doc, query or {})]
+        if projection:
+            keep = [key for key, value in projection.items() if value == 1]
+            rows = [{key: doc.get(key) for key in keep if key in doc} for doc in rows]
+        return rows
+
+
+class _FakeSwClassifyCollection:
+    def __init__(self, docs):
+        self.docs = list(docs)
+
+    def find(self, query=None, projection=None):
+        rows = [
+            doc
+            for doc in self.docs
+            if all(doc.get(key) == value for key, value in (query or {}).items())
+        ]
+        if projection:
+            keep = [key for key, value in projection.items() if value == 1]
+            rows = [{key: doc.get(key) for key in keep if key in doc} for doc in rows]
+        return rows
+
+
+def _sw_member(con_code, l1_code, l1_name, l2_code, l2_name, **extra):
+    doc = {
+        "con_code": con_code,
+        "src": "SW2021",
+        "is_new": "Y",
+        "in_date": "20000101",
+        "out_date": None,
+        "l1_code": l1_code,
+        "l1_name": l1_name,
+        "l2_code": l2_code,
+        "l2_name": l2_name,
+    }
+    doc.update(extra)
+    return doc
+
+
+def _sw_classify(index_code, industry_code, name, level, parent_code="0"):
+    return {
+        "src": "SW2021",
+        "level": level,
+        "index_code": index_code,
+        "industry_code": industry_code,
+        "industry_name": name,
+        "parent_code": parent_code,
+    }
+
+
+def _install_sw_fakes(monkeypatch, fake_db, members, classify):
+    monkeypatch.setattr(stock_ranking, "get_db_collections", lambda: fake_db)
+    monkeypatch.setattr(
+        stock_ranking,
+        "get_data_db",
+        lambda: {
+            "volume_price": FakeVolumePriceCollection([]),
+            "sw_index_member": _FakeSwMemberCollection(members),
+            "sw_index_classify": _FakeSwClassifyCollection(classify),
+        },
+    )
+
+
+def _sw_score_docs():
+    return [
+        {'symbol': 'AAA.SH', 'composite_score': {'balanced': 90}, 'cycle_score': 1, 'value_score': 1, 'fundamental_score': 1, 'growth_score': 1, 'technical_score': 1, 'money_flow_score': 1, 'score_date': '20250920'},
+        {'symbol': 'BBB.SH', 'composite_score': {'balanced': 80}, 'cycle_score': 1, 'value_score': 1, 'fundamental_score': 1, 'growth_score': 1, 'technical_score': 1, 'money_flow_score': 1, 'score_date': '20250920'},
+        {'symbol': 'CCC.SH', 'composite_score': {'balanced': 70}, 'cycle_score': 1, 'value_score': 1, 'fundamental_score': 1, 'growth_score': 1, 'technical_score': 1, 'money_flow_score': 1, 'score_date': '20250920'},
+        {'symbol': 'DDD.SH', 'composite_score': {'balanced': 60}, 'cycle_score': 1, 'value_score': 1, 'fundamental_score': 1, 'growth_score': 1, 'technical_score': 1, 'money_flow_score': 1, 'score_date': '20250920'},
+    ]
+
+
+def _sw_info_docs():
+    return [
+        {'symbol': 'AAA.SH', 'name': 'A Corp'},
+        {'symbol': 'BBB.SH', 'name': 'B Corp'},
+        {'symbol': 'CCC.SH', 'name': 'C Corp'},
+        {'symbol': 'DDD.SH', 'name': 'D Corp'},
+    ]
+
+
+def _sw_members():
+    return [
+        _sw_member('AAA.SH', '801080.SI', '电子', '801081.SI', '半导体'),
+        _sw_member('BBB.SH', '801780.SI', '银行', '801781.SI', '股份制银行Ⅱ'),
+        _sw_member('CCC.SH', '801080.SI', '电子', '801081.SI', '半导体'),
+        _sw_member('DDD.SH', '801080.SI', '电子', '801082.SI', '光学光电子'),
+    ]
+
+
+def _sw_classify_docs():
+    return [
+        _sw_classify('801080.SI', '270000', '电子', 'L1'),
+        _sw_classify('801780.SI', '480000', '银行', 'L1'),
+        _sw_classify('801081.SI', '270100', '半导体', 'L2', '270000'),
+        _sw_classify('801082.SI', '270200', '光学光电子', 'L2', '270000'),
+        _sw_classify('801781.SI', '480100', '股份制银行Ⅱ', 'L2', '480000'),
+    ]
+
+
+@pytest.mark.unit
+def test_stock_rankings_attach_sw_industry_and_l1_ranks(monkeypatch):
+    fake_db = FakeDB(stock_scores_docs=_sw_score_docs(), stock_info_docs=_sw_info_docs())
+    _install_sw_fakes(monkeypatch, fake_db, _sw_members(), _sw_classify_docs())
+
+    resp = TestClient(app).get('/api/stock-rankings?limit=10&strategy=balanced')
+
+    assert resp.status_code == 200
+    rows = {row['symbol']: row for row in resp.json()['data']}
+    assert rows['AAA.SH']['sw_l1'] == '电子'
+    assert rows['AAA.SH']['sw_l2'] == '半导体'
+    assert (rows['AAA.SH']['industry_rank'], rows['AAA.SH']['industry_total']) == (1, 3)
+    assert (rows['CCC.SH']['industry_rank'], rows['CCC.SH']['industry_total']) == (2, 3)
+    assert (rows['DDD.SH']['industry_rank'], rows['DDD.SH']['industry_total']) == (3, 3)
+    assert (rows['BBB.SH']['industry_rank'], rows['BBB.SH']['industry_total']) == (1, 1)
+
+
+@pytest.mark.unit
+def test_stock_rankings_filter_by_sw_l1(monkeypatch):
+    fake_db = FakeDB(stock_scores_docs=_sw_score_docs(), stock_info_docs=_sw_info_docs())
+    _install_sw_fakes(monkeypatch, fake_db, _sw_members(), _sw_classify_docs())
+
+    resp = TestClient(app).get(
+        '/api/stock-rankings?limit=10&industry_level=l1&industry=801080.SI'
+    )
+
+    assert resp.status_code == 200
+    data = resp.json()['data']
+    assert [row['symbol'] for row in data] == ['AAA.SH', 'CCC.SH', 'DDD.SH']
+    assert [row['industry_rank'] for row in data] == [1, 2, 3]
+    assert all(row['industry_total'] == 3 for row in data)
+
+
+@pytest.mark.unit
+def test_stock_rankings_filter_by_sw_l2_and_rank_at_l2(monkeypatch):
+    fake_db = FakeDB(stock_scores_docs=_sw_score_docs(), stock_info_docs=_sw_info_docs())
+    _install_sw_fakes(monkeypatch, fake_db, _sw_members(), _sw_classify_docs())
+
+    resp = TestClient(app).get(
+        '/api/stock-rankings?limit=10&industry_level=l2&industry=801081.SI'
+    )
+
+    assert resp.status_code == 200
+    data = resp.json()['data']
+    assert [row['symbol'] for row in data] == ['AAA.SH', 'CCC.SH']
+    assert [(row['industry_rank'], row['industry_total']) for row in data] == [(1, 2), (2, 2)]
+
+
+@pytest.mark.unit
+def test_stock_rankings_l2_rank_without_filter(monkeypatch):
+    fake_db = FakeDB(stock_scores_docs=_sw_score_docs(), stock_info_docs=_sw_info_docs())
+    _install_sw_fakes(monkeypatch, fake_db, _sw_members(), _sw_classify_docs())
+
+    resp = TestClient(app).get('/api/stock-rankings?limit=10&industry_level=l2')
+
+    assert resp.status_code == 200
+    rows = {row['symbol']: row for row in resp.json()['data']}
+    assert (rows['AAA.SH']['industry_rank'], rows['AAA.SH']['industry_total']) == (1, 2)
+    assert (rows['DDD.SH']['industry_rank'], rows['DDD.SH']['industry_total']) == (1, 1)
+    assert (rows['BBB.SH']['industry_rank'], rows['BBB.SH']['industry_total']) == (1, 1)
+
+
+@pytest.mark.unit
+def test_stock_rankings_unknown_sw_industry_is_400(monkeypatch):
+    fake_db = FakeDB(stock_scores_docs=_sw_score_docs(), stock_info_docs=_sw_info_docs())
+    _install_sw_fakes(monkeypatch, fake_db, _sw_members(), _sw_classify_docs())
+
+    resp = TestClient(app).get('/api/stock-rankings?industry_level=l1&industry=不存在')
+
+    assert resp.status_code == 400
+    assert '未知的申万行业' in resp.json()['detail']
+
+
+@pytest.mark.unit
+def test_stock_rankings_history_uses_pit_sw_membership(monkeypatch):
+    docs = [
+        {'symbol': 'AAA.SH', 'composite_score': {'balanced': 90}, 'cycle_score': 1, 'value_score': 1, 'fundamental_score': 1, 'growth_score': 1, 'technical_score': 1, 'money_flow_score': 1, 'score_date': '20200102'},
+    ]
+    members = [
+        _sw_member('AAA.SH', '801010.SI', '农林牧渔', '801011.SI', '种植业', in_date='20000101', out_date='20211231', is_new='N'),
+        _sw_member('AAA.SH', '801080.SI', '电子', '801081.SI', '半导体', in_date='20220101'),
+    ]
+    classify = [
+        _sw_classify('801010.SI', '110000', '农林牧渔', 'L1'),
+        _sw_classify('801080.SI', '270000', '电子', 'L1'),
+        _sw_classify('801011.SI', '110100', '种植业', 'L2', '110000'),
+        _sw_classify('801081.SI', '270100', '半导体', 'L2', '270000'),
+    ]
+    fake_db = FakeDB(stock_scores_docs=docs, stock_info_docs=[{'symbol': 'AAA.SH', 'name': 'A Corp'}])
+    _install_sw_fakes(monkeypatch, fake_db, members, classify)
+
+    resp = TestClient(app).get('/api/stock-rankings?limit=10&date=20200102')
+
+    assert resp.status_code == 200
+    row = resp.json()['data'][0]
+    assert row['sw_l1'] == '农林牧渔'
+    assert row['sw_l2'] == '种植业'
+
+
+@pytest.mark.unit
+def test_stock_ranking_industries_returns_both_levels(monkeypatch):
+    fake_db = FakeDB()
+    _install_sw_fakes(monkeypatch, fake_db, [], _sw_classify_docs())
+
+    resp = TestClient(app).get('/api/stock-rankings/industries')
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert [row['code'] for row in body['l1']] == ['801080.SI', '801780.SI']
+    assert [row['code'] for row in body['l2']] == ['801081.SI', '801082.SI', '801781.SI']
+    assert body['l2'][0]['parent_code'] == '270000'
+
+
+@pytest.mark.unit
+def test_stock_rankings_industry_rank_ties_share_position(monkeypatch):
+    docs = [
+        {'symbol': 'AAA.SH', 'composite_score': {'balanced': 90}, 'score_date': '20250920'},
+        {'symbol': 'CCC.SH', 'composite_score': {'balanced': 90}, 'score_date': '20250920'},
+        {'symbol': 'DDD.SH', 'composite_score': {'balanced': 60}, 'score_date': '20250920'},
+    ]
+    info_docs = [
+        {'symbol': 'AAA.SH', 'name': 'A Corp'},
+        {'symbol': 'CCC.SH', 'name': 'C Corp'},
+        {'symbol': 'DDD.SH', 'name': 'D Corp'},
+    ]
+    fake_db = FakeDB(stock_scores_docs=docs, stock_info_docs=info_docs)
+    _install_sw_fakes(monkeypatch, fake_db, _sw_members(), _sw_classify_docs())
+
+    resp = TestClient(app).get('/api/stock-rankings?limit=10&strategy=balanced')
+
+    assert resp.status_code == 200
+    rows = {row['symbol']: row for row in resp.json()['data']}
+    assert (rows['AAA.SH']['industry_rank'], rows['AAA.SH']['industry_total']) == (1, 3)
+    assert (rows['CCC.SH']['industry_rank'], rows['CCC.SH']['industry_total']) == (1, 3)
+    assert (rows['DDD.SH']['industry_rank'], rows['DDD.SH']['industry_total']) == (3, 3)
