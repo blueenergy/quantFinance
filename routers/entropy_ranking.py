@@ -119,8 +119,11 @@ def _hfq_return_pct(
     future_td = _normalize_date(future_doc.get("trade_date") if future_doc else None)
     base_af = adj_dao.factor_for(symbol, base_td or "", variants=_symbol_variants(symbol)) if base_td else None
     future_af = adj_dao.factor_for(symbol, future_td or "", variants=_symbol_variants(symbol)) if future_td else None
-    base_adj = base_close * (base_af if base_af is not None else 1.0)
-    future_adj = future_close * (future_af if future_af is not None else 1.0)
+    # 任一端缺因子就整体退回裸价，避免「后复权 ÷ 裸价」跨口径相除。
+    if base_af is None or future_af is None:
+        base_af = future_af = 1.0
+    base_adj = base_close * base_af
+    future_adj = future_close * future_af
     if base_adj <= 0:
         return None
     return round((future_adj / base_adj - 1.0) * 100.0, 2)

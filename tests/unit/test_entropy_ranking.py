@@ -96,3 +96,26 @@ def test_future_returns_uses_hfq_factors(monkeypatch):
 
     # hfq: (11*1.1)/(10*1.0)-1 = 21%
     assert out["future_return_1m_pct"] == pytest.approx(21.0)
+
+
+@pytest.mark.unit
+def test_future_returns_degrades_both_legs_when_one_factor_missing(monkeypatch):
+    """目标日缺因子时必须整体退裸价，不能「后复权 ÷ 裸价」。"""
+    vp = _FakeVpColl(
+        [
+            {"symbol": "600519.SH", "trade_date": "20240101", "close": 10.0},
+            {"symbol": "600519.SH", "trade_date": "20240201", "close": 11.0},
+        ],
+        [
+            # 只有基准日有因子，目标日缺失（如目标日当天因子尚未入库）
+            {"symbol": "600519.SH", "trade_date": "20240101", "adj_factor": 2.0},
+        ],
+    )
+    fake_db = _FakeDataDb()
+    fake_db._vp = vp
+    monkeypatch.setattr(entropy_ranking, "get_data_db", lambda: fake_db)
+
+    out = entropy_ranking._future_returns("600519.SH", "20240101")
+
+    # 裸价口径: 11/10-1 = 10%；旧实现会算成 11/(10*2)-1 = -45%
+    assert out["future_return_1m_pct"] == pytest.approx(10.0)

@@ -725,8 +725,13 @@ def _hfq_return_pct(
 
     end_af = _lookup_factor(_factor_pair(sym, end_doc))
     base_af = _lookup_factor(_factor_pair(sym, base_doc))
-    end_adj = end_close * (end_af if end_af is not None else 1.0)
-    base_adj = base_close * (base_af if base_af is not None else 1.0)
+    # 任一端缺因子就整体退回裸价。只回退缺的一端会变成「后复权 ÷ 裸价」：
+    # 盘中最新 bar 的 adj_factor 通常要到收盘后 ~17:35 才入库，此时
+    # 基准腿有因子、终点腿没有，涨跌会显示成 -90% 量级。
+    if end_af is None or base_af is None:
+        end_af = base_af = 1.0
+    end_adj = end_close * end_af
+    base_adj = base_close * base_af
     if base_adj <= 0:
         return None
     return (end_adj / base_adj - 1.0) * 100.0

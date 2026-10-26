@@ -1421,6 +1421,27 @@ def test_return_since_degrades_without_factor():
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize(
+    "factor_map",
+    [
+        # 只有终点腿有因子（盘中最新 bar 已入库、基准日缺失时反过来）
+        {("AAA.SH", "20251001"): 1.2},
+        # 只有基准腿有因子（盘中最新 bar 的 adj_factor 尚未入库的真实场景）
+        {("AAA.SH", "20250920"): 2.0},
+    ],
+    ids=["end_only", "base_only"],
+)
+def test_return_since_degrades_both_legs_when_one_factor_missing(factor_map):
+    """单腿缺因子时必须整体退裸价，不能「后复权 ÷ 裸价」跨口径相除。"""
+    latest = {"symbol": "AAA.SH", "trade_date": "20251001", "close": 110.0}
+    base = {"symbol": "AAA.SH", "trade_date": "20250920", "close": 100.0}
+    out = stock_ranking._return_since_from_docs(
+        latest, base, sym="AAA.SH", factor_map=factor_map
+    )
+    assert out["return_since_score_pct"] == pytest.approx(10.0)
+
+
+@pytest.mark.unit
 def test_normalize_return_as_of():
     assert stock_ranking._normalize_return_as_of(None) is None
     assert stock_ranking._normalize_return_as_of("") is None
