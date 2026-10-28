@@ -531,6 +531,109 @@ def live_snapshot_execution_backfill_task():
         _release_scheduler_job_lock(job_id)
 
 
+def trade_fill_notify_task():
+    """Push a DingTalk message for each newly filled strategy signal.
+
+    A watermark stored on this job's ``schedule_config`` row bounds the scan,
+    so historical fills are never replayed: the first run only records the
+    watermark. ``notified_at`` on the signal makes the send idempotent — it is
+    stamped only after the webhook accepts the message, so a failure retries
+    on the next tick.
+    """
+    from db import get_db_collections
+    from services.ops_notify import send_ops_alert
+
+    job_id = "trade_fill_notify"
+    if not _acquire_scheduler_job_lock(job_id, ttl_seconds=120):
+        return
+    try:
+        collections = get_db_collections()
+        config_coll = collections.get("schedule_config")
+        signals = collections["trade_signals"]
+
+        state = {}
+        if config_coll is not None:
+            state = config_coll.find_one({"job_id": job_id}) or {}
+        watermark = float(state.get("last_fill_ts") or 0.0)
+        if watermark <= 0:
+            if config_coll is not None:
+                config_coll.update_one(
+                    {"job_id": job_id},
+                    {"$set": {"last_fill_ts": time.time()}},
+                    upsert=True,
+                )
+            log.info("[FillNotify] watermark initialised; historical fills are not replayed.")
+            return
+
+        pending = list(
+            signals.find(
+                {
+                    "status": "filled",
+                    "notified_at": {"$exists": False},
+                    "updated_at": {"$gte": watermark},
+                },
+                {
+                    "symbol": 1,
+                    "action": 1,
+                    "size": 1,
+                    "filled_qty": 1,
+                    "avg_price": 1,
+                    "price": 1,
+                    "strategy": 1,
+                    "account_id": 1,
+                    "order_id": 1,
+                    "updated_at": 1,
+                    "created_at": 1,
+                },
+            )
+            .sort("updated_at", 1)
+            .limit(20)
+        )
+
+        for doc in pending:
+            price = doc.get("avg_price") or doc.get("price")
+            size = int(doc.get("filled_qty") or doc.get("size") or 0)
+            amount = float(price) * size if price else 0.0
+            ts = doc.get("updated_at") or doc.get("created_at") or time.time()
+            when = datetime.fromtimestamp(float(ts)).strftime("%Y-%m-%d %H:%M:%S")
+            lines = [
+                "**%s**  %s %s @ %s" % (
+                    doc.get("symbol"),
+                    str(doc.get("action") or "").upper(),
+                    size,
+                    price,
+                ),
+                "",
+                "- 成交金额: ¥%s" % format(amount, ",.0f"),
+                "- 策略: %s" % (doc.get("strategy") or "-"),
+                "- 账户: %s" % (doc.get("account_id") or "-"),
+                "- order_id: %s" % (doc.get("order_id") or "-"),
+                "- 时间: %s" % when,
+            ]
+            if not send_ops_alert("策略成交", lines):
+                log.warning(
+                    "[FillNotify] send failed for %s; will retry next tick",
+                    doc.get("order_id"),
+                )
+                break
+
+            signals.update_one(
+                {"_id": doc["_id"], "notified_at": {"$exists": False}},
+                {"$set": {"notified_at": time.time()}},
+            )
+            if config_coll is not None:
+                config_coll.update_one(
+                    {"job_id": job_id},
+                    {"$max": {"last_fill_ts": float(ts)}},
+                    upsert=True,
+                )
+            log.info("[FillNotify] sent %s", doc.get("order_id"))
+    except Exception as exc:
+        log.error("[FillNotify] failed: %s", exc, exc_info=True)
+    finally:
+        _release_scheduler_job_lock(job_id)
+
+
 def hot_stock_poll_task(source: str):
     """热股分析任务 - 基于最新 THS / DC 热榜数据检查并提交分析。"""
     from db import get_db_collections, get_analyzer_db
@@ -594,6 +697,7 @@ TASK_MAP = {
     'live_snapshot_intraday': live_snapshot_intraday_task,
     'live_snapshot_reconcile_intraday': live_snapshot_reconcile_task,
     'live_snapshot_execution_backfill': live_snapshot_execution_backfill_task,
+    'trade_fill_notify': trade_fill_notify_task,
 }
 
 # Default trigger configurations
@@ -715,6 +819,12 @@ DEFAULT_SCHEDULES = {
     },
     'live_snapshot_execution_backfill': {
         'name': "实盘成交后快照补偿刷新 (每30秒)",
+        'type': "interval",
+        'seconds': 30,
+        'is_active': True,
+    },
+    'trade_fill_notify': {
+        'name': "策略成交通知 (每30秒)",
         'type': "interval",
         'seconds': 30,
         'is_active': True,
