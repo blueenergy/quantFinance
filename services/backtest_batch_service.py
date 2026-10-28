@@ -12,8 +12,12 @@ from typing import Any, Dict, List, Optional, Tuple
 from bson import ObjectId
 from fastapi import HTTPException
 
-from services.backtest_batch_schemas import BacktestBatchCreate, BacktestCombo
-from services.backtest_precheck import validate_backtest_window
+from services.backtest_batch_schemas import (
+    BacktestBatchCreate,
+    BacktestCombo,
+    resolve_regime_index,
+)
+from services.backtest_precheck import validate_backtest_window, validate_regime_window
 
 MAX_COMPARE_TASKS = 500
 
@@ -249,6 +253,9 @@ def build_backtest_task_doc(
     combo_key: Optional[str] = None,
     combo_index: Optional[int] = None,
     combo_label: Optional[str] = None,
+    regime_cash: bool = False,
+    regime_index: Optional[str] = None,
+    regime_rule: Optional[str] = None,
 ) -> Dict[str, Any]:
     task_doc = {
         "task_id": new_task_id(symbol),
@@ -258,6 +265,9 @@ def build_backtest_task_doc(
         "strategy_key": strategy_key,
         "preset": preset,
         "strategy_params": strategy_params or {},
+        "regime_cash": bool(regime_cash),
+        "regime_index": regime_index if regime_cash else None,
+        "regime_rule": regime_rule if regime_cash else None,
         "start_date": start_date,
         "end_date": end_date,
         "initial_cash": initial_cash,
@@ -456,6 +466,20 @@ def create_batch(
     if symbols:
         asset_type = infer_asset_type_from_symbol(symbols[0], asset_type)
 
+    regime_cash = bool(task.regime_cash)
+    try:
+        regime_index = resolve_regime_index(
+            regime_cash=regime_cash,
+            regime_index=task.regime_index,
+            universe_type=task.universe_type,
+            universe_value=task.universe_value,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    regime_rule = task.regime_rule if regime_cash else None
+    if regime_cash:
+        validate_regime_window(regime_index, task.start_date, task.end_date)
+
     combos = resolve_combos(task)
     combo_keys_seen: set[str] = set()
     combo_entries: List[Tuple[BacktestCombo, str]] = []
@@ -512,6 +536,9 @@ def create_batch(
         "strategy_key": primary.strategy_key,
         "preset": primary.preset,
         "strategy_params": primary.strategy_params or {},
+        "regime_cash": regime_cash,
+        "regime_index": regime_index,
+        "regime_rule": regime_rule,
         "start_date": task.start_date,
         "end_date": task.end_date,
         "initial_cash": task.initial_cash,
@@ -551,6 +578,9 @@ def create_batch(
                     combo_key=combo_key,
                     combo_index=combo_index,
                     combo_label=combo.label,
+                    regime_cash=regime_cash,
+                    regime_index=regime_index,
+                    regime_rule=regime_rule,
                 )
             )
             batch_index += 1

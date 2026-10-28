@@ -472,6 +472,21 @@ def rerun_backtest_batch_sync(
         end_date=payload.end_date or batch["end_date"],
         initial_cash=payload.initial_cash or batch.get("initial_cash", 1000000.0),
         limit_symbols=0,
+        regime_cash=(
+            payload.regime_cash
+            if payload.regime_cash is not None
+            else bool(batch.get("regime_cash"))
+        ),
+        regime_index=(
+            payload.regime_index
+            if payload.regime_index is not None
+            else batch.get("regime_index")
+        ),
+        regime_rule=(
+            payload.regime_rule
+            if payload.regime_rule is not None
+            else batch.get("regime_rule")
+        ),
     )
     result = create_backtest_batch_sync(collections, current_user, new_payload)
     new_batch_id = result.get("batch_id")
@@ -1120,6 +1135,9 @@ def create_loop(
             "initial_cash": batch.get("initial_cash"),
             "universe_type": batch.get("universe_type"),
             "universe_value": batch.get("universe_value"),
+            "regime_cash": bool(batch.get("regime_cash")),
+            "regime_index": batch.get("regime_index"),
+            "regime_rule": batch.get("regime_rule"),
         }
     elif batch_config:
         payload = BacktestBatchCreate(**batch_config)

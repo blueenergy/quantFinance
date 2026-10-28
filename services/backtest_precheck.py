@@ -12,7 +12,7 @@ that is merely borderline is still allowed through to the worker.
 """
 import logging
 import math
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Dict, Iterable, Optional
 
 from fastapi import HTTPException
@@ -104,5 +104,60 @@ def validate_backtest_window(
                 f"'{strategy_key}': it needs at least {min_bars} trading bars to "
                 f"warm up its indicators, but the range holds at most {available}. "
                 f"Use a span of at least {minimum_calendar_days(min_bars)} calendar days."
+            ),
+        )
+
+
+def validate_regime_window(
+    index_code: Any,
+    start_date: Any,
+    end_date: Any,
+    *,
+    min_bars: int = 120,
+    warmup_days: int = 400,
+) -> None:
+    """Reject a regime batch before expansion when its reference index has no data.
+
+    The worker needs roughly ``warmup_days`` of index history before the first
+    backtest bar to seed the K indicators. Checking here avoids expanding one
+    bad config into hundreds of identically failing child tasks.
+    """
+    code = str(index_code or "").strip()
+    if not code:
+        raise HTTPException(status_code=422, detail="牛熊择时需要选择参照指数")
+    start = _parse_date(start_date)
+    end = _parse_date(end_date)
+    if start is None or end is None:
+        return
+
+    warm_start = (start - timedelta(days=int(warmup_days))).strftime("%Y%m%d")
+    start_text = start.strftime("%Y%m%d")
+    end_text = end.strftime("%Y%m%d")
+    try:
+        from db import get_data_db
+
+        collection = get_data_db()["index_prices"]
+        count = collection.count_documents(
+            {"ts_code": code, "trade_date": {"$gte": warm_start, "$lte": end_text}}
+        )
+        first = collection.find_one(
+            {"ts_code": code, "trade_date": {"$gte": warm_start, "$lte": start_text}},
+            {"trade_date": 1},
+            sort=[("trade_date", 1)],
+        )
+    except Exception as exc:  # noqa: BLE001 - surface a clear API error
+        log.warning("Regime index pre-check failed for %s: %s", code, exc)
+        raise HTTPException(
+            status_code=503,
+            detail=f"无法读取参照指数行情 {code}，请稍后重试",
+        ) from exc
+
+    first_date = str((first or {}).get("trade_date") or "")
+    if count < int(min_bars) or not first_date:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"参照指数 {code} 在 {warm_start}-{end_text} 只有 {count} 条行情，"
+                f"不足以做牛熊判断（至少 {min_bars} 条，且需覆盖 {start_text} 之前）"
             ),
         )

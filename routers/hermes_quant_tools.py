@@ -3927,6 +3927,9 @@ class BacktestSweepRequest(BaseModel):
     limit_symbols: int = 0
     experiment_type: str = "compare"
     combos: List[BacktestCombo] = Field(default_factory=list)
+    regime_cash: bool = False
+    regime_index: Optional[str] = None
+    regime_rule: Optional[str] = None
 
 
 @router.get("/backtest/strategies", operation_id="backtest_strategies", tags=[MCP_READ_TAG])

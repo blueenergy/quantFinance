@@ -257,6 +257,7 @@ def get_data_db():
         # Index reference/meta data (index_constituents: only quant_data; never finance)
         "index_meta": data_db["index_meta"],
         "index_constituents": data_db["index_constituents"],
+        "index_prices": data_db["index_prices"],
         # Shenwan industry classification/membership (ranking industry dimension)
         "sw_index_member": data_db["sw_index_member"],
         "sw_index_classify": data_db["sw_index_classify"],

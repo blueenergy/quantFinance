@@ -23,6 +23,7 @@ from services.backtest_batch_schemas import (
     BacktestBatchCreate,
     BacktestBatchRerunCreate,
     BacktestCombo,
+    resolve_regime_index,
 )
 from services.backtest_batch_service import (
     LEASE_RESET_FIELDS,
@@ -36,7 +37,7 @@ from services.backtest_batch_service import (
     refresh_batch_summary as _refresh_batch_summary,
     serialize_batch as _serialize_batch,
 )
-from services.backtest_precheck import validate_backtest_window
+from services.backtest_precheck import validate_backtest_window, validate_regime_window
 
 router = APIRouter(prefix="/backtest", tags=["backtest"])
 
@@ -55,6 +56,9 @@ class BacktestTaskCreate(BaseModel):
     start_date: str = Field(..., description="Backtest start date (YYYYMMDD)")
     end_date: str = Field(..., description="Backtest end date (YYYYMMDD)")
     initial_cash: float = Field(default=1000000.0, description="Initial cash for backtest")
+    regime_cash: bool = Field(default=False, description="牛市开仓、非牛空仓")
+    regime_index: Optional[str] = Field(default=None, description="参照指数；空=沪深300")
+    regime_rule: Optional[str] = Field(default=None, description="指数状态规则 preset")
 
     @field_validator("start_date", "end_date")
     @classmethod
@@ -63,6 +67,16 @@ class BacktestTaskCreate(BaseModel):
         if not value:
             raise ValueError("start_date/end_date are required")
         return value.replace("-", "")
+
+    @field_validator("regime_index")
+    @classmethod
+    def validate_regime_index(cls, v: Any) -> Optional[str]:
+        return BacktestBatchCreate.validate_regime_index(v)
+
+    @field_validator("regime_rule")
+    @classmethod
+    def validate_regime_rule(cls, v: Any) -> Optional[str]:
+        return BacktestBatchCreate.validate_regime_rule(v)
 
     model_config = ConfigDict(
         json_schema_extra = {
@@ -103,6 +117,9 @@ class BacktestTaskResponse(BaseModel):
     preset: Optional[str] = Field(default=None, description="Preset name used when creating the task")
     # 4. Use Field for default_factory for mutable types
     strategy_params: Dict[str, Any] = Field(default_factory=dict, description="Parameters for the trading strategy")
+    regime_cash: bool = Field(default=False, description="牛市开仓、非牛空仓")
+    regime_index: Optional[str] = Field(default=None, description="参照指数代码")
+    regime_rule: Optional[str] = Field(default=None, description="指数状态规则 preset")
     # 2. Use date objects for date fields
     start_date: Optional[date] = Field(None, description="Start date of the backtest period (YYYY-MM-DD)")
     end_date: Optional[date] = Field(None, description="End date of the backtest period (YYYY-MM-DD)")
@@ -332,6 +349,18 @@ async def create_backtest_task(
 
     validate_backtest_window(collections, [task.strategy_key], task.start_date, task.end_date)
 
+    regime_cash = bool(task.regime_cash)
+    try:
+        regime_index = resolve_regime_index(
+            regime_cash=regime_cash,
+            regime_index=task.regime_index,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    regime_rule = task.regime_rule if regime_cash else None
+    if regime_cash:
+        validate_regime_window(regime_index, task.start_date, task.end_date)
+
     symbol = _normalize_symbol(task.symbol, asset_type)
     task_doc = _build_backtest_task_doc(
         current_user=current_user,
@@ -343,6 +372,9 @@ async def create_backtest_task(
         start_date=task.start_date,
         end_date=task.end_date,
         initial_cash=task.initial_cash,
+        regime_cash=regime_cash,
+        regime_index=regime_index,
+        regime_rule=regime_rule,
     )
     
     result = backtest_tasks_col.insert_one(task_doc)
@@ -362,6 +394,9 @@ async def create_backtest_task(
         strategy_key=task_doc["strategy_key"],
         preset=task_doc.get("preset"),
         strategy_params=task_doc["strategy_params"],
+        regime_cash=bool(task_doc.get("regime_cash")),
+        regime_index=task_doc.get("regime_index"),
+        regime_rule=task_doc.get("regime_rule"),
         start_date=task_doc["start_date"],
         end_date=task_doc["end_date"],
         initial_cash=task_doc["initial_cash"],
@@ -594,6 +629,21 @@ async def rerun_backtest_batch(
         end_date=payload.end_date or batch["end_date"],
         initial_cash=payload.initial_cash or batch.get("initial_cash", 1000000.0),
         limit_symbols=0,
+        regime_cash=(
+            payload.regime_cash
+            if payload.regime_cash is not None
+            else bool(batch.get("regime_cash"))
+        ),
+        regime_index=(
+            payload.regime_index
+            if payload.regime_index is not None
+            else batch.get("regime_index")
+        ),
+        regime_rule=(
+            payload.regime_rule
+            if payload.regime_rule is not None
+            else batch.get("regime_rule")
+        ),
     )
     result = create_batch(collections, current_user, new_payload)
     collections["backtest_batches"].update_one(
