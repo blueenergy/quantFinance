@@ -126,6 +126,35 @@ async def get_earnings_hunter_signals(
         "data": signals
     }
 
+@router.get("/earnings/watch-reports")
+async def list_earnings_watch_reports(
+    days: int = Query(30, ge=1, le=365, description="最近 N 个自然日"),
+    symbol: Optional[str] = Query(None, description="股票代码（可带或不带 .SH/.SZ）"),
+    limit: int = Query(50, ge=1, le=200, description="返回条数"),
+    current_user: dict = Depends(get_current_active_user),
+):
+    """
+    自选/持仓定期报告的 AI 解读列表（quantAnalyzer 的 earnings_report_analysis 产出）。
+
+    按披露日倒序；symbol 传单票时用于个股工作台展示最新一份。
+    """
+    from db import get_collection
+    from utils.symbol_utils import normalize_symbol
+
+    cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y%m%d")
+    query: Dict[str, Any] = {"trade_date": {"$gte": cutoff}}
+    if symbol:
+        query["ts_code"] = normalize_symbol(symbol)
+
+    docs = list(
+        get_collection("earnings_watch_reports")
+        .find(query)
+        .sort("trade_date", -1)
+        .limit(limit)
+    )
+    return {"success": True, "count": len(docs), "data": [serialize_doc(d) for d in docs]}
+
+
 @router.post("/hunter/analyze/{signal_id}")
 async def analyze_hunter_signal(
     signal_id: str,
