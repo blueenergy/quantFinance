@@ -34,6 +34,7 @@ MCP 暴露面按 route tag 拆分为 wukong-quant-read 与 wukong-quant-actions�
   — 个人化端点（需先 user_login 获取 token 并设置 X-User-Token header）—
   POST /hermes-tools/user/login            — 用户登录，返回 JWT token
   GET  /hermes-tools/user/profile          — 当前用户账户信息
+  GET  /hermes-tools/user/portfolio        — 个人账户持仓/资金/权益只读快照
   GET  /hermes-tools/user/watchlist        — 自选股列表 + 最新量化评分排行
   POST /hermes-tools/user/watchlist/add    — 添加股票到自选股
   DEL  /hermes-tools/user/watchlist/remove/{symbol} — 从自选股删除
@@ -53,7 +54,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from auth import get_user_from_header_token, require_hermes_quant_internal_key
-from db import data_db, db, get_analyzer_db, get_db_collections, get_trading_db_collections
+from db import data_db, db, get_analyzer_db, get_data_db, get_db_collections, get_trading_db_collections
 from models.analysis_task import AnalysisMode
 from routers.market import fetch_market_analysis_result
 from routers.portfolio_research import _load_full_result_rows
@@ -551,15 +552,52 @@ async def hermes_sector_latest(
     if not doc:
         return {"success": False, "error": f"暂无 {source.upper()} 板块分析数据"}
 
-    return {
+    trade_date = str(doc.get("trade_date") or "")
+    latest_trade_date = None
+    try:
+        from db import get_data_db
+
+        today_ymd = datetime.now().strftime("%Y%m%d")
+        cal = get_data_db()["trade_calendar"].find_one(
+            {"exchange": "SSE", "is_open": 1, "trade_date": {"$lte": today_ymd}},
+            projection={"trade_date": 1},
+            sort=[("trade_date", -1)],
+        )
+        latest_trade_date = str((cal or {}).get("trade_date") or "") or None
+    except Exception:
+        latest_trade_date = None
+
+    stale = False
+    age_days = None
+    try:
+        if trade_date:
+            base_date = latest_trade_date or datetime.now().strftime("%Y%m%d")
+            age_days = (
+                datetime.strptime(base_date, "%Y%m%d")
+                - datetime.strptime(trade_date, "%Y%m%d")
+            ).days
+            stale = age_days > 0
+    except ValueError:
+        pass
+
+    response = {
         "success": True,
         "source": source,
         "trade_date": doc.get("trade_date"),
+        "latest_trade_date": latest_trade_date,
+        "stale": stale,
+        "age_days": age_days,
         "analysis": doc.get("analysis"),
         "data_summary": doc.get("data_summary"),
         "model": doc.get("model"),
         "created_at": doc["created_at"].isoformat() if doc.get("created_at") else None,
     }
+    if stale:
+        response["warning"] = (
+            "sector analysis is older than the latest market date; "
+            "do not use it as current market evidence"
+        )
+    return response
 
 
 # ---------------------------------------------------------------------------
@@ -3532,6 +3570,38 @@ async def user_profile(
         "created_at": str(user.get("created_at", "")),
         "last_login": str(user.get("last_login", "")),
     }
+
+
+# ---------------------------------------------------------------------------
+# 用户组合快照（只读）
+# ---------------------------------------------------------------------------
+
+@router.get("/user/portfolio", operation_id="portfolio_snapshot", tags=[MCP_READ_TAG])
+async def user_portfolio_snapshot(
+    securities_account_id: Optional[str] = Query(
+        None, description="可选账户 ID；不传则取该用户最近同步的账户"
+    ),
+    equity_limit: int = Query(20, ge=1, le=120, description="返回最近 N 个交易日的权益曲线"),
+    user: dict = Depends(get_user_from_header_token),
+    _: bool = Depends(require_hermes_quant_internal_key),
+):
+    """
+    获取当前登录用户的只读组合快照：账户资金、持仓、权重、浮盈亏、最近权益曲线。
+
+    需要 X-User-Token。`data_quality.warnings` 会显式标注：
+    - total_asset 源为 0（按 market_value + cash 计算）
+    - 账户同步过期
+    - 最新 trader_account_equity 与账户快照差异 > 0.5%（16:00 初值 vs 最终 sync）
+    """
+    from services.portfolio_snapshot import build_portfolio_snapshot
+
+    return build_portfolio_snapshot(
+        user["id"],
+        get_db_collections(),
+        get_data_db(),
+        securities_account_id=securities_account_id,
+        equity_limit=equity_limit,
+    )
 
 
 # ---------------------------------------------------------------------------

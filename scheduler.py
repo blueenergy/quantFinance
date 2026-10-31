@@ -251,6 +251,61 @@ def generate_market_analysis_task(job_id: str):
         log.error(f"[Market Analysis] Scheduling failed: {e}", exc_info=True)
 
 
+def generate_sector_concept_analysis_task(job_id: str):
+    """Schedule daily DC/THS sector concept analysis after the close.
+
+    The cache read by the MCP ``sector_latest`` tool is produced by this task;
+    without a scheduler entry it only refreshes when someone hits the manual
+    ``/sector-concept/analyze`` endpoint.
+    """
+    from db import get_db_collections
+    from services.analysis_tasks import build_task_doc
+
+    try:
+        collections = get_db_collections()
+        tasks_col = collections["analysis_tasks"]
+        users_coll = collections["users"]
+
+        today_str = datetime.now().strftime("%Y%m%d")
+        source = "ths" if job_id.endswith("_ths") else "dc"
+        admin_user = users_coll.find_one({"username": "admin", "is_admin": True})
+        user_id = str(admin_user["_id"]) if admin_user else "system"
+
+        existing = tasks_col.find_one({
+            "type": "sector_concept_analysis",
+            "params.date": today_str,
+            "params.source": source,
+            "status": {"$in": ["pending", "processing"]},
+        })
+        if existing:
+            log.info(
+                "[Sector Concept] Task '%s' already pending for %s, skipping.",
+                job_id,
+                today_str,
+            )
+            return
+
+        task_doc = build_task_doc(
+            current_user={
+                "id": user_id,
+                "username": "system" if user_id == "system" else "admin",
+            },
+            task_type="sector_concept_analysis",
+            priority=20,
+            params={"date": today_str, "source": source},
+            source="scheduler",
+        )
+        result = tasks_col.insert_one(task_doc)
+        log.info(
+            "[Sector Concept] Scheduled task %s for %s source=%s",
+            result.inserted_id,
+            today_str,
+            source,
+        )
+    except Exception as e:
+        log.error("[Sector Concept] Scheduling failed: %s", e, exc_info=True)
+
+
 def generate_global_analysis_task(job_id: str):
     """Schedule Global Market Analysis task (Runs at 08:30 AM)."""
     from db import get_db_collections
@@ -682,6 +737,7 @@ TASK_MAP = {
     'market_analysis_1630': generate_market_analysis_task,
     'global_analysis_0830': generate_global_analysis_task,
     'iv_analysis_1510': generate_iv_analysis_task,
+    'sector_concept_analysis_dc': generate_sector_concept_analysis_task,
     'hot_stock_poll_ths': lambda: hot_stock_poll_task('ths'),
     'hot_stock_poll_dc': lambda: hot_stock_poll_task('dc'),
     'theme_lag_validation_subscribe_1530': lambda: theme_lag_validation_subscription_scan_task(
@@ -694,6 +750,7 @@ TASK_MAP = {
     'strategy_lab_loop_tick': strategy_lab_loop_tick_task,
     't0_signal_evaluation': t0_signal_evaluation_task,
     'equity_snapshot_eod': equity_snapshot_eod_task,
+    'equity_snapshot_final': equity_snapshot_eod_task,
     'live_snapshot_intraday': live_snapshot_intraday_task,
     'live_snapshot_reconcile_intraday': live_snapshot_reconcile_task,
     'live_snapshot_execution_backfill': live_snapshot_execution_backfill_task,
@@ -735,6 +792,14 @@ DEFAULT_SCHEDULES = {
         'name': "A股波动率分析 (15:10)",
         'type': "cron",
         'hour': 15,
+        'minute': 10,
+        'day_of_week': 'mon-fri',
+        'is_active': True,
+    },
+    'sector_concept_analysis_dc': {
+        'name': "板块/概念 AI 分析 (16:10)",
+        'type': "cron",
+        'hour': 16,
         'minute': 10,
         'day_of_week': 'mon-fri',
         'is_active': True,
@@ -794,10 +859,18 @@ DEFAULT_SCHEDULES = {
         'is_active': True,
     },
     'equity_snapshot_eod': {
-        'name': "实盘资金曲线盘后快照 (16:00)",
+        'name': "实盘资金曲线盘后初值 (16:00)",
         'type': "cron",
         'hour': 16,
         'minute': 0,
+        'day_of_week': 'mon-fri',
+        'is_active': True,
+    },
+    'equity_snapshot_final': {
+        'name': "实盘资金曲线收盘终值快照 (21:30)",
+        'type': "cron",
+        'hour': 21,
+        'minute': 30,
         'day_of_week': 'mon-fri',
         'is_active': True,
     },
@@ -868,7 +941,12 @@ def sync_job(job_id, config_data):
         import functools
         
         # Pass job_id if the function expects it (by name match)
-        if "market_analysis_" in job_id or "global_analysis" in job_id or "iv_analysis" in job_id:
+        if (
+            "market_analysis_" in job_id
+            or "global_analysis" in job_id
+            or "iv_analysis" in job_id
+            or "sector_concept_analysis_" in job_id
+        ):
             task_callable = functools.partial(task_func, job_id=job_id)
         else:
             task_callable = task_func
