@@ -13,6 +13,8 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional
 from zoneinfo import ZoneInfo
 
+from bson import ObjectId
+
 SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
 ACCOUNT_SNAPSHOT_STALE_SECONDS = 6 * 60 * 60
 
@@ -355,4 +357,66 @@ def build_portfolio_snapshot(
             "names": "quant_data.stock_info",
             "trade_date": "quant_data.volume_price",
         },
+    }
+
+
+def build_all_portfolio_snapshots(
+    finance_collections: Dict[str, Any],
+    data_collections: Dict[str, Any],
+    *,
+    equity_limit: int = 20,
+) -> Dict[str, Any]:
+    """Build one snapshot per account owner.
+
+    The route layer must enforce ``is_admin`` before calling this: it returns
+    every owner's positions and must never be reachable by a normal user.
+    """
+    user_ids = sorted(
+        {
+            str(row.get("user_id"))
+            for row in finance_collections["trader_accounts"].find({}, {"user_id": 1})
+            if row.get("user_id")
+        }
+    )
+
+    accounts: List[Dict[str, Any]] = []
+    errors: List[Dict[str, Any]] = []
+    for user_id in user_ids:
+        snapshot = build_portfolio_snapshot(
+            user_id,
+            finance_collections,
+            data_collections,
+            equity_limit=equity_limit,
+        )
+        if not snapshot.get("success"):
+            errors.append({"user_id": user_id, "error": snapshot.get("error")})
+            continue
+
+        user_doc: Dict[str, Any] = {}
+        try:
+            user_doc = finance_collections["users"].find_one({"_id": ObjectId(user_id)}) or {}
+        except Exception:
+            try:
+                user_doc = finance_collections["users"].find_one({"_id": user_id}) or {}
+            except Exception:
+                user_doc = {}
+        snapshot["username"] = user_doc.get("username")
+        snapshot["is_admin"] = bool(user_doc.get("is_admin", False))
+        accounts.append(snapshot)
+
+    accounts.sort(key=lambda item: str((item.get("account") or {}).get("account_id") or ""))
+    totals = {
+        "accounts": len(accounts),
+        "total_asset": round(sum(_numeric((item.get("account") or {}).get("total_asset")) for item in accounts), 2),
+        "market_value": round(sum(_numeric((item.get("account") or {}).get("market_value")) for item in accounts), 2),
+        "cash": round(sum(_numeric((item.get("account") or {}).get("cash")) for item in accounts), 2),
+    }
+    return {
+        "success": True,
+        "snapshot_version": "v0.2",
+        "all_accounts": True,
+        "generated_at": datetime.now(SHANGHAI_TZ).isoformat(),
+        "totals": totals,
+        "accounts": accounts,
+        "errors": errors,
     }

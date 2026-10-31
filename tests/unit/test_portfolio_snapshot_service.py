@@ -1,6 +1,15 @@
+import asyncio
 import time
 
-from services.portfolio_snapshot import build_portfolio_snapshot
+import pytest
+from bson import ObjectId
+from fastapi import HTTPException
+
+from routers import hermes_quant_tools as h
+from services.portfolio_snapshot import (
+    build_all_portfolio_snapshots,
+    build_portfolio_snapshot,
+)
 
 
 class _Cursor(list):
@@ -236,3 +245,148 @@ def test_build_snapshot_selects_requested_account():
 
     assert snap["account"]["account_id"] == "acct-2"
     assert snap["data_quality"]["positions_count"] == 1
+
+
+UID_PERSONAL = "6a5122cb2703714b7ba223bf"
+UID_SYSTEM = "6a563b1b433b707247eca2d0"
+
+
+def _two_account_finance():
+    finance = {
+        "users": _Collection(
+            [
+                {"_id": ObjectId(UID_PERSONAL), "username": "shuyolin", "is_admin": True},
+                {"_id": ObjectId(UID_SYSTEM), "username": "blue_energy", "is_admin": False},
+            ]
+        ),
+        "trader_accounts": _Collection(
+            [
+                _account(
+                    user_id=UID_PERSONAL,
+                    securities_account_id="sec-1",
+                    account_id="8885156549",
+                    total_asset=300.0,
+                    market_value=200.0,
+                    cash=100.0,
+                ),
+                _account(
+                    user_id=UID_SYSTEM,
+                    securities_account_id="sec-2",
+                    account_id="62129066",
+                    total_asset=500.0,
+                    market_value=400.0,
+                    cash=100.0,
+                ),
+            ]
+        ),
+        "trader_positions": _Collection(
+            [
+                _position(
+                    "600114.SH", 10, 10.0, 8.0, 80.0,
+                    user_id=UID_PERSONAL, securities_account_id="sec-1",
+                ),
+                _position(
+                    "600114.SH", 20, 10.0, 8.0, 160.0,
+                    user_id=UID_SYSTEM, securities_account_id="sec-2",
+                ),
+            ]
+        ),
+        "trader_account_equity": _Collection(
+            [
+                _equity("20261030", 300.0, user_id=UID_PERSONAL, securities_account_id="sec-1"),
+                _equity("20261030", 500.0, user_id=UID_SYSTEM, securities_account_id="sec-2"),
+            ]
+        ),
+    }
+    data = {
+        "stock_info": _Collection(
+            [
+                {"symbol": "600114.SH", "name": "东睦股份", "industry": "机械基件", "sw_l1": "机械设备"},
+            ]
+        ),
+        "volume_price": _Collection([{"trade_date": "20261030"}]),
+    }
+    return finance, data
+
+
+def test_build_all_snapshots_returns_each_account_with_username():
+    finance, data = _two_account_finance()
+
+    result = build_all_portfolio_snapshots(finance, data)
+
+    assert result["success"] is True
+    assert result["all_accounts"] is True
+    assert result["totals"] == {
+        "accounts": 2,
+        "total_asset": 800.0,
+        "market_value": 600.0,
+        "cash": 200.0,
+    }
+    by_account = {item["account"]["account_id"]: item for item in result["accounts"]}
+    assert set(by_account) == {"8885156549", "62129066"}
+    assert by_account["8885156549"]["username"] == "shuyolin"
+    assert by_account["8885156549"]["is_admin"] is True
+    assert by_account["62129066"]["username"] == "blue_energy"
+    assert by_account["62129066"]["is_admin"] is False
+    assert len(by_account["8885156549"]["positions"]) == 1
+    assert len(by_account["62129066"]["positions"]) == 1
+
+
+def test_portfolio_all_accounts_rejects_non_admin(monkeypatch):
+    finance, data = _two_account_finance()
+    monkeypatch.setattr(h, "get_db_collections", lambda: finance)
+    monkeypatch.setattr(h, "get_data_db", lambda: data)
+
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(
+            h.user_portfolio_snapshot(
+                all_accounts=True,
+                equity_limit=20,
+                user={"id": UID_SYSTEM, "is_admin": False},
+                _=True,
+            )
+        )
+
+    assert exc.value.status_code == 403
+
+
+def test_portfolio_all_accounts_returns_both_for_admin(monkeypatch):
+    finance, data = _two_account_finance()
+    monkeypatch.setattr(h, "get_db_collections", lambda: finance)
+    monkeypatch.setattr(h, "get_data_db", lambda: data)
+
+    result = asyncio.run(
+        h.user_portfolio_snapshot(
+            all_accounts=True,
+            equity_limit=20,
+            user={"id": UID_PERSONAL, "is_admin": True},
+            _=True,
+        )
+    )
+
+    assert result["success"] is True
+    assert result["totals"]["accounts"] == 2
+    assert {item["account"]["account_id"] for item in result["accounts"]} == {
+        "8885156549",
+        "62129066",
+    }
+
+
+def test_portfolio_single_account_shape_unchanged(monkeypatch):
+    finance, data = _two_account_finance()
+    monkeypatch.setattr(h, "get_db_collections", lambda: finance)
+    monkeypatch.setattr(h, "get_data_db", lambda: data)
+
+    result = asyncio.run(
+        h.user_portfolio_snapshot(
+            securities_account_id=None,
+            all_accounts=False,
+            equity_limit=20,
+            user={"id": UID_PERSONAL, "is_admin": True},
+            _=True,
+        )
+    )
+
+    assert result["success"] is True
+    assert result["account"]["account_id"] == "8885156549"
+    assert "accounts" not in result
