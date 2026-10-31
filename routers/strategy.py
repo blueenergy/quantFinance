@@ -63,6 +63,11 @@ def list_strategies(current_user: Dict = Depends(get_current_user)) -> Dict[str,
 				"allow_live": s.get("allow_live", True),
 				"allow_backtest": s.get("allow_backtest", True),
 				"min_service_level": s.get("min_service_level", "free"),
+				# Minute/daily variants share a family so the UI can show one
+				# strategy with a cadence selector instead of two columns.
+				"family": s.get("family", key),
+				"family_name": s.get("family_name", s.get("name", key)),
+				"cadence": s.get("cadence", "minute"),
 			}
 			# 标记 VIP 专属策略 based on min_service_level
 			if item["min_service_level"] == "vip":
