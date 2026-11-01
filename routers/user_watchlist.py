@@ -350,23 +350,33 @@ def set_watchlist_strategy(req: WatchlistStrategySetRequest, current_user: dict 
 # ==================== 自选股详细信息 ====================
 
 @router.get("/watchlist-stocks")
-def get_user_watchlist_stocks(current_user: dict = Depends(get_current_active_user)):
-    """获取当前用户自选股的详细信息（日K线数据）"""
+def get_user_watchlist_stocks(
+    symbols: Optional[str] = None,
+    current_user: dict = Depends(get_current_active_user),
+):
+    """获取自选股的详细信息（日K线数据）。
+
+    默认读取用户自选股；显式传 ``symbols``（逗号分隔）时只查这些代码，
+    供「策略配置」页的持仓视图复用名称/行情，而不必先把股票加进自选股。
+    """
     try:
         user_id = get_user_id(current_user)
-        
-        # 获取用户自选股列表
+
         collections = get_db_collections()
         data_collections = get_data_db()
         user_watchlists_collection = collections["user_watchlists"]
-        watchlist_doc = user_watchlists_collection.find_one({"user_id": user_id})
-        if not watchlist_doc or not watchlist_doc.get("symbols"):
-            return {
-                "success": True,
-                "data": []
-            }
-        
-        symbols = watchlist_doc["symbols"]
+
+        if symbols:
+            symbol_list = [s.strip() for s in symbols.split(",") if s.strip()]
+        else:
+            watchlist_doc = user_watchlists_collection.find_one({"user_id": user_id})
+            if not watchlist_doc or not watchlist_doc.get("symbols"):
+                return {
+                    "success": True,
+                    "data": []
+                }
+            symbol_list = watchlist_doc["symbols"]
+
         result = []
 
         volume_price_col = data_collections["volume_price"]
@@ -374,10 +384,10 @@ def get_user_watchlist_stocks(current_user: dict = Depends(get_current_active_us
         etf_daily_col = data_collections.get("etf_daily")
         sw_industry_map = _load_sw_industry_map(
             data_collections.get("sw_index_member"),
-            symbols,
+            symbol_list,
         )
         
-        for symbol in symbols:
+        for symbol in symbol_list:
             industry = ""
             sw_industry = sw_industry_map.get(remove_exchange_suffix(symbol))
             # Check Stock first
