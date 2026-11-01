@@ -233,6 +233,9 @@ class RecordResponseModel(BaseModel):
     high: Optional[float] = None
     low: Optional[float] = None
     volume: Optional[float] = None
+    amount: Optional[float] = None
+    volume_unit: Optional[str] = None
+    amount_unit: Optional[str] = None
     composite_score: Optional[float] = None
     cycle_score: Optional[float] = None
     growth_score: Optional[float] = None
@@ -361,6 +364,7 @@ _RECORDS_PROJECT_KLINE = {
         "high": 1,
         "low": 1,
         "volume": 1,
+        "amount": 1,
         "name": 1,
     }
 }
@@ -442,6 +446,20 @@ def _etf_records_or_none(
     )
 
 
+def _annotate_kline_units(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Label stock/ETF daily bars: volume in hands, amount in thousand yuan.
+
+    Both ``volume_price`` and ``etf_daily`` are tushare-shaped (vol=手,
+    amount=千元). The chart would otherwise be free to misread the same number
+    as yuan, which is a silent 1000× error.
+    """
+    for row in rows:
+        row.setdefault("volume_unit", "hands")
+        if row.get("amount") is not None:
+            row.setdefault("amount_unit", "qian_yuan")
+    return rows
+
+
 @router.get("/records/", response_model=List[RecordResponseModel])
 def get_records(
     symbol: Optional[str] = Query(None),
@@ -457,7 +475,7 @@ def get_records(
 ):
     etf_docs = _etf_records_or_none(symbol, limit, start_date, end_date, adjust)
     if etf_docs is not None:
-        return etf_docs
+        return _annotate_kline_units(etf_docs)
 
     query = {}
     if symbol:
@@ -520,7 +538,7 @@ def get_records(
         docs = _attach_finance_scores(docs)
     if not include_scores or not any(row.get("name") for row in docs):
         docs = _stamp_kline_name(docs, symbol)
-    return _attach_decision_gs_fields(docs)
+    return _annotate_kline_units(_attach_decision_gs_fields(docs))
 
 
 def _attach_decision_gs_fields(docs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:

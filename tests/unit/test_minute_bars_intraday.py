@@ -43,6 +43,7 @@ def day_1m(ymd: str, symbol: str = "000001.SZ"):
                 "low": close - 0.05,
                 "close": close,
                 "volume": 100,
+                "amount": 1000.0,
             }
         )
     return rows
@@ -127,6 +128,7 @@ def test_build_intraday_gs_bars_stamps_formula_and_keeps_closed_30m():
     assert bars[-1]["is_partial"] is False
     assert bars[0]["gs_formula_id"] == "decision_gs_v1"
     assert bars[0]["mj20"] is not None
+    assert bars[0]["amount"] == 30000.0
     assert all(row["gs_signal"] is None for row in bars)
 
 
@@ -144,6 +146,9 @@ def test_get_minute_bars_1m_unchanged(monkeypatch, authed_client):
     assert body["count"] == 240
     assert "gs_formula_id" not in body["data"][0]
     assert body["data"][0]["trade_date"] == "202609070931"
+    assert body["data"][0]["amount"] == 1000.0
+    assert body["data"][0]["amount_unit"] == "yuan"
+    assert body["data"][0]["volume_unit"] == "hands"
     assert body["day"] == "20260907"
 
 
@@ -192,6 +197,8 @@ def test_get_minute_bars_30m_resamples_and_attaches_gs(monkeypatch, authed_clien
     assert body["tf"] == "30m"
     assert body["count"] == 8
     assert body["data"][0]["gs_formula_id"] == "decision_gs_v1"
+    assert body["data"][0]["amount"] == 30000.0
+    assert body["data"][0]["amount_unit"] == "yuan"
     assert {row["trade_date"][:8] for row in body["data"]} == {"20260907"}
     gte = coll.last_query["trade_date"]["$gte"]
     assert gte < "202609070000"

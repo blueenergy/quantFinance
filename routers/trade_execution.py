@@ -643,6 +643,15 @@ def _log_trade_timing(label: str, started_at: float, **parts: Any) -> None:
     log.warning("%s timing total=%.3fs %s", label, elapsed, suffix)
 
 
+def _annotate_minute_units(bars: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Label minute bars: volume in hands, amount in yuan (QMT native)."""
+    for bar in bars:
+        bar.setdefault("volume_unit", "hands")
+        if bar.get("amount") is not None:
+            bar.setdefault("amount_unit", "yuan")
+    return bars
+
+
 @router.get("/minute-bars/", summary="获取股票分钟K线数据")
 def get_minute_bars(
     symbol: str = Query(..., description="股票代码"),
@@ -723,6 +732,7 @@ def get_minute_bars(
                 end_date=visible_end,
                 limit=limit,
             )
+        bars = _annotate_minute_units(bars)
 
         payload: Dict[str, Any] = {
             "success": True,

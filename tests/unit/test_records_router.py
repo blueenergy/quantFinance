@@ -92,6 +92,33 @@ def test_get_records_and_project(monkeypatch, empty_adj):
 
 
 @pytest.mark.unit
+def test_get_records_includes_amount_and_units(monkeypatch, empty_adj):
+    docs = [
+        {
+            '_id': '000000000000000000000001',
+            'symbol': '000001',
+            'trade_date': '20250920',
+            'open': 10.0,
+            'high': 11.0,
+            'low': 9.0,
+            'close': 12.0,
+            'volume': 100,
+            'amount': 2000.0,
+        },
+    ]
+    monkeypatch.setattr(records, 'collection', FakeCollection(docs))
+
+    client = TestClient(app)
+    resp = client.get('/api/records/?symbol=000001&limit=1')
+    assert resp.status_code == 200
+    row = resp.json()[0]
+    assert row['volume'] == 100.0
+    assert row['amount'] == 2000.0
+    assert row['volume_unit'] == 'hands'
+    assert row['amount_unit'] == 'qian_yuan'
+
+
+@pytest.mark.unit
 def test_get_records_attaches_decision_gs(monkeypatch, empty_adj):
     docs = [
         {
