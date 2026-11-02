@@ -26,6 +26,7 @@ MCP 暴露面按 route tag 拆分为 wukong-quant-read 与 wukong-quant-actions�
   GET  /hermes-tools/shenwan/pe-pb           — 申万行业指数月度 PE/PB 历史分位
   GET  /hermes-tools/stock/screen            — 智能选股：多条件财务筛选 + 申万行业
   GET  /hermes-tools/stock/foreign-top10-floatholders — 外资投行进入前十大流通股东筛选
+  GET  /hermes-tools/institutional/holdings-summary — 社保/养老金/险资/外资前十大流通股东汇总
 
   — 组合研究（参数扫描）端点（需 X-User-Token）—
   GET  /hermes-tools/portfolio-research/jobs            — 列出组合研究任务，定位 job_id
@@ -67,6 +68,8 @@ from services.backtest_batch_service import (
     list_batch_result_rows,
     refresh_batch_summary,
 )
+from services.holder_taxonomy import ALL_CATEGORIES, parse_categories
+from services.institutional_holdings import build_institutional_holdings_summary
 from services.ladder_daily import build_daily_ladder_payload
 
 MCP_READ_TAG = "Hermes quant read tools"
@@ -4550,3 +4553,133 @@ async def hermes_portfolio_research_result(
     if include_rows:
         payload["rows"] = [_compact_row(row) for row in rows]
     return payload
+
+
+# ---------------------------------------------------------------------------
+# 险资/社保/外资前十大流通股东汇总
+# ---------------------------------------------------------------------------
+
+def _holder_stock_info_map(codes: List[str]) -> Dict[str, Dict[str, Any]]:
+    if not codes:
+        return {}
+    try:
+        rows = data_db["stock_info"].find(
+            {
+                "$or": [
+                    {"symbol": {"$in": codes}},
+                    {"ts_code": {"$in": codes}},
+                ]
+            },
+            {"_id": 0, "symbol": 1, "ts_code": 1, "name": 1, "industry": 1},
+        )
+    except Exception:
+        return {}
+    out: Dict[str, Dict[str, Any]] = {}
+    for row in rows:
+        meta = {"name": row.get("name") or "", "industry": row.get("industry") or ""}
+        for key in (row.get("symbol"), row.get("ts_code")):
+            if key:
+                out[str(key)] = meta
+    return out
+
+
+def _latest_previous_holder_period(collection: Any, period: str) -> Optional[str]:
+    try:
+        values = collection.distinct("end_date", {"end_date": {"$lt": period}})
+    except Exception:
+        values = []
+    valid = sorted(str(value) for value in values if value)
+    return valid[-1] if valid else None
+
+
+def _institutional_holdings_summary_payload(
+    *,
+    period: str,
+    categories: Optional[str] = None,
+    previous_period: Optional[str] = None,
+    industry: Optional[str] = None,
+    new_only: bool = False,
+    top_n: int = 20,
+    collection: Any = None,
+) -> Dict[str, Any]:
+    normalized_period = str(period or "").strip()
+    if len(normalized_period) != 8 or not normalized_period.isdigit():
+        return {"success": False, "error": "period 必须是 YYYYMMDD，例如 20260930"}
+
+    coll = collection or data_db["top10_floatholders"]
+    resolved_previous = (
+        str(previous_period).strip() if previous_period else None
+    ) or _latest_previous_holder_period(coll, normalized_period)
+    selected_categories = parse_categories(categories)
+
+    projection = {"_id": 0, "ts_code": 1, "holder_name": 1, "raw": 1}
+    try:
+        current_rows = list(coll.find({"end_date": normalized_period}, projection))
+        previous_rows = (
+            list(coll.find({"end_date": resolved_previous}, projection))
+            if resolved_previous
+            else []
+        )
+    except Exception as exc:
+        logger.exception("institutional holdings summary query failed")
+        return {"success": False, "error": f"公募/机构持仓数据暂时不可用: {exc}"}
+
+    codes = sorted(
+        {
+            str(row.get("ts_code") or "")
+            for row in current_rows + previous_rows
+            if row.get("ts_code")
+        }
+    )
+    stock_info = _holder_stock_info_map(codes)
+    summary = build_institutional_holdings_summary(
+        current_rows,
+        previous_rows,
+        period=normalized_period,
+        previous_period=resolved_previous,
+        categories=selected_categories,
+        stock_info=stock_info,
+        industry=industry,
+        new_only=new_only,
+        top_n=top_n if isinstance(top_n, int) else 20,
+    )
+    payload: Dict[str, Any] = {"success": True, **summary}
+    if not current_rows:
+        payload["warning"] = (
+            f"{normalized_period} 没有 top10_floatholders 数据；"
+            "请先运行 run_holder_snapshot_sync --period"
+        )
+    return payload
+
+
+@router.get(
+    "/institutional/holdings-summary",
+    operation_id="institutional_holdings_summary",
+    tags=[MCP_READ_TAG],
+)
+def institutional_holdings_summary(
+    period: str = Query(..., description="报告期 YYYYMMDD，例如 20260930"),
+    categories: Optional[str] = Query(
+        None,
+        description=(
+            "逗号分隔类别；默认 all。可选 social_security / pension / insurance / "
+            "foreign_bank / foreign_asset_manager / hksc，或社保/养老金/险资/外资/北向"
+        ),
+    ),
+    previous_period: Optional[str] = Query(
+        None, description="上一期 YYYYMMDD；不传则取该期之前最近一期"
+    ),
+    industry: Optional[str] = Query(None, description="按 stock_info.industry 过滤"),
+    new_only: bool = Query(False, description="top_stocks 仅返回较上一期新进的股票"),
+    top_n: int = Query(20, ge=1, le=100, description="每类 Top 股票/机构数量"),
+    _: bool = Depends(require_hermes_quant_internal_key),
+):
+    """按报告期汇总社保/养老金/险资/外资等前十大流通股东持仓。"""
+    return _institutional_holdings_summary_payload(
+        period=period,
+        categories=categories,
+        previous_period=previous_period,
+        industry=industry,
+        new_only=new_only,
+        top_n=top_n,
+    )
