@@ -56,24 +56,27 @@ _JUNK_FUND = re.compile(
 )
 
 _FOREIGN_ASSET_MANAGER = re.compile(
-    r"BLACKROCK|贝莱德|VANGUARD|先锋领航|先锋基金|FIDELITY|富达|SCHRODER|施罗德|"
+    r"BLACKROCK|贝莱德|VANGUARD|先锋领航|先锋基金|"
+    r"FIDELITY|富达基金|富达国际|富达香港|SCHRODER|施罗德|"
     r"\bFIL\b|MSCI|MORGAN\s*STANLEY\s*INVESTMENT|摩根士丹利(国际)?投资管理|"
     r"瑞银(资产|基金)",
     re.I,
 )
 
 _FOREIGN_BANK = re.compile(
-    r"GOLDMAN|高盛|MORGAN\s*STANLEY|摩根士丹利|摩根斯坦利|"
+    r"GOLDMAN|高盛国际|高盛公司|高盛集团|高盛高华|高盛[（(]亚洲[）)]|"
+    r"MORGAN\s*STANLEY|摩根士丹利|摩根斯坦利|"
     r"J\.?\s*P\.?\s*MORGAN|JP\s*MORGAN|摩根大通|JPM|"
-    r"\bUBS\b|瑞银|BARCLAYS?|BARCARLY|巴克莱|"
-    r"CITI(GROUP|BANK|CORP|GLOBAL|SECUR)|\bCITI\b|花旗|"
+    r"\bUBS\b|瑞银证券|瑞银集团|UBS\s*AG|"
+    r"BARCLAYS?|BARCARLY|巴克莱银行|巴克莱|"
+    r"CITI(GROUP|BANK|CORP|GLOBAL|SECUR)|\bCITI\b|花旗银行|花旗环球|"
     r"STANDARD\s*CHARTERED|渣打|SCB\s*HK|SC\s*BANK|"
     r"BNP|PARIBAS|法巴|巴黎银行|"
     r"DEUTSCHE|德意志|德银|DB\s*GLOBAL|"
     r"SOCIE?TE?\s*GENERALE|法兴|法国兴业|SG\s*SEC|"
-    r"CREDIT\s*SUISSE|瑞信|"
+    r"CREDIT\s*SUISSE|瑞士信贷|瑞信证券|瑞信银行|"
     r"BANK\s*OF\s*AMERICA|BAML|美银|美国银行|"
-    r"NOMURA|野村|HSBC|汇丰(?!金)",
+    r"NOMURA|野村|HSBC|汇丰银行|香港上海汇丰",
     re.I,
 )
 

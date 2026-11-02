@@ -88,8 +88,20 @@ def test_holder_taxonomy_core_and_exclusions():
     assert classify_holder("香港中央结算有限公司") == "hksc"
     assert classify_holder("贝莱德基金") == "foreign_asset_manager"
     assert classify_holder("先锋领航基金") == "foreign_asset_manager"
+    assert classify_holder("富达基金") == "foreign_asset_manager"
     assert classify_holder("程先锋") is None
     assert classify_holder("中国银行-摩根士丹利数字经济混合型证券投资基金") is None
+    assert classify_holder("深圳市汇丰源投资有限公司") is None
+    assert classify_holder("山东汇丰铸造科技股份有限公司") is None
+    assert classify_holder("百瑞信托有限责任公司") is None
+    assert classify_holder("威海弘阳瑞信息技术中心(有限合伙)") is None
+    assert classify_holder("珠海瑞信投资管理有限公司") is None
+    assert classify_holder("高盛尔") is None
+    assert classify_holder("安吉高盛投资合伙企业(有限合伙)") is None
+    assert classify_holder("深圳市创东方富达投资企业(有限合伙)") is None
+    assert classify_holder("香港上海汇丰银行有限公司") == "foreign_bank"
+    assert classify_holder("高盛国际-自有资金") == "foreign_bank"
+    assert classify_holder("瑞士信贷") == "foreign_bank"
     assert classify_holder("国投瑞银国家安全灵活配置混合型证券投资基金") is None
 
 
@@ -200,3 +212,71 @@ def test_summary_flags_partial_previous_coverage():
     assert result["comparison"]["reliable"] is False
     assert result["comparison"]["previous_coverage_ratio"] == 0.5
     assert any("覆盖不足" in caveat for caveat in result["caveats"])
+
+
+def test_change_type_uses_ratio_when_amount_is_distorted():
+    current = [
+        _row(
+            "601328.SH",
+            "香港上海汇丰银行有限公司",
+            141.36 * YI,
+            ratio=15.99,
+            float_ratio=15.99,
+        )
+    ]
+    previous = [
+        _row(
+            "601328.SH",
+            "香港上海汇丰银行有限公司",
+            141.36 * YI,
+            ratio=15.99,
+            float_ratio=15.99,
+            end_date="20260630",
+        )
+    ]
+    result = build_institutional_holdings_summary(
+        current,
+        previous,
+        period="20260930",
+        previous_period="20260630",
+        stock_info={"601328.SH": {"name": "交通银行", "industry": "银行"}},
+        top_n=5,
+    )
+    row = result["top_stocks"]["foreign_bank"][0]
+    assert row["change_type"] == "unchanged"
+    assert row["change_ratio_pp"] == 0.0
+    assert row["change_amount_yi"] == 0.0
+
+
+def test_change_type_ratio_can_differ_from_amount():
+    current = [
+        _row(
+            "601009.SH",
+            "法国巴黎银行(含QFII)",
+            120 * YI,
+            ratio=1.5,
+            float_ratio=1.5,
+        )
+    ]
+    previous = [
+        _row(
+            "601009.SH",
+            "法国巴黎银行(含QFII)",
+            100 * YI,
+            ratio=2.0,
+            float_ratio=2.0,
+            end_date="20260630",
+        )
+    ]
+    result = build_institutional_holdings_summary(
+        current,
+        previous,
+        period="20260930",
+        previous_period="20260630",
+        stock_info={"601009.SH": {"name": "南京银行", "industry": "银行"}},
+        top_n=5,
+    )
+    row = result["top_stocks"]["foreign_bank"][0]
+    assert row["change_amount_yi"] == 20.0
+    assert row["change_ratio_pp"] == -0.5
+    assert row["change_type"] == "decreased"

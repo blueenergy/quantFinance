@@ -93,15 +93,28 @@ def _filter_industry(
     return out
 
 
-def _change_type(current: float, previous: float, has_current: bool, has_previous: bool) -> str:
+def _change_type(
+    current_ratio: float,
+    previous_ratio: float,
+    current_amount: float,
+    previous_amount: float,
+    has_current: bool,
+    has_previous: bool,
+) -> str:
+    """Classify by disclosed share ratio, falling back to amount.
+
+    Tushare ``hold_amount`` is not always the report-date market value (and for
+    strategic stakes it can be a fixed carrying value), so ratio change is the
+    primary signal for share-count changes.
+    """
     if has_current and not has_previous:
         return "new"
     if has_previous and not has_current:
         return "exited"
-    if current > previous:
-        return "increased"
-    if current < previous:
-        return "decreased"
+    if current_ratio != previous_ratio:
+        return "increased" if current_ratio > previous_ratio else "decreased"
+    if current_amount != previous_amount:
+        return "increased" if current_amount > previous_amount else "decreased"
     return "unchanged"
 
 
@@ -156,7 +169,17 @@ def build_institutional_holdings_summary(
             cur_amount = float((cur or {}).get("amount") or 0.0)
             prev_amount = float((prev or {}).get("amount") or 0.0)
             change = cur_amount - prev_amount
-            kind = _change_type(cur_amount, prev_amount, cur is not None, prev is not None)
+            cur_ratio = float((cur or {}).get("ratio") or 0.0)
+            prev_ratio = float((prev or {}).get("ratio") or 0.0)
+            ratio_change = cur_ratio - prev_ratio
+            kind = _change_type(
+                cur_ratio,
+                prev_ratio,
+                cur_amount,
+                prev_amount,
+                cur is not None,
+                prev is not None,
+            )
             counts[kind] = counts.get(kind, 0) + 1
             net_change += change
             info = meta.get(code) or {}
@@ -166,7 +189,9 @@ def build_institutional_holdings_summary(
                 "industry": info.get("industry") or "",
                 "holder_count": len((cur or {}).get("holders") or []),
                 "hold_amount_yi": round(cur_amount / _YI, 2),
-                "hold_ratio_sum": round(float((cur or {}).get("ratio") or 0.0), 2),
+                "hold_ratio_sum": round(cur_ratio, 2),
+                "previous_hold_ratio_sum": round(prev_ratio, 2),
+                "change_ratio_pp": round(ratio_change, 2),
                 "hold_float_ratio_sum": round(
                     float((cur or {}).get("float_ratio") or 0.0), 2
                 ),
