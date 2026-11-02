@@ -2002,7 +2002,9 @@ def _fund_inventory_section(symbol: str) -> Dict[str, Any]:
                 "price_adjusted": True,
             },
             {"_id": 0},
-            sort=[("period_curr", -1), ("updated_at", -1)],
+            # Same period may have a full pair and a top-10 pair. Prefer full
+            # holdings for the single-stock inventory tab; then latest build.
+            sort=[("period_curr", -1), ("comparison_scope", 1), ("updated_at", -1)],
         )
     snap = public_snapshot(doc)
     return {

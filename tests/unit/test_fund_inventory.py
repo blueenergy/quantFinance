@@ -711,14 +711,16 @@ def test_official_top10_exit_is_not_classified_as_negative():
 
 
 @pytest.mark.unit
-def test_workbench_fund_inventory_prefers_latest_updated_pair(monkeypatch):
-    old = _doc(
+def test_workbench_fund_inventory_prefers_full_scope_over_top10(monkeypatch):
+    full = _doc(
         symbol="300502",
         period_curr="20260630",
         period_prev="20251231",
+        comparison_scope="full",
+        quality_status="official",
         updated_at="2026-11-01T00:00:00",
     )
-    new = _doc(
+    top10 = _doc(
         symbol="300502",
         period_curr="20260630",
         period_prev="20260331",
@@ -727,10 +729,11 @@ def test_workbench_fund_inventory_prefers_latest_updated_pair(monkeypatch):
         updated_at="2026-11-02T00:00:00",
         state="new_inventory",
     )
-    coll = _Collection([old, new])
+    coll = _Collection([full, top10])
     monkeypatch.setattr(
         "routers.stock_workbench.get_data_db",
         lambda: {"fund_inventory_snapshots": coll},
     )
     section = _fund_inventory_section("300502.SZ")
-    assert section["snapshot"]["period_prev"] == "20260331"
+    assert section["snapshot"]["period_prev"] == "20251231"
+    assert section["snapshot"]["comparison_scope"] == "full"
