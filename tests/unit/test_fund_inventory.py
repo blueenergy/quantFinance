@@ -708,3 +708,29 @@ def test_official_top10_exit_is_not_classified_as_negative():
     assert result["category"] != "negative_combo"
     assert "前十大" in result["caveat"]
     assert result["evidence"][0] == "退出前十大"
+
+
+@pytest.mark.unit
+def test_workbench_fund_inventory_prefers_latest_updated_pair(monkeypatch):
+    old = _doc(
+        symbol="300502",
+        period_curr="20260630",
+        period_prev="20251231",
+        updated_at="2026-11-01T00:00:00",
+    )
+    new = _doc(
+        symbol="300502",
+        period_curr="20260630",
+        period_prev="20260331",
+        comparison_scope="top10",
+        quality_status="official",
+        updated_at="2026-11-02T00:00:00",
+        state="new_inventory",
+    )
+    coll = _Collection([old, new])
+    monkeypatch.setattr(
+        "routers.stock_workbench.get_data_db",
+        lambda: {"fund_inventory_snapshots": coll},
+    )
+    section = _fund_inventory_section("300502.SZ")
+    assert section["snapshot"]["period_prev"] == "20260331"

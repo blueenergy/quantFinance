@@ -2002,7 +2002,7 @@ def _fund_inventory_section(symbol: str) -> Dict[str, Any]:
                 "price_adjusted": True,
             },
             {"_id": 0},
-            sort=[("period_curr", -1)],
+            sort=[("period_curr", -1), ("updated_at", -1)],
         )
     snap = public_snapshot(doc)
     return {
