@@ -122,6 +122,9 @@ def classify_inventory_candidate(
         doc.get("quality_status") or quality.get("status") or "official"
     )
     provisional = quality_status == "provisional"
+    comparison_scope = doc.get("comparison_scope") or quality.get("comparison_scope")
+    top10_scope = comparison_scope == "top10"
+    preview = provisional or top10_scope
     market = str(
         doc.get("market")
         or ("HK" if str(doc.get("ts_code") or "").endswith(".HK") else "A")
@@ -174,15 +177,15 @@ def classify_inventory_candidate(
         category = "earnings_inflection"
     elif state == "inventory_turnover" and large_rise:
         category = "high_level_turnover"
-        if provisional:
+        if preview:
             caveat = "当前仅表示已披露基金前十大换手，结论弱于正式全持仓。"
     elif (
         state == "inventory_exit"
-        and not provisional
+        and not preview
         and profit_deteriorating
     ):
         category = "negative_combo"
-    elif state == "inventory_exit" and provisional:
+    elif state == "inventory_exit" and preview:
         caveat = "当前仅代表退出已披露基金前十大，不按完整持仓退出判负面。"
 
     has_context = any(
@@ -201,7 +204,7 @@ def classify_inventory_candidate(
             hk_caveat = "港股暂缺与 A 股同口径的盈利和估值评分。"
             caveat = f"{caveat} {hk_caveat}".strip()
 
-    state_labels = PREVIEW_STATE_LABELS if provisional else STATE_LABELS
+    state_labels = PREVIEW_STATE_LABELS if preview else STATE_LABELS
     evidence = [state_labels.get(state) or state or "库存状态未知"]
     if latest_profit_yoy is not None:
         evidence.append(f"单季净利同比 {latest_profit_yoy:+.1f}%")
@@ -251,11 +254,14 @@ def public_snapshot(
     quality = doc.get("quality") if isinstance(doc.get("quality"), dict) else {}
     quality_status = doc.get("quality_status") or quality.get("status") or "official"
     provisional = quality_status == "provisional"
+    comparison_scope = doc.get("comparison_scope") or quality.get("comparison_scope")
+    top10_scope = comparison_scope == "top10"
+    preview = provisional or top10_scope
     market = doc.get("market") or (
         "HK" if str(doc.get("ts_code") or "").endswith(".HK") else "A"
     )
-    state_labels = PREVIEW_STATE_LABELS if provisional else STATE_LABELS
-    state_hints = PREVIEW_STATE_HINTS if provisional else STATE_HINTS
+    state_labels = PREVIEW_STATE_LABELS if preview else STATE_LABELS
+    state_hints = PREVIEW_STATE_HINTS if preview else STATE_HINTS
     return {
         "symbol": doc.get("symbol"),
         "ts_code": doc.get("ts_code"),
@@ -265,7 +271,7 @@ def public_snapshot(
         "period_prev": doc.get("period_prev"),
         "period_curr": doc.get("period_curr"),
         "compare_mode": doc.get("compare_mode"),
-        "comparison_scope": doc.get("comparison_scope") or quality.get("comparison_scope"),
+        "comparison_scope": comparison_scope,
         "quality_status": quality_status,
         "quality": quality,
         "disclosure_prev": doc.get("disclosure_prev"),
@@ -313,15 +319,22 @@ def public_snapshot(
             )
             if provisional
             else (
-                f"数据截止报告期 {doc.get('period_curr')}，"
-                "反映的是季报结束后筹码堆在哪里，不是今日买卖。"
+                (
+                    f"数据截止报告期 {doc.get('period_curr')}，当前是季报前十大口径；"
+                    "未披露基金不会被视为退出，不代表完整全持仓。"
+                )
+                if top10_scope
+                else (
+                    f"数据截止报告期 {doc.get('period_curr')}，"
+                    "反映的是季报结束后筹码堆在哪里，不是今日买卖。"
+                )
             )
         ) + (
             " 港股按报告内隐价格剔除价格和汇率影响，暂未校正拆股等公司行动。"
             if market == "HK"
             else ""
         ),
-        "four_questions": _four_questions(doc, provisional=provisional) if price_adjusted else [],
+        "four_questions": _four_questions(doc, provisional=preview) if price_adjusted else [],
     }
 
 

@@ -2,10 +2,22 @@ from datetime import date
 
 import pytest
 
-from routers.fund_inventory import list_fund_inventory_periods, list_fund_inventory_snapshots
+from routers.fund_inventory import (
+    FundInventoryReviewRequest,
+    get_fund_inventory_comparison,
+    list_fund_inventory_pairs,
+    list_fund_inventory_periods,
+    list_fund_inventory_snapshots,
+    trigger_fund_inventory_review,
+)
 from routers.stock_workbench import _fund_inventory_section
 from services.fund_inventory import classify_inventory_candidate, public_snapshot
+from services.fund_inventory_comparison import build_period_comparison
 from services.fund_inventory_context import build_candidate_contexts
+from services.fund_inventory_review import (
+    build_evidence_fingerprint,
+    build_period_review_evidence_pack,
+)
 
 YI = 1e8
 
@@ -440,3 +452,259 @@ def test_list_periods(monkeypatch):
     monkeypatch.setattr("routers.fund_inventory.get_data_db", lambda: {"fund_inventory_snapshots": coll})
     body = list_fund_inventory_periods(current_user={"id": "u1"})
     assert body["data"]["periods"][0] == "20260630"
+
+
+@pytest.mark.unit
+def test_public_snapshot_official_top10_uses_top10_labels():
+    snap = public_snapshot(_doc(quality_status="official", comparison_scope="top10"))
+    assert snap["state_label"] == "前十大强化"
+    assert "季报前十大口径" in snap["lag_note"]
+    assert "前十大" in snap["four_questions"][0]["question"]
+
+
+@pytest.mark.unit
+def test_build_period_comparison_groups_states_and_industries():
+    rows = [
+        _doc(
+            symbol="300502",
+            industry="电子",
+            state="incumbent_strengthen",
+            net_ex_price=80 * YI,
+            new_inflow=30 * YI,
+            incumbent_delta=50 * YI,
+            mv_price_effect=50 * YI,
+            surface_mv_chg=130 * YI,
+        ),
+        _doc(
+            symbol="688256",
+            ts_code="688256.SH",
+            name="寒武纪",
+            industry="计算机",
+            state="new_inventory",
+            net_ex_price=20 * YI,
+            new_inflow=20 * YI,
+            incumbent_delta=0,
+        ),
+        _doc(
+            symbol="600000",
+            ts_code="600000.SH",
+            name="浦发银行",
+            industry="电子",
+            state="inventory_exit",
+            net_ex_price=-50 * YI,
+            new_inflow=0,
+            incumbent_delta=-50 * YI,
+            mv_price_effect=-10 * YI,
+            surface_mv_chg=-60 * YI,
+        ),
+    ]
+    result = build_period_comparison(
+        rows,
+        period_curr="20260630",
+        period_prev="20260331",
+        comparison_scope="top10",
+        quality_status="official",
+        top_n=5,
+    )
+    assert result["totals"]["net_ex_price_yi"] == 50.0
+    assert result["state_counts"]["incumbent_strengthen"] == 1
+    assert result["state_counts"]["new_inventory"] == 1
+    assert result["state_counts"]["inventory_exit"] == 1
+    electronics = next(row for row in result["industries"] if row["industry"] == "电子")
+    assert electronics["net_ex_price_yi"] == 30.0
+    assert electronics["stocks"] == 2
+    assert result["top"]["net_outflow"][0]["ts_code"] == "600000.SH"
+    assert result["top"]["new_inventory"][0]["ts_code"] == "688256.SH"
+    assert any("季报口径" in caveat for caveat in result["caveats"])
+
+
+@pytest.mark.unit
+def test_list_pairs_and_comparison_filter_by_period_prev(monkeypatch):
+    coll = _Collection(
+        [
+            _doc(
+                period_curr="20260630",
+                period_prev="20260331",
+                comparison_scope="top10",
+                quality_status="official",
+                net_ex_price=10 * YI,
+            ),
+            _doc(
+                period_curr="20260630",
+                period_prev="20251231",
+                comparison_scope="full",
+                quality_status="official",
+                net_ex_price=20 * YI,
+            ),
+        ]
+    )
+    monkeypatch.setattr(
+        "routers.fund_inventory.get_data_db",
+        lambda: {"fund_inventory_snapshots": coll},
+    )
+    pairs_body = list_fund_inventory_pairs(market=None, current_user={"id": "u1"})
+    pairs = pairs_body["data"]["pairs"]
+    assert len(pairs) == 2
+    assert {pair["period_prev"] for pair in pairs} == {"20260331", "20251231"}
+
+    comparison = get_fund_inventory_comparison(
+        period_curr="20260630",
+        period_prev="20260331",
+        market=None,
+        top_n=5,
+        current_user={"id": "u1"},
+    )
+    assert comparison["data"]["period_prev"] == "20260331"
+    assert comparison["data"]["comparison_scope"] == "top10"
+    assert comparison["data"]["totals"]["net_ex_price_yi"] == 10.0
+
+
+@pytest.mark.unit
+def test_list_snapshots_filters_period_prev(monkeypatch):
+    coll = _Collection(
+        [
+            _doc(period_curr="20260630", period_prev="20260331", symbol="300502"),
+            _doc(
+                period_curr="20260630",
+                period_prev="20251231",
+                symbol="688256",
+                ts_code="688256.SH",
+                name="寒武纪",
+            ),
+        ]
+    )
+    monkeypatch.setattr(
+        "routers.fund_inventory.get_data_db",
+        lambda: {"fund_inventory_snapshots": coll},
+    )
+    monkeypatch.setattr(
+        "routers.fund_inventory.build_candidate_contexts",
+        lambda *args, **kwargs: {},
+    )
+    body = list_fund_inventory_snapshots(
+        period="20260630",
+        period_prev="20260331",
+        state=None,
+        market=None,
+        limit=50,
+        sort="net_ex_price",
+        current_user={"id": "u1"},
+    )
+    assert body["data"]["period_prev"] == "20260331"
+    assert [row["ts_code"] for row in body["data"]["rows"]] == ["300502.SZ"]
+
+
+@pytest.mark.unit
+def test_build_period_review_evidence_pack_has_stable_ids():
+    comparison = build_period_comparison(
+        [
+            _doc(
+                symbol="300502",
+                industry="电子",
+                state="incumbent_strengthen",
+                net_ex_price=80 * YI,
+                new_inflow=30 * YI,
+                incumbent_delta=50 * YI,
+            ),
+            _doc(
+                symbol="688256",
+                ts_code="688256.SH",
+                name="寒武纪",
+                industry="计算机",
+                state="new_inventory",
+                net_ex_price=20 * YI,
+                new_inflow=20 * YI,
+                incumbent_delta=0,
+            ),
+        ],
+        period_curr="20260630",
+        period_prev="20260331",
+        comparison_scope="top10",
+        quality_status="official",
+        top_n=5,
+    )
+    pack = build_period_review_evidence_pack(comparison, top_n=5)
+    ids = set(pack["available_evidence_ids"])
+    assert "overview.net_flow" in ids
+    assert "state.inventory_exit.count" in ids
+    assert "industry.inflow.1" in ids
+    assert "stock.new_inventory.1" in ids
+    assert len(ids) == len(pack["evidence"])
+    assert build_evidence_fingerprint(pack) == build_evidence_fingerprint(pack)
+
+
+class _TaskCollection:
+    def __init__(self):
+        self.docs = []
+
+    def find_one(self, query=None, sort=None):
+        return None
+
+    def insert_one(self, doc):
+        self.docs.append(doc)
+
+        class _Result:
+            inserted_id = "task-1"
+
+        return _Result()
+
+
+@pytest.mark.unit
+def test_trigger_fund_inventory_review_enqueues_task(monkeypatch):
+    comparison = build_period_comparison(
+        [_doc(state="new_inventory", net_ex_price=20 * YI, new_inflow=20 * YI)],
+        period_curr="20260630",
+        period_prev="20260331",
+        comparison_scope="top10",
+        quality_status="official",
+        top_n=5,
+    )
+    tasks = _TaskCollection()
+    monkeypatch.setattr(
+        "routers.fund_inventory.get_fund_inventory_comparison",
+        lambda **kwargs: {"success": True, "data": comparison},
+    )
+    monkeypatch.setattr(
+        "routers.fund_inventory.get_db_collections",
+        lambda: {"analysis_tasks": tasks},
+    )
+    body = trigger_fund_inventory_review(
+        FundInventoryReviewRequest(
+            period_curr="20260630",
+            period_prev="20260331",
+            top_n=5,
+        ),
+        current_user={"id": "u1", "username": "tester"},
+    )
+    assert body["data"]["task_id"] == "task-1"
+    assert body["data"]["reused"] is False
+    assert len(tasks.docs) == 1
+    task = tasks.docs[0]
+    assert task["type"] == "fund_inventory_period_review"
+    assert task["params"]["evidence_pack"]["period_curr"] == "20260630"
+
+
+@pytest.mark.unit
+def test_official_top10_exit_is_not_classified_as_negative():
+    result = classify_inventory_candidate(
+        _doc(
+            state="inventory_exit",
+            quality_status="official",
+            comparison_scope="top10",
+        ),
+        {
+            "score": {
+                "growth_score": 30,
+                "fundamental_score": 40,
+                "value_score": 45,
+            },
+            "financials": [
+                {"q_netprofit_yoy": -20},
+                {"q_netprofit_yoy": -5},
+            ],
+            "ytd_return_pct": -15,
+        },
+    )
+    assert result["category"] != "negative_combo"
+    assert "前十大" in result["caveat"]
+    assert result["evidence"][0] == "退出前十大"
