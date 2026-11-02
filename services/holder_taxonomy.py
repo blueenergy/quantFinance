@@ -56,7 +56,7 @@ _JUNK_FUND = re.compile(
 )
 
 _FOREIGN_ASSET_MANAGER = re.compile(
-    r"BLACKROCK|贝莱德|VANGUARD|先锋|FIDELITY|富达|SCHRODER|施罗德|"
+    r"BLACKROCK|贝莱德|VANGUARD|先锋领航|先锋基金|FIDELITY|富达|SCHRODER|施罗德|"
     r"\bFIL\b|MSCI|MORGAN\s*STANLEY\s*INVESTMENT|摩根士丹利(国际)?投资管理|"
     r"瑞银(资产|基金)",
     re.I,

@@ -87,6 +87,8 @@ def test_holder_taxonomy_core_and_exclusions():
     assert classify_holder("BARCLAYSBANKPLC") == "foreign_bank"
     assert classify_holder("香港中央结算有限公司") == "hksc"
     assert classify_holder("贝莱德基金") == "foreign_asset_manager"
+    assert classify_holder("先锋领航基金") == "foreign_asset_manager"
+    assert classify_holder("程先锋") is None
     assert classify_holder("中国银行-摩根士丹利数字经济混合型证券投资基金") is None
     assert classify_holder("国投瑞银国家安全灵活配置混合型证券投资基金") is None
 
