@@ -85,6 +85,7 @@ from routers.scheduler_admin import router as scheduler_admin_router
 from routers.sector_concept import router as sector_concept_router
 from routers.hot_stock import router as hot_stock_router
 from routers.etf import router as etf_router
+from routers.etf_national_team import router as etf_national_team_router
 from routers.data_pulse import router as data_pulse_router
 from routers.market_events import router as market_events_router
 from routers.earnings import router as earnings_router
@@ -225,6 +226,7 @@ app.include_router(scheduler_admin_router, prefix="/api/admin/scheduler", tags=[
 app.include_router(sector_concept_router, prefix="/api", tags=["板块与概念解析"])
 app.include_router(hot_stock_router, prefix="/api", tags=["盘中热股捕捉"])
 app.include_router(etf_router, prefix="/api", tags=["ETF智能分析"])
+app.include_router(etf_national_team_router, prefix="/api", tags=["国家队ETF监控"])
 app.include_router(data_pulse_router, prefix="/api", tags=["数据脉搏健康度"])
 app.include_router(market_events_router, prefix="/api", tags=["市场事件日历"])
 app.include_router(earnings_router, prefix="/api", tags=["财报猎手"])
