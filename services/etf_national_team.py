@@ -22,7 +22,7 @@ import statistics
 import threading
 import time
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 # 2025 annual report top-10 holders (see llm-wiki national-team note).
@@ -142,6 +142,49 @@ def load_pool(data_db: Any) -> List[Dict[str, Any]]:
             }
         )
     return out
+
+
+_DATES_TTL_SECONDS = 60.0
+_DATES_LOCK = threading.Lock()
+_DATES_CACHE: Dict[str, Tuple[float, List[str]]] = {}
+
+
+def list_trade_dates(data_db: Any, limit: int = 60) -> List[str]:
+    """Trading dates where *all* pool ETFs have 1m bars.
+
+    Used by the dashboard date picker.  The aggregation is bounded to the last
+    180 calendar days and cached for a minute; the QMT backfill currently
+    covers 2026-09-01 onward, so older dates are intentionally absent.
+    """
+    pool = load_pool(data_db)
+    codes = [item["ts_code"] for item in pool]
+    if not codes:
+        return []
+    key = f"{id(data_db)}:{int(limit)}"
+    now = time.monotonic()
+    with _DATES_LOCK:
+        cached = _DATES_CACHE.get(key)
+        if cached and now - cached[0] < _DATES_TTL_SECONDS:
+            return list(cached[1])
+    cutoff = (datetime.now() - timedelta(days=180)).strftime("%Y%m%d") + "0000"
+    pipeline = [
+        {"$match": {"symbol": {"$in": codes}, "trade_date": {"$gte": cutoff}}},
+        {
+            "$group": {
+                "_id": {"$substrBytes": ["$trade_date", 0, 8]},
+                "symbols": {"$addToSet": "$symbol"},
+            }
+        },
+        {"$match": {"symbols": {"$size": len(codes)}}},
+        {"$sort": {"_id": -1}},
+        {"$limit": int(limit)},
+    ]
+    dates = sorted(
+        str(row["_id"]) for row in data_db["minute_bars"].aggregate(pipeline)
+    )
+    with _DATES_LOCK:
+        _DATES_CACHE[key] = (now, dates)
+    return dates
 
 
 def _latest_trade_date(data_db: Any, codes: Sequence[str]) -> Optional[str]:
