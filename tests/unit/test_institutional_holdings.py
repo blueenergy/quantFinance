@@ -73,6 +73,10 @@ STOCK_INFO = {
 }
 
 
+def _prices(rows):
+    return {row["ts_code"]: 1.0 for row in rows}
+
+
 def test_holder_taxonomy_core_and_exclusions():
     assert classify_holder("全国社保基金四一三组合") == "social_security"
     assert classify_holder("招商基金管理有限公司-社保基金1903组合") == "social_security"
@@ -119,6 +123,8 @@ def test_summary_groups_categories_and_changes():
         period="20260930",
         previous_period="20260630",
         stock_info=STOCK_INFO,
+        current_prices=_prices(CURRENT),
+        previous_prices=_prices(PREVIOUS),
         top_n=5,
     )
     by_category = result["summary"]["by_category"]
@@ -146,6 +152,8 @@ def test_summary_new_only_and_industry_filter():
         period="20260930",
         previous_period="20260630",
         stock_info=STOCK_INFO,
+        current_prices=_prices(CURRENT),
+        previous_prices=_prices(PREVIOUS),
         industry="银行",
         new_only=True,
         top_n=5,
@@ -181,6 +189,10 @@ def test_payload_resolves_previous_period_and_filters(monkeypatch):
         "routers.hermes_quant_tools._holder_stock_info_map",
         lambda codes: STOCK_INFO,
     )
+    monkeypatch.setattr(
+        "routers.hermes_quant_tools._holder_price_map",
+        lambda period, codes: {code: 1.0 for code in codes},
+    )
     coll = _FakeColl(CURRENT + PREVIOUS)
     result = _institutional_holdings_summary_payload(
         period="20260930",
@@ -207,6 +219,8 @@ def test_summary_flags_partial_previous_coverage():
         period="20260930",
         previous_period="20260630",
         stock_info=STOCK_INFO,
+        current_prices=_prices(CURRENT),
+        previous_prices=_prices(PREVIOUS[:1]),
         top_n=5,
     )
     assert result["comparison"]["reliable"] is False
@@ -240,6 +254,8 @@ def test_change_type_uses_ratio_when_amount_is_distorted():
         period="20260930",
         previous_period="20260630",
         stock_info={"601328.SH": {"name": "交通银行", "industry": "银行"}},
+        current_prices={"601328.SH": 1.0},
+        previous_prices={"601328.SH": 1.0},
         top_n=5,
     )
     row = result["top_stocks"]["foreign_bank"][0]
@@ -274,9 +290,80 @@ def test_change_type_ratio_can_differ_from_amount():
         period="20260930",
         previous_period="20260630",
         stock_info={"601009.SH": {"name": "南京银行", "industry": "银行"}},
+        current_prices={"601009.SH": 1.0},
+        previous_prices={"601009.SH": 1.0},
         top_n=5,
     )
     row = result["top_stocks"]["foreign_bank"][0]
     assert row["change_amount_yi"] == 20.0
     assert row["change_ratio_pp"] == -0.5
     assert row["change_type"] == "decreased"
+
+
+def test_market_value_uses_report_date_close():
+    current = [
+        _row(
+            "601328.SH",
+            "香港上海汇丰银行有限公司",
+            1 * YI,
+            ratio=15.99,
+            float_ratio=15.99,
+        )
+    ]
+    previous = [
+        _row(
+            "601328.SH",
+            "香港上海汇丰银行有限公司",
+            1 * YI,
+            ratio=15.99,
+            float_ratio=15.99,
+            end_date="20260630",
+        )
+    ]
+    result = build_institutional_holdings_summary(
+        current,
+        previous,
+        period="20260930",
+        previous_period="20260630",
+        stock_info={"601328.SH": {"name": "交通银行", "industry": "银行"}},
+        current_prices={"601328.SH": 2.0},
+        previous_prices={"601328.SH": 1.0},
+        top_n=5,
+    )
+    row = result["top_stocks"]["foreign_bank"][0]
+    assert row["hold_shares_yi"] == 1.0
+    assert row["hold_amount_yi"] == 2.0
+    assert row["previous_hold_shares_yi"] == 1.0
+    assert row["previous_hold_amount_yi"] == 1.0
+    assert row["change_shares_yi"] == 0.0
+    assert row["change_amount_yi"] == 1.0
+    assert row["change_type"] == "unchanged"
+    assert row["price"] == 2.0
+
+
+def test_missing_price_keeps_shares_and_nulls_value():
+    current = [
+        _row(
+            "601328.SH",
+            "香港上海汇丰银行有限公司",
+            1 * YI,
+            ratio=15.99,
+            float_ratio=15.99,
+        )
+    ]
+    result = build_institutional_holdings_summary(
+        current,
+        [],
+        period="20260930",
+        previous_period="20260630",
+        stock_info={"601328.SH": {"name": "交通银行", "industry": "银行"}},
+        current_prices={},
+        previous_prices={},
+        top_n=5,
+    )
+    row = result["top_stocks"]["foreign_bank"][0]
+    assert row["hold_shares_yi"] == 1.0
+    assert row["hold_amount_yi"] is None
+    assert row["price_missing"] is True
+    assert result["summary"]["total_missing_price_stocks"] == 1
+    assert any("缺少报告期收盘价" in caveat for caveat in result["caveats"])

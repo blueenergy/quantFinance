@@ -4583,6 +4583,36 @@ def _holder_stock_info_map(codes: List[str]) -> Dict[str, Dict[str, Any]]:
     return out
 
 
+def _holder_price_map(period: Optional[str], codes: List[str]) -> Dict[str, float]:
+    if not period or not codes:
+        return {}
+    try:
+        rows = data_db["volume_price"].find(
+            {
+                "trade_date": str(period),
+                "$or": [
+                    {"symbol": {"$in": codes}},
+                    {"ts_code": {"$in": codes}},
+                ],
+            },
+            {"_id": 0, "symbol": 1, "ts_code": 1, "close": 1},
+        )
+    except Exception:
+        return {}
+    out: Dict[str, float] = {}
+    for row in rows:
+        try:
+            close = float(row.get("close"))
+        except (TypeError, ValueError):
+            continue
+        if close <= 0:
+            continue
+        for key in (row.get("symbol"), row.get("ts_code")):
+            if key:
+                out[str(key)] = close
+    return out
+
+
 def _latest_previous_holder_period(collection: Any, period: str) -> Optional[str]:
     try:
         values = collection.distinct("end_date", {"end_date": {"$lt": period}})
@@ -4632,6 +4662,10 @@ def _institutional_holdings_summary_payload(
         }
     )
     stock_info = _holder_stock_info_map(codes)
+    current_prices = _holder_price_map(normalized_period, codes)
+    previous_prices = (
+        _holder_price_map(resolved_previous, codes) if resolved_previous else {}
+    )
     summary = build_institutional_holdings_summary(
         current_rows,
         previous_rows,
@@ -4639,6 +4673,8 @@ def _institutional_holdings_summary_payload(
         previous_period=resolved_previous,
         categories=selected_categories,
         stock_info=stock_info,
+        current_prices=current_prices,
+        previous_prices=previous_prices,
         industry=industry,
         new_only=new_only,
         top_n=top_n if isinstance(top_n, int) else 20,
