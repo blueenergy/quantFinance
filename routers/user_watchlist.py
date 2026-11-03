@@ -329,18 +329,32 @@ def set_watchlist_strategy(req: WatchlistStrategySetRequest, current_user: dict 
     
     import time
     enabled = getattr(req, "enabled", True)
-    
+
+    # params 采用「合并」语义：未发送的键保持不变，只有 deleted_keys 里的键会被删除。
+    # 旧实现是整体替换；任何部分 payload（如 2026-11-01 的应用模板 bug）都会静默
+    # 删掉 state_prefix / core_shares。见 vault:
+    # projects/trading/repos/quantFinance-dashboard/watchlist-preset-apply-params-source.md
+    query = {"user_id": user_id, "symbol": req.symbol, "strategy_key": req.strategy}
+    existing = strat_col.find_one(query) or {}
+    existing_params = dict(existing.get("params") or {})
+    if req.params is None:
+        params = existing_params
+    else:
+        params = {**existing_params, **req.params}
+    for key in req.deleted_keys or []:
+        params.pop(key, None)
+
     # 构建更新文档，自动添加 engine 字段
     update_doc = {
         "strategy_key": req.strategy,
-        "params": req.params,
+        "params": params,
         "updated_at": time.time(),
         "enabled": enabled,
         "engine": "vnpy",  # 🔥 自动设置 engine 为 vnpy（实盘策略仅支持 vnpy）
     }
-    
+
     strat_col.update_one(
-        {"user_id": user_id, "symbol": req.symbol, "strategy_key": req.strategy},
+        query,
         {"$set": update_doc},
         upsert=True
     )

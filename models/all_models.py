@@ -98,7 +98,10 @@ class WatchlistUpdateRequest(BaseModel):
 class WatchlistStrategySetRequest(BaseModel):
     symbol: str
     strategy: str
-    params: dict
+    # None = 不修改已有 params（用于只切换 enabled 的场景）；dict = 合并到已有 params 上。
+    params: Optional[Dict[str, Any]] = None
+    # 显式要求删除的 params 键；合并语义下，未发送的键默认保留。
+    deleted_keys: List[str] = []
     enabled: Optional[bool] = True
 
 class WatchlistStrategyResponse(BaseModel):
