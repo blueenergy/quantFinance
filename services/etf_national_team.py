@@ -449,11 +449,17 @@ def compute_snapshot(
     pool_cur = 0.0
     pool_base = 0.0
     pool_tail = 0.0
+    pool_prev_cur = 0.0
+    pool_prev = 0.0
+    pool_avg5_cur = 0.0
+    pool_avg5 = 0.0
     tail_shares: List[float] = []
     breadth2 = 0
     breadth25 = 0
     share1_values: List[float] = []
     share5_values: List[float] = []
+    prev_day = max((day for day in ctx["days"] if day < today), default=None)
+    avg5_days = ctx["hist_days"][-5:]
 
     # Build per-code series once; reuse for breadth timeline.
     series_by_code = {code: _series_for_code(ctx, code) for code in ctx["codes"]}
@@ -465,6 +471,15 @@ def compute_snapshot(
         cur = series["today_cum"][idx]
         base = series["base_med"][idx] or 0.0
         ratio = cur / base if base else 0.0
+        prev_map = (ctx["bars"].get(code, {}).get(prev_day)) if prev_day else {}
+        prev_cum = _cumulative_series(prev_map or {}, times)[idx] if prev_day else None
+        avg5_values = [
+            _cumulative_series((ctx["bars"].get(code, {}).get(day) or {}), times)[idx]
+            for day in avg5_days
+        ]
+        avg5_cum = statistics.mean(avg5_values) if avg5_values else None
+        prev_ratio = cur / prev_cum if prev_cum else None
+        avg5_ratio = cur / avg5_cum if avg5_cum else None
         today_map = (ctx["bars"].get(code, {}).get(today)) or {}
         tail = _tail_amount(today_map, actual_as_of) if actual_as_of > "1430" else 0.0
         tail_share = tail / cur if cur and actual_as_of > "1430" else None
@@ -493,6 +508,12 @@ def compute_snapshot(
         pool_cur += cur
         pool_base += base
         pool_tail += tail
+        if prev_cum:
+            pool_prev_cur += cur
+            pool_prev += prev_cum
+        if avg5_cum:
+            pool_avg5_cur += cur
+            pool_avg5 += avg5_cum
 
         prev_close = None
         for day in sorted(ctx["daily_close"].get(code, {}), reverse=True):
@@ -519,6 +540,10 @@ def compute_snapshot(
                 "amount_yuan": cur,
                 "baseline_yuan": base,
                 "ratio": ratio,
+                "prev_day_amount_yuan": prev_cum,
+                "prev_day_ratio": prev_ratio,
+                "avg5_amount_yuan": avg5_cum,
+                "avg5_ratio": avg5_ratio,
                 "tail_share": tail_share,
                 "tail_baseline": tail_baseline,
                 "tail_ratio": tail_ratio,
@@ -612,6 +637,10 @@ def compute_snapshot(
             "amount_yuan": pool_cur,
             "baseline_yuan": pool_base,
             "ratio": (pool_cur / pool_base) if pool_base else None,
+            "prev_day_amount_yuan": pool_prev,
+            "prev_day_ratio": (pool_prev_cur / pool_prev) if pool_prev else None,
+            "avg5_amount_yuan": pool_avg5,
+            "avg5_ratio": (pool_avg5_cur / pool_avg5) if pool_avg5 else None,
         },
         "tail": {
             "share": pool_tail_share,
