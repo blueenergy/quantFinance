@@ -161,6 +161,53 @@ def _pivot(
     return matrix.reindex(index=list(times), columns=list(keys))
 
 
+def _align_asof(
+    df: pd.DataFrame,
+    metric: str,
+    times: Sequence[str],
+    keys: Sequence[str],
+    *,
+    max_gap_minutes: int = 4,
+) -> pd.DataFrame:
+    """把每个行业快照时刻映射到「不晚于它」的最近一个指数快照。
+
+    行业桥的快照落在奇数分钟（14:21/23/…），指数 poller 落在偶数分钟
+    （14:20/22/…）；直接 reindex 会全部落空。这里做 as-of 对齐，并限制
+    最大回看分钟数，避免把很早之前的快照当成当前值。
+    """
+    matrix = df.pivot_table(index="snapshot_time", columns="ts_code", values=metric, aggfunc="last")
+    matrix = matrix.sort_index().reindex(columns=list(keys))
+    out = pd.DataFrame(np.nan, index=list(times), columns=list(keys))
+    if matrix.empty:
+        return out
+    index_times = [str(v) for v in matrix.index]
+    index_minutes = [_time_minutes(t) for t in index_times]
+    for t in times:
+        pos = np.searchsorted(index_times, str(t), side="right") - 1
+        if pos < 0:
+            continue
+        if _time_minutes(t) - index_minutes[pos] > max_gap_minutes:
+            continue
+        out.loc[t] = matrix.iloc[pos].to_numpy()
+    return out
+
+
+def _score_from_matrices(
+    matrices: Dict[str, pd.DataFrame],
+    times: Sequence[str],
+    keys: Sequence[str],
+    min_metrics: int,
+) -> pd.DataFrame:
+    total = pd.DataFrame(0.0, index=list(times), columns=list(keys))
+    count = pd.DataFrame(0, index=list(times), columns=list(keys))
+    for raw in matrices.values():
+        ranked = raw.rank(axis=1, pct=True)
+        total = total.add(ranked.fillna(0.0), fill_value=0.0)
+        count = count.add(ranked.notna().astype(int), fill_value=0)
+    score = (total / count.replace(0, np.nan)) * 100.0
+    return score.where(count >= min_metrics)
+
+
 def _score_matrix(
     df: pd.DataFrame,
     times: Sequence[str],
@@ -169,21 +216,13 @@ def _score_matrix(
     metrics: Optional[Sequence[str]] = None,
     min_metrics: int = MIN_METRICS,
     key_col: str = "sector_code",
-    ffill_limit: int = 0,
 ) -> pd.DataFrame:
     use_metrics = list(metrics or _METRICS)
-    total = pd.DataFrame(0.0, index=list(times), columns=list(keys))
-    count = pd.DataFrame(0, index=list(times), columns=list(keys))
-    for metric in use_metrics:
-        raw = _pivot(df, metric, times, keys, key_col=key_col)
-        if ffill_limit:
-            # 宽基 poller 和行业桥的分钟边界可能差 1 分钟；短缺口前向填充
-            raw = raw.ffill(limit=ffill_limit)
-        ranked = raw.rank(axis=1, pct=True)
-        total = total.add(ranked.fillna(0.0), fill_value=0.0)
-        count = count.add(ranked.notna().astype(int), fill_value=0)
-    score = (total / count.replace(0, np.nan)) * 100.0
-    return score.where(count >= min_metrics)
+    matrices = {
+        metric: _pivot(df, metric, times, keys, key_col=key_col)
+        for metric in use_metrics
+    }
+    return _score_from_matrices(matrices, times, keys, min_metrics)
 
 
 def _change_matrix(score: pd.DataFrame, times: Sequence[str], minutes: int = 30) -> pd.DataFrame:
@@ -251,18 +290,11 @@ def _build_indices(rows: Sequence[Dict[str, Any]], times: Sequence[str]) -> List
         .astype(str)
         .to_dict()
     )
-    scores = _score_matrix(
-        df,
-        times,
-        codes,
-        metrics=_INDEX_METRICS,
-        min_metrics=2,
-        key_col="ts_code",
-        ffill_limit=2,
-    )
-    pct_chg = _pivot(df, "pct_chg", times, codes, key_col="ts_code").ffill(limit=2)
-    intraday = _pivot(df, "intraday_move", times, codes, key_col="ts_code").ffill(limit=2)
-    range_pos = _pivot(df, "range_pos", times, codes, key_col="ts_code").ffill(limit=2)
+    matrices = {metric: _align_asof(df, metric, times, codes) for metric in _INDEX_METRICS}
+    scores = _score_from_matrices(matrices, times, codes, min_metrics=2)
+    pct_chg = matrices["pct_chg"]
+    intraday = matrices["intraday_move"]
+    range_pos = matrices["range_pos"]
 
     out: List[Dict[str, Any]] = []
     for code in codes:
