@@ -704,9 +704,11 @@ def _national_team_bar_fresh(as_of: str, hm: str) -> bool:
 def national_team_alert_task():
     """Push national-team ETF level upgrades to DingTalk.
 
-    Runs every 5 minutes on weekdays.  The task itself skips the lunch break
-    and the 15:00-15:05 window (waiting for the closing bar); from 15:05 it
-    becomes the close-confirmation run.  Stale data is ignored so a broken
+    Runs every 5 minutes on weekdays.  The task starts at 09:45: the opening
+    auction baseline is too small, and a 40-day replay showed 4 false
+    "suspect" verdicts at 09:35/09:40 vs 1 at 09:45.  It also skips the lunch
+    break and the 15:00-15:05 window (waiting for the closing bar); from 15:05
+    it becomes the close-confirmation run.  Stale data is ignored so a broken
     minute bridge cannot replay yesterday's verdict as today's alert.
     """
     from db import data_db, db
@@ -721,7 +723,7 @@ def national_team_alert_task():
         if now.weekday() >= 5:
             return
         hm = now.strftime("%H%M")
-        if hm < "0935":
+        if hm < "0945":
             return
         if "1130" < hm < "1300":
             return
