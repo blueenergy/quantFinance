@@ -91,6 +91,7 @@ from routers.market_events import router as market_events_router
 from routers.earnings import router as earnings_router
 from routers.analysis_tasks import router as analysis_tasks_router
 from routers.shenwan_index import router as shenwan_index_router
+from routers.market_trend import router as market_trend_router
 from routers.assistant_bff import router as assistant_bff_router
 from routers.hermes_quant_tools import (
     MCP_ACTION_TAG,
@@ -232,6 +233,7 @@ app.include_router(market_events_router, prefix="/api", tags=["市场事件日�
 app.include_router(earnings_router, prefix="/api", tags=["财报猎手"])
 app.include_router(analysis_tasks_router, prefix="/api", tags=["分析任务中心"])
 app.include_router(shenwan_index_router, prefix="/api/shenwan-index", tags=["申万行业指数"])
+app.include_router(market_trend_router, prefix="/api/market-trend", tags=["市场趋势全景"])
 app.include_router(assistant_bff_router, prefix="/api/assistant", tags=["助手BFF"])
 app.include_router(hermes_quant_tools_router, prefix="/api", tags=["Hermes quant tools"])
 app.include_router(macro_router, prefix="/api", tags=["宏观分析"])
