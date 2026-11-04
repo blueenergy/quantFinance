@@ -169,12 +169,16 @@ def _score_matrix(
     metrics: Optional[Sequence[str]] = None,
     min_metrics: int = MIN_METRICS,
     key_col: str = "sector_code",
+    ffill_limit: int = 0,
 ) -> pd.DataFrame:
     use_metrics = list(metrics or _METRICS)
     total = pd.DataFrame(0.0, index=list(times), columns=list(keys))
     count = pd.DataFrame(0, index=list(times), columns=list(keys))
     for metric in use_metrics:
         raw = _pivot(df, metric, times, keys, key_col=key_col)
+        if ffill_limit:
+            # 宽基 poller 和行业桥的分钟边界可能差 1 分钟；短缺口前向填充
+            raw = raw.ffill(limit=ffill_limit)
         ranked = raw.rank(axis=1, pct=True)
         total = total.add(ranked.fillna(0.0), fill_value=0.0)
         count = count.add(ranked.notna().astype(int), fill_value=0)
@@ -254,10 +258,11 @@ def _build_indices(rows: Sequence[Dict[str, Any]], times: Sequence[str]) -> List
         metrics=_INDEX_METRICS,
         min_metrics=2,
         key_col="ts_code",
+        ffill_limit=2,
     )
-    pct_chg = _pivot(df, "pct_chg", times, codes, key_col="ts_code")
-    intraday = _pivot(df, "intraday_move", times, codes, key_col="ts_code")
-    range_pos = _pivot(df, "range_pos", times, codes, key_col="ts_code")
+    pct_chg = _pivot(df, "pct_chg", times, codes, key_col="ts_code").ffill(limit=2)
+    intraday = _pivot(df, "intraday_move", times, codes, key_col="ts_code").ffill(limit=2)
+    range_pos = _pivot(df, "range_pos", times, codes, key_col="ts_code").ffill(limit=2)
 
     out: List[Dict[str, Any]] = []
     for code in codes:
