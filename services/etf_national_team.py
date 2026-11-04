@@ -174,8 +174,9 @@ def list_trade_dates(data_db: Any, limit: int = 60) -> List[str]:
     """Trading dates where *all* pool ETFs have 1m bars.
 
     Used by the dashboard date picker.  The aggregation is bounded to the last
-    180 calendar days and cached for a minute; the QMT backfill currently
-    covers 2026-09-01 onward, so older dates are intentionally absent.
+    400 calendar days (``limit`` caps it further, max 240 sessions) and cached
+    for a minute.  The QMT backfill now covers 2025-12-01 onward; dates before
+    that are absent until backfilled.
     """
     pool = load_pool(data_db)
     codes = [item["ts_code"] for item in pool]
@@ -187,7 +188,7 @@ def list_trade_dates(data_db: Any, limit: int = 60) -> List[str]:
         cached = _DATES_CACHE.get(key)
         if cached and now - cached[0] < _DATES_TTL_SECONDS:
             return list(cached[1])
-    cutoff = (datetime.now() - timedelta(days=180)).strftime("%Y%m%d") + "0000"
+    cutoff = (datetime.now() - timedelta(days=400)).strftime("%Y%m%d") + "0000"
     pipeline = [
         {"$match": {"symbol": {"$in": codes}, "trade_date": {"$gte": cutoff}}},
         {
