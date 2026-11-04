@@ -99,6 +99,32 @@ def _sector_docs():
     return docs
 
 
+def _index_docs():
+    names = [
+        ("000001.SH", "上证指数"),
+        ("000016.SH", "上证50"),
+        ("000300.SH", "沪深300"),
+        ("000905.SH", "中证500"),
+        ("000852.SH", "中证1000"),
+        ("399006.SZ", "创业板指"),
+        ("000688.SH", "科创50"),
+        ("399673.SZ", "创业板50"),
+        ("399303.SZ", "国证2000"),
+    ]
+    docs = []
+    for rank, (code, name) in enumerate(names, start=1):
+        for snap in _times():
+            docs.append({
+                "ts_code": code,
+                "name": name,
+                "snapshot_time": snap,
+                "pct_chg": float(rank),
+                "intraday_move": float(rank),
+                "range_pos": rank / 10.0,
+            })
+    return docs
+
+
 def _breadth_docs():
     docs = []
     for snap in _times():
@@ -118,6 +144,7 @@ def _breadth_docs():
 def _seed(monkeypatch):
     monkeypatch.setattr(mi, "_SECTOR_STRENGTH", FakeCollection(_sector_docs()))
     monkeypatch.setattr(mi, "_MARKET_SPECTRUM", FakeCollection(_breadth_docs()))
+    monkeypatch.setattr(mi, "_INDEX_SNAPSHOTS", FakeCollection(_index_docs()))
     monkeypatch.setattr(mi, "_CACHE", {})
     monkeypatch.setattr(mi, "_DATES_CACHE", {})
 
@@ -154,6 +181,14 @@ def test_payload_shape_and_cross_section(monkeypatch):
     assert summary["strong_to_weak"][0]["name"] == "有色金属"
     assert payload["breadth"]["yang5"][-1] == 0.7
     assert payload["breadth"]["yang30"][-1] == 0.3
+
+    indices = payload["indices"]
+    assert len(indices) == 9
+    by_code = {item["code"]: item for item in indices}
+    assert by_code["399303.SZ"]["latest"] == 100.0
+    assert by_code["000001.SH"]["latest"] == pytest.approx(100.0 / 9.0, abs=0.1)
+    assert by_code["000688.SH"]["latest_pct_chg"] == 7.0
+    assert len(by_code["000300.SH"]["scores"]) == 17
 
 
 @pytest.mark.unit
@@ -214,9 +249,11 @@ def test_latest_date_is_default(monkeypatch):
 def test_empty_collection_returns_message(monkeypatch):
     monkeypatch.setattr(mi, "_SECTOR_STRENGTH", FakeCollection([]))
     monkeypatch.setattr(mi, "_MARKET_SPECTRUM", FakeCollection([]))
+    monkeypatch.setattr(mi, "_INDEX_SNAPSHOTS", FakeCollection([]))
     monkeypatch.setattr(mi, "_CACHE", {})
     monkeypatch.setattr(mi, "_DATES_CACHE", {})
     payload = mi._build_payload("", "L1", 5)
     assert payload["success"] is True
     assert payload["times"] == []
+    assert payload["indices"] == []
     assert "暂无数据" in payload["message"]

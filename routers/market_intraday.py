@@ -39,6 +39,9 @@ _METRICS = [
 
 _SECTOR_STRENGTH = realtime_db["realtime_sector_strength"]
 _MARKET_SPECTRUM = realtime_db["market_spectrum_realtime_daily"]
+_INDEX_SNAPSHOTS = realtime_db["index_realtime_snapshots"]
+
+_INDEX_METRICS = ["pct_chg", "intraday_move", "range_pos"]
 
 _SECTOR_PROJ = {
     "_id": 0,
@@ -65,6 +68,15 @@ _SPECTRUM_PROJ = {
     "below_ma_count": 1,
     "total_stocks": 1,
     "coverage_ratio": 1,
+}
+_INDEX_PROJ = {
+    "_id": 0,
+    "ts_code": 1,
+    "name": 1,
+    "snapshot_time": 1,
+    "pct_chg": 1,
+    "intraday_move": 1,
+    "range_pos": 1,
 }
 
 _CACHE: Dict[str, Tuple[float, Dict[str, Any]]] = {}
@@ -128,26 +140,46 @@ def _load_breadth_rows(date: str) -> List[Dict[str, Any]]:
     return list(_MARKET_SPECTRUM.find(query, _SPECTRUM_PROJ))
 
 
+def _load_index_rows(date: str) -> List[Dict[str, Any]]:
+    query = {"snapshot_time": {"$gte": date + "0900", "$lte": date + "1500"}}
+    return list(_INDEX_SNAPSHOTS.find(query, _INDEX_PROJ))
+
+
 def _time_minutes(snapshot: str) -> int:
     raw = str(snapshot)
     return int(raw[8:10]) * 60 + int(raw[10:12])
 
 
-def _pivot(df: pd.DataFrame, metric: str, times: Sequence[str], sectors: Sequence[str]) -> pd.DataFrame:
-    matrix = df.pivot_table(index="snapshot_time", columns="sector_code", values=metric, aggfunc="last")
-    return matrix.reindex(index=list(times), columns=list(sectors))
+def _pivot(
+    df: pd.DataFrame,
+    metric: str,
+    times: Sequence[str],
+    keys: Sequence[str],
+    key_col: str = "sector_code",
+) -> pd.DataFrame:
+    matrix = df.pivot_table(index="snapshot_time", columns=key_col, values=metric, aggfunc="last")
+    return matrix.reindex(index=list(times), columns=list(keys))
 
 
-def _score_matrix(df: pd.DataFrame, times: Sequence[str], sectors: Sequence[str]) -> pd.DataFrame:
-    total = pd.DataFrame(0.0, index=list(times), columns=list(sectors))
-    count = pd.DataFrame(0, index=list(times), columns=list(sectors))
-    for metric in _METRICS:
-        raw = _pivot(df, metric, times, sectors)
+def _score_matrix(
+    df: pd.DataFrame,
+    times: Sequence[str],
+    keys: Sequence[str],
+    *,
+    metrics: Optional[Sequence[str]] = None,
+    min_metrics: int = MIN_METRICS,
+    key_col: str = "sector_code",
+) -> pd.DataFrame:
+    use_metrics = list(metrics or _METRICS)
+    total = pd.DataFrame(0.0, index=list(times), columns=list(keys))
+    count = pd.DataFrame(0, index=list(times), columns=list(keys))
+    for metric in use_metrics:
+        raw = _pivot(df, metric, times, keys, key_col=key_col)
         ranked = raw.rank(axis=1, pct=True)
         total = total.add(ranked.fillna(0.0), fill_value=0.0)
         count = count.add(ranked.notna().astype(int), fill_value=0)
     score = (total / count.replace(0, np.nan)) * 100.0
-    return score.where(count >= MIN_METRICS)
+    return score.where(count >= min_metrics)
 
 
 def _change_matrix(score: pd.DataFrame, times: Sequence[str], minutes: int = 30) -> pd.DataFrame:
@@ -162,11 +194,16 @@ def _change_matrix(score: pd.DataFrame, times: Sequence[str], minutes: int = 30)
     return out
 
 
-def _series_or_empty(frame: pd.DataFrame, column: Optional[str], times: Sequence[str]) -> List[Optional[float]]:
+def _series_or_empty(
+    frame: pd.DataFrame,
+    column: Optional[str],
+    times: Sequence[str],
+    digits: int = 1,
+) -> List[Optional[float]]:
     if not column or column not in frame.columns:
         return [None] * len(times)
     values = frame.reindex(times)[column].tolist()
-    return [_round_or_none(v) for v in values]
+    return [_round_or_none(v, digits) for v in values]
 
 
 def _sector_payload(
@@ -191,6 +228,54 @@ def _sector_payload(
         "avg_pct_chg": _series_or_empty(avg_pct, code, times),
         "latest": latest,
     }
+
+
+def _build_indices(rows: Sequence[Dict[str, Any]], times: Sequence[str]) -> List[Dict[str, Any]]:
+    """宽基盘中：9 个指数之间的横截面相对强弱，与行业分不可直接比较。"""
+    if not rows:
+        return []
+    df = pd.DataFrame(rows)
+    df["snapshot_time"] = df["snapshot_time"].astype(str)
+    df = df.drop_duplicates(["snapshot_time", "ts_code"], keep="last")
+    for metric in _INDEX_METRICS:
+        df[metric] = pd.to_numeric(df.get(metric), errors="coerce")
+
+    codes = sorted(df["ts_code"].unique())
+    names = (
+        df.drop_duplicates("ts_code", keep="last")
+        .set_index("ts_code")["name"]
+        .astype(str)
+        .to_dict()
+    )
+    scores = _score_matrix(
+        df,
+        times,
+        codes,
+        metrics=_INDEX_METRICS,
+        min_metrics=2,
+        key_col="ts_code",
+    )
+    pct_chg = _pivot(df, "pct_chg", times, codes, key_col="ts_code")
+    intraday = _pivot(df, "intraday_move", times, codes, key_col="ts_code")
+    range_pos = _pivot(df, "range_pos", times, codes, key_col="ts_code")
+
+    out: List[Dict[str, Any]] = []
+    for code in codes:
+        score_values = _series_or_empty(scores, code, times)
+        latest = next((v for v in reversed(score_values) if v is not None), None)
+        pct_values = _series_or_empty(pct_chg, code, times, digits=2)
+        latest_pct = next((v for v in reversed(pct_values) if v is not None), None)
+        out.append({
+            "code": code,
+            "name": names.get(code, code),
+            "scores": score_values,
+            "pct_chg": pct_values,
+            "intraday_move": _series_or_empty(intraday, code, times, digits=2),
+            "range_pos": _series_or_empty(range_pos, code, times, digits=3),
+            "latest": latest,
+            "latest_pct_chg": latest_pct,
+        })
+    return out
 
 
 def _summary(
@@ -283,6 +368,7 @@ def _build_payload(date: str, level: str, ma_period: int) -> Dict[str, Any]:
             "as_of": None,
             "times": [],
             "sectors": [],
+            "indices": [],
             "breadth": {},
             "summary": {},
             "available_dates": available,
@@ -298,6 +384,7 @@ def _build_payload(date: str, level: str, ma_period: int) -> Dict[str, Any]:
             "as_of": None,
             "times": [],
             "sectors": [],
+            "indices": [],
             "breadth": {},
             "summary": {},
             "available_dates": available,
@@ -362,6 +449,8 @@ def _build_payload(date: str, level: str, ma_period: int) -> Dict[str, Any]:
         _sector_payload(code, names.get(code, code), times, score, chg30, positive, above_ma, avg_pct)
         for code in sectors
     ]
+    # 宽基盘中：独立 9 个指数之间的横截面分；数据未接入时为空数组
+    indices_payload = _build_indices(_load_index_rows(date), times)
     # 前端默认按最新分排序；这里保留代码顺序作为「固定顺序」
     summary = _summary(df, score, chg30, names, times)
 
@@ -371,6 +460,7 @@ def _build_payload(date: str, level: str, ma_period: int) -> Dict[str, Any]:
         "as_of": times[-1],
         "times": list(times),
         "sectors": sectors_payload,
+        "indices": indices_payload,
         "breadth": breadth,
         "summary": summary,
         "available_dates": available,
@@ -386,8 +476,10 @@ def _meta(level: str, ma_period: int) -> Dict[str, Any]:
         "metrics": _METRICS,
         "min_metrics": MIN_METRICS,
         "cadence": "2min",
-        "source": "realtime_sector_strength + market_spectrum_realtime_daily",
+        "source": "realtime_sector_strength + market_spectrum_realtime_daily + index_realtime_snapshots",
         "score_note": "每个快照上跨行业横截面百分位均值；100=当前最强，0=当前最弱。",
+        "index_metrics": _INDEX_METRICS,
+        "index_score_note": "宽基分数是 9 个指数之间的横截面相对强弱，与行业分不可直接比较。",
     }
 
 
