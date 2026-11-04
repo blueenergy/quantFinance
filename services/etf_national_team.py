@@ -18,6 +18,7 @@ it can be exercised against today's data without booting the API.
 """
 from __future__ import annotations
 
+import bisect
 import statistics
 import threading
 import time
@@ -302,6 +303,251 @@ def _load_shares(data_db: Any, codes: Sequence[str], today: str) -> Dict[str, Di
             "chg5": chg5,
         }
     return out
+
+
+_HISTORY_TTL_SECONDS = 60.0
+_HISTORY_LOCK = threading.Lock()
+_HISTORY_CACHE: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+
+
+def _load_share_series(
+    data_db: Any, codes: Sequence[str], start_day: str
+) -> Dict[str, Tuple[List[str], List[float]]]:
+    """Ascending (dates, fd_share) per ETF, for point-in-time share changes."""
+    out: Dict[str, Tuple[List[str], List[float]]] = {}
+    for code in codes:
+        rows = list(
+            data_db["etf_shares"]
+            .find(
+                {"ts_code": code, "trade_date": {"$gte": start_day}},
+                {"trade_date": 1, "fd_share": 1, "_id": 0},
+            )
+            .sort("trade_date", 1)
+        )
+        dates: List[str] = []
+        values: List[float] = []
+        for row in rows:
+            value = _num(row.get("fd_share"))
+            if value:
+                dates.append(str(row.get("trade_date")))
+                values.append(value)
+        out[code] = (dates, values)
+    return out
+
+
+def _share_changes(
+    series: Tuple[List[str], List[float]], day: str
+) -> Tuple[Optional[float], Optional[float]]:
+    dates, values = series
+    idx = bisect.bisect_right(dates, day) - 1
+    if idx < 0 or not values[idx]:
+        return None, None
+    current = values[idx]
+    chg1 = (
+        (current / values[idx - 1] - 1) * 100
+        if idx >= 1 and values[idx - 1]
+        else None
+    )
+    chg5 = (
+        (current / values[idx - 5] - 1) * 100
+        if idx >= 5 and values[idx - 5]
+        else None
+    )
+    return chg1, chg5
+
+
+def _pool_day_stats(
+    bars: Mapping[str, Mapping[str, Mapping[str, Tuple[float, float]]]],
+    codes: Sequence[str],
+    day: str,
+    as_of: str,
+) -> Tuple[Dict[str, float], Dict[str, float], str]:
+    """Per-code cumulative / tail amount up to ``as_of`` plus the last bar time."""
+    cum: Dict[str, float] = {}
+    tail: Dict[str, float] = {}
+    last_hm = ""
+    for code in codes:
+        day_map = bars.get(code, {}).get(day) or {}
+        total = 0.0
+        tail_total = 0.0
+        for hm, (amount, _close) in day_map.items():
+            if hm > as_of:
+                continue
+            total += amount
+            if "1430" < hm <= as_of:
+                tail_total += amount
+            if hm > last_hm:
+                last_hm = hm
+        cum[code] = total
+        tail[code] = tail_total
+    return cum, tail, last_hm
+
+
+def compute_history(
+    data_db: Any,
+    as_of: Optional[str] = None,
+    limit: int = 60,
+) -> Dict[str, Any]:
+    """Daily national-team signal series at a fixed intraday time.
+
+    Every row uses the same definition as :func:`compute_snapshot`, so the
+    history reconciles with the cross-section shown in the dashboard.  The
+    first 20 covered sessions only have a partial baseline; ``baseline_days``
+    exposes how many sessions were actually available.
+    """
+    pool = load_pool(data_db)
+    codes = [item["ts_code"] for item in pool]
+    if not codes:
+        raise ValueError("national-team pool is empty")
+    as_of_hm = _norm_time(as_of) or "1500"
+    if as_of_hm < "0930" or as_of_hm > "1500":
+        raise ValueError(f"as_of {as_of_hm} is outside the trading session")
+    limit = max(1, int(limit))
+    cache_key = f"{id(data_db)}:{as_of_hm}:{limit}"
+    now = time.monotonic()
+    with _HISTORY_LOCK:
+        cached = _HISTORY_CACHE.get(cache_key)
+        if cached and now - cached[0] < _HISTORY_TTL_SECONDS:
+            return cached[1]
+
+    # The dashboard can only replay full-coverage sessions; the baseline may
+    # still use the older single-ETF sessions, matching compute_snapshot().
+    covered_dates = list_trade_dates(data_db, limit=min(240, limit + 20))
+    if not covered_dates:
+        raise ValueError("no minute_bars data for the national-team pool")
+    out_dates = covered_dates[-limit:]
+    latest = covered_dates[-1]
+    raw_calendar = data_db["etf_daily"].distinct(
+        "trade_date",
+        {"ts_code": {"$in": codes}, "trade_date": {"$lte": latest}},
+    )
+    calendar = sorted({_norm_day(x) for x in raw_calendar if _norm_day(x)})
+    if not calendar:
+        calendar = list(covered_dates)
+    calendar = sorted(set(calendar) | set(out_dates))
+    earliest = out_dates[0]
+    calendar = [d for d in calendar if d < earliest][-20:] + [
+        d for d in calendar if d >= earliest
+    ]
+    bars = _load_bars(data_db, codes, calendar)
+    present = {
+        day: {code for code in codes if bars.get(code, {}).get(day)}
+        for day in calendar
+    }
+    stats = {
+        day: _pool_day_stats(bars, codes, day, as_of_hm)
+        for day in calendar
+        if present.get(day)
+    }
+    share_start = (
+        datetime.strptime(calendar[0], "%Y%m%d") - timedelta(days=40)
+    ).strftime("%Y%m%d")
+    share_series = _load_share_series(data_db, codes, share_start)
+
+    rows: List[Dict[str, Any]] = []
+    for day in out_dates:
+        if day not in stats:
+            continue
+        hist_days = [d for d in calendar if d < day and d in stats][-20:]
+        baseline_days = min(
+            (
+                sum(1 for h in hist_days if code in present.get(h, set()))
+                for code in codes
+            ),
+            default=0,
+        )
+        cum, tail, last_hm = stats[day]
+        pool_cur = 0.0
+        pool_base = 0.0
+        breadth2 = 0
+        breadth25 = 0
+        share1_values: List[float] = []
+        share5_values: List[float] = []
+        for code in codes:
+            cur = cum.get(code) or 0.0
+            base = _median(
+                [
+                    stats[h][0].get(code) or 0.0
+                    for h in hist_days
+                    if code in present.get(h, set())
+                ]
+            )
+            ratio = cur / base if base else 0.0
+            pool_cur += cur
+            pool_base += base or 0.0
+            if ratio >= 2.0:
+                breadth2 += 1
+            if ratio >= 2.5:
+                breadth25 += 1
+            share1, share5 = _share_changes(share_series.get(code, ([], [])), day)
+            if share1 is not None:
+                share1_values.append(share1)
+            if share5 is not None:
+                share5_values.append(share5)
+
+        if as_of_hm > "1430" and pool_cur:
+            day_tail_share = sum(tail.values()) / pool_cur
+        else:
+            day_tail_share = None
+        tail_baselines: List[float] = []
+        if as_of_hm > "1430":
+            for hist_day in hist_days:
+                h_cum, h_tail, _ = stats[hist_day]
+                h_cur = sum(h_cum.values())
+                if h_cur:
+                    tail_baselines.append(sum(h_tail.values()) / h_cur)
+        tail_baseline = _median(tail_baselines)
+        tail_ratio = (
+            day_tail_share / tail_baseline
+            if day_tail_share is not None and tail_baseline
+            else None
+        )
+
+        avg_share1 = statistics.mean(share1_values) if share1_values else None
+        if (
+            breadth25 >= 3
+            and avg_share1 is not None
+            and avg_share1 >= 1
+            and tail_ratio is not None
+            and tail_ratio >= 1.3
+        ):
+            level = "high"
+        elif breadth25 >= 3:
+            level = "suspect"
+        elif breadth2 >= 2:
+            level = "watch"
+        else:
+            level = "calm"
+
+        rows.append(
+            {
+                "trade_date": day,
+                "level": level,
+                "level_label": _label_level(level),
+                "pool_ratio": (pool_cur / pool_base) if pool_base else None,
+                "amount_yuan": pool_cur,
+                "baseline_yuan": pool_base,
+                "breadth_2x": breadth2,
+                "breadth_25x": breadth25,
+                "tail_ratio": tail_ratio,
+                "share_chg_1d": avg_share1,
+                "share_chg_5d": (
+                    statistics.mean(share5_values) if share5_values else None
+                ),
+                "baseline_days": baseline_days,
+                "partial": bool(last_hm and last_hm < as_of_hm),
+            }
+        )
+
+    payload = {
+        "success": True,
+        "as_of": as_of_hm,
+        "dates": out_dates,
+        "rows": rows,
+    }
+    with _HISTORY_LOCK:
+        _HISTORY_CACHE[cache_key] = (now, payload)
+    return payload
 
 
 def _context_key(data_db: Any, trade_date: Optional[str]) -> str:

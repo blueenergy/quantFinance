@@ -7,7 +7,12 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 
 from auth import get_current_active_user
 from db import data_db
-from services.etf_national_team import compute_curve, compute_snapshot, list_trade_dates
+from services.etf_national_team import (
+    compute_curve,
+    compute_history,
+    compute_snapshot,
+    list_trade_dates,
+)
 
 router = APIRouter(prefix="/etf/national-team", tags=["etf-national-team"])
 
@@ -21,6 +26,22 @@ def get_national_team_dates(
         return {"success": True, "dates": list_trade_dates(data_db, limit=limit)}
     except Exception as exc:  # pragma: no cover
         raise HTTPException(status_code=500, detail=f"national-team dates failed: {exc}")
+
+
+@router.get("/history", summary="国家队 ETF 日频信号历史")
+def get_national_team_history(
+    as_of: Optional[str] = Query(
+        None, description="HHMM; default 1500 (close snapshot)"
+    ),
+    limit: int = Query(60, ge=1, le=240),
+    current_user: dict = Depends(get_current_active_user),
+):
+    try:
+        return compute_history(data_db, as_of=as_of, limit=limit)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except Exception as exc:  # pragma: no cover
+        raise HTTPException(status_code=500, detail=f"national-team history failed: {exc}")
 
 
 @router.get("/snapshot", summary="国家队 ETF 盘中信号快照")
