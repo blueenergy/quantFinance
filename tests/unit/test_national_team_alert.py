@@ -35,7 +35,15 @@ def _snapshot(level="suspect", as_of="1030", tail_ratio=None, trade_date="202611
             "ratio": 1.40,
         },
         "tail": tail,
-        "share": {"avg_chg_1d": 1.2, "avg_chg_5d": 3.4, "date": "20261103"},
+        "share": {
+            "avg_chg_1d": 1.2,
+            "avg_chg_5d": 3.4,
+            "date": "20261103",
+            "pool_flow": 1.5,
+            "rotation": 1.1,
+            "direction": "inflow",
+            "direction_label": "净申购",
+        },
         "first_signal": {"watch": "1000", "suspect": "1030"},
         "index_moves": [
             {"ts_code": "000300.SH", "name": "沪深300", "pct_chg": -0.20},
@@ -76,6 +84,23 @@ def test_build_alert_includes_evidence_and_close_wording():
 def test_build_alert_before_tail_window():
     _, lines = nta.build_alert(_snapshot(level="watch", as_of="1124"), close=False)
     assert any("未到 14:30" in line for line in lines)
+
+
+def test_build_alert_marks_redemption_direction():
+    snapshot = _snapshot(level="suspect")
+    snapshot["share"].update(
+        {
+            "pool_flow": -3.26,
+            "rotation": 1.05,
+            "direction": "outflow",
+            "direction_label": "净赎回",
+        }
+    )
+    title, lines = nta.build_alert(snapshot)
+    text = "\n".join(lines)
+    assert "净赎回" in title
+    assert "池子净申赎(AUM加权) -3.26%" in text
+    assert "相消比 1.05" in text
 
 
 def test_watch_is_below_threshold():

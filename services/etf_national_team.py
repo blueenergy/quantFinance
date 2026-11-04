@@ -61,6 +61,26 @@ LEVEL_LABELS = {
     "high": "高置信",
 }
 
+# Net primary-market share flow, AUM-weighted.  +/-1% of prior pool AUM is the
+# same threshold used by the per-ETF share confirmation, so a day can only be
+# "high" (buy) when the direction is inflow.
+SHARE_DIRECTION_LABELS = {
+    "inflow": "净申购",
+    "outflow": "净赎回",
+    "neutral": "中性",
+    "unknown": "未知",
+}
+
+
+def _share_direction(flow: Optional[float]) -> str:
+    if flow is None:
+        return "unknown"
+    if flow >= 1.0:
+        return "inflow"
+    if flow <= -1.0:
+        return "outflow"
+    return "neutral"
+
 _CTX_TTL_SECONDS = 30.0
 _CTX_LOCK = threading.Lock()
 _CTX_CACHE: Dict[str, Tuple[float, Dict[str, Any]]] = {}
@@ -301,6 +321,9 @@ def _load_shares(data_db: Any, codes: Sequence[str], today: str) -> Dict[str, Di
             "date": values[0][0] if values else None,
             "chg1": chg1,
             "chg5": chg5,
+            "latest": values[0][1] if values else None,
+            "prev": values[1][1] if len(values) > 1 else None,
+            "prev_date": values[1][0] if len(values) > 1 else None,
         }
     return out
 
@@ -337,11 +360,18 @@ def _load_share_series(
 
 def _share_changes(
     series: Tuple[List[str], List[float]], day: str
-) -> Tuple[Optional[float], Optional[float]]:
+) -> Tuple[
+    Optional[float],
+    Optional[float],
+    Optional[float],
+    Optional[float],
+    Optional[str],
+]:
+    """(chg1, chg5, latest, prev, prev_date) for the latest row <= day."""
     dates, values = series
     idx = bisect.bisect_right(dates, day) - 1
     if idx < 0 or not values[idx]:
-        return None, None
+        return None, None, None, None, None
     current = values[idx]
     chg1 = (
         (current / values[idx - 1] - 1) * 100
@@ -353,7 +383,9 @@ def _share_changes(
         if idx >= 5 and values[idx - 5]
         else None
     )
-    return chg1, chg5
+    prev = values[idx - 1] if idx >= 1 else None
+    prev_date = dates[idx - 1] if idx >= 1 else None
+    return chg1, chg5, current, prev, prev_date
 
 
 def _pool_day_stats(
@@ -443,6 +475,9 @@ def compute_history(
         datetime.strptime(calendar[0], "%Y%m%d") - timedelta(days=40)
     ).strftime("%Y%m%d")
     share_series = _load_share_series(data_db, codes, share_start)
+    daily_close = _load_daily_closes(
+        data_db, codes, sorted({share_start, *calendar})
+    )
 
     rows: List[Dict[str, Any]] = []
     for day in out_dates:
@@ -463,6 +498,9 @@ def compute_history(
         breadth25 = 0
         share1_values: List[float] = []
         share5_values: List[float] = []
+        flow_delta = 0.0
+        flow_base = 0.0
+        flow_abs = 0.0
         for code in codes:
             cur = cum.get(code) or 0.0
             base = _median(
@@ -479,11 +517,28 @@ def compute_history(
                 breadth2 += 1
             if ratio >= 2.5:
                 breadth25 += 1
-            share1, share5 = _share_changes(share_series.get(code, ([], [])), day)
+            (
+                share1,
+                share5,
+                latest_share,
+                prev_share,
+                prev_share_date,
+            ) = _share_changes(share_series.get(code, ([], [])), day)
             if share1 is not None:
                 share1_values.append(share1)
             if share5 is not None:
                 share5_values.append(share5)
+            weight_close = (
+                daily_close.get(code, {}).get(prev_share_date)
+                if prev_share_date
+                else None
+            )
+            if latest_share and prev_share and weight_close:
+                base_aum = prev_share * weight_close
+                delta_aum = (latest_share - prev_share) * weight_close
+                flow_base += base_aum
+                flow_delta += delta_aum
+                flow_abs += abs(delta_aum)
 
         if as_of_hm > "1430" and pool_cur:
             day_tail_share = sum(tail.values()) / pool_cur
@@ -504,6 +559,9 @@ def compute_history(
         )
 
         avg_share1 = statistics.mean(share1_values) if share1_values else None
+        pool_flow = (flow_delta / flow_base * 100) if flow_base else None
+        share_rotation = (flow_abs / abs(flow_delta)) if flow_delta else None
+        share_direction = _share_direction(pool_flow)
         if (
             breadth25 >= 3
             and avg_share1 is not None
@@ -534,6 +592,10 @@ def compute_history(
                 "share_chg_5d": (
                     statistics.mean(share5_values) if share5_values else None
                 ),
+                "pool_share_flow": pool_flow,
+                "share_rotation": share_rotation,
+                "direction": share_direction,
+                "direction_label": SHARE_DIRECTION_LABELS[share_direction],
                 "baseline_days": baseline_days,
                 "partial": bool(last_hm and last_hm < as_of_hm),
             }
@@ -747,6 +809,9 @@ def compute_snapshot(
     breadth25 = 0
     share1_values: List[float] = []
     share5_values: List[float] = []
+    flow_delta = 0.0
+    flow_base = 0.0
+    flow_abs = 0.0
     prev_day = max((day for day in ctx["days"] if day < today), default=None)
     avg5_days = ctx["hist_days"][-5:]
 
@@ -809,6 +874,24 @@ def compute_snapshot(
             if day < today:
                 prev_close = ctx["daily_close"][code][day]
                 break
+
+        # AUM-weighted net primary-market flow.  Weight with the close on the
+        # previous share row's date, so price moves do not contaminate shares.
+        share_info = ctx["shares"].get(code) or {}
+        latest_share = share_info.get("latest")
+        prev_share = share_info.get("prev")
+        prev_share_date = share_info.get("prev_date")
+        weight_close = None
+        if prev_share_date:
+            weight_close = ctx["daily_close"].get(code, {}).get(prev_share_date)
+        weight_close = weight_close or prev_close
+        if latest_share and prev_share and weight_close:
+            base_aum = prev_share * weight_close
+            delta_aum = (latest_share - prev_share) * weight_close
+            flow_base += base_aum
+            flow_delta += delta_aum
+            flow_abs += abs(delta_aum)
+
         last_price = series["price"][idx]
         pct_chg = (
             (last_price / prev_close - 1) * 100
@@ -865,6 +948,9 @@ def compute_snapshot(
     )
     avg_share1 = statistics.mean(share1_values) if share1_values else None
     avg_share5 = statistics.mean(share5_values) if share5_values else None
+    pool_flow = (flow_delta / flow_base * 100) if flow_base else None
+    share_rotation = (flow_abs / abs(flow_delta)) if flow_delta else None
+    share_direction = _share_direction(pool_flow)
 
     # Breadth timeline / first crossings.  Ignore the opening auction window:
     # a tiny 09:30 baseline makes almost anything look like a signal.
@@ -940,6 +1026,10 @@ def compute_snapshot(
             "avg_chg_1d": avg_share1,
             "avg_chg_5d": avg_share5,
             "date": share_date,
+            "pool_flow": pool_flow,
+            "rotation": share_rotation,
+            "direction": share_direction,
+            "direction_label": SHARE_DIRECTION_LABELS[share_direction],
         },
         "first_signal": {
             "watch": first_watch,

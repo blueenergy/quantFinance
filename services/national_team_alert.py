@@ -82,8 +82,13 @@ def build_alert(snapshot: Mapping[str, Any], close: bool = False) -> Tuple[str, 
     tail = snapshot.get("tail") or {}
     share = snapshot.get("share") or {}
     first = snapshot.get("first_signal") or {}
+    direction = str(share.get("direction") or "")
+    direction_label = str(share.get("direction_label") or "")
+    headline = label
+    if direction in ("inflow", "outflow") and direction_label:
+        headline = f"{label}·{direction_label}"
 
-    title = f"{TITLE_PREFIX}{header} · {label} ({trade_date} {as_of})"
+    title = f"{TITLE_PREFIX}{header} · {headline} ({trade_date} {as_of})"
 
     lines: List[str] = [
         f"- 交易日 {trade_date} · 数据截至 {as_of}",
@@ -124,6 +129,18 @@ def build_alert(snapshot: Mapping[str, Any], close: bool = False) -> Tuple[str, 
             "- 份额确认(T+1) 日 %s / 5日 %s（数据日 %s）"
             % (_fmt_share(share1), _fmt_share(share.get("avg_chg_5d")), share.get("date") or "-")
         )
+    pool_flow = share.get("pool_flow")
+    if pool_flow is not None:
+        rotation = share.get("rotation")
+        rot_text = ""
+        try:
+            if rotation is not None:
+                rot_text = " · 相消比 %.2f" % float(rotation)
+        except (TypeError, ValueError):
+            rot_text = ""
+        lines.append(
+            "- 池子净申赎(AUM加权) %s%s" % (_fmt_share(pool_flow), rot_text)
+        )
 
     moves = [
         "%s %s" % (item.get("name") or item.get("ts_code"), _fmt_share(item.get("pct_chg")))
@@ -162,7 +179,9 @@ def build_alert(snapshot: Mapping[str, Any], close: bool = False) -> Tuple[str, 
         lines.append("- " + " · ".join(first_parts))
 
     lines.append("")
-    lines.append("> 国家队不可直接观测；「%s」为量价 + 份额证据，不构成确认。" % label)
+    lines.append(
+        "> 国家队不可直接观测；「%s」为量价 + 份额证据，不构成确认。" % headline
+    )
     return title, lines
 
 
