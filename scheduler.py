@@ -689,6 +689,88 @@ def trade_fill_notify_task():
         _release_scheduler_job_lock(job_id)
 
 
+def _national_team_bar_fresh(as_of: str, hm: str) -> bool:
+    """True when *as_of* is within 10 minutes of the expected latest 1m bar."""
+    def minutes(value: str) -> int:
+        return int(value[:2]) * 60 + int(value[2:4])
+
+    try:
+        expected = min(minutes(hm), 11 * 60 + 30) if hm < "1300" else minutes(hm)
+        return expected - minutes(as_of) <= 10
+    except (TypeError, ValueError):
+        return False
+
+
+def national_team_alert_task():
+    """Push national-team ETF level upgrades to DingTalk.
+
+    Runs every 5 minutes on weekdays.  The task itself skips the lunch break
+    and the 15:00-15:05 window (waiting for the closing bar); from 15:05 it
+    becomes the close-confirmation run.  Stale data is ignored so a broken
+    minute bridge cannot replay yesterday's verdict as today's alert.
+    """
+    from db import data_db, db
+    from services.etf_national_team import compute_snapshot
+    from services.national_team_alert import evaluate_snapshot
+
+    job_id = "national_team_alert"
+    if not _acquire_scheduler_job_lock(job_id, ttl_seconds=240):
+        return
+    try:
+        now = datetime.now()
+        if now.weekday() >= 5:
+            return
+        hm = now.strftime("%H%M")
+        if hm < "0935":
+            return
+        if "1130" < hm < "1300":
+            return
+        if "1500" <= hm < "1505":
+            return
+        if hm > "1555":
+            return
+        close = hm >= "1505"
+
+        try:
+            snapshot = compute_snapshot(data_db)
+        except ValueError as exc:
+            log.info("[NationalTeamAlert] snapshot unavailable: %s", exc)
+            return
+
+        today = now.strftime("%Y%m%d")
+        if str(snapshot.get("trade_date")) != today:
+            log.info(
+                "[NationalTeamAlert] latest trade_date %s != today %s; skip",
+                snapshot.get("trade_date"),
+                today,
+            )
+            return
+
+        as_of = str(snapshot.get("as_of") or "")
+        if close:
+            # Prefer the 15:00 bar (closing auction included).  If it never
+            # arrives, accept >=14:55 after 15:15 rather than skipping the
+            # whole close confirmation.
+            if as_of < "1500" and not (hm >= "1515" and as_of >= "1455"):
+                log.info("[NationalTeamAlert] close bars not ready (as_of=%s)", as_of)
+                return
+        elif not _national_team_bar_fresh(as_of, hm):
+            log.info(
+                "[NationalTeamAlert] stale bars (as_of=%s now=%s); skip", as_of, hm
+            )
+            return
+
+        evaluate_snapshot(
+            snapshot,
+            db["national_team_alert_state"],
+            close=close,
+        )
+    except Exception as exc:
+        log.error("[NationalTeamAlert] failed: %s", exc, exc_info=True)
+    finally:
+        _release_scheduler_job_lock(job_id)
+
+
 def hot_stock_poll_task(source: str):
     """热股分析任务 - 基于最新 THS / DC 热榜数据检查并提交分析。"""
     from db import get_db_collections, get_analyzer_db
@@ -755,6 +837,7 @@ TASK_MAP = {
     'live_snapshot_reconcile_intraday': live_snapshot_reconcile_task,
     'live_snapshot_execution_backfill': live_snapshot_execution_backfill_task,
     'trade_fill_notify': trade_fill_notify_task,
+    'national_team_alert': national_team_alert_task,
 }
 
 # Default trigger configurations
@@ -900,6 +983,14 @@ DEFAULT_SCHEDULES = {
         'name': "策略成交通知 (每30秒)",
         'type': "interval",
         'seconds': 30,
+        'is_active': True,
+    },
+    'national_team_alert': {
+        'name': "国家队 ETF 信号钉钉提醒 (每5分钟)",
+        'type': "cron",
+        'hour': '9-15',
+        'minute': '*/5',
+        'day_of_week': 'mon-fri',
         'is_active': True,
     },
 }
