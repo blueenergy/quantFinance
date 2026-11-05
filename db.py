@@ -166,6 +166,10 @@ def get_trading_db_collections() -> Dict[str, Collection]:
         "portfolio_trailing_stop_runs": trading_db["portfolio_trailing_stop_runs"],
         "portfolio_live_snapshots": trading_db["portfolio_live_snapshots"],
         "portfolio_reconcile_alerts": trading_db["portfolio_reconcile_alerts"],
+        # First-board shadow execution (Phase A); no trade_signals writes.
+        "first_board_execution_settings": trading_db["first_board_execution_settings"],
+        "first_board_order_intents": trading_db["first_board_order_intents"],
+        "first_board_execution_runs": trading_db["first_board_execution_runs"],
     }
 
 def get_analyzer_db():
