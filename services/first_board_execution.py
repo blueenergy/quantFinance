@@ -55,6 +55,17 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
         "skip_existing_positions": True,
         "skip_if_limit_up": True,
     },
+    "gates": {
+        "sector": {
+            "enabled": True,
+            "level": "L1",
+            "ma_period": 5,
+            "min_above_ma5_ratio": 0.60,
+            "confirm_level": "L3",
+            "min_median_pct_chg": 0.0,
+            "on_missing": "skip",
+        }
+    },
     "entry": {
         "order_type": "limit",
         "max_slippage_bps": 100,
@@ -175,6 +186,74 @@ def _position_map(rows: Iterable[Mapping[str, Any]]) -> Dict[str, Mapping[str, A
     return out
 
 
+def load_sector_strength(
+    data_db: Any,
+    realtime_db: Any,
+    symbols: Sequence[str],
+    snapshot_time: Optional[str] = None,
+    ma_period: int = 5,
+) -> Tuple[Dict[str, Dict[str, Any]], Optional[str]]:
+    """Attach SW L1 breadth + L3 median to each symbol.
+
+    Gate chosen 2026-11-05: L1 ``above_ma5_ratio >= 0.60`` and L3
+    ``median_pct_chg > 0``.  The L3 median is the confirmation leg; the L1
+    breadth is the primary leg.
+    """
+    cleaned = sorted({str(symbol) for symbol in symbols if symbol})
+    if not cleaned:
+        return {}, None
+    strength = realtime_db["realtime_sector_strength"]
+    if snapshot_time is None:
+        latest = strength.find_one(sort=[("snapshot_time", -1)])
+        if not latest:
+            return {}, None
+        snapshot_time = str(latest.get("snapshot_time") or "")
+    members = {
+        str(doc.get("con_code")): doc
+        for doc in data_db["sw_index_member"].find(
+            {"con_code": {"$in": cleaned}, "src": "SW2021", "is_new": "Y"},
+            {
+                "_id": 0,
+                "con_code": 1,
+                "l1_code": 1,
+                "l1_name": 1,
+                "l3_code": 1,
+                "l3_name": 1,
+            },
+        )
+    }
+    codes = {
+        str(value)
+        for doc in members.values()
+        for value in (doc.get("l1_code"), doc.get("l3_code"))
+        if value
+    }
+    by_code: Dict[Tuple[str, str], Mapping[str, Any]] = {}
+    if codes:
+        for doc in strength.find(
+            {
+                "snapshot_time": snapshot_time,
+                "ma_period": int(ma_period),
+                "sector_code": {"$in": sorted(codes)},
+            }
+        ):
+            by_code[(str(doc.get("level")), str(doc.get("sector_code")))] = doc
+    out: Dict[str, Dict[str, Any]] = {}
+    for symbol, member in members.items():
+        l1 = by_code.get(("L1", str(member.get("l1_code")))) or {}
+        l3 = by_code.get(("L3", str(member.get("l3_code")))) or {}
+        out[symbol] = {
+            "sector_l1_code": member.get("l1_code"),
+            "sector_l1_name": member.get("l1_name"),
+            "sector_l1_above_ma5_ratio": _num(l1.get("above_ma5_ratio")),
+            "sector_l3_code": member.get("l3_code"),
+            "sector_l3_name": member.get("l3_name"),
+            "sector_l3_median_pct_chg": _num(l3.get("median_pct_chg")),
+            "sector_snapshot_time": snapshot_time,
+        }
+    return out, snapshot_time
+
+
 def _target_amount(
     *,
     mode: str,
@@ -211,6 +290,7 @@ def build_intents(
     user_id: str = "",
     account_id: str = "",
     securities_account_id: str = "",
+    sector_strength: Optional[Mapping[str, Mapping[str, Any]]] = None,
 ) -> Tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     sizing = settings.get("sizing") or {}
     filters = settings.get("filters") or {}
@@ -236,6 +316,13 @@ def build_intents(
     skip_if_limit_up = bool(filters.get("skip_if_limit_up", True))
     order_type = str(entry.get("order_type") or "limit").lower()
     max_slippage_bps = max(0, int(entry.get("max_slippage_bps") or 0))
+    gates = settings.get("gates") or {}
+    sector_gate = gates.get("sector") or {}
+    sector_gate_enabled = bool(sector_gate.get("enabled", True))
+    sector_min_ratio = float(sector_gate.get("min_above_ma5_ratio", 0.60))
+    sector_min_median = float(sector_gate.get("min_median_pct_chg", 0.0))
+    sector_on_missing = str(sector_gate.get("on_missing", "skip")).lower()
+    sector_map = sector_strength or {}
 
     investable_cash = max(0.0, available_cash - equity * min_cash_reserve_pct)
     remaining_cash = investable_cash
@@ -251,6 +338,33 @@ def build_intents(
         name = str(candidate.get("name") or "")
         if not symbol:
             continue
+        sector = sector_map.get(symbol) or {}
+        if sector_gate_enabled:
+            l1_ratio = _num(sector.get("sector_l1_above_ma5_ratio"))
+            l3_median = _num(sector.get("sector_l3_median_pct_chg"))
+            if l1_ratio is None or l3_median is None:
+                if sector_on_missing != "pass":
+                    dropped.append({"symbol": symbol, "reason": "sector_data_missing"})
+                    continue
+            else:
+                if l1_ratio < sector_min_ratio:
+                    dropped.append(
+                        {
+                            "symbol": symbol,
+                            "reason": "sector_l1_breadth_weak",
+                            "sector_l1_above_ma5_ratio": l1_ratio,
+                        }
+                    )
+                    continue
+                if l3_median <= sector_min_median:
+                    dropped.append(
+                        {
+                            "symbol": symbol,
+                            "reason": "sector_l3_median_weak",
+                            "sector_l3_median_pct_chg": l3_median,
+                        }
+                    )
+                    continue
         score = _num(candidate.get("score"), 0.0) or 0.0
         if exclude_bj and symbol.endswith(".BJ"):
             dropped.append({"symbol": symbol, "reason": "excluded_bj"})
@@ -340,6 +454,11 @@ def build_intents(
                 "sizing_mode": mode,
                 "sizing_value": value,
                 "capped_by": caps,
+                "sector_l1_name": sector.get("sector_l1_name"),
+                "sector_l1_above_ma5_ratio": _num(sector.get("sector_l1_above_ma5_ratio")),
+                "sector_l3_name": sector.get("sector_l3_name"),
+                "sector_l3_median_pct_chg": _num(sector.get("sector_l3_median_pct_chg")),
+                "sector_snapshot_time": sector.get("sector_snapshot_time"),
                 "user_id": user_id,
                 "account_id": account_id,
                 "securities_account_id": securities_account_id,
@@ -381,6 +500,7 @@ def run_shadow(
     finance_collections: Mapping[str, Any],
     trading_collections: Mapping[str, Any],
     data_db: Any,
+    realtime_db: Any,
     trade_date: str,
     account_key: str,
     candidates_collection: str = DEFAULT_CANDIDATES_COLLECTION,
@@ -398,6 +518,13 @@ def run_shadow(
     settings = load_settings(trading_collections[settings_collection], account_key)
     candidates = load_candidates(data_db, candidates_collection, trade_date)
     positions = load_positions(finance_collections, account)
+    sector_gate = (settings.get("gates") or {}).get("sector") or {}
+    sector_strength, sector_snapshot_time = load_sector_strength(
+        data_db,
+        realtime_db,
+        [str(row.get("symbol")) for row in candidates if row.get("symbol")],
+        ma_period=int(sector_gate.get("ma_period", 5)),
+    )
 
     equity = (
         equity_override
@@ -436,6 +563,7 @@ def run_shadow(
         user_id=str(account.get("user_id") or ""),
         account_id=str(account.get("account_id") or ""),
         securities_account_id=str(account.get("securities_account_id") or ""),
+        sector_strength=sector_strength,
     )
     for row in intents:
         row["candidates_collection"] = candidates_collection
@@ -447,6 +575,7 @@ def run_shadow(
         "securities_account_id": account.get("securities_account_id"),
         "equity": round(equity or 0.0, 2),
         "available_cash": round(available_cash or 0.0, 2),
+        "sector_snapshot_time": sector_snapshot_time,
         "candidates_seen": len(candidates),
         "intents": len(intents),
         "dropped": len(dropped),
@@ -482,6 +611,7 @@ def run_shadow(
             "securities_account_id": account.get("securities_account_id"),
             "mode": "shadow",
             "candidates_collection": candidates_collection,
+            "sector_snapshot_time": sector_snapshot_time,
             "equity": summary["equity"],
             "available_cash": summary["available_cash"],
             "candidates_seen": len(candidates),
@@ -528,7 +658,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         format="%(asctime)s [first_board_exec] %(levelname)s %(message)s",
     )
     trade_date = args.trade_date or datetime.now(CN_TZ).strftime("%Y%m%d")
-    from db import data_db, get_db_collections, get_trading_db_collections, trading_db
+    from db import (
+        data_db,
+        get_db_collections,
+        get_trading_db_collections,
+        realtime_db,
+        trading_db,
+    )
 
     trading_collections = get_trading_db_collections()
     for collection_name in (
@@ -542,6 +678,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         finance_collections=get_db_collections(),
         trading_collections=trading_collections,
         data_db=data_db,
+        realtime_db=realtime_db,
         trade_date=trade_date,
         account_key=args.account_id,
         candidates_collection=args.candidates_collection,
