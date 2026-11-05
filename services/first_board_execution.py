@@ -510,6 +510,7 @@ def run_shadow(
     equity_override: Optional[float] = None,
     cash_override: Optional[float] = None,
     use_latest_prices: bool = False,
+    sector_snapshot_time: Optional[str] = None,
     dry_run: bool = False,
 ) -> Dict[str, Any]:
     account = load_account(finance_collections, account_key)
@@ -523,6 +524,7 @@ def run_shadow(
         data_db,
         realtime_db,
         [str(row.get("symbol")) for row in candidates if row.get("symbol")],
+        snapshot_time=sector_snapshot_time,
         ma_period=int(sector_gate.get("ma_period", 5)),
     )
 
@@ -646,6 +648,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--equity", type=float, default=None, help="replay override")
     parser.add_argument("--cash", type=float, default=None, help="replay override")
     parser.add_argument("--use-latest-prices", action="store_true")
+    parser.add_argument("--sector-snapshot-time", default=None,
+                        help="PIT replay: use this sector snapshot (YYYYMMDDHHMM) instead of latest")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--log-level", default="INFO")
     return parser.parse_args(argv)
@@ -688,6 +692,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         equity_override=args.equity,
         cash_override=args.cash,
         use_latest_prices=args.use_latest_prices,
+        sector_snapshot_time=args.sector_snapshot_time,
         dry_run=args.dry_run,
     )
     print(json.dumps(summary, ensure_ascii=False, indent=2, default=str))
