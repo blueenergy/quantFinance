@@ -1146,13 +1146,11 @@ def test_model_score_preset_and_lineage_carry_model_id():
         "score_type": "score_column",
         "score_column": "model_score",
         "model_id": "m1",
-        "star_round_lot": True,
         "top_n": 20,
         "rebalance_days": 20,
     }
     params = portfolio_research._preset_params_from_candidate(candidate)
     assert params["model_id"] == "m1"
-    assert params["star_round_lot"] is True
     assert portfolio_research._lineage_params_hash(candidate) != portfolio_research._lineage_params_hash(
         {**candidate, "model_id": "m2"}
     )
@@ -1958,7 +1956,6 @@ def test_create_live_preview_enqueues_score_column_with_model_prediction(monkeyp
     task = collections["portfolio_plan_generation_tasks"].docs[0]
     assert task["params_override"]["model_id"] == "research-csi1000-clean-raw5"
     assert task["params_override"]["score_type"] == "score_column"
-    assert task["params_override"]["star_round_lot"] is True
     assert task["params_override"]["top_n"] == 20
     assert response["data"]["task_id"] == task["task_id"]
 

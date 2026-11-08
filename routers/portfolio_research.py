@@ -624,7 +624,6 @@ PRESET_PARAM_KEYS = {
     "score_type",
     "score_column",
     "model_id",
-    "star_round_lot",
     "growth_weight",
     "cycle_weight",
     "top_n",
@@ -786,11 +785,6 @@ def _candidate_strategy_config_from_row(job: Dict[str, Any], row: Dict[str, Any]
         # params_hash per model. Omit it for legacy growth/cycle candidates so
         # their existing preset hashes do not change.
         candidate["model_id"] = model_id
-    if score_type == "score_column":
-        # Research sizes every board in 100-share lots; keep live STAR targets
-        # on the same grid instead of the exchange-legal 1-share increment
-        # (216 -> 200).
-        candidate["star_round_lot"] = True
     if str(row.get("regime_mode") or "off") == "bull_g60_else_cash":
         candidate["regime_cash"] = True
         rule = str(params.get("regime_rule") or "").strip()
@@ -1089,7 +1083,6 @@ LINEAGE_PARAM_KEYS = {
     "score_type",
     "score_column",
     "model_id",
-    "star_round_lot",
     "growth_weight",
     "cycle_weight",
     "score_weights",
