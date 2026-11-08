@@ -615,6 +615,7 @@ PRESET_PARAM_KEYS = {
     "index_benchmark_symbol",
     "score_type",
     "score_column",
+    "model_id",
     "growth_weight",
     "cycle_weight",
     "top_n",
@@ -769,6 +770,13 @@ def _candidate_strategy_config_from_row(job: Dict[str, Any], row: Dict[str, Any]
         "status": "draft",
         "version": 1,
     }
+    model_id = str(params.get("model_id") or row.get("model_id") or "").strip()
+    if model_id:
+        # Model-score research carries the prediction lineage; live construction
+        # needs it to load quant_ml.model_predictions and to keep a separate
+        # params_hash per model. Omit it for legacy growth/cycle candidates so
+        # their existing preset hashes do not change.
+        candidate["model_id"] = model_id
     if str(row.get("regime_mode") or "off") == "bull_g60_else_cash":
         candidate["regime_cash"] = True
         rule = str(params.get("regime_rule") or "").strip()
@@ -798,13 +806,30 @@ def _assert_live_candidate(
         )
     candidate_score_type = candidate.get("score_type")
     score_weights = candidate.get("score_weights")
-    if candidate_score_type and candidate_score_type not in ("growth_cycle_weighted", "weighted_score"):
+    if candidate_score_type == "score_column":
+        # Score-column recipes are allowed for live/paper only when the model
+        # lineage is explicit. Without model_id the worker cannot tell which
+        # quant_ml.model_predictions rows to use, and silently falling back to
+        # growth/cycle weights would trade a different strategy.
+        if not str(candidate.get("model_id") or "").strip():
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"score_column research results require model_id before they "
+                    f"can be {action}."
+                ),
+            )
+        if not str(candidate.get("score_column") or "").strip():
+            raise HTTPException(
+                status_code=409,
+                detail=f"score_column research results require score_column before they can be {action}.",
+            )
+    elif candidate_score_type and candidate_score_type not in ("growth_cycle_weighted", "weighted_score"):
         raise HTTPException(
             status_code=409,
             detail=(
-                f"Only growth_cycle_weighted and weighted_score research results "
-                f"can be {action}. Score-column construction templates are not "
-                "productized yet."
+                f"Only growth_cycle_weighted, weighted_score and model-backed "
+                f"score_column research results can be {action}."
             ),
         )
     if candidate_score_type == "weighted_score":
@@ -983,6 +1008,7 @@ LINEAGE_PARAM_KEYS = {
     "index_benchmark_symbol",
     "score_type",
     "score_column",
+    "model_id",
     "growth_weight",
     "cycle_weight",
     "score_weights",
@@ -1324,6 +1350,59 @@ def _validate_model_id_coverage(model_id: str, start_date: str, end_date: str) -
         )
 
 
+MODEL_SCORE_LIVE_MAX_STALENESS_DAYS = 45
+
+
+def _validate_live_model_score(candidate: Dict[str, Any], base_date: str) -> None:
+    """Fail fast when a score_column candidate has no usable model prediction."""
+    if str(candidate.get("score_type") or "") != "score_column":
+        return
+    model_id = str(candidate.get("model_id") or "").strip()
+    score_column = str(candidate.get("score_column") or "").strip()
+    if not model_id or not score_column:
+        raise HTTPException(
+            status_code=409,
+            detail="score_column live preview requires model_id and score_column.",
+        )
+    normalized = _normalize_date(base_date)
+    predictions = get_ml_db_collections()["model_predictions"]
+    latest = predictions.find_one(
+        {"model_id": model_id, "trade_date": {"$lte": normalized}},
+        {"_id": 0, "trade_date": 1},
+        sort=[("trade_date", -1)],
+    )
+    if not latest or not latest.get("trade_date"):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"model_id {model_id} has no prediction at or before {normalized}; "
+                "run the shadow/training job before previewing."
+            ),
+        )
+    pred_date = str(latest["trade_date"])
+    try:
+        age_days = (
+            datetime.strptime(normalized, "%Y%m%d") - datetime.strptime(pred_date, "%Y%m%d")
+        ).days
+    except ValueError:
+        age_days = 0
+    if age_days > MODEL_SCORE_LIVE_MAX_STALENESS_DAYS:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"model_id {model_id} is stale: latest prediction {pred_date}, "
+                f"base_date {normalized} ({age_days}d > "
+                f"{MODEL_SCORE_LIVE_MAX_STALENESS_DAYS}d)."
+            ),
+        )
+    count = predictions.count_documents({"model_id": model_id, "trade_date": pred_date})
+    if count == 0:
+        raise HTTPException(
+            status_code=409,
+            detail=f"model_id {model_id} has no scores on {pred_date}.",
+        )
+
+
 def _build_research_job_document(user_id: str, request: CreateResearchJobRequest) -> Dict[str, Any]:
     start_date = _normalize_date(request.start_date)
     end_date = _normalize_date(request.end_date)
@@ -1651,6 +1730,7 @@ async def create_portfolio_research_live_preview(
     combo_payload = _load_combo_payload(artifact, combo_key) if combo_key else None
     parity_inputs = _research_parity_inputs(combo_payload)
     base_date = _normalize_date(request.as_of_date or datetime.utcnow().strftime("%Y%m%d"))
+    _validate_live_model_score(candidate, base_date)
     now = datetime.utcnow()
     task = {
         "task_id": str(uuid.uuid4()),
@@ -1890,6 +1970,7 @@ async def activate_portfolio_research_live_preview(
     if not plan or not candidate:
         raise HTTPException(status_code=409, detail="live preview has no candidate plan")
     _assert_live_candidate(candidate)
+    _validate_live_model_score(candidate, task.get("base_date") or datetime.utcnow().strftime("%Y%m%d"))
     parity_summary = _compact_parity(preview_result.get("parity"))
     unsupported_features = _unsupported_research_features(task)
     if (parity_summary.get("status") != "clean" or unsupported_features) and not request.admin_override:
