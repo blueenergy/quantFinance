@@ -1125,6 +1125,21 @@ def test_publish_portfolio_research_result_rejects_score_column(monkeypatch):
     assert "require model_id" in exc.value.detail
 
 
+def test_model_score_preset_and_lineage_carry_model_id():
+    candidate = {
+        "score_type": "score_column",
+        "score_column": "model_score",
+        "model_id": "m1",
+        "top_n": 20,
+        "rebalance_days": 20,
+    }
+    params = portfolio_research._preset_params_from_candidate(candidate)
+    assert params["model_id"] == "m1"
+    assert portfolio_research._lineage_params_hash(candidate) != portfolio_research._lineage_params_hash(
+        {**candidate, "model_id": "m2"}
+    )
+
+
 def test_publish_portfolio_research_result_rejects_duplicate_preset(monkeypatch):
     collections = _collections()
     monkeypatch.setattr(portfolio_research, "get_trading_db_collections", lambda: collections)
