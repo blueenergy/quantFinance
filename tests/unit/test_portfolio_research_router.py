@@ -1744,6 +1744,68 @@ def test_create_live_preview_enqueues_preview_task(monkeypatch):
 
 
 @pytest.mark.unit
+def test_create_live_preview_matches_selected_row_without_combo_key(monkeypatch):
+    collections = _collections()
+    monkeypatch.setattr(portfolio_research, "get_trading_db_collections", lambda: collections)
+
+    job = {
+        "job_id": "job-row",
+        "user_id": "user-1",
+        "params": {
+            "universe_index": "csi1000",
+            "top_n_values": [20],
+            "horizon": 20,
+            "score_column": "growth_cycle_g60_c40_score",
+            "transaction_cost": 0.001,
+            "index_benchmark_symbol": "000852.SH",
+        },
+    }
+    row = {
+        "score_variant": "growth_cycle_g60_c40",
+        "variant": "growth_cycle_neutral",
+        "top_n": 20,
+        "rebalance_interval_days": 20,
+        "construction_mode": "industry_neutral",
+        "max_industry_weight": 0.3,
+        "regime_mode": "off",
+        "trailing_stop_pct": None,
+    }
+    collections["portfolio_research_jobs"].insert_one(job)
+    collections["portfolio_research_results"].insert_one(
+        {
+            "result_id": "res-row",
+            "job_id": "job-row",
+            "user_id": "user-1",
+            "rows": [row],
+            "row_count_total": 1,
+        }
+    )
+
+    response = asyncio.run(
+        portfolio_research.create_portfolio_research_live_preview(
+            "res-row",
+            portfolio_research.LivePreviewRequest(
+                selected_row={
+                    "score_variant": "growth_cycle_g60_c40",
+                    "variant": "growth_cycle_neutral",
+                    "top_n": 20,
+                    "rebalance_interval_days": 20,
+                    "regime_mode": "off",
+                    "max_industry_weight": 0.3,
+                },
+                as_of_date="20261108",
+            ),
+            current_user={"id": "user-1"},
+        )
+    )
+
+    task = collections["portfolio_plan_generation_tasks"].docs[0]
+    assert task["params_override"]["top_n"] == 20
+    assert task["combo_key"] is None
+    assert response["data"]["task_id"] == task["task_id"]
+
+
+@pytest.mark.unit
 def test_create_live_preview_rejects_score_column_before_enqueue(monkeypatch):
     collections = _collections()
     monkeypatch.setattr(portfolio_research, "get_trading_db_collections", lambda: collections)

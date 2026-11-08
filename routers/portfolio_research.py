@@ -302,6 +302,14 @@ class LivePreviewRequest(BaseModel):
         default=None,
         description="Result row combo_key. Required when the result has multiple rows.",
     )
+    selected_row: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description=(
+            "Row identity (score_variant/variant/top_n/rebalance_interval_days/"
+            "trailing_stop_pct/regime_mode/max_industry_weight). Used when the row "
+            "has no saved combo detail JSON."
+        ),
+    )
     as_of_date: Optional[str] = Field(
         default=None,
         description="YYYYMMDD preview date; defaults to today (UTC).",
@@ -984,6 +992,49 @@ def _load_full_result_rows(result: Dict[str, Any]) -> List[Dict[str, Any]]:
     if total <= len(preview_rows):
         return preview_rows
     return artifact_rows or preview_rows
+
+
+_ROW_IDENTITY_KEYS = (
+    "score_variant",
+    "variant",
+    "top_n",
+    "rebalance_interval_days",
+    "trailing_stop_pct",
+    "regime_mode",
+    "regime_rule",
+    "max_industry_weight",
+)
+
+
+def _normalize_row_value(value: Any) -> Any:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+    text = str(value).strip().lower()
+    return None if text in ("", "none", "null", "na", "n/a") else text
+
+
+def _match_selected_row(rows: List[Dict[str, Any]], selected: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Match a table row back to the full result by swept dimensions.
+
+    Rows without a combo detail JSON have no combo_key; the drawer still sends
+    their identity so live preview can work without re-running the whole sweep.
+    """
+    wanted = {
+        key: _normalize_row_value(selected.get(key))
+        for key in _ROW_IDENTITY_KEYS
+        if _normalize_row_value(selected.get(key)) is not None
+    }
+    matches = [
+        row
+        for row in rows
+        if all(_normalize_row_value(row.get(key)) == value for key, value in wanted.items())
+    ]
+    if not matches:
+        return None
+    detailed = [row for row in matches if row.get("combo_key")]
+    return (detailed or matches)[0]
 
 
 def _params_hash(params: Dict[str, Any]) -> str:
@@ -1713,12 +1764,17 @@ async def create_portfolio_research_live_preview(
         row = next((item for item in rows if str(item.get("combo_key") or "") == combo_key), None)
         if row is None:
             raise HTTPException(status_code=404, detail="research combo not found")
+    elif request.selected_row:
+        row = _match_selected_row(rows, request.selected_row)
+        if row is None:
+            raise HTTPException(status_code=404, detail="research row not found")
+        combo_key = str(row.get("combo_key") or "").strip()
     elif len(rows) == 1:
         row = rows[0]
     else:
         raise HTTPException(
             status_code=400,
-            detail="combo_key is required when the result has multiple rows",
+            detail="combo_key or selected_row is required when the result has multiple rows",
         )
 
     candidate = _candidate_strategy_config_from_row(job, row)
