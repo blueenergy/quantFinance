@@ -1125,16 +1125,34 @@ def test_publish_portfolio_research_result_rejects_score_column(monkeypatch):
     assert "require model_id" in exc.value.detail
 
 
+def test_model_score_live_rejects_non_validated_horizon():
+    candidate = {
+        "score_type": "score_column",
+        "score_column": "model_score",
+        "model_id": "m1",
+        "top_n": 10,
+        "rebalance_days": 10,
+        "construction_mode": "industry_neutral",
+        "regime_cash": False,
+    }
+    with pytest.raises(HTTPException) as exc:
+        portfolio_research._assert_live_candidate(candidate, {}, action="previewed")
+    assert exc.value.status_code == 409
+    assert "fixed to top20 / 20-day" in str(exc.value.detail)
+
+
 def test_model_score_preset_and_lineage_carry_model_id():
     candidate = {
         "score_type": "score_column",
         "score_column": "model_score",
         "model_id": "m1",
+        "star_round_lot": True,
         "top_n": 20,
         "rebalance_days": 20,
     }
     params = portfolio_research._preset_params_from_candidate(candidate)
     assert params["model_id"] == "m1"
+    assert params["star_round_lot"] is True
     assert portfolio_research._lineage_params_hash(candidate) != portfolio_research._lineage_params_hash(
         {**candidate, "model_id": "m2"}
     )
@@ -1940,6 +1958,7 @@ def test_create_live_preview_enqueues_score_column_with_model_prediction(monkeyp
     task = collections["portfolio_plan_generation_tasks"].docs[0]
     assert task["params_override"]["model_id"] == "research-csi1000-clean-raw5"
     assert task["params_override"]["score_type"] == "score_column"
+    assert task["params_override"]["star_round_lot"] is True
     assert task["params_override"]["top_n"] == 20
     assert response["data"]["task_id"] == task["task_id"]
 
@@ -2183,6 +2202,12 @@ def test_activate_live_preview_schedules_model_score_combo(monkeypatch):
         "model_id": "m1",
         "growth_weight": None,
         "cycle_weight": None,
+        "top_n": 20,
+        "rebalance_days": 20,
+        "construction_mode": "industry_neutral",
+        "max_industry_weight": 0.3,
+        "regime_cash": False,
+        "regime_rule": None,
     }
     collections["portfolio_plan_generation_tasks"].insert_one(task)
 

@@ -624,6 +624,7 @@ PRESET_PARAM_KEYS = {
     "score_type",
     "score_column",
     "model_id",
+    "star_round_lot",
     "growth_weight",
     "cycle_weight",
     "top_n",
@@ -785,6 +786,11 @@ def _candidate_strategy_config_from_row(job: Dict[str, Any], row: Dict[str, Any]
         # params_hash per model. Omit it for legacy growth/cycle candidates so
         # their existing preset hashes do not change.
         candidate["model_id"] = model_id
+    if score_type == "score_column":
+        # Research sizes every board in 100-share lots; keep live STAR targets
+        # on the same grid instead of the exchange-legal 1-share increment
+        # (216 -> 200).
+        candidate["star_round_lot"] = True
     if str(row.get("regime_mode") or "off") == "bull_g60_else_cash":
         candidate["regime_cash"] = True
         rule = str(params.get("regime_rule") or "").strip()
@@ -831,6 +837,29 @@ def _assert_live_candidate(
             raise HTTPException(
                 status_code=409,
                 detail=f"score_column research results require score_column before they can be {action}.",
+            )
+        # The model is trained on a 20-day forward label and only the
+        # top20 / h20 / industry-neutral / always-invest cluster was validated
+        # for live. h10/h40 and other constructions are research-only; allowing
+        # them through would run the model outside its validated horizon.
+        live_top_n = int(candidate.get("top_n") or 0)
+        live_rebalance = int(candidate.get("rebalance_days") or 0)
+        live_construction = str(candidate.get("construction_mode") or "top_n")
+        if (
+            live_top_n != 20
+            or live_rebalance != 20
+            or live_construction != "industry_neutral"
+            or bool(candidate.get("regime_cash"))
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Model-score live/paper is fixed to top20 / 20-day / "
+                    f"industry_neutral / always-invest; this row is "
+                    f"top{live_top_n} / {live_rebalance}d / {live_construction} / "
+                    f"regime_cash={bool(candidate.get('regime_cash'))}. "
+                    "Use the research page to test other sizes or horizons."
+                ),
             )
     elif candidate_score_type and candidate_score_type not in ("growth_cycle_weighted", "weighted_score"):
         raise HTTPException(
@@ -1060,6 +1089,7 @@ LINEAGE_PARAM_KEYS = {
     "score_type",
     "score_column",
     "model_id",
+    "star_round_lot",
     "growth_weight",
     "cycle_weight",
     "score_weights",
