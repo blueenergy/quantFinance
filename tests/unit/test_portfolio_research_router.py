@@ -2162,6 +2162,48 @@ def test_activate_live_preview_schedules_clean_combo(monkeypatch):
     assert collections["portfolio_plan_generation_tasks"].docs[0]["activation_status"] == "scheduled"
 
 
+def test_activate_live_preview_schedules_model_score_combo(monkeypatch):
+    collections = _collections()
+    monkeypatch.setattr(portfolio_research, "get_trading_db_collections", lambda: collections)
+    monkeypatch.setattr(
+        portfolio_research,
+        "get_ml_db_collections",
+        lambda: {
+            "model_predictions": _Collection(
+                [{"model_id": "m1", "trade_date": "20250106"}]
+            )
+        },
+    )
+    task = _preview_task()
+    task["base_date"] = "20250106"
+    task["params_override"] = {
+        **_activation_candidate(),
+        "score_type": "score_column",
+        "score_column": "model_score",
+        "model_id": "m1",
+        "growth_weight": None,
+        "cycle_weight": None,
+    }
+    collections["portfolio_plan_generation_tasks"].insert_one(task)
+
+    response = asyncio.run(
+        portfolio_research.activate_portfolio_research_live_preview(
+            "task-activate",
+            portfolio_research.ActivateResearchComboRequest(
+                execution_venue="paper",
+                effective_date="20991231",
+            ),
+            current_user={"id": "user-1"},
+        )
+    )
+
+    data = response["data"]
+    assert data["activation"]["status"] == "scheduled"
+    assert data["preset"]["params"]["model_id"] == "m1"
+    assert data["preset"]["params"]["score_type"] == "score_column"
+    assert data["activation"]["params_override"]["model_id"] == "m1"
+
+
 def test_activate_live_preview_admin_override_applies_now(monkeypatch):
     collections = _collections()
     monkeypatch.setattr(portfolio_research, "get_trading_db_collections", lambda: collections)
