@@ -1,2 +1,5 @@
 # CI dependency wrapper: keep runtime deps single-sourced in requirements.txt
 -r requirements.txt
+
+# Test-only dependency used by tests/unit/test_first_board_execution.py.
+mongomock
