@@ -1643,6 +1643,10 @@ async def create_portfolio_research_live_preview(
         )
 
     candidate = _candidate_strategy_config_from_row(job, row)
+    # Reject configs live construction cannot reproduce before enqueueing the
+    # preview task. Otherwise the worker fails asynchronously with an opaque
+    # error (e.g. score_column -> growth_weight=None -> float(None)).
+    _assert_live_candidate(candidate, job.get("params") or {}, action="previewed")
     artifact = result.get("artifact") or {}
     combo_payload = _load_combo_payload(artifact, combo_key) if combo_key else None
     parity_inputs = _research_parity_inputs(combo_payload)

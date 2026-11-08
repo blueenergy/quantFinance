@@ -1741,6 +1741,65 @@ def test_create_live_preview_enqueues_preview_task(monkeypatch):
 
 
 @pytest.mark.unit
+def test_create_live_preview_rejects_score_column_before_enqueue(monkeypatch):
+    collections = _collections()
+    monkeypatch.setattr(portfolio_research, "get_trading_db_collections", lambda: collections)
+
+    job = {
+        "job_id": "job-model",
+        "user_id": "user-1",
+        "params": {
+            "universe_index": "csi1000",
+            "top_n_values": [10],
+            "horizon": 10,
+            "score_column": "model_score",
+            "model_id": "research-csi1000-clean-raw5",
+            "index_benchmark_symbol": "000852.SH",
+        },
+    }
+    row = {
+        "combo_key": "combo-model",
+        "score_variant": "model_score",
+        "score_column": "model_score",
+        "growth_weight": None,
+        "cycle_weight": None,
+        "variant": "growth_cycle_neutral",
+        "top_n": 10,
+        "rebalance_interval_days": 10,
+        "construction_mode": "industry_neutral",
+        "max_industry_weight": 0.3,
+        "regime_mode": "off",
+        "trailing_stop_pct": None,
+    }
+    collections["portfolio_research_jobs"].insert_one(job)
+    collections["portfolio_research_results"].insert_one(
+        {
+            "result_id": "res-model",
+            "job_id": "job-model",
+            "user_id": "user-1",
+            "rows": [row],
+            "row_count_total": 1,
+        }
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(
+            portfolio_research.create_portfolio_research_live_preview(
+                "res-model",
+                portfolio_research.LivePreviewRequest(
+                    combo_key="combo-model",
+                    as_of_date="20261108",
+                ),
+                current_user={"id": "user-1"},
+            )
+        )
+
+    assert exc_info.value.status_code == 409
+    assert "Score-column" in str(exc_info.value.detail)
+    assert collections["portfolio_plan_generation_tasks"].docs == []
+
+
+@pytest.mark.unit
 def test_get_live_preview_returns_task_result(monkeypatch):
     collections = _collections()
     monkeypatch.setattr(portfolio_research, "get_trading_db_collections", lambda: collections)
