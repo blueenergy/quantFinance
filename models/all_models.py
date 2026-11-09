@@ -1,5 +1,5 @@
 from pydantic import BaseModel, EmailStr, model_validator
-from typing import Optional, List, Any, Dict
+from typing import Optional, List, Any, Dict, Literal
 from datetime import datetime, timedelta
 
 class UserBase(BaseModel):
@@ -103,6 +103,12 @@ class WatchlistStrategySetRequest(BaseModel):
     # 显式要求删除的 params 键；合并语义下，未发送的键默认保留。
     deleted_keys: List[str] = []
     enabled: Optional[bool] = True
+    # Disabling a strategy that still manages shares requires an explicit
+    # decision: "clear" flattens the managed sleeve, "keep" leaves it alone.
+    position_action: Optional[Literal["clear", "keep"]] = None
+    # Only meaningful with position_action="clear": also cancel same-symbol
+    # BUY signals that could fill after the strategy stops.
+    cancel_pending_buys: bool = False
 
 class WatchlistStrategyResponse(BaseModel):
     symbol: str

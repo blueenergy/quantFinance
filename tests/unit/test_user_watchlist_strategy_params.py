@@ -108,6 +108,13 @@ def test_deleted_keys_are_removed(monkeypatch):
 def test_omitted_params_leave_existing_params_untouched(monkeypatch):
     """Toggles can omit params instead of echoing a possibly stale snapshot."""
     strategy_col = _install(monkeypatch, [_existing_doc()])
+    # Disable now consults the position guard; this test is about params merge,
+    # so pin a flat position to keep the guard from changing the outcome.
+    monkeypatch.setattr(
+        user_watchlist,
+        "fetch_position_guard",
+        lambda *a, **k: {"ok": True, "position": {"managed_qty": 0}, "can_auto_clear": False},
+    )
     req = WatchlistStrategySetRequest(
         symbol="600114.SH",
         strategy="daily_sma_cross",

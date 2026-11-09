@@ -3,20 +3,34 @@
 处理自选股列表、策略、实时数据等功能
 """
 
+import logging
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Depends, HTTPException
 from models.all_models import (
-    WatchlistRequest, WatchlistUpdateRequest, WatchlistStrategySetRequest, 
+    WatchlistRequest, WatchlistUpdateRequest, WatchlistStrategySetRequest,
     WatchlistStrategyResponse
 )
 from auth import get_current_active_user
 from db import get_db_collections, get_data_db
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
+from services.strategy_position_guard import (
+    GUARD_CODE,
+    GUARD_UNAVAILABLE_CODE,
+    POSITION_CLEAR_FAILED_CODE,
+    POSITION_CLEAR_UNAVAILABLE_CODE,
+    build_fallback_guard,
+    build_flatten_signal,
+    cancel_active_buys,
+    fetch_position_guard,
+    find_active_disable_sell,
+    reset_strategy_state,
+)
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 # 与 quant-data-engine 东财自选轮询一致：按上海日历日匹配 ``trade_date``，避免 API 容器为 UTC 时错位。
 _CN_TZ = ZoneInfo("Asia/Shanghai")
@@ -294,27 +308,106 @@ def get_watchlist_strategies(current_user: dict = Depends(get_current_active_use
     return {"success": True, "data": data}
 
 
+def _guard_detail(code: str, message: str, guard: Dict[str, Any]) -> Dict[str, Any]:
+    return {"code": code, "message": message, "guard": guard}
+
+
+def _managed_qty(guard: Dict[str, Any]) -> Optional[int]:
+    position = guard.get("position") or {}
+    value = position.get("managed_qty")
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _evaluate_disable_guard(
+    req: WatchlistStrategySetRequest,
+    current_user: dict,
+    collections: Dict[str, Any],
+    user_id: str,
+    existing: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """Return the guard payload, or raise 409/400 before anything is written.
+
+    ``position_action`` is a decision, not a quantity: the manager recomputes
+    the sleeve on every call, so a dialog left open while the position moves
+    cannot sell a stale size.
+    """
+    guard = fetch_position_guard(current_user, req.symbol, req.strategy)
+    if guard is None:
+        fallback = build_fallback_guard(
+            collections, user_id, existing, req.symbol, req.strategy
+        )
+        if req.position_action == "clear":
+            raise HTTPException(
+                status_code=409,
+                detail=_guard_detail(
+                    GUARD_UNAVAILABLE_CODE,
+                    "策略管理服务不可用，无法确认该策略管理多少持仓；不能自动清仓",
+                    fallback,
+                ),
+            )
+        broker_qty = int((fallback.get("position") or {}).get("broker_qty") or 0)
+        if broker_qty > 0 and req.position_action is None:
+            raise HTTPException(
+                status_code=409,
+                detail=_guard_detail(
+                    GUARD_UNAVAILABLE_CODE,
+                    "策略管理服务不可用，无法确认该策略管理多少持仓；请选择保留持仓或人工卖出",
+                    fallback,
+                ),
+            )
+        return None
+
+    managed = _managed_qty(guard)
+    needs_confirmation = managed is None or managed > 0
+    if req.position_action is None and needs_confirmation:
+        message = (
+            f"该策略当前管理 {managed} 股，停止前请确认如何处理持仓"
+            if managed is not None
+            else "无法自动确认该策略的独立持仓，停止前请确认如何处理"
+        )
+        raise HTTPException(
+            status_code=409,
+            detail=_guard_detail(GUARD_CODE, message, guard),
+        )
+
+    if req.position_action == "clear" and not guard.get("can_auto_clear"):
+        raise HTTPException(
+            status_code=400,
+            detail=_guard_detail(
+                POSITION_CLEAR_UNAVAILABLE_CODE,
+                "当前无法自动清仓：可卖数量为 0，或无法确认策略管理量；请手动处理或选择保留持仓",
+                guard,
+            ),
+        )
+    return guard
+
+
 @router.post("/watchlist/strategy")
 def set_watchlist_strategy(req: WatchlistStrategySetRequest, current_user: dict = Depends(get_current_active_user)):
     """设置或更新自选股的策略
-    
+
     CRITICAL: Query must include strategy_key to ensure precise match
     This prevents updating wrong strategy when user has multiple strategies for same symbol
-    
+
     NOTE: 自动设置 engine="vnpy"，因为实盘策略目前只支持 vnpy 引擎
     """
     collections = get_db_collections()
     watchlist_col = collections["user_watchlists"]
     strat_col = collections["watchlist_strategies"]
     user_id = get_user_id(current_user)
-    
+
     # VIP-only live deployment restriction for Hidden Dragon strategy
     if req.strategy == "hidden_dragon":
         service_level = current_user.get("service_level", "free")
         if service_level != "vip":
             # 用户可见错误信息使用中文
             raise HTTPException(status_code=403, detail="潜龙低吸策略仅对VIP用户开放")
-    
+
     # Auto-add symbol to watchlist if not present
     doc = watchlist_col.find_one({"user_id": user_id})
     symbols = doc["symbols"] if doc and "symbols" in doc else []
@@ -326,7 +419,7 @@ def set_watchlist_strategy(req: WatchlistStrategySetRequest, current_user: dict 
             {"$set": {"symbols": symbols}},
             upsert=True
         )
-    
+
     import time
     enabled = getattr(req, "enabled", True)
 
@@ -344,6 +437,16 @@ def set_watchlist_strategy(req: WatchlistStrategySetRequest, current_user: dict 
     for key in req.deleted_keys or []:
         params.pop(key, None)
 
+    was_enabled = bool(existing.get("enabled", False))
+
+    # A true -> false transition (or an explicit clear retry) must look at
+    # the shares the strategy currently manages before anything is written.
+    guard: Optional[Dict[str, Any]] = None
+    if enabled is False and (was_enabled or req.position_action == "clear"):
+        guard = _evaluate_disable_guard(
+            req, current_user, collections, user_id, existing
+        )
+
     # 构建更新文档，自动添加 engine 字段
     update_doc = {
         "strategy_key": req.strategy,
@@ -352,13 +455,92 @@ def set_watchlist_strategy(req: WatchlistStrategySetRequest, current_user: dict 
         "enabled": enabled,
         "engine": "vnpy",  # 🔥 自动设置 engine 为 vnpy（实盘策略仅支持 vnpy）
     }
+    if enabled is False and was_enabled:
+        update_doc["last_disabled_at"] = update_doc["updated_at"]
+        update_doc["last_disable_action"] = req.position_action or "keep"
 
     strat_col.update_one(
         query,
         {"$set": update_doc},
         upsert=True
     )
-    return {"success": True}
+
+    flatten_order_id = None
+    flatten_qty = 0
+    cancel_result = None
+    state_reset: Optional[bool] = None
+    if enabled is False and req.position_action == "clear" and guard is not None:
+        clear_qty = int(guard.get("clear_qty") or 0)
+        account = guard.get("account") or {}
+        account_id = account.get("securities_account_id")
+        if clear_qty > 0:
+            # A retry after an insert that actually succeeded must not double-sell.
+            existing_sell = find_active_disable_sell(
+                collections, user_id, account_id, req.symbol
+            )
+            if existing_sell:
+                flatten_order_id = existing_sell.get("order_id")
+                flatten_qty = int(existing_sell.get("size") or 0)
+            else:
+                signal_doc = build_flatten_signal(
+                    user_id=user_id,
+                    symbol=req.symbol,
+                    account=account,
+                    position=guard.get("position") or {},
+                    clear_qty=clear_qty,
+                    strategy_key=req.strategy,
+                )
+                try:
+                    collections["trade_signals"].insert_one(signal_doc)
+                except Exception as exc:  # noqa: BLE001 - report a partial failure honestly
+                    logger.exception("strategy-disable flatten signal insert failed")
+                    raise HTTPException(
+                        status_code=500,
+                        detail={
+                            "code": POSITION_CLEAR_FAILED_CODE,
+                            "message": "策略已停止，但清仓委托提交失败；请到持仓页手动卖出或重试",
+                            "strategy_disabled": True,
+                            "flatten_submitted": False,
+                        },
+                    ) from exc
+                flatten_order_id = signal_doc["order_id"]
+                flatten_qty = clear_qty
+        # Stop the worker and zero its state before a later re-enable can load
+        # a stale pos and get stuck emitting SELLs the broker rejects.
+        reset_result = reset_strategy_state(current_user, req.symbol, req.strategy)
+        state_reset = bool(
+            reset_result is not None
+            and (
+                reset_result.get("reset") is True
+                or reset_result.get("reason") == "no_state_file"
+            )
+        )
+        if reset_result is None:
+            logger.warning(
+                "strategy-disable state reset failed for %s/%s",
+                req.symbol,
+                req.strategy,
+            )
+        if req.cancel_pending_buys:
+            cancel_result = cancel_active_buys(
+                collections, user_id, account_id, req.symbol
+            )
+
+    response: Dict[str, Any] = {"success": True}
+    if enabled is False and was_enabled:
+        response["disabled"] = True
+    if guard is not None:
+        response["position"] = guard.get("position")
+        response["can_auto_clear"] = guard.get("can_auto_clear")
+        response["session"] = guard.get("session")
+    if flatten_order_id:
+        response["flatten_order_id"] = flatten_order_id
+        response["flatten_qty"] = flatten_qty
+    if cancel_result:
+        response["cancel_pending_buys"] = cancel_result
+    if state_reset is not None:
+        response["state_reset"] = state_reset
+    return response
 
 
 # ==================== 自选股详细信息 ====================
