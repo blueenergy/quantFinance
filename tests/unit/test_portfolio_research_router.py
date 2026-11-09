@@ -2178,6 +2178,41 @@ def test_activate_live_preview_schedules_clean_combo(monkeypatch):
     assert collections["portfolio_plan_generation_tasks"].docs[0]["activation_status"] == "scheduled"
 
 
+def test_activate_live_preview_generate_now_enqueues_auto_approved_plan(monkeypatch):
+    from zoneinfo import ZoneInfo
+
+    collections = _collections()
+    monkeypatch.setattr(portfolio_research, "get_trading_db_collections", lambda: collections)
+    collections["portfolio_plan_generation_tasks"].insert_one(_preview_task())
+    today = datetime.now(ZoneInfo("Asia/Shanghai")).strftime("%Y%m%d")
+
+    response = asyncio.run(
+        portfolio_research.activate_portfolio_research_live_preview(
+            "task-activate",
+            portfolio_research.ActivateResearchComboRequest(
+                execution_venue="paper",
+                effective_date="20991231",
+                generate_now=True,
+            ),
+            current_user={"id": "user-1"},
+        )
+    )
+
+    data = response["data"]
+    assert data["applied_now"] is True
+    assert data["activation"]["status"] == "active"
+    assert data["activation"]["effective_date"] == today
+    assert data["activation"]["generate_now"] is True
+    task = next(
+        row
+        for row in collections["portfolio_plan_generation_tasks"].docs
+        if row.get("source") == "strategy_activation"
+    )
+    assert task["base_date"] == today
+    assert task["mode"] == "rebalance"
+    assert task["auto_approve"] is True
+
+
 def test_activate_live_preview_schedules_model_score_combo(monkeypatch):
     collections = _collections()
     monkeypatch.setattr(portfolio_research, "get_trading_db_collections", lambda: collections)

@@ -10,6 +10,7 @@ import shutil
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Annotated, Any, Dict, List, Literal, Optional, Union
+from zoneinfo import ZoneInfo
 import os
 import uuid
 
@@ -326,6 +327,17 @@ class ActivateResearchComboRequest(BaseModel):
     effective_date: Optional[str] = Field(
         default=None,
         description="YYYYMMDD switch date; defaults to the next rebalance date of the active lineage.",
+    )
+    generate_now: bool = Field(
+        default=False,
+        description=(
+            "Apply the activation today, generate the first plan immediately and "
+            "auto-approve it. Live publish still requires the normal preflight."
+        ),
+    )
+    auto_approve: bool = Field(
+        default=True,
+        description="Auto-approve the first generated plan (review is still required before publish).",
     )
     admin_override: bool = Field(
         default=False,
@@ -2000,6 +2012,7 @@ def _enqueue_activation_task(
             "source": "strategy_activation",
             "activation_id": activation["activation_id"],
             "auto": False,
+            "auto_approve": bool(activation.get("auto_approve")),
             "status": "pending",
             "attempts": 0,
             "plan_id": None,
@@ -2067,15 +2080,20 @@ async def activate_portfolio_research_live_preview(
             },
         )
 
-    today = datetime.utcnow().strftime("%Y%m%d")
-    effective_date = _normalize_date(
-        request.effective_date
-        or preview_result.get("suggested_effective_date")
-        or plan.get("next_rebalance_date")
-        or today
-    )
-    if effective_date < today:
+    # Use the local A-share calendar date. UTC is still the previous day between
+    # 00:00 and 08:00 CN, which made "activate today" look like a future date.
+    today = datetime.now(ZoneInfo("Asia/Shanghai")).strftime("%Y%m%d")
+    if request.generate_now:
         effective_date = today
+    else:
+        effective_date = _normalize_date(
+            request.effective_date
+            or preview_result.get("suggested_effective_date")
+            or plan.get("next_rebalance_date")
+            or today
+        )
+        if effective_date < today:
+            effective_date = today
 
     strategy_template_id = str(
         candidate.get("strategy_template_id")
@@ -2156,6 +2174,8 @@ async def activate_portfolio_research_live_preview(
         "params_override": preset_params,
         "execution_venue": request.execution_venue,
         "effective_date": effective_date,
+        "generate_now": bool(request.generate_now),
+        "auto_approve": bool(request.auto_approve),
         "status": "scheduled",
         "replaces": replaces,
         "source_result_id": result_id,
