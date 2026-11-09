@@ -1138,7 +1138,20 @@ def test_model_score_live_rejects_non_validated_horizon():
     with pytest.raises(HTTPException) as exc:
         portfolio_research._assert_live_candidate(candidate, {}, action="previewed")
     assert exc.value.status_code == 409
-    assert "fixed to top20 / 20-day" in str(exc.value.detail)
+    assert "fixed to top10/top20 / 20-day" in str(exc.value.detail)
+
+
+def test_model_score_live_allows_top10_h20_neutral():
+    candidate = {
+        "score_type": "score_column",
+        "score_column": "model_score",
+        "model_id": "m1",
+        "top_n": 10,
+        "rebalance_days": 20,
+        "construction_mode": "industry_neutral",
+        "regime_cash": False,
+    }
+    portfolio_research._assert_live_candidate(candidate, {}, action="previewed")
 
 
 def test_model_score_preset_and_lineage_carry_model_id():
