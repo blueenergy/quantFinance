@@ -646,6 +646,7 @@ PRESET_PARAM_KEYS = {
     "rebalance_days",
     "construction_mode",
     "max_industry_weight",
+    "entry_vol_cap",
     "lot_size",
     "transaction_cost",
     "buy_commission_rate",
@@ -797,6 +798,10 @@ def _candidate_strategy_config_from_row(job: Dict[str, Any], row: Dict[str, Any]
         # params_hash per model. Omit it for legacy growth/cycle candidates so
         # their existing preset hashes do not change.
         candidate["model_id"] = model_id
+        # Live publish already blocks 20d annualized vol >= 1.0. Filter at
+        # selection so a top10 book still holds ten tradable names instead of
+        # silently losing two slots at publish.
+        candidate["entry_vol_cap"] = float(params.get("entry_vol_cap") or 1.0)
     if str(row.get("regime_mode") or "off") == "bull_g60_else_cash":
         candidate["regime_cash"] = True
         rule = str(params.get("regime_rule") or "").strip()
@@ -1101,6 +1106,7 @@ LINEAGE_PARAM_KEYS = {
     "rebalance_days",
     "construction_mode",
     "max_industry_weight",
+    "entry_vol_cap",
 }
 
 
