@@ -38,6 +38,7 @@ def _install(monkeypatch, strategy_docs):
             "watchlist_strategies": strategy_col,
         },
     )
+    monkeypatch.setattr(user_watchlist, "trigger_worker_reload", lambda *a, **k: None)
     return strategy_col
 
 

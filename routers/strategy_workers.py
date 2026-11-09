@@ -164,6 +164,30 @@ async def list_workers(current_user: dict = Depends(get_current_user)) -> Dict[s
     return {**data, "deployment_mode": "remote"}
 
 
+@router.get("/position-guard")
+async def get_position_guard_proxy(
+    symbol: str,
+    strategy_key: str,
+    current_user: dict = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """Proxy the manager's managed-position preview for the run page."""
+    from auth import create_access_token
+    from urllib.parse import quote
+
+    token = create_access_token(
+        data={
+            "sub": current_user["username"],
+            "user_id": str(current_user.get("id")),
+        }
+    )
+    endpoint = (
+        "/configs/position-guard"
+        f"?symbol={quote(str(symbol), safe='')}"
+        f"&strategy_key={quote(str(strategy_key), safe='')}"
+    )
+    return await _call_remote_api(endpoint, token)
+
+
 @router.get("/workers/{worker_key}")
 async def get_worker(worker_key: str, current_user: dict = Depends(get_current_user)) -> Dict[str, Any]:
     """获取单个 Worker 的详细信息

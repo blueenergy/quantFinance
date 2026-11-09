@@ -37,6 +37,7 @@ ACTIVE_SIGNAL_STATUSES = [
 ]
 
 _GUARD_TIMEOUT_SECONDS = 5.0
+_RELOAD_TIMEOUT_SECONDS = 10.0
 
 
 def _guard_base_url() -> Optional[str]:
@@ -112,6 +113,35 @@ def reset_strategy_state(
         logger.warning(
             "position state reset unavailable for %s/%s: %s", symbol, strategy_key, exc
         )
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def trigger_worker_reload(current_user: dict) -> Optional[Dict[str, Any]]:
+    """Trigger an immediate orchestrator sync after a strategy config write.
+
+    Best effort: on failure the manager's 60-second monitor still applies the
+    new ``enabled`` flag. A 10-second timeout covers one worker's stop/join.
+    """
+    base = _guard_base_url()
+    if not base:
+        return None
+    try:
+        token = create_access_token(
+            data={
+                "sub": current_user.get("username"),
+                "user_id": str(current_user.get("id")),
+            }
+        )
+        response = httpx.post(
+            f"{base}/reload",
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=_RELOAD_TIMEOUT_SECONDS,
+        )
+        response.raise_for_status()
+        data = response.json()
+    except Exception as exc:  # noqa: BLE001 - the monitor thread is the fallback
+        logger.warning("immediate worker reload unavailable: %s", exc)
         return None
     return data if isinstance(data, dict) else None
 

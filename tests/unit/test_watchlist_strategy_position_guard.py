@@ -79,6 +79,11 @@ def _install(
         "reset_strategy_state",
         lambda *a, **k: {"ok": True, "reset": True},
     )
+    monkeypatch.setattr(
+        user_watchlist,
+        "trigger_worker_reload",
+        lambda *a, **k: {"ok": True, "started": 0, "stopped": 0},
+    )
     return collections
 
 
@@ -246,6 +251,7 @@ def test_disable_clear_inserts_sell_for_managed_sleeve(monkeypatch):
     assert signal["meta"]["core_qty"] == 8000
     assert signal["activate_after"] is not None
     assert result["state_reset"] is True
+    assert result["worker_reload"] is True
 
 
 def test_clear_is_capped_by_t1_available(monkeypatch):
@@ -271,6 +277,18 @@ def test_clear_still_succeeds_when_state_reset_fails(monkeypatch):
     assert result["success"] is True
     assert result["state_reset"] is False
     assert len(collections["trade_signals"].inserted) == 1
+
+
+def test_reload_failure_still_writes_and_reports_false(monkeypatch):
+    collections = _install(monkeypatch, strategies=[_existing_600150()])
+    monkeypatch.setattr(user_watchlist, "fetch_position_guard", lambda *a, **k: _guard())
+    monkeypatch.setattr(user_watchlist, "trigger_worker_reload", lambda *a, **k: None)
+
+    result = user_watchlist.set_watchlist_strategy(_req(position_action="keep"), _user())
+
+    assert result["success"] is True
+    assert result["worker_reload"] is False
+    assert collections["watchlist_strategies"].updates[-1][1]["$set"]["enabled"] is False
 
 
 def test_clear_with_zero_sellable_returns_400(monkeypatch):

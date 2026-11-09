@@ -27,6 +27,7 @@ from services.strategy_position_guard import (
     fetch_position_guard,
     find_active_disable_sell,
     reset_strategy_state,
+    trigger_worker_reload,
 )
 
 router = APIRouter()
@@ -540,6 +541,14 @@ def set_watchlist_strategy(req: WatchlistStrategySetRequest, current_user: dict 
         response["cancel_pending_buys"] = cancel_result
     if state_reset is not None:
         response["state_reset"] = state_reset
+
+    # Make start/stop/param changes visible immediately instead of waiting for
+    # the manager's 60-second config poll. Failure is non-fatal.
+    reload_result = trigger_worker_reload(current_user)
+    response["worker_reload"] = reload_result is not None
+    if reload_result:
+        response["worker_sync"] = reload_result
+
     return response
 
 
