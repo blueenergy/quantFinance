@@ -104,14 +104,23 @@ def snapshot_account_equity(
         source_ts = _timestamp(source_synced_at)
         age_seconds = (time.time() - source_ts) if source_ts is not None else None
         is_stale = bool(age_seconds is None or age_seconds > stale_seconds)
+        market_value = _numeric(account.get("market_value"))
+        cash = _numeric(account.get("cash"))
+        total_asset_source = _numeric(
+            account.get("total_asset", account.get("total_assets"))
+        )
+        # QMT occasionally reports total_asset=0 while cash/market_value are
+        # valid. Fall back like portfolio_snapshot does, otherwise the equity
+        # curve silently records a zero point for that day.
+        total_asset = round(total_asset_source or (market_value + cash), 2)
         row = {
             "user_id": user_id,
             "securities_account_id": str(securities_account_id),
             "date": snapshot_date,
-            "total_asset": _numeric(account.get("total_asset", account.get("total_assets"))),
-            "cash": _numeric(account.get("cash")),
+            "total_asset": total_asset,
+            "cash": cash,
             "available_cash": _numeric(account.get("available_cash")),
-            "market_value": _numeric(account.get("market_value")),
+            "market_value": market_value,
             "account_id": account.get("account_id"),
             "broker": account.get("broker"),
             "source_synced_at": source_synced_at,

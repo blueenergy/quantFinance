@@ -79,6 +79,31 @@ def test_snapshot_account_equity_upserts_latest_account_point():
     assert row["is_stale"] is True
 
 
+def test_snapshot_account_equity_falls_back_when_total_asset_is_zero():
+    collections = {
+        "trader_accounts": _Collection(
+            [
+                {
+                    "user_id": "user-1",
+                    "securities_account_id": "acct-1",
+                    "total_asset": 0,
+                    "cash": 56347.14,
+                    "available_cash": 56347.14,
+                    "market_value": 411110.40,
+                    "synced_at": 1,
+                }
+            ]
+        ),
+        "trader_account_equity": _Collection(),
+    }
+
+    snapshot_account_equity(collections, date="20261106", stale_seconds=0)
+    row = collections["trader_account_equity"].docs[0]
+    assert row["total_asset"] == 467457.54
+    assert row["market_value"] == 411110.40
+    assert row["cash"] == 56347.14
+
+
 def test_compute_live_plan_equity_uses_plan_executions_and_fees():
     plan = {
         "user_id": "user-1",
