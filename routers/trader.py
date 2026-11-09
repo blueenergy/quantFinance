@@ -21,7 +21,7 @@ from db import get_db_collections, get_data_db, get_trading_db_collections
 from utils.stock_utils import serialize_doc
 from utils.time_display import add_display_time_fields
 from bson import ObjectId
-from services.live_equity import list_account_equity
+from services.live_equity import build_account_equity_live_point, list_account_equity
 from services.trade_latency_metrics import build_trade_latency_rollup
 from services.trader_execution_upload import upsert_trader_execution
 from services.portfolio_live_snapshot import rebuild_live_snapshot_for_plan_guarded
@@ -962,9 +962,18 @@ def get_account_equity(
     securities_account_id: Optional[str] = Query(None, description="Filter by securities account ID"),
     start_date: Optional[str] = Query(None, description="Start date YYYYMMDD or YYYY-MM-DD"),
     end_date: Optional[str] = Query(None, description="End date YYYYMMDD or YYYY-MM-DD"),
+    include_live: bool = Query(
+        True,
+        description="Append today's live intraday point on trading days when the account snapshot is fresh",
+    ),
     current_user: dict = Depends(get_current_active_user),
 ):
-    """Get persisted account-level daily equity snapshots."""
+    """Get persisted account-level daily equity snapshots.
+
+    With ``include_live`` the response ends with a synthetic point for today
+    built from the latest ``trader_accounts`` snapshot, so the dashboard can
+    extend the curve intraday instead of waiting for the 16:00/21:30 EOD frames.
+    """
     try:
         collections = get_db_collections()
         rows = list_account_equity(
@@ -974,6 +983,22 @@ def get_account_equity(
             start_date=start_date,
             end_date=end_date,
         )
+        if include_live and securities_account_id:
+            live_point = build_account_equity_live_point(
+                collections,
+                get_data_db(),
+                user_id=current_user["id"],
+                securities_account_id=securities_account_id,
+            )
+            start_ymd = start_date.replace("-", "") if start_date else None
+            end_ymd = end_date.replace("-", "") if end_date else None
+            live_date = live_point.get("date") if live_point else None
+            if live_date and (not start_ymd or start_ymd <= live_date) and (
+                not end_ymd or end_ymd >= live_date
+            ):
+                rows = [row for row in rows if row.get("date") != live_date]
+                rows.append(live_point)
+                rows.sort(key=lambda row: str(row.get("date") or ""))
         return {"success": True, "data": [serialize_doc(row) for row in rows]}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to fetch account equity: {str(e)}")

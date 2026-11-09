@@ -1,4 +1,12 @@
-from services.live_equity import compute_live_plan_equity, snapshot_account_equity, snapshot_live_plan_equity
+from datetime import datetime
+
+from services.live_equity import (
+    SHANGHAI_TZ,
+    build_account_equity_live_point,
+    compute_live_plan_equity,
+    snapshot_account_equity,
+    snapshot_live_plan_equity,
+)
 
 
 class _Cursor(list):
@@ -198,3 +206,86 @@ def test_snapshot_live_plan_equity_writes_when_plan_has_paper_conflict():
     assert row["plan_id"] == "plan-1"
     assert row["has_paper_conflict"] is True
     assert row["execution_count"] == 1
+
+
+def _live_account_collections(synced_at, total_asset=100000):
+    return {
+        "trader_accounts": _Collection(
+            [
+                {
+                    "user_id": "user-1",
+                    "securities_account_id": "acct-1",
+                    "total_asset": total_asset,
+                    "cash": 20000,
+                    "available_cash": 19000,
+                    "market_value": 80000,
+                    "synced_at": synced_at,
+                }
+            ]
+        )
+    }
+
+
+def _calendar_collections(trade_date="20261109"):
+    return {"trade_calendar": _Collection([{"exchange": "SSE", "trade_date": trade_date, "is_open": 1}])}
+
+
+def test_build_account_equity_live_point_on_trading_day():
+    now = datetime(2026, 11, 9, 15, 0, tzinfo=SHANGHAI_TZ)
+    source_synced_at = now.timestamp() - 30
+
+    point = build_account_equity_live_point(
+        _live_account_collections(source_synced_at),
+        _calendar_collections(),
+        user_id="user-1",
+        securities_account_id="acct-1",
+        now=now,
+    )
+
+    assert point["date"] == "20261109"
+    assert point["total_asset"] == 100000
+    assert point["is_intraday"] is True
+    assert point["is_stale"] is False
+    assert point["live_synced_at"] == source_synced_at
+
+
+def test_build_account_equity_live_point_skips_non_trading_day():
+    now = datetime(2026, 11, 9, 15, 0, tzinfo=SHANGHAI_TZ)
+
+    point = build_account_equity_live_point(
+        _live_account_collections(now.timestamp() - 30),
+        {"trade_calendar": _Collection()},
+        user_id="user-1",
+        securities_account_id="acct-1",
+        now=now,
+    )
+
+    assert point is None
+
+
+def test_build_account_equity_live_point_skips_stale_snapshot():
+    now = datetime(2026, 11, 9, 15, 0, tzinfo=SHANGHAI_TZ)
+
+    point = build_account_equity_live_point(
+        _live_account_collections(now.timestamp() - 3600),
+        _calendar_collections(),
+        user_id="user-1",
+        securities_account_id="acct-1",
+        now=now,
+    )
+
+    assert point is None
+
+
+def test_build_account_equity_live_point_skips_zero_total_asset():
+    now = datetime(2026, 11, 9, 15, 0, tzinfo=SHANGHAI_TZ)
+
+    point = build_account_equity_live_point(
+        _live_account_collections(now.timestamp() - 30, total_asset=0),
+        _calendar_collections(),
+        user_id="user-1",
+        securities_account_id="acct-1",
+        now=now,
+    )
+
+    assert point is None

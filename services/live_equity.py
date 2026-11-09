@@ -17,6 +17,9 @@ from services.trade_ledger import (
 SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
 DEFAULT_INITIAL_CAPITAL = 1_000_000.0
 ACCOUNT_SNAPSHOT_STALE_SECONDS = 6 * 60 * 60
+# Trader pushes account data every ~60s; five minutes tolerates a missed cycle
+# without letting a dead QMT connection masquerade as today's live point.
+LIVE_EQUITY_POINT_MAX_AGE_SECONDS = 5 * 60
 
 
 def _today_yyyymmdd(now: Optional[datetime] = None) -> str:
@@ -136,6 +139,77 @@ def snapshot_account_equity(
         written += 1
 
     return {"date": snapshot_date, "written": written, "skipped": skipped}
+
+
+def build_account_equity_live_point(
+    finance_collections: Dict[str, Any],
+    data_collections: Dict[str, Any],
+    *,
+    user_id: str,
+    securities_account_id: Optional[str] = None,
+    now: Optional[datetime] = None,
+    max_age_seconds: int = LIVE_EQUITY_POINT_MAX_AGE_SECONDS,
+) -> Optional[Dict[str, Any]]:
+    """Build a synthetic intraday equity point from the latest account snapshot.
+
+    Returns ``None`` unless every condition holds:
+    - today (Asia/Shanghai) is an SSE trading day;
+    - the account snapshot was synced within ``max_age_seconds``;
+    - the broker reported a positive ``total_asset``.
+
+    The positive ``total_asset`` requirement is deliberate: QMT rolls
+    ``market_value`` back to the previous close after hours, so the
+    ``market_value + cash`` fallback used for the EOD frame can be wrong
+    intraday. A missing point is better than a fabricated one.
+    """
+    if not user_id or not securities_account_id:
+        return None
+
+    snapshot_date = _today_yyyymmdd(now)
+    calendar = data_collections["trade_calendar"]
+    if not calendar.find_one(
+        {"exchange": "SSE", "trade_date": snapshot_date, "is_open": 1}
+    ):
+        return None
+
+    account = finance_collections["trader_accounts"].find_one(
+        {
+            "user_id": user_id,
+            "securities_account_id": str(securities_account_id),
+        }
+    )
+    if not account:
+        return None
+
+    source_synced_at = account.get("synced_at")
+    source_ts = _timestamp(source_synced_at)
+    if source_ts is None:
+        return None
+    current_ts = _timestamp(now) if now is not None else time.time()
+    age_seconds = current_ts - source_ts
+    if age_seconds < 0 or age_seconds > max_age_seconds:
+        return None
+
+    total_asset = _numeric(account.get("total_asset"))
+    if total_asset <= 0:
+        return None
+
+    return {
+        "user_id": user_id,
+        "securities_account_id": str(securities_account_id),
+        "date": snapshot_date,
+        "total_asset": round(total_asset, 2),
+        "cash": _numeric(account.get("cash")),
+        "available_cash": _numeric(account.get("available_cash")),
+        "market_value": _numeric(account.get("market_value")),
+        "account_id": account.get("account_id"),
+        "broker": account.get("broker"),
+        "source_synced_at": source_synced_at,
+        "source_synced_age_seconds": age_seconds,
+        "is_stale": False,
+        "is_intraday": True,
+        "live_synced_at": source_synced_at,
+    }
 
 
 def list_account_equity(
