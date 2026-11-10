@@ -7926,3 +7926,22 @@ def test_lineage_timeline_includes_trailing_stop_setting(monkeypatch):
     assert setting["enabled"] is True
     assert setting["trailing_stop_pct"] == 0.15
     assert setting["source"] == "lineage_controls"
+
+
+def test_distinct_trade_dates_skips_closed_calendar_rows():
+    """trade_calendar now stores closed days too; they must not count as sessions."""
+    data = {
+        "trade_calendar": _Collection(
+            [
+                {"trade_date": "20261106", "is_open": "1"},
+                {"trade_date": "20261107", "is_open": "0"},
+                {"trade_date": "20261108", "is_open": "0"},
+                {"trade_date": "20261109", "is_open": 1},
+                {"trade_date": "20261110", "is_open": "1"},
+            ]
+        )
+    }
+
+    assert portfolio_plans._distinct_trade_dates(
+        data, {"trade_date": {"$gte": "20261106", "$lte": "20261110"}}
+    ) == ["20261106", "20261109", "20261110"]

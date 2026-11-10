@@ -6,7 +6,7 @@ from typing import Any, Optional
 
 # 2026-11-10 凌晨日历被重写成全日历：is_open 由 int 1 变成字符串 "1"/"0"，
 # 且不再只存开市日。所有读日历的判断都必须同时兼容两种表示与休市日。
-_OPEN_FLAG_VALUES = (1, "1")
+OPEN_FLAG_VALUES = (1, "1")
 _TRUE_TEXT = {"1", "true", "yes", "y", "open"}
 
 
@@ -30,7 +30,7 @@ def latest_sse_open_day(calendar: Any, end_date: str) -> Optional[str]:
     doc = calendar.find_one(
         {
             "exchange": "SSE",
-            "is_open": {"$in": list(_OPEN_FLAG_VALUES)},
+            "is_open": {"$in": list(OPEN_FLAG_VALUES)},
             "trade_date": {"$lte": str(end_date)},
         },
         projection={"trade_date": 1},

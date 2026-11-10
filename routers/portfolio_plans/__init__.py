@@ -94,6 +94,7 @@ from services.portfolio_symbol_risk import (
     opportunity_ledger_read_enabled,
 )
 from services.trade_ledger import group_executions_by_order
+from services.trading_calendar import OPEN_FLAG_VALUES
 # Retained as a package-level symbol: publishing.replan_portfolio_plan_remainder
 # resolves it via _pp.resolve_market_reference_price (so tests can monkeypatch it
 # on the package namespace); it is no longer called directly in this module.
@@ -5485,7 +5486,10 @@ def _distinct_trade_dates(data_collections: Dict[str, Any], query: Dict[str, Any
     """
     calendar = data_collections.get("trade_calendar")
     if calendar is not None:
-        days = calendar.distinct("trade_date", query)
+        # The collection now also stores closed days (is_open "0"), so a bare
+        # date-range query would count weekends/holidays as trading days.
+        calendar_query = {**query, "is_open": {"$in": list(OPEN_FLAG_VALUES)}}
+        days = calendar.distinct("trade_date", calendar_query)
         if days:
             return sorted({str(d) for d in days if d})
     try:
