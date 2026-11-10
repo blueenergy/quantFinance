@@ -4594,6 +4594,71 @@ def test_list_portfolios_includes_live_and_paper_lineages(monkeypatch):
     assert paper["param_summary"] == "csi500 · Top30 · 10d · industry_capped"
 
 
+def test_list_portfolios_skips_cancelled_and_ledger_event_latest_plans(monkeypatch):
+    # An abandoned off-cycle plan (e.g. a cancelled liquidation dated in the
+    # future) or an external manual ledger record must not become the portfolio
+    # "latest" and render its lineup as the current book.
+    cols = _collections()
+    fin = _finance_collections()
+    data = _data_collections()
+    cols["portfolio_trade_plans"] = _Collection(
+        [
+            {
+                "plan_id": "live-b",
+                "record_kind": "trade_plan",
+                "strategy_template_id": "st-live",
+                "user_id": "user-1",
+                "base_date": "20250125",
+                "status": "executed_live",
+                "params_hash": "hx-live",
+                "strategy_name": "LiveCombo",
+                "params_snapshot": {"top_n": 20, "rebalance_days": 20, "construction_mode": "top_n", "universe_index": "csi1000"},
+            },
+            {
+                "plan_id": "live-cancelled",
+                "record_kind": "trade_plan",
+                "strategy_template_id": "st-live",
+                "user_id": "user-1",
+                "base_date": "20251231",
+                "status": "cancelled",
+                "origin": "manual",
+                "params_hash": "hx-live",
+                "strategy_name": "LiveCombo",
+                "params_snapshot": {"top_n": 20, "rebalance_days": 20, "construction_mode": "top_n", "universe_index": "csi1000"},
+            },
+            {
+                "plan_id": "live-extman",
+                "record_kind": "ledger_event",
+                "plan_type": "manual",
+                "manual_action": "external_manual",
+                "strategy_template_id": "st-live",
+                "user_id": "user-1",
+                "base_date": "20251231",
+                "status": "filled",
+                "origin": "manual",
+                "params_hash": "hx-live",
+                "strategy_name": "LiveCombo",
+                "params_snapshot": {"top_n": 20, "rebalance_days": 20, "construction_mode": "top_n", "universe_index": "csi1000"},
+            },
+        ]
+    )
+    fin["trade_signals"].docs = [
+        {
+            "order_id": "live-order",
+            "user_id": "user-1",
+            "mode": "live",
+            "plan_id": "live-b",
+            "securities_account_id": "acct-1",
+        },
+    ]
+    _patch_lineage_live_env(monkeypatch, cols, fin, data)
+    resp = asyncio.run(portfolio_plans.list_portfolios(current_user={"id": "user-1"}))
+    ports = resp["data"]["portfolios"]
+    live = next(row for row in ports if row["params_hash"] == "hx-live")
+    assert live["latest_plan_id"] == "live-b"
+    assert live["latest_plan_status"] == "executed_live"
+
+
 def test_list_portfolios_treats_unfilled_live_signals_as_live(monkeypatch):
     cols = _collections()
     fin = _finance_collections()
@@ -7465,6 +7530,103 @@ def test_reconcile_live_holdings_reports_pure_manual_position(monkeypatch):
     assert manual_by_symbol["300655.SZ"]["ledger_shares"] == 0
     assert manual_by_symbol["300655.SZ"]["account_shares"] == 13000
     assert manual_by_symbol["300655.SZ"]["diff"] == 13000
+
+
+def test_reconcile_live_holdings_legacy_rejected_and_sell_only_records_are_manual(monkeypatch):
+    # 600114 case: the only live records are a supervisor strategy's rejected
+    # single-stream orders (plan_id=None, zero fill) and a manual sell. Zero-fill
+    # rejections and sell-only records must not mark the symbol strategy-owned,
+    # or a core position the portfolio strategies never bought shows a red
+    # ledger-vs-broker diff in every portfolio sharing the account.
+    cols, fin, data = _reconcile_shared_account_fixtures()
+    fin["trade_signals"].docs = [
+        {
+            "order_id": "oa",
+            "user_id": "user-1",
+            "mode": "live",
+            "plan_id": "plan-a",
+            "securities_account_id": "acct-1",
+            "symbol": "000001.SZ",
+            "status": "filled",
+            "created_at": 1,
+        },
+        {
+            "order_id": "sb1",
+            "user_id": "user-1",
+            "mode": "live",
+            "plan_id": None,
+            "securities_account_id": "acct-1",
+            "symbol": "600114.SH",
+            "action": "BUY",
+            "status": "rejected",
+            "size": 40000,
+            "filled_qty": 0,
+            "created_at": 1,
+        },
+        {
+            "order_id": "manual-sell",
+            "user_id": "user-1",
+            "mode": "live",
+            "plan_id": None,
+            "securities_account_id": "acct-1",
+            "symbol": "600114.SH",
+            "action": "SELL",
+            "status": "filled",
+            "size": 2500,
+            "filled_qty": 2500,
+            "created_at": 2,
+        },
+    ]
+    fin["trade_executions"].docs = [
+        {
+            "order_id": "oa",
+            "user_id": "user-1",
+            "securities_account_id": "acct-1",
+            "symbol": "000001.SZ",
+            "side": "BUY",
+            "filled_size": 100,
+            "filled_price": 10.0,
+            "timestamp": 1.0,
+        },
+        {
+            "order_id": "sb1",
+            "user_id": "user-1",
+            "securities_account_id": "acct-1",
+            "symbol": "600114.SH",
+            "action": "BUY",
+            "status": "rejected",
+            "filled_size": 0,
+            "filled_price": 0.0,
+            "timestamp": 1.0,
+        },
+    ]
+    fin["trader_positions"].docs = [
+        {
+            "user_id": "user-1",
+            "securities_account_id": "acct-1",
+            "symbol": "000001.SZ",
+            "volume": 100,
+            "synced_at": 1700.0,
+        },
+        {
+            "user_id": "user-1",
+            "securities_account_id": "acct-1",
+            "symbol": "600114.SH",
+            "volume": 144100,
+            "synced_at": 1700.0,
+        },
+    ]
+    _patch_lineage_live_env(monkeypatch, cols, fin, data)
+    plan = cols["portfolio_trade_plans"].find_one({"plan_id": "plan-a"})
+
+    result = portfolio_plans._reconcile_live_holdings(cols, fin, data, plan, "user-1")
+
+    assert result["in_sync"] is True
+    assert result["diffs"] == []
+    manual_by_symbol = {row["symbol"]: row for row in result["manual_positions"]}
+    assert manual_by_symbol["600114.SH"]["ledger_shares"] == 0
+    assert manual_by_symbol["600114.SH"]["account_shares"] == 144100
+    assert manual_by_symbol["600114.SH"]["diff"] == 144100
 
 
 def test_reconcile_live_holdings_manual_plan_fill_is_manual(monkeypatch):

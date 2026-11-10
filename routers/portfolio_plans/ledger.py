@@ -40,6 +40,14 @@ _INFLIGHT_SIGNAL_STATUSES = frozenset(
 # of these never makes the strategy the owner of the shares.
 _MANUAL_EXECUTION_SOURCES = frozenset({"external_manual_record", "chase_manual"})
 
+# Terminal statuses that prove no shares changed hands. Legacy broker rows (e.g.
+# a supervisor strategy's rejected single-stream order) must not donate their
+# symbol to the strategy bucket: doing so turns a manual core position held in
+# the same account into a permanent red "ledger vs broker" diff.
+_NO_FILL_STATUSES = frozenset(
+    {"cancelled", "canceled", "rejected", "failed", "expired"}
+)
+
 
 def _account_level_live_holdings(
     finance_collections: Dict[str, Any],
@@ -194,12 +202,26 @@ def _strategy_attributable_symbol_keys(
     Manual holdings share the brokerage account with the strategy, so ledger and
     broker legitimately disagree on them. A symbol counts as manual only when
     every live record for it is provably not a strategy decision -- a manual
-    execution source, or a plan that fails ``is_strategy_decision`` -- or when it
-    has no records at all. Records we cannot attribute (a dangling ``plan_id``)
+    execution source, a plan that fails ``is_strategy_decision``, a record that
+    never filled (rejected/cancelled/expired), or a sell-only record (a sell
+    cannot explain extra broker shares) -- or when it has no records at all.
+    Records we cannot attribute (a dangling ``plan_id``, or a missing action)
     keep the symbol strategy-attributable, so an unrecorded strategy fill still
     raises the banner instead of being silently written off as manual.
     """
-    projection = {"_id": 0, "symbol": 1, "source": 1, "plan_id": 1, "order_id": 1}
+    projection = {
+        "_id": 0,
+        "symbol": 1,
+        "source": 1,
+        "plan_id": 1,
+        "order_id": 1,
+        "action": 1,
+        "side": 1,
+        "status": 1,
+        "filled_size": 1,
+        "filled_qty": 1,
+        "quantity": 1,
+    }
     signals: List[Dict[str, Any]] = []
     signals_col = finance_collections.get("trade_signals")
     if signals_col is not None:
@@ -242,6 +264,15 @@ def _strategy_attributable_symbol_keys(
         if not key:
             continue
         if str(row.get("source") or "") in _MANUAL_EXECUTION_SOURCES:
+            continue
+        status = str(row.get("status") or "").strip().lower()
+        if status in _NO_FILL_STATUSES and _pp._execution_fill_quantity(row) <= 0:
+            continue
+        action = str(row.get("action") or row.get("side") or "").strip().lower()
+        # A sell cannot create a positive ledger/broker gap, so it is not proof
+        # that the strategy owns the extra shares. Unknown actions stay
+        # attributable (legacy rows may omit it).
+        if action in {"sell", "s"}:
             continue
         plan_id = row.get("plan_id")
         if not plan_id:

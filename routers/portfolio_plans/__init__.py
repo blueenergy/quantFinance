@@ -5305,6 +5305,36 @@ def _build_portfolio_summary_payload(
     }
 
 
+_ABANDONED_PLAN_STATUSES = frozenset({"cancelled", "rejected", "superseded", "expired"})
+
+
+def _latest_display_plan(
+    plans: List[Dict[str, Any]], *, skip_ledger_events: bool = False
+) -> Dict[str, Any]:
+    """Newest plan that still describes the book.
+
+    Sorting by ``base_date`` alone lets an abandoned plan (e.g. a cancelled
+    off-cycle liquidation dated in the future) win the "latest" slot and render
+    its lineup as the current plan. Ledger events (external manual records) are
+    not strategy plans, so callers that want the latest *plan* (portfolio list,
+    cadence) skip them too. Falls back to the newest row when every candidate
+    is hidden.
+    """
+    candidates = [
+        row
+        for row in plans
+        if str(row.get("status") or "") not in _ABANDONED_PLAN_STATUSES
+        and (
+            not skip_ledger_events
+            or _resilient_record_kind(row) != RECORD_KIND_LEDGER_EVENT
+        )
+    ]
+    return max(
+        candidates,
+        key=lambda row: (str(row.get("base_date") or ""), str(row.get("created_at") or "")),
+    ) if candidates else plans[0]
+
+
 def _list_portfolios_payload(
     trading_collections: Dict[str, Any],
     finance_collections: Dict[str, Any],
@@ -5324,6 +5354,7 @@ def _list_portfolios_payload(
                 "plan_type": 1,
                 "manual_action": 1,
                 "record_kind": 1,
+                "created_at": 1,
                 "params_snapshot": 1,
                 "paper_execution_mode": 1,
             },
@@ -5409,7 +5440,7 @@ def _list_portfolios_payload(
         if not has_live and not has_paper:
             continue
 
-        latest = max(all_lineage, key=lambda row: str(row.get("base_date") or ""))
+        latest = _latest_display_plan(all_lineage, skip_ledger_events=True)
         earliest = min(all_lineage, key=lambda row: str(row.get("base_date") or ""))
         lineage_control = lineage_control_by_group.get(
             key,
@@ -5868,17 +5899,14 @@ def _build_lineage_timeline_payload(
         raise HTTPException(status_code=404, detail="lineage plans not found")
     _mark("load_plans")
 
-    latest_plan = plans[0]
+    latest_plan = _latest_display_plan(plans)
     # record_kind is the authoritative type (stamped at write time). External
     # ledger facts (record_kind == ledger_event) are not strategy decisions, so
     # cadence / drift / headline look past them to the latest real plan. headline
     # prefers whatever still needs human action so a same-day ledger record never
     # hides a rebalance awaiting approval. require_record_kind fails loud if any
     # document is missing its kind (a write-path bug, not something to paper over).
-    cadence_plan = next(
-        (row for row in plans if require_record_kind(row) != RECORD_KIND_LEDGER_EVENT),
-        latest_plan,
-    )
+    cadence_plan = _latest_display_plan(plans, skip_ledger_events=True)
     headline_plan = next((row for row in plans if _plan_action_required(row)), latest_plan)
 
     latest_rebalance = next(
