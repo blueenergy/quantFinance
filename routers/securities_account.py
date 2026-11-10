@@ -112,7 +112,12 @@ def list_broker_options(current_user: dict = Depends(get_current_active_user)):
 
 
 def _broker_qmt_supported(collections, broker: str) -> bool:
-    doc = collections["brokers"].find_one({"name": broker})
+    col = collections.get("brokers")
+    if col is None:
+        # Legacy/limited collection maps (tests, old deployments): keep the
+        # pre-gate behaviour instead of blocking every live account.
+        return True
+    doc = col.find_one({"name": broker})
     return bool(doc and doc.get("qmt_supported"))
 
 
