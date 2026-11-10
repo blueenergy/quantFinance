@@ -1,4 +1,5 @@
 
+import math
 from datetime import datetime, date, timezone
 from bson import ObjectId
 from .symbol_utils import normalize_symbol
@@ -13,6 +14,10 @@ def serialize_doc(doc):
             return obj.isoformat()
         elif isinstance(obj, date):
             return obj.isoformat()
+        elif isinstance(obj, float):
+            # Starlette's JSONResponse uses allow_nan=False; a NaN/Infinity stored
+            # in Mongo would otherwise turn the whole endpoint into a 500.
+            return obj if math.isfinite(obj) else None
         elif isinstance(obj, dict):
             return {k: convert(v) for k, v in obj.items()}
         elif isinstance(obj, list):
