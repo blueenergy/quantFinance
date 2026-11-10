@@ -95,3 +95,41 @@ def test_manual_create_signal_uses_selected_account(monkeypatch):
     assert signal["securities_account_id"] == str(account_b)
     assert signal["broker"] == "BrokerB"
     assert signal["account_id"] == "B456"
+
+
+
+def test_manual_create_rejects_unready_account(monkeypatch):
+    account = {
+        "_id": ObjectId(),
+        "user_id": "user-1",
+        "broker": "BrokerA",
+        "account_id": "A123",
+        "live_trading_enabled": True,
+    }
+    signals = _Collection()
+    collections = {
+        "trade_signals": signals,
+        "securities_accounts": _Collection([account]),
+        "worker_status": _Collection([]),
+        "trader_accounts": _Collection([]),
+        "qmt_clients": _Collection([]),
+    }
+    monkeypatch.setattr(trading_manual, "get_db_collections", lambda: collections)
+
+    try:
+        trading_manual.manual_create_signal(
+            {
+                "symbol": "000001.SZ",
+                "action": "buy",
+                "size": 100,
+                "securities_account_id": str(account["_id"]),
+            },
+            current_user={"id": "user-1"},
+        )
+    except trading_manual.HTTPException as exc:
+        assert exc.status_code == 400
+        assert "未就绪" in exc.detail
+    else:
+        raise AssertionError("expected unready account to reject manual order")
+
+    assert signals.docs == []

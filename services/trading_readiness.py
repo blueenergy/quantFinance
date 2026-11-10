@@ -28,10 +28,14 @@ def _latest_row(collection: Any, query: Dict[str, Any]) -> Dict[str, Any]:
     try:
         return collection.find_one(query, sort=[("synced_at", -1)]) or {}
     except TypeError:
+        pass
+    try:
         rows = list(collection.find(query))
-        if not rows:
-            return {}
-        return max(rows, key=lambda row: row.get("synced_at") or 0)
+    except Exception:
+        return collection.find_one(query) or {}
+    if not rows:
+        return {}
+    return max(rows, key=lambda row: row.get("synced_at") or 0)
 
 
 def account_trading_readiness(
