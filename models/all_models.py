@@ -197,6 +197,14 @@ class SecuritiesAccountResponse(SecuritiesAccountBase):
     live_trading_enabled: bool = False
     risk_limits: Optional[Dict[str, Any]] = None
     fee_model: Optional[Dict[str, Any]] = None
+    # End-to-end readiness (permission + executor mapping + fresh heartbeats).
+    trading_ready: Optional[bool] = None
+    trading_status: Optional[str] = None
+    trading_status_reason: Optional[str] = None
+    mapping_complete: Optional[bool] = None
+    instance_state: Optional[str] = None
+    worker_seen_at: Optional[float] = None
+    account_synced_at: Optional[float] = None
 
 
 class WorkerNodeRegisterRequest(BaseModel):

@@ -10,6 +10,7 @@ from models.all_models import (
 )
 from auth import get_current_active_user
 from db import get_db_collections
+from services.trading_readiness import account_trading_readiness, require_trading_ready
 
 router = APIRouter()
 
@@ -30,6 +31,13 @@ def _account_response(d: dict) -> SecuritiesAccountResponse:
         live_trading_enabled=bool(d.get("live_trading_enabled", False)),
         risk_limits=d.get("risk_limits"),
         fee_model=d.get("fee_model"),
+        trading_ready=d.get("trading_ready"),
+        trading_status=d.get("trading_status"),
+        trading_status_reason=d.get("trading_status_reason"),
+        mapping_complete=d.get("mapping_complete"),
+        instance_state=d.get("instance_state"),
+        worker_seen_at=d.get("worker_seen_at"),
+        account_synced_at=d.get("account_synced_at"),
     )
 
 
@@ -136,7 +144,8 @@ def list_accounts(current_user: dict = Depends(get_current_active_user)):
     docs = col.find({"user_id": str(current_user["id"])})
     out = []
     for d in docs:
-        out.append(_account_response(d))
+        readiness = account_trading_readiness(collections, d)
+        out.append(_account_response({**d, **readiness}))
     
     # 调试：打印返回的账户数据
     print(f"\n=== GET /securities_accounts ===")

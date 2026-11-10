@@ -12,6 +12,7 @@ from bson.errors import InvalidId
 from db import get_db_collections
 from auth import get_current_active_user
 from services.live_trade_signals import default_valid_until
+from services.trading_readiness import require_trading_ready
 from utils.stock_utils import serialize_doc
 from utils.symbol_utils import normalize_symbol
 import time
@@ -203,6 +204,7 @@ def manual_create_signal(
             user_id=user_id,
             securities_account_id=securities_account_id,
         )
+        require_trading_ready(collections, user_account)
         securities_account_id = str(user_account["_id"])
         
         # 生成订单ID

@@ -26,6 +26,7 @@ from services.intraday_t0_trades import (
     trade_exists_for_signal,
 )
 from services.portfolio_record_kind import PLAN_TYPE_INTRADAY_T0
+from services.trading_readiness import require_trading_ready
 from utils.stock_utils import serialize_doc
 from utils.symbol_utils import normalize_symbol
 
@@ -318,6 +319,14 @@ def build_execution_intent(
         raise ValueError(
             "signal belongs to a different securities account than the selected plan"
         )
+    account_coll = get_db_collections().get("securities_accounts")
+    if account_coll is not None:
+        account_doc = account_coll.find_one(
+            {"_id": ObjectId(accounts["securities_account_id"]), "user_id": user_id}
+        )
+        if not account_doc:
+            raise ValueError("securities account not found")
+        require_trading_ready(get_db_collections(), account_doc)
     symbol = normalize_symbol(str(signal.get("symbol") or ""))
     if not symbol:
         raise ValueError("signal has no symbol")

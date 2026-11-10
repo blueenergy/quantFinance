@@ -27,6 +27,7 @@ from stock_data_access.board_lots import (  # pyright: ignore[reportMissingImpor
 )
 
 from auth import get_current_user
+from services.trading_readiness import require_trading_ready
 from services.live_trade_signals import (
     ACTIVE_SIGNAL_STATUSES,
     active_signal_query_for_order_ids,
@@ -443,6 +444,7 @@ async def live_rebalance_portfolio(
             status_code=409,
             detail="securities account is not enabled for live trading",
         )
+    require_trading_ready(finance_collections, account)
 
     strategy_template_id = str(plan.get("strategy_template_id") or "")
     params_hash = str(plan.get("params_hash") or "")
@@ -968,6 +970,7 @@ def publish_portfolio_plan_live_signals(
     if plan.get("paper_executed_at") or trading_collections["portfolio_paper_executions"].find_one({"plan_id": plan_id, "user_id": user_id}):
         raise HTTPException(status_code=400, detail="plan already has paper executions; cannot publish live signals")
     account = _pp._require_securities_account(finance_collections, request.securities_account_id, user_id)
+    require_trading_ready(finance_collections, account)
     items = list(
         trading_collections["portfolio_trade_plan_items"]
         .find({"plan_id": plan_id, "user_id": user_id})
@@ -1311,6 +1314,7 @@ def replan_portfolio_plan_remainder(
         raise HTTPException(status_code=400, detail="plan has no live signals to reconcile")
 
     account = _pp._require_securities_account(finance_collections, request.securities_account_id, user_id)
+    require_trading_ready(finance_collections, account)
     account_snapshot = _pp._latest_account_snapshot(finance_collections, account, user_id)
     account_synced = bool(account_snapshot)
     broker_available_cash = _numeric(
