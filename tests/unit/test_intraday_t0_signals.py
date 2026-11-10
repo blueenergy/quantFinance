@@ -344,7 +344,7 @@ def test_reference_notional_uses_median_position_value(monkeypatch):
     monkeypatch.setattr(
         t0,
         "get_user_positions",
-        lambda uid, trade_date=None: (
+        lambda uid, trade_date=None, securities_account_id=None: (
             "auto",
             [
                 {"quantity": 100, "current_price": 10.0},  # 1,000
@@ -358,7 +358,7 @@ def test_reference_notional_uses_median_position_value(monkeypatch):
 
 @pytest.mark.unit
 def test_reference_notional_falls_back_without_positions(monkeypatch):
-    monkeypatch.setattr(t0, "get_user_positions", lambda uid, trade_date=None: ("auto", []))
+    monkeypatch.setattr(t0, "get_user_positions", lambda uid, trade_date=None, securities_account_id=None: ("auto", []))
     assert t0._reference_notional("u1", "20260820") == t0.REFERENCE_NOTIONAL_FALLBACK
 
 
@@ -506,7 +506,7 @@ def test_evaluate_writes_cost_and_net_return(monkeypatch):
     monkeypatch.setattr(
         t0,
         "_snapshot_after",
-        lambda uid, symbol, target, trade_date: {
+        lambda uid, symbol, target, trade_date, securities_account_id=None: {
             "price": 101.0,
             "snapshot_time": "202608201035",
         },
@@ -516,9 +516,9 @@ def test_evaluate_writes_cost_and_net_return(monkeypatch):
     monkeypatch.setattr(
         t0,
         "get_user_positions",
-        lambda uid, trade_date=None: ("auto", [{"quantity": 10000, "current_price": 10.0}]),
+        lambda uid, trade_date=None, securities_account_id=None: ("auto", [{"quantity": 10000, "current_price": 10.0}]),
     )
-    monkeypatch.setattr("services.intraday_t0_trades._t0_fee_model", lambda: FEE_MODEL)
+    monkeypatch.setattr("services.intraday_t0_trades._t0_fee_model", lambda *a, **k: FEE_MODEL)
 
     result = t0.evaluate_signals_for_user("u1", "20260820")
     assert result["ref_notional"] == pytest.approx(100_000)
@@ -582,15 +582,15 @@ def test_evaluate_adds_spread_to_cost(monkeypatch):
     monkeypatch.setattr(t0, "_INDEXES_READY", True)
     monkeypatch.setattr(
         t0, "_snapshot_after",
-        lambda uid, symbol, target, trade_date: {"price": 101.0, "snapshot_time": "202608201035"},
+        lambda uid, symbol, target, trade_date, securities_account_id=None: {"price": 101.0, "snapshot_time": "202608201035"},
     )
     monkeypatch.setattr(t0, "latest_daily_record", lambda symbol, trade_date=None: None)
     monkeypatch.setattr(t0, "_next_daily", lambda symbol, trade_date: None)
     monkeypatch.setattr(
         t0, "get_user_positions",
-        lambda uid, trade_date=None: ("auto", [{"quantity": 10000, "current_price": 10.0}]),
+        lambda uid, trade_date=None, securities_account_id=None: ("auto", [{"quantity": 10000, "current_price": 10.0}]),
     )
-    monkeypatch.setattr("services.intraday_t0_trades._t0_fee_model", lambda: FEE_MODEL)
+    monkeypatch.setattr("services.intraday_t0_trades._t0_fee_model", lambda *a, **k: FEE_MODEL)
 
     result = t0.evaluate_signals_for_user("u1", "20260820")
     assert result["fee_cost_pct"] == pytest.approx(0.07)      # 费用部分不受价差影响

@@ -774,9 +774,51 @@ def store_position_snapshot(
         raise HTTPException(status_code=500, detail=f"Failed to store snapshot: {str(e)}")
 
 
+def _resolve_account_scope(
+    collections,
+    user_id: str,
+    securities_account_id: Optional[str],
+    *,
+    all_accounts: bool = False,
+) -> Optional[str]:
+    """Resolve the account scope for endpoints that read synced books.
+
+    Single-account users keep the legacy implicit behavior.  A user with
+    several accounts must name one; only endpoints that explicitly support
+    merging (``all_accounts=true``) may return ``None`` and read across all
+    books.  This prevents silently mixing the personal and strategy accounts.
+    """
+    if securities_account_id:
+        return str(securities_account_id)
+    accounts_coll = collections.get("trader_accounts")
+    if accounts_coll is None:
+        # Legacy/limited collection maps (tests, old deployments) keep the
+        # implicit single-book behavior.
+        return None
+    accounts = list(
+        accounts_coll
+        .find({"user_id": user_id}, {"securities_account_id": 1})
+        .sort("synced_at", -1)
+    )
+    if not accounts:
+        return None
+    if len(accounts) == 1:
+        return str(accounts[0].get("securities_account_id") or "")
+    if all_accounts:
+        return None
+    raise HTTPException(
+        status_code=400,
+        detail="用户存在多个证券账户，请指定 securities_account_id（或显式 all_accounts=true）",
+    )
+
+
 @router.get("/trader/positions", summary="Get current positions")
 def get_positions(
     securities_account_id: Optional[str] = Query(None, description="Filter by securities account ID"),
+    all_accounts: bool = Query(
+        False,
+        description="显式合并该用户全部证券账户的持仓；多账户时默认必须指定 securities_account_id",
+    ),
     current_user: dict = Depends(get_current_active_user)
 ):
     """Get current positions synced from quantTrader."""
@@ -785,14 +827,17 @@ def get_positions(
         data_collections = get_data_db()
         positions_coll = collections["trader_positions"]
         stock_info_coll = data_collections["stock_info"]
-        
+
         user_id = current_user["id"]
-        
+        sec_id = _resolve_account_scope(
+            collections, user_id, securities_account_id, all_accounts=all_accounts
+        )
+
         # Build query
         query = {"user_id": user_id}
-        if securities_account_id:
-            query["securities_account_id"] = securities_account_id
-        
+        if sec_id:
+            query["securities_account_id"] = sec_id
+
         # Fetch positions
         cursor = positions_coll.find(query)
         positions = [serialize_doc(doc) for doc in cursor]
@@ -845,6 +890,8 @@ def get_positions(
             "count": len(positions)
         }
         
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to fetch positions: {str(e)}")
 
@@ -912,12 +959,13 @@ def get_account(
         accounts_coll = collections["trader_accounts"]
         
         user_id = current_user["id"]
-        
+
         # Build query
+        sec_id = _resolve_account_scope(collections, user_id, securities_account_id)
         query = {"user_id": user_id}
-        if securities_account_id:
-            query["securities_account_id"] = securities_account_id
-        
+        if sec_id:
+            query["securities_account_id"] = sec_id
+
         # Fetch latest account info
         account = accounts_coll.find_one(
             query,
@@ -953,6 +1001,8 @@ def get_account(
             "data": transformed_account
         }
         
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to fetch account: {str(e)}")
 
@@ -976,19 +1026,22 @@ def get_account_equity(
     """
     try:
         collections = get_db_collections()
+        user_id = current_user["id"]
+        # Equity curves are per account; never merge two books in one series.
+        sec_id = _resolve_account_scope(collections, user_id, securities_account_id)
         rows = list_account_equity(
             collections,
-            user_id=current_user["id"],
-            securities_account_id=securities_account_id,
+            user_id=user_id,
+            securities_account_id=sec_id,
             start_date=start_date,
             end_date=end_date,
         )
-        if include_live and securities_account_id:
+        if include_live and sec_id:
             live_point = build_account_equity_live_point(
                 collections,
                 get_data_db(),
-                user_id=current_user["id"],
-                securities_account_id=securities_account_id,
+                user_id=user_id,
+                securities_account_id=sec_id,
             )
             start_ymd = start_date.replace("-", "") if start_date else None
             end_ymd = end_date.replace("-", "") if end_date else None
@@ -1000,6 +1053,8 @@ def get_account_equity(
                 rows.append(live_point)
                 rows.sort(key=lambda row: str(row.get("date") or ""))
         return {"success": True, "data": [serialize_doc(row) for row in rows]}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to fetch account equity: {str(e)}")
 

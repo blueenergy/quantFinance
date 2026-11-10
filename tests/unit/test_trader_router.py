@@ -809,3 +809,81 @@ def test_cleanup_positions_endpoint_integration(monkeypatch):
     finally:
         # Clean up overrides
         app.dependency_overrides = {}
+
+
+class TestMultiAccountScoping:
+    """A user with several securities accounts must not get silently merged data."""
+
+    @pytest.fixture
+    def setup(self, monkeypatch):
+        self.accounts_coll = FakeCollection([
+            {
+                "_id": ObjectId(),
+                "user_id": "user_123",
+                "securities_account_id": "sec-a",
+                "account_id": "8885156549",
+                "total_asset": 100.0,
+                "cash": 10.0,
+                "market_value": 90.0,
+                "synced_at": 1,
+            },
+            {
+                "_id": ObjectId(),
+                "user_id": "user_123",
+                "securities_account_id": "sec-b",
+                "account_id": "62129066",
+                "total_asset": 200.0,
+                "cash": 20.0,
+                "market_value": 180.0,
+                "synced_at": 2,
+            },
+        ])
+        self.positions_coll = FakeCollection([
+            {"_id": ObjectId(), "user_id": "user_123", "securities_account_id": "sec-a", "symbol": "600000.SH", "qty": 100},
+            {"_id": ObjectId(), "user_id": "user_123", "securities_account_id": "sec-b", "symbol": "000001.SZ", "qty": 200},
+        ])
+        self.stock_info_coll = FakeCollection([
+            {"_id": ObjectId(), "symbol": "600000.SH", "name": "浦发银行"},
+            {"_id": ObjectId(), "symbol": "000001.SZ", "name": "平安银行"},
+        ])
+        fake_collections = {
+            "trader_accounts": self.accounts_coll,
+            "trader_positions": self.positions_coll,
+        }
+        monkeypatch.setattr(trader, "get_db_collections", lambda: fake_collections)
+        monkeypatch.setattr(trader, "get_data_db", lambda: {"stock_info": self.stock_info_coll})
+        app.dependency_overrides[get_current_active_user] = lambda: {"id": "user_123"}
+        yield
+        app.dependency_overrides = {}
+
+    def test_positions_requires_account_when_multiple(self, setup):
+        response = TestClient(app).get("/api/trader/positions")
+        assert response.status_code == 400
+        assert "多个证券账户" in response.json()["detail"]
+
+    def test_positions_filters_by_account(self, setup):
+        response = TestClient(app).get(
+            "/api/trader/positions", params={"securities_account_id": "sec-a"}
+        )
+        assert response.status_code == 200
+        assert response.json()["count"] == 1
+        assert response.json()["data"][0]["symbol"] == "600000.SH"
+
+    def test_positions_all_accounts_is_explicit(self, setup):
+        response = TestClient(app).get(
+            "/api/trader/positions", params={"all_accounts": "true"}
+        )
+        assert response.status_code == 200
+        assert response.json()["count"] == 2
+
+    def test_account_requires_account_when_multiple(self, setup):
+        response = TestClient(app).get("/api/trader/account")
+        assert response.status_code == 400
+        assert "多个证券账户" in response.json()["detail"]
+
+    def test_account_filters_by_account(self, setup):
+        response = TestClient(app).get(
+            "/api/trader/account", params={"securities_account_id": "sec-b"}
+        )
+        assert response.status_code == 200
+        assert response.json()["data"]["account_id"] == "62129066"

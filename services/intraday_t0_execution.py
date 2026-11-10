@@ -257,13 +257,16 @@ def _route_signal_execution(
     *,
     pair_id: Optional[str],
     buy_first_enabled: bool,
+    securities_account_id: Optional[str] = None,
 ) -> Tuple[str, Optional[str], str]:
     """Return (action, pair_id, pair_style) for a signal execution."""
     open_pair: Optional[Dict[str, Any]] = None
     if pair_id:
         open_pair = _resolve_open_pair(user_id, symbol, pair_id)
     else:
-        open_pair = find_open_pair_for_symbol(user_id, symbol)
+        open_pair = find_open_pair_for_symbol(
+            user_id, symbol, securities_account_id=securities_account_id
+        )
 
     if signal_type == "SELL_WATCH":
         if open_pair and open_pair.get("style") == "buy_first":
@@ -310,6 +313,11 @@ def build_execution_intent(
         current_user,
         settings=settings,
     )
+    signal_account = str(signal.get("securities_account_id") or "").strip() or None
+    if signal_account and signal_account != accounts["securities_account_id"]:
+        raise ValueError(
+            "signal belongs to a different securities account than the selected plan"
+        )
     symbol = normalize_symbol(str(signal.get("symbol") or ""))
     if not symbol:
         raise ValueError("signal has no symbol")
@@ -337,6 +345,7 @@ def build_execution_intent(
         symbol,
         pair_id=pair_id,
         buy_first_enabled=buy_first_enabled,
+        securities_account_id=accounts["securities_account_id"],
     )
 
     current_shares = _basis_shares(user_id, accounts["securities_account_id"], symbol)
@@ -376,7 +385,9 @@ def build_execution_intent(
         uncovered = to_int(pair.get("uncovered_qty"))
         if uncovered <= 0:
             raise ValueError("open pair has no uncovered quantity")
-        available = _broker_available_qty(user_id, symbol)
+        available = _broker_available_qty(
+            user_id, symbol, securities_account_id=accounts["securities_account_id"]
+        )
         qty = to_int(quantity) if quantity is not None else to_int(trade_preview.get("suggested_qty"))
         qty = _round_lot(qty)
         max_qty = min(uncovered, available) if available > 0 else uncovered
@@ -488,7 +499,8 @@ def sync_execution_trade_leg(
 ) -> Optional[Dict[str, Any]]:
     """Mirror a submitted execution leg into the trade ledger for pair routing."""
     signal_id = str(intent.get("signal_id") or "")
-    if signal_id and trade_exists_for_signal(user_id, signal_id):
+    account_id = str(intent.get("securities_account_id") or "").strip() or None
+    if signal_id and trade_exists_for_signal(user_id, signal_id, account_id):
         return None
     price = to_float(signal.get("price"))
     if price is None or price <= 0:
@@ -528,6 +540,7 @@ def sync_execution_trade_leg(
                 "trade_date": trade_date,
                 "signal_id": signal_id or None,
                 "pair_id": intent.get("pair_id"),
+                "securities_account_id": account_id,
                 "notes": "auto_sync_from_execution" if auto else "sync_from_execution",
             },
         )
@@ -725,6 +738,7 @@ def apply_broker_fill_to_t0_ledger(
                 "price": price,
                 "signal_id": signal_id,
                 "pair_id": pair_id,
+                "securities_account_id": exec_doc.get("securities_account_id"),
                 "notes": "sync_from_fill",
             },
         )
@@ -842,11 +856,18 @@ async def submit_execution_async(
     }
 
 
-def list_executions(user_id: str, limit: int = 100) -> List[Dict[str, Any]]:
+def list_executions(
+    user_id: str,
+    limit: int = 100,
+    securities_account_id: Optional[str] = None,
+) -> List[Dict[str, Any]]:
     ensure_intraday_t0_execution_indexes()
+    query: Dict[str, Any] = {"user_id": user_id}
+    if securities_account_id:
+        query["securities_account_id"] = str(securities_account_id)
     rows = (
         _executions_coll()
-        .find({"user_id": user_id})
+        .find(query)
         .sort([("created_at", DESCENDING), ("_id", DESCENDING)])
         .limit(limit)
     )
@@ -863,9 +884,24 @@ def maybe_auto_execute_after_signal(user_id: str, signal_doc: Dict[str, Any]) ->
     settings = get_user_settings(user_id)["data"]
     if not settings.get("auto_execute_enabled"):
         return None
+    # A signal belongs to one account; never auto-execute it against a plan
+    # bound to a different book.  Skipping is quieter than a failed execution
+    # row per foreign signal.
+    settings_account = str(settings.get("securities_account_id") or "").strip()
+    signal_account = str(signal_doc.get("securities_account_id") or "").strip()
+    if signal_account and settings_account and signal_account != settings_account:
+        return None
     if signal_type == "BUY_WATCH":
         symbol = normalize_symbol(str(signal_doc.get("symbol") or ""))
-        open_pair = find_open_pair_for_symbol(user_id, symbol) if symbol else None
+        open_pair = (
+            find_open_pair_for_symbol(
+                user_id,
+                symbol,
+                securities_account_id=signal_doc.get("securities_account_id"),
+            )
+            if symbol
+            else None
+        )
         opening_buy_first = not open_pair or open_pair.get("style") != "sell_first"
         if opening_buy_first and not settings.get("buy_first_enabled"):
             return None

@@ -19,6 +19,7 @@ from services.intraday_t0_signals import (
     generate_signals_for_all_users,
     generate_signals_for_user,
     get_user_positions,
+    iter_t0_books,
     performance_summary,
     upsert_mock_position,
 )
@@ -57,6 +58,7 @@ class GenerateSignalsPayload(BaseModel):
     trade_date: Optional[str] = None
     snapshot_time: Optional[str] = None
     source: str = "auto"
+    securities_account_id: Optional[str] = None
 
 
 class WatchlistImportPayload(BaseModel):
@@ -89,6 +91,7 @@ class ExecutionSubmitPayload(BaseModel):
 
 class RecordTradePayload(BaseModel):
     symbol: str = Field(..., min_length=1)
+    securities_account_id: Optional[str] = None
     leg: str = Field(..., pattern="^(sell|buy)$")
     quantity: int = Field(..., gt=0)
     price: float = Field(..., gt=0)
@@ -141,11 +144,19 @@ def intraday_t0_readiness(
 def get_positions(
     source: str = Query("auto", pattern="^(auto|real|mock|watchlist)$"),
     trade_date: Optional[str] = Query(None, description="YYYYMMDD or YYYY-MM-DD"),
+    securities_account_id: Optional[str] = Query(
+        None, description="Limit real positions to one securities account"
+    ),
     current_user: dict = Depends(get_current_active_user),
 ):
     """Return normalized real/mock/watchlist positions enriched with realtime daily K data."""
     try:
-        actual_source, positions = get_user_positions(_user_id(current_user), source=source, trade_date=trade_date)
+        actual_source, positions = get_user_positions(
+            _user_id(current_user),
+            source=source,
+            trade_date=trade_date,
+            securities_account_id=securities_account_id,
+        )
         market = {}
         if positions:
             from services.intraday_t0_signals import compact_trade_date, latest_market_spectrum
@@ -230,13 +241,38 @@ def generate_signals(
     current_user: dict = Depends(get_current_active_user),
 ):
     payload = payload or GenerateSignalsPayload()
+    user_id = _user_id(current_user)
     try:
-        return generate_signals_for_user(
-            _user_id(current_user),
-            trade_date=payload.trade_date,
-            snapshot_time=payload.snapshot_time,
-            source=payload.source,
-        )
+        if payload.securities_account_id:
+            return generate_signals_for_user(
+                user_id,
+                trade_date=payload.trade_date,
+                snapshot_time=payload.snapshot_time,
+                source=payload.source,
+                securities_account_id=payload.securities_account_id,
+            )
+        # No account named: generate one book per synced account instead of
+        # scoring a merged, ambiguous position list.
+        books = [book for book in iter_t0_books() if book[0] == user_id]
+        if not books:
+            books = [(user_id, None)]
+        results = [
+            generate_signals_for_user(
+                user_id,
+                trade_date=payload.trade_date,
+                snapshot_time=payload.snapshot_time,
+                source=payload.source,
+                securities_account_id=sec_id,
+            )
+            for _, sec_id in books
+        ]
+        return {
+            "success": True,
+            "trade_date": results[0].get("trade_date") if results else None,
+            "books_count": len(results),
+            "signals_count": sum(r.get("signals_count", 0) for r in results),
+            "results": results,
+        }
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"生成日内T+0信号失败: {exc}")
 
@@ -258,6 +294,7 @@ def generate_all_signals_internal(
 def get_signals(
     trade_date: Optional[str] = Query(None, description="YYYYMMDD or YYYY-MM-DD"),
     symbol: Optional[str] = Query(None),
+    securities_account_id: Optional[str] = Query(None),
     limit: int = Query(200, ge=1, le=1000),
     current_user: dict = Depends(get_current_active_user),
 ):
@@ -268,6 +305,8 @@ def get_signals(
         query["trade_date"] = compact_trade_date(trade_date)
     if symbol:
         query["symbol"] = normalize_symbol(symbol)
+    if securities_account_id:
+        query["securities_account_id"] = str(securities_account_id)
     cursor = (
         get_db_collections()["intraday_t0_signals"]
         .find(query)
@@ -281,10 +320,15 @@ def get_signals(
 @router.post("/signals/evaluate")
 def evaluate_signals(
     trade_date: Optional[str] = Query(None, description="YYYYMMDD or YYYY-MM-DD"),
+    securities_account_id: Optional[str] = Query(None),
     current_user: dict = Depends(get_current_active_user),
 ):
     try:
-        return evaluate_signals_for_user(_user_id(current_user), trade_date=trade_date)
+        return evaluate_signals_for_user(
+            _user_id(current_user),
+            trade_date=trade_date,
+            securities_account_id=securities_account_id,
+        )
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"评估日内T+0信号失败: {exc}")
 
@@ -292,10 +336,15 @@ def evaluate_signals(
 @router.get("/signals/performance")
 def get_signal_performance(
     trade_date: Optional[str] = Query(None, description="YYYYMMDD or YYYY-MM-DD"),
+    securities_account_id: Optional[str] = Query(None),
     current_user: dict = Depends(get_current_active_user),
 ):
     try:
-        return performance_summary(_user_id(current_user), trade_date=trade_date)
+        return performance_summary(
+            _user_id(current_user),
+            trade_date=trade_date,
+            securities_account_id=securities_account_id,
+        )
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"获取日内T+0表现统计失败: {exc}")
 
@@ -306,6 +355,7 @@ def get_signal_acceptance(
     trade_date: Optional[str] = Query(
         None, description="窗口**结束日**（含）YYYYMMDD or YYYY-MM-DD；留空取今天"
     ),
+    securities_account_id: Optional[str] = Query(None),
     current_user: dict = Depends(get_current_active_user),
 ):
     """T+0 验收口径：按 style 分离、按 (股票, 交易日) 聚类的净胜率 + 95% CI。
@@ -314,7 +364,10 @@ def get_signal_acceptance(
     """
     try:
         return acceptance_summary(
-            _user_id(current_user), lookback_days=lookback_days, trade_date=trade_date
+            _user_id(current_user),
+            lookback_days=lookback_days,
+            trade_date=trade_date,
+            securities_account_id=securities_account_id,
         )
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"获取日内T+0验收统计失败: {exc}")
@@ -323,13 +376,18 @@ def get_signal_acceptance(
 @router.get("/signals/export")
 def export_signals(
     trade_date: Optional[str] = Query(None, description="YYYYMMDD or YYYY-MM-DD"),
+    securities_account_id: Optional[str] = Query(None),
     current_user: dict = Depends(get_current_active_user),
 ):
     from services.intraday_t0_signals import compact_trade_date
 
     try:
         td = compact_trade_date(trade_date) if trade_date else "all"
-        content = export_signals_csv(_user_id(current_user), trade_date=trade_date)
+        content = export_signals_csv(
+            _user_id(current_user),
+            trade_date=trade_date,
+            securities_account_id=securities_account_id,
+        )
         filename = f"intraday_t0_signals_{td}.csv"
         return Response(
             content=content,
@@ -343,13 +401,18 @@ def export_signals(
 @router.get("/signals/evaluations/export")
 def export_signal_evaluations(
     trade_date: Optional[str] = Query(None, description="YYYYMMDD or YYYY-MM-DD"),
+    securities_account_id: Optional[str] = Query(None),
     current_user: dict = Depends(get_current_active_user),
 ):
     from services.intraday_t0_signals import compact_trade_date
 
     try:
         td = compact_trade_date(trade_date) if trade_date else "all"
-        content = export_evaluations_csv(_user_id(current_user), trade_date=trade_date)
+        content = export_evaluations_csv(
+            _user_id(current_user),
+            trade_date=trade_date,
+            securities_account_id=securities_account_id,
+        )
         filename = f"intraday_t0_evaluations_{td}.csv"
         return Response(
             content=content,
@@ -397,11 +460,18 @@ def create_trade(
 def get_trades(
     trade_date: Optional[str] = Query(None, description="YYYYMMDD or YYYY-MM-DD"),
     symbol: Optional[str] = Query(None),
+    securities_account_id: Optional[str] = Query(None),
     limit: int = Query(200, ge=1, le=1000),
     current_user: dict = Depends(get_current_active_user),
 ):
     try:
-        rows = list_trades(_user_id(current_user), trade_date=trade_date, symbol=symbol, limit=limit)
+        rows = list_trades(
+            _user_id(current_user),
+            trade_date=trade_date,
+            symbol=symbol,
+            limit=limit,
+            securities_account_id=securities_account_id,
+        )
         return {"success": True, "count": len(rows), "data": rows}
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"获取T+0成交记录失败: {exc}")
@@ -410,10 +480,15 @@ def get_trades(
 @router.get("/trades/open")
 def get_open_trade_pairs(
     trade_date: Optional[str] = Query(None, description="YYYYMMDD or YYYY-MM-DD"),
+    securities_account_id: Optional[str] = Query(None),
     current_user: dict = Depends(get_current_active_user),
 ):
     try:
-        rows = list_open_pairs(_user_id(current_user), trade_date=trade_date)
+        rows = list_open_pairs(
+            _user_id(current_user),
+            trade_date=trade_date,
+            securities_account_id=securities_account_id,
+        )
         return {"success": True, "count": len(rows), "data": rows}
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"获取未回补配对失败: {exc}")
@@ -422,10 +497,15 @@ def get_open_trade_pairs(
 @router.get("/trades/day-summary")
 def get_trade_day_summary(
     trade_date: Optional[str] = Query(None, description="YYYYMMDD or YYYY-MM-DD"),
+    securities_account_id: Optional[str] = Query(None),
     current_user: dict = Depends(get_current_active_user),
 ):
     try:
-        return day_summary(_user_id(current_user), trade_date=trade_date)
+        return day_summary(
+            _user_id(current_user),
+            trade_date=trade_date,
+            securities_account_id=securities_account_id,
+        )
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"获取T+0日终汇总失败: {exc}")
 
@@ -508,10 +588,15 @@ async def submit_execution(
 @router.get("/execution/history")
 def get_execution_history(
     limit: int = Query(100, ge=1, le=500),
+    securities_account_id: Optional[str] = Query(None),
     current_user: dict = Depends(get_current_active_user),
 ):
     try:
-        rows = list_executions(_user_id(current_user), limit=limit)
+        rows = list_executions(
+            _user_id(current_user),
+            limit=limit,
+            securities_account_id=securities_account_id,
+        )
         return {"success": True, "count": len(rows), "data": rows}
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"获取T+0执行历史失败: {exc}")
@@ -520,10 +605,15 @@ def get_execution_history(
 @router.post("/trades/day-close-check")
 def run_day_close_check(
     trade_date: Optional[str] = Query(None, description="YYYYMMDD or YYYY-MM-DD"),
+    securities_account_id: Optional[str] = Query(None),
     current_user: dict = Depends(get_current_active_user),
 ):
     try:
-        return day_close_check(_user_id(current_user), trade_date=trade_date)
+        return day_close_check(
+            _user_id(current_user),
+            trade_date=trade_date,
+            securities_account_id=securities_account_id,
+        )
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"T+0日终检查失败: {exc}")
 

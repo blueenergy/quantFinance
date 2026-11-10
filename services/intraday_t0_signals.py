@@ -59,10 +59,32 @@ def ensure_intraday_t0_indexes() -> None:
         [("user_id", ASCENDING), ("symbol", ASCENDING), ("signal_type", ASCENDING), ("snapshot_time", DESCENDING)],
         name="user_symbol_signal_idx",
     )
-    collections["intraday_t0_position_snapshots"].create_index(
-        [("user_id", ASCENDING), ("symbol", ASCENDING), ("snapshot_time", ASCENDING)],
+    collections["intraday_t0_signals"].create_index(
+        [
+            ("user_id", ASCENDING),
+            ("securities_account_id", ASCENDING),
+            ("trade_date", DESCENDING),
+            ("snapshot_time", DESCENDING),
+        ],
+        name="user_account_trade_snapshot_idx",
+    )
+    # Multi-account: the same symbol can be snapshotted for several accounts at
+    # the same minute, so the uniqueness key must include the account.  Drop
+    # the legacy index once (idempotent) and create the account-aware one.
+    snapshots = collections["intraday_t0_position_snapshots"]
+    try:
+        snapshots.drop_index("user_symbol_snapshot_unique")
+    except Exception:
+        pass
+    snapshots.create_index(
+        [
+            ("user_id", ASCENDING),
+            ("securities_account_id", ASCENDING),
+            ("symbol", ASCENDING),
+            ("snapshot_time", ASCENDING),
+        ],
         unique=True,
-        name="user_symbol_snapshot_unique",
+        name="user_account_symbol_snapshot_unique",
     )
     collections["intraday_t0_signal_evaluations"].create_index(
         [("signal_id", ASCENDING), ("horizon", ASCENDING)],
@@ -294,7 +316,12 @@ def enrich_position(position: Dict[str, Any], trade_date: Optional[str] = None) 
     return position
 
 
-def get_user_positions(user_id: str, source: str = "auto", trade_date: Optional[str] = None) -> Tuple[str, List[Dict[str, Any]]]:
+def get_user_positions(
+    user_id: str,
+    source: str = "auto",
+    trade_date: Optional[str] = None,
+    securities_account_id: Optional[str] = None,
+) -> Tuple[str, List[Dict[str, Any]]]:
     ensure_intraday_t0_indexes()
     cols = get_db_collections()
     source = (source or "auto").lower()
@@ -302,8 +329,13 @@ def get_user_positions(user_id: str, source: str = "auto", trade_date: Optional[
         source = "auto"
 
     if source in {"auto", "real"}:
-        real_docs = list(cols["trader_positions"].find({"user_id": user_id}))
+        real_query: Dict[str, Any] = {"user_id": user_id}
+        if securities_account_id:
+            real_query["securities_account_id"] = str(securities_account_id)
+        real_docs = list(cols["trader_positions"].find(real_query))
         real_positions = [normalize_real_position(doc) for doc in real_docs]
+        for position in real_positions:
+            position["securities_account_id"] = str(securities_account_id) if securities_account_id else None
         real_positions = [p for p in real_positions if p.get("symbol") and p.get("quantity", 0) > 0]
         if source == "real" or real_positions:
             return "real", [enrich_position(p, trade_date) for p in real_positions]
@@ -528,11 +560,18 @@ def cooldown_suppressed(
     price: Optional[float],
     cooldown_minutes: int = DEFAULT_COOLDOWN_MINUTES,
     price_reset_pct: float = DEFAULT_PRICE_RESET_PCT,
+    securities_account_id: Optional[str] = None,
 ) -> bool:
     if signal_type not in WATCH_SIGNAL_TYPES:
         return False
+    query: Dict[str, Any] = {
+        "user_id": user_id,
+        "symbol": symbol,
+        "signal_type": signal_type,
+        "securities_account_id": securities_account_id or None,
+    }
     last = get_db_collections()["intraday_t0_signals"].find_one(
-        {"user_id": user_id, "symbol": symbol, "signal_type": signal_type},
+        query,
         sort=[("snapshot_time", DESCENDING)],
     )
     if not last:
@@ -625,9 +664,11 @@ def store_position_snapshot(
     trade_date: str,
     snapshot_time: str,
     features: Dict[str, Any],
+    securities_account_id: Optional[str] = None,
 ) -> None:
     doc = {
         "user_id": user_id,
+        "securities_account_id": str(securities_account_id) if securities_account_id else None,
         "symbol": position["symbol"],
         "name": position.get("name", ""),
         "trade_date": compact_trade_date(trade_date),
@@ -638,8 +679,14 @@ def store_position_snapshot(
         "features": features,
         "created_at": now_ts(),
     }
+    snapshot_query: Dict[str, Any] = {
+        "user_id": user_id,
+        "symbol": position["symbol"],
+        "snapshot_time": snapshot_time,
+        "securities_account_id": str(securities_account_id) if securities_account_id else None,
+    }
     get_db_collections()["intraday_t0_position_snapshots"].update_one(
-        {"user_id": user_id, "symbol": position["symbol"], "snapshot_time": snapshot_time},
+        snapshot_query,
         {"$set": doc},
         upsert=True,
     )
@@ -650,24 +697,39 @@ def generate_signals_for_user(
     trade_date: Optional[str] = None,
     snapshot_time: Optional[str] = None,
     source: str = "auto",
+    securities_account_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     ensure_intraday_t0_indexes()
     td = compact_trade_date(trade_date)
     st = (snapshot_time or current_snapshot_time(td)).replace("-", "")[:12]
-    actual_source, positions = get_user_positions(user_id, source=source, trade_date=td)
+    account_id = str(securities_account_id) if securities_account_id else None
+    actual_source, positions = get_user_positions(
+        user_id,
+        source=source,
+        trade_date=td,
+        securities_account_id=account_id,
+    )
     enabled_positions = [p for p in positions if p.get("enabled", True) and p.get("symbol")]
     signals: List[Dict[str, Any]] = []
     coll = get_db_collections()["intraday_t0_signals"]
     for position in enabled_positions:
         features = build_features(position, td, st)
-        store_position_snapshot(user_id, position, td, st, features)
+        store_position_snapshot(user_id, position, td, st, features, account_id)
         signal_type, score, reasons = classify_signal(position, features, st)
-        if cooldown_suppressed(user_id, position["symbol"], signal_type, st, to_float(position.get("current_price"))):
+        if cooldown_suppressed(
+            user_id,
+            position["symbol"],
+            signal_type,
+            st,
+            to_float(position.get("current_price")),
+            securities_account_id=account_id,
+        ):
             signal_type = "HOLD"
             score = min(score, 45.0)
             reasons = ["cooldown_suppressed"]
         doc = {
             "user_id": user_id,
+            "securities_account_id": account_id,
             "symbol": position["symbol"],
             "name": position.get("name", ""),
             "trade_date": td,
@@ -692,6 +754,7 @@ def generate_signals_for_user(
     return {
         "success": True,
         "user_id": user_id,
+        "securities_account_id": account_id,
         "trade_date": td,
         "snapshot_time": st,
         "position_source": actual_source,
@@ -701,27 +764,45 @@ def generate_signals_for_user(
     }
 
 
-def iter_users_with_intraday_positions() -> Iterable[str]:
+def iter_t0_books() -> List[Tuple[str, Optional[str]]]:
+    """One T+0 book per securities account, plus a legacy user-level book for
+    mock positions.  Signals, snapshots and trades are keyed by this pair."""
     cols = get_db_collections()
-    user_ids = set()
-    for doc in cols["trader_positions"].find({"qty": {"$gt": 0}}, {"user_id": 1}):
-        if doc.get("user_id"):
-            user_ids.add(str(doc["user_id"]))
+    books: set[Tuple[str, Optional[str]]] = set()
+    for doc in cols["trader_accounts"].find({}, {"user_id": 1, "securities_account_id": 1}):
+        user_id = str(doc.get("user_id") or "")
+        sec_id = str(doc.get("securities_account_id") or "")
+        if user_id and sec_id:
+            books.add((user_id, sec_id))
     for doc in cols["intraday_t0_mock_positions"].find({"enabled": True}, {"user_id": 1}):
         if doc.get("user_id"):
-            user_ids.add(str(doc["user_id"]))
-    return sorted(user_ids)
+            books.add((str(doc["user_id"]), None))
+    return sorted(books, key=lambda item: (item[0], item[1] or ""))
+
+
+def iter_users_with_intraday_positions() -> Iterable[str]:
+    """Legacy helper (scheduler evaluation loops users, not books)."""
+    return sorted({user_id for user_id, _ in iter_t0_books()})
 
 
 def generate_signals_for_all_users(trade_date: Optional[str], snapshot_time: Optional[str]) -> Dict[str, Any]:
     results = []
-    for user_id in iter_users_with_intraday_positions():
-        results.append(generate_signals_for_user(user_id, trade_date=trade_date, snapshot_time=snapshot_time))
+    books = iter_t0_books()
+    for user_id, securities_account_id in books:
+        results.append(
+            generate_signals_for_user(
+                user_id,
+                trade_date=trade_date,
+                snapshot_time=snapshot_time,
+                securities_account_id=securities_account_id,
+            )
+        )
     return {
         "success": True,
         "trade_date": compact_trade_date(trade_date),
         "snapshot_time": snapshot_time,
-        "users_count": len(results),
+        "users_count": len({user_id for user_id, _ in books}),
+        "books_count": len(books),
         "signals_count": sum(r.get("signals_count", 0) for r in results),
         "results": results,
     }
@@ -735,7 +816,11 @@ def _parse_snapshot_time(snapshot_time: str) -> Optional[datetime]:
 
 
 def _snapshot_after(
-    user_id: str, symbol: str, target_time: datetime, trade_date: str
+    user_id: str,
+    symbol: str,
+    target_time: datetime,
+    trade_date: str,
+    securities_account_id: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """取目标时刻之后、**同一交易日内**的第一条快照；当日没有则返回 None。
 
@@ -743,12 +828,14 @@ def _snapshot_after(
     只有下界时会跨日取到下一个交易日的价格 —— 那是隔夜跳空，不是这个 horizon 的结果。
     """
     target = target_time.strftime("%Y%m%d%H%M")
+    query: Dict[str, Any] = {
+        "user_id": user_id,
+        "symbol": symbol,
+        "snapshot_time": {"$gte": target, "$lte": f"{trade_date}1500"},
+        "securities_account_id": str(securities_account_id) if securities_account_id else None,
+    }
     return get_db_collections()["intraday_t0_position_snapshots"].find_one(
-        {
-            "user_id": user_id,
-            "symbol": symbol,
-            "snapshot_time": {"$gte": target, "$lte": f"{trade_date}1500"},
-        },
+        query,
         sort=[("snapshot_time", ASCENDING)],
     )
 
@@ -795,7 +882,9 @@ def signal_spread_cost_pct(signal: Dict[str, Any]) -> float:
     return value
 
 
-def _reference_notional(user_id: str, trade_date: str) -> float:
+def _reference_notional(
+    user_id: str, trade_date: str, securities_account_id: Optional[str] = None
+) -> float:
     """参考名义金额 = 当日各持仓市值的中位数（取不到则回落常量）。
 
     成本百分比**不是定值**：最低佣金 5 元在名义金额 5 万以下会咬（1 万 → 0.15%，
@@ -803,7 +892,11 @@ def _reference_notional(user_id: str, trade_date: str) -> float:
     """
     values: List[float] = []
     try:
-        for position in get_user_positions(user_id, trade_date=trade_date)[1]:
+        for position in get_user_positions(
+            user_id,
+            trade_date=trade_date,
+            securities_account_id=securities_account_id,
+        )[1]:
             qty = to_float(position.get("quantity"))
             price = to_float(position.get("current_price"))
             if qty and price:
@@ -838,19 +931,26 @@ def net_return_pct(
     return value - cost_pct
 
 
-def evaluate_signals_for_user(user_id: str, trade_date: Optional[str] = None) -> Dict[str, Any]:
+def evaluate_signals_for_user(
+    user_id: str,
+    trade_date: Optional[str] = None,
+    securities_account_id: Optional[str] = None,
+) -> Dict[str, Any]:
     ensure_intraday_t0_indexes()
     td = compact_trade_date(trade_date)
     cols = get_db_collections()
     from services.intraday_t0_trades import _t0_fee_model  # 同上，避免循环 import
 
-    ref_notional = _reference_notional(user_id, td)
+    ref_notional = _reference_notional(user_id, td, securities_account_id)
     # 成本 = 费用（日级：取决于参考名义金额）+ 价差（逐信号：取决于该时刻的盘口）。
     # 两者必须分开 —— 费用对当日所有信号是同一个数，价差不是。
     # 只算费用的旧口径会低估约 40%（实测中位价差 0.0385%，费用部分 0.0700%）。
     fee_cost_pct = round_trip_cost_pct(_t0_fee_model(), ref_notional)
     day_cost_pcts: List[float] = []
-    signals = list(cols["intraday_t0_signals"].find({"user_id": user_id, "trade_date": td}))
+    signal_query: Dict[str, Any] = {"user_id": user_id, "trade_date": td}
+    if securities_account_id:
+        signal_query["securities_account_id"] = str(securities_account_id)
+    signals = list(cols["intraday_t0_signals"].find(signal_query))
     eval_coll = cols["intraday_t0_signal_evaluations"]
     written = 0
     horizons = [5, 15, 30, 60]
@@ -869,7 +969,11 @@ def evaluate_signals_for_user(user_id: str, trade_date: Optional[str] = None) ->
         docs: List[Dict[str, Any]] = []
         for minutes in horizons:
             snap = _snapshot_after(
-                user_id, symbol, signal_dt + timedelta(minutes=minutes), td
+                user_id,
+                symbol,
+                signal_dt + timedelta(minutes=minutes),
+                td,
+                signal.get("securities_account_id"),
             )
             if not snap:
                 continue
@@ -880,6 +984,7 @@ def evaluate_signals_for_user(user_id: str, trade_date: Optional[str] = None) ->
                 {
                     "signal_id": signal_id,
                     "user_id": user_id,
+                    "securities_account_id": signal.get("securities_account_id"),
                     "symbol": symbol,
                     "trade_date": td,
                     "horizon": f"{minutes}m",
@@ -898,6 +1003,7 @@ def evaluate_signals_for_user(user_id: str, trade_date: Optional[str] = None) ->
                 {
                     "signal_id": signal_id,
                     "user_id": user_id,
+                    "securities_account_id": signal.get("securities_account_id"),
                     "symbol": symbol,
                     "trade_date": td,
                     "horizon": "close",
@@ -917,6 +1023,7 @@ def evaluate_signals_for_user(user_id: str, trade_date: Optional[str] = None) ->
                     {
                         "signal_id": signal_id,
                         "user_id": user_id,
+                    "securities_account_id": signal.get("securities_account_id"),
                         "symbol": symbol,
                         "trade_date": td,
                         "horizon": "t1_open",
@@ -933,6 +1040,7 @@ def evaluate_signals_for_user(user_id: str, trade_date: Optional[str] = None) ->
                     {
                         "signal_id": signal_id,
                         "user_id": user_id,
+                    "securities_account_id": signal.get("securities_account_id"),
                         "symbol": symbol,
                         "trade_date": td,
                         "horizon": "t1_max",
@@ -1136,11 +1244,17 @@ def _rows_from_grouped(
     return rows
 
 
-def performance_summary(user_id: str, trade_date: Optional[str] = None) -> Dict[str, Any]:
+def performance_summary(
+    user_id: str,
+    trade_date: Optional[str] = None,
+    securities_account_id: Optional[str] = None,
+) -> Dict[str, Any]:
     ensure_intraday_t0_indexes()
     query: Dict[str, Any] = {"user_id": user_id}
     if trade_date:
         query["trade_date"] = compact_trade_date(trade_date)
+    if securities_account_id:
+        query["securities_account_id"] = str(securities_account_id)
     rows = list(get_db_collections()["intraday_t0_signal_evaluations"].find(query, {"_id": 0}))
     summary = _rows_from_grouped(
         _group_evaluations_by_signal_horizon(rows),
@@ -1245,6 +1359,7 @@ def acceptance_summary(
     lookback_days: int = ACCEPTANCE_LOOKBACK_DAYS,
     trade_date: Optional[str] = None,
     min_clusters: int = ACCEPTANCE_MIN_CLUSTERS,
+    securities_account_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Phase 1 验收口径：按 style 分离、按 (股票, 交易日) 聚类的净胜率 + 95% CI。
 
@@ -1268,10 +1383,11 @@ def acceptance_summary(
     # 刻意不用 distinct() / $lte：测试用的 FakeCollection 两者都不支持，
     # 且缺字段的行会在 `None <= str` 上抛 TypeError。取回后在 Python 里切窗口
     # （与 performance_summary 的无界查询同形，无新增性能风险）。
+    eval_query: Dict[str, Any] = {"user_id": user_id}
+    if securities_account_id:
+        eval_query["securities_account_id"] = str(securities_account_id)
     rows = list(
-        get_db_collections()["intraday_t0_signal_evaluations"].find(
-            {"user_id": user_id}, {"_id": 0}
-        )
+        get_db_collections()["intraday_t0_signal_evaluations"].find(eval_query, {"_id": 0})
     )
     end = compact_trade_date(trade_date) if trade_date else compact_trade_date()
     all_dates = sorted(
@@ -1345,11 +1461,17 @@ def _csv_cell(value: Any) -> str:
     return text
 
 
-def export_signals_csv(user_id: str, trade_date: Optional[str] = None) -> str:
+def export_signals_csv(
+    user_id: str,
+    trade_date: Optional[str] = None,
+    securities_account_id: Optional[str] = None,
+) -> str:
     ensure_intraday_t0_indexes()
     query: Dict[str, Any] = {"user_id": user_id}
     if trade_date:
         query["trade_date"] = compact_trade_date(trade_date)
+    if securities_account_id:
+        query["securities_account_id"] = str(securities_account_id)
     rows = list(
         get_db_collections()["intraday_t0_signals"]
         .find(query, {"_id": 0})
@@ -1394,9 +1516,15 @@ def export_signals_csv(user_id: str, trade_date: Optional[str] = None) -> str:
     return "\n".join(lines) + ("\n" if lines else "")
 
 
-def export_evaluations_csv(user_id: str, trade_date: Optional[str] = None) -> str:
+def export_evaluations_csv(
+    user_id: str,
+    trade_date: Optional[str] = None,
+    securities_account_id: Optional[str] = None,
+) -> str:
     ensure_intraday_t0_indexes()
     query: Dict[str, Any] = {"user_id": user_id}
+    if securities_account_id:
+        query["securities_account_id"] = str(securities_account_id)
     if trade_date:
         query["trade_date"] = compact_trade_date(trade_date)
     rows = list(

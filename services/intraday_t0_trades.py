@@ -50,6 +50,20 @@ def ensure_intraday_t0_trade_indexes() -> None:
         [("user_id", ASCENDING), ("symbol", ASCENDING), ("trade_date", DESCENDING)],
         name="user_symbol_trade_date_idx",
     )
+    # Multi-account query paths: pair lookups and per-account trade lists.
+    coll.create_index(
+        [("user_id", ASCENDING), ("securities_account_id", ASCENDING), ("pair_id", ASCENDING)],
+        name="user_account_pair_idx",
+    )
+    coll.create_index(
+        [
+            ("user_id", ASCENDING),
+            ("securities_account_id", ASCENDING),
+            ("trade_date", DESCENDING),
+            ("created_at", DESCENDING),
+        ],
+        name="user_account_trade_date_idx",
+    )
     _TRADE_INDEXES_READY = True
 
 
@@ -66,7 +80,7 @@ def _load_signal_meta(signal_id: Optional[str], user_id: str) -> Dict[str, Any]:
         return {}
     doc = get_db_collections()["intraday_t0_signals"].find_one(
         {"_id": oid, "user_id": user_id},
-        {"signal_type": 1, "signal_score": 1, "snapshot_time": 1, "symbol": 1},
+        {"signal_type": 1, "signal_score": 1, "snapshot_time": 1, "symbol": 1, "securities_account_id": 1},
     )
     if not doc:
         return {}
@@ -75,20 +89,26 @@ def _load_signal_meta(signal_id: Optional[str], user_id: str) -> Dict[str, Any]:
         "signal_score": doc.get("signal_score"),
         "signal_snapshot_time": doc.get("snapshot_time"),
         "signal_symbol": doc.get("symbol"),
+        "securities_account_id": doc.get("securities_account_id"),
     }
 
 
-def _broker_available_qty(user_id: str, symbol: str) -> int:
+def _broker_available_qty(
+    user_id: str, symbol: str, securities_account_id: Optional[str] = None
+) -> int:
     normalized = normalize_symbol(symbol)
     projection = {"available_qty": 1, "can_use_volume": 1, "qty": 1, "synced_at": 1, "symbol": 1}
+    base_query: Dict[str, Any] = {"user_id": user_id}
+    if securities_account_id:
+        base_query["securities_account_id"] = str(securities_account_id)
     doc = get_db_collections()["trader_positions"].find_one(
-        {"user_id": user_id, "symbol": normalized},
+        {**base_query, "symbol": normalized},
         projection,
     )
     if not doc:
         for cand in {normalized, normalized.split(".")[0]}:
             doc = get_db_collections()["trader_positions"].find_one(
-                {"user_id": user_id, "symbol": cand},
+                {**base_query, "symbol": cand},
                 projection,
             )
             if doc:
@@ -99,6 +119,7 @@ def _broker_available_qty(user_id: str, symbol: str) -> int:
         get_db_collections(),
         user_id,
         {normalized, normalized.split(".")[0]},
+        securities_account_id=securities_account_id,
     )
     sellable = sellable_shares(
         doc,
@@ -167,12 +188,19 @@ def _pair_state_from_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
-def _load_pair_rows(user_id: str, pair_id: str) -> List[Dict[str, Any]]:
-    return list(_trades_coll().find({"user_id": user_id, "pair_id": pair_id}))
+def _load_pair_rows(
+    user_id: str, pair_id: str, securities_account_id: Optional[str] = None
+) -> List[Dict[str, Any]]:
+    query: Dict[str, Any] = {"user_id": user_id, "pair_id": pair_id}
+    if securities_account_id:
+        query["securities_account_id"] = str(securities_account_id)
+    return list(_trades_coll().find(query))
 
 
-def _pair_info(user_id: str, pair_id: str) -> Dict[str, Any]:
-    rows = _load_pair_rows(user_id, pair_id)
+def _pair_info(
+    user_id: str, pair_id: str, securities_account_id: Optional[str] = None
+) -> Dict[str, Any]:
+    rows = _load_pair_rows(user_id, pair_id, securities_account_id)
     if not rows:
         raise ValueError("pair_id not found")
     state = _pair_state_from_rows(rows)
@@ -184,25 +212,35 @@ def _pair_info(user_id: str, pair_id: str) -> Dict[str, Any]:
     }
 
 
-def _try_pair_info(user_id: str, pair_id: str) -> Optional[Dict[str, Any]]:
+def _try_pair_info(
+    user_id: str, pair_id: str, securities_account_id: Optional[str] = None
+) -> Optional[Dict[str, Any]]:
     try:
-        return _pair_info(user_id, pair_id)
+        return _pair_info(user_id, pair_id, securities_account_id)
     except ValueError:
         return None
 
 
-def _uncovered_qty_for_pair(user_id: str, pair_id: str) -> int:
-    rows = _load_pair_rows(user_id, pair_id)
+def _uncovered_qty_for_pair(
+    user_id: str, pair_id: str, securities_account_id: Optional[str] = None
+) -> int:
+    rows = _load_pair_rows(user_id, pair_id, securities_account_id)
     if not rows:
         return 0
     state = _pair_state_from_rows(rows)
     return to_int(state.get("uncovered_qty"))
 
 
-def _buy_first_reserved_qty(user_id: str, symbol: str, *, exclude_pair_id: Optional[str] = None) -> int:
+def _buy_first_reserved_qty(
+    user_id: str,
+    symbol: str,
+    *,
+    exclude_pair_id: Optional[str] = None,
+    securities_account_id: Optional[str] = None,
+) -> int:
     normalized = normalize_symbol(symbol)
     reserved = 0
-    for pair in list_open_pairs(user_id):
+    for pair in list_open_pairs(user_id, securities_account_id=securities_account_id):
         if exclude_pair_id and pair.get("pair_id") == exclude_pair_id:
             continue
         if pair.get("style") != "buy_first":
@@ -213,17 +251,35 @@ def _buy_first_reserved_qty(user_id: str, symbol: str, *, exclude_pair_id: Optio
     return reserved
 
 
-def _buy_first_open_capacity(user_id: str, symbol: str, *, exclude_pair_id: Optional[str] = None) -> int:
-    available = _broker_available_qty(user_id, symbol)
-    reserved = _buy_first_reserved_qty(user_id, symbol, exclude_pair_id=exclude_pair_id)
+def _buy_first_open_capacity(
+    user_id: str,
+    symbol: str,
+    *,
+    exclude_pair_id: Optional[str] = None,
+    securities_account_id: Optional[str] = None,
+) -> int:
+    available = _broker_available_qty(user_id, symbol, securities_account_id=securities_account_id)
+    reserved = _buy_first_reserved_qty(
+        user_id,
+        symbol,
+        exclude_pair_id=exclude_pair_id,
+        securities_account_id=securities_account_id,
+    )
     return max(0, available - reserved)
 
 
-def find_open_pair_for_symbol(user_id: str, symbol: str, trade_date: Optional[str] = None) -> Optional[Dict[str, Any]]:
+def find_open_pair_for_symbol(
+    user_id: str,
+    symbol: str,
+    trade_date: Optional[str] = None,
+    securities_account_id: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
     normalized = normalize_symbol(symbol)
     candidates = [
         p
-        for p in list_open_pairs(user_id, trade_date=trade_date)
+        for p in list_open_pairs(
+            user_id, trade_date=trade_date, securities_account_id=securities_account_id
+        )
         if normalize_symbol(str(p.get("symbol") or "")) == normalized
     ]
     return candidates[-1] if candidates else None
@@ -242,10 +298,13 @@ def preview_trade_from_signal(
     symbol = normalize_symbol(str(meta.get("signal_symbol") or ""))
     if not symbol:
         raise ValueError("signal has no symbol")
-    available = _broker_available_qty(user_id, symbol)
+    account_id = meta.get("securities_account_id")
+    available = _broker_available_qty(user_id, symbol, securities_account_id=account_id)
     ratio = float(buy_qty_ratio if buy_qty_ratio is not None else sell_qty_ratio)
     signal_type = str(meta.get("signal_type") or "")
-    open_pair = find_open_pair_for_symbol(user_id, symbol)
+    open_pair = find_open_pair_for_symbol(
+        user_id, symbol, securities_account_id=account_id
+    )
     warnings: List[str] = []
     suggested_qty = 0
     pair_style: Optional[str] = None
@@ -273,7 +332,9 @@ def preview_trade_from_signal(
                 warnings.append("open sell_first pair has no uncovered quantity")
         else:
             pair_style = "buy_first"
-            capacity = _buy_first_open_capacity(user_id, symbol)
+            capacity = _buy_first_open_capacity(
+                user_id, symbol, securities_account_id=account_id
+            )
             suggested_qty = _round_lot(int(capacity * ratio))
             if suggested_qty < 100 and capacity >= 100:
                 suggested_qty = 100
@@ -292,6 +353,7 @@ def preview_trade_from_signal(
     return {
         "success": True,
         "signal_id": signal_id,
+        "securities_account_id": account_id,
         "symbol": symbol,
         "signal_type": signal_type,
         "signal_score": meta.get("signal_score"),
@@ -305,11 +367,20 @@ def preview_trade_from_signal(
     }
 
 
-def _t0_fee_model() -> Dict[str, Any]:
-    """从 securities_accounts 读费率模型（无 user 维度；优先 live 账户）。"""
+def _t0_fee_model(
+    user_id: Optional[str] = None, securities_account_id: Optional[str] = None
+) -> Dict[str, Any]:
+    """从 securities_accounts 读费率模型；多账户时优先本账户的配置。"""
     accounts = get_db_collections().get("securities_accounts")
     if accounts is None:
         return {}
+    if user_id and securities_account_id:
+        doc = accounts.find_one(
+            {"user_id": str(user_id), "securities_account_id": str(securities_account_id)},
+            {"fee_model": 1},
+        )
+        if doc and doc.get("fee_model"):
+            return doc["fee_model"]
     docs = list(accounts.find({}, {"fee_model": 1, "live_trading_enabled": 1}).limit(10))
     for doc in docs:
         if doc.get("fee_model") and doc.get("live_trading_enabled"):
@@ -363,15 +434,6 @@ def record_trade(user_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     if price is None or price <= 0:
         raise ValueError("price must be positive")
     trade_date = compact_trade_date(payload.get("trade_date"))
-    fees = to_float(payload.get("fees"))
-    if fees is None:
-        fee_model = _t0_fee_model()
-        if not fee_model:
-            log.warning(
-                "no fee_model in securities_accounts; recording t0 trade %s with fees=0 (net==gross)",
-                symbol,
-            )
-        fees = calc_trade_fees(leg, quantity, price, fee_model)
     signal_id = str(payload.get("signal_id") or "").strip() or None
     pair_id = str(payload.get("pair_id") or "").strip() or None
     notes = str(payload.get("notes") or "").strip()
@@ -380,9 +442,24 @@ def record_trade(user_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     if signal_id and not signal_meta:
         raise ValueError("signal_id not found")
 
+    payload_account = str(payload.get("securities_account_id") or "").strip() or None
+    signal_account = str(signal_meta.get("securities_account_id") or "").strip() or None
+    if payload_account and signal_account and payload_account != signal_account:
+        raise ValueError("securities_account_id does not match the signal's account")
+    securities_account_id = payload_account or signal_account
+    fees = to_float(payload.get("fees"))
+    if fees is None:
+        fee_model = _t0_fee_model(user_id, securities_account_id)
+        if not fee_model:
+            log.warning(
+                "no fee_model in securities_accounts; recording t0 trade %s with fees=0 (net==gross)",
+                symbol,
+            )
+        fees = calc_trade_fees(leg, quantity, price, fee_model)
+
     if leg == "sell":
         if pair_id:
-            pair = _try_pair_info(user_id, pair_id)
+            pair = _try_pair_info(user_id, pair_id, securities_account_id)
             if pair:
                 if pair.get("style") != "buy_first":
                     raise ValueError("sell with pair_id only closes buy_first pairs")
@@ -391,28 +468,38 @@ def record_trade(user_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
                 uncovered = to_int(pair.get("uncovered_qty"))
                 if uncovered <= 0:
                     raise ValueError("open pair has no uncovered quantity")
-                available = _broker_available_qty(user_id, symbol)
+                available = _broker_available_qty(
+                    user_id, symbol, securities_account_id=securities_account_id
+                )
                 max_qty = min(uncovered, available) if available > 0 else uncovered
                 if quantity > max_qty:
                     raise ValueError(f"sell quantity exceeds close limit ({max_qty})")
             else:
-                open_pair = find_open_pair_for_symbol(user_id, symbol)
+                open_pair = find_open_pair_for_symbol(
+                    user_id, symbol, securities_account_id=securities_account_id
+                )
                 if open_pair:
                     raise ValueError("open pair exists — close it before opening a new sell_first pair")
-                available = _broker_available_qty(user_id, symbol)
+                available = _broker_available_qty(
+                    user_id, symbol, securities_account_id=securities_account_id
+                )
                 if available > 0 and quantity > available:
                     raise ValueError(f"quantity exceeds available_qty ({available})")
         else:
-            open_pair = find_open_pair_for_symbol(user_id, symbol)
+            open_pair = find_open_pair_for_symbol(
+                user_id, symbol, securities_account_id=securities_account_id
+            )
             if open_pair:
                 raise ValueError("open pair exists — close it before opening a new sell_first pair")
             pair_id = str(uuid.uuid4())
-            available = _broker_available_qty(user_id, symbol)
+            available = _broker_available_qty(
+                user_id, symbol, securities_account_id=securities_account_id
+            )
             if available > 0 and quantity > available:
                 raise ValueError(f"quantity exceeds available_qty ({available})")
     else:
         if pair_id:
-            pair = _try_pair_info(user_id, pair_id)
+            pair = _try_pair_info(user_id, pair_id, securities_account_id)
             if pair:
                 if pair.get("style") == "buy_first":
                     raise ValueError("cannot add buy leg to an open buy_first pair")
@@ -422,19 +509,27 @@ def record_trade(user_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
                 if quantity > uncovered:
                     raise ValueError(f"buy quantity exceeds uncovered sell qty ({uncovered})")
             else:
-                open_pair = find_open_pair_for_symbol(user_id, symbol)
+                open_pair = find_open_pair_for_symbol(
+                    user_id, symbol, securities_account_id=securities_account_id
+                )
                 if open_pair:
                     raise ValueError("open pair exists — close it before opening a new buy_first pair")
-                capacity = _buy_first_open_capacity(user_id, symbol)
+                capacity = _buy_first_open_capacity(
+                    user_id, symbol, securities_account_id=securities_account_id
+                )
                 if capacity <= 0:
                     raise ValueError("no buy_first capacity — available_qty exhausted or zero")
                 if quantity > capacity:
                     raise ValueError(f"buy quantity exceeds buy_first capacity ({capacity})")
         else:
-            open_pair = find_open_pair_for_symbol(user_id, symbol)
+            open_pair = find_open_pair_for_symbol(
+                user_id, symbol, securities_account_id=securities_account_id
+            )
             if open_pair:
                 raise ValueError("open pair exists — close it before opening a new buy_first pair")
-            capacity = _buy_first_open_capacity(user_id, symbol)
+            capacity = _buy_first_open_capacity(
+                user_id, symbol, securities_account_id=securities_account_id
+            )
             if capacity <= 0:
                 raise ValueError("no buy_first capacity — available_qty exhausted or zero")
             if quantity > capacity:
@@ -443,6 +538,7 @@ def record_trade(user_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
 
     doc = {
         "user_id": user_id,
+        "securities_account_id": securities_account_id,
         "trade_date": trade_date,
         "symbol": symbol,
         "leg": leg,
@@ -460,15 +556,14 @@ def record_trade(user_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     return {"success": True, "data": serialize_doc(doc)}
 
 
-def trade_exists_for_signal(user_id: str, signal_id: str) -> bool:
+def trade_exists_for_signal(
+    user_id: str, signal_id: str, securities_account_id: Optional[str] = None
+) -> bool:
     ensure_intraday_t0_trade_indexes()
-    return (
-        _trades_coll().find_one(
-            {"user_id": user_id, "signal_id": signal_id},
-            {"_id": 1},
-        )
-        is not None
-    )
+    query: Dict[str, Any] = {"user_id": user_id, "signal_id": signal_id}
+    if securities_account_id:
+        query["securities_account_id"] = str(securities_account_id)
+    return _trades_coll().find_one(query, {"_id": 1}) is not None
 
 
 def list_trades(
@@ -476,6 +571,7 @@ def list_trades(
     trade_date: Optional[str] = None,
     symbol: Optional[str] = None,
     limit: int = 200,
+    securities_account_id: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     ensure_intraday_t0_trade_indexes()
     query: Dict[str, Any] = {"user_id": user_id}
@@ -483,6 +579,8 @@ def list_trades(
         query["trade_date"] = compact_trade_date(trade_date)
     if symbol:
         query["symbol"] = normalize_symbol(symbol)
+    if securities_account_id:
+        query["securities_account_id"] = str(securities_account_id)
     rows = (
         _trades_coll()
         .find(query)
@@ -504,6 +602,7 @@ def _pairs_from_rows(rows: Iterable[Dict[str, Any]], user_id: str) -> List[Dict[
             {
                 "pair_id": pair_id,
                 "user_id": user_id,
+                "securities_account_id": row.get("securities_account_id"),
                 "trade_date": row.get("trade_date"),
                 "symbol": row.get("symbol"),
                 "opening_leg": None,
@@ -595,7 +694,11 @@ def _pairs_from_rows(rows: Iterable[Dict[str, Any]], user_id: str) -> List[Dict[
     return pairs
 
 
-def _aggregate_pairs(user_id: str, trade_date: Optional[str] = None) -> List[Dict[str, Any]]:
+def _aggregate_pairs(
+    user_id: str,
+    trade_date: Optional[str] = None,
+    securities_account_id: Optional[str] = None,
+) -> List[Dict[str, Any]]:
     # Rows are always loaded across ALL dates (no trade_date filter in the
     # query): a cross-day pair whose opening leg is on day N and closing leg
     # on N+1 must be aggregated from both legs, otherwise the N+1 view treats
@@ -607,7 +710,10 @@ def _aggregate_pairs(user_id: str, trade_date: Optional[str] = None) -> List[Dic
     # - as-of: state/style/PnL is computed from legs up to AND INCLUDING that
     #   date, so a pair opened on N shows open on N, and its PnL lands on the
     #   closing day N+1 instead of being booked back onto the opening day.
-    rows = list(_trades_coll().find({"user_id": user_id}).sort([("created_at", ASCENDING)]))
+    pair_query: Dict[str, Any] = {"user_id": user_id}
+    if securities_account_id:
+        pair_query["securities_account_id"] = str(securities_account_id)
+    rows = list(_trades_coll().find(pair_query).sort([("created_at", ASCENDING)]))
     td = compact_trade_date(trade_date) if trade_date else None
     if td:
         on_td = {
@@ -624,11 +730,18 @@ def _aggregate_pairs(user_id: str, trade_date: Optional[str] = None) -> List[Dic
     return _pairs_from_rows(rows, user_id)
 
 
-def _open_pairs_as_of(user_id: str, trade_date: str) -> List[Dict[str, Any]]:
+def _open_pairs_as_of(
+    user_id: str,
+    trade_date: str,
+    securities_account_id: Optional[str] = None,
+) -> List[Dict[str, Any]]:
     """Open pairs at the close of trade_date — INCLUDING carry-overs whose
     opening leg is on an earlier date (they hold overnight risk too, and the
     date-scoped day_summary omits them because they have no leg on that day)."""
-    rows = list(_trades_coll().find({"user_id": user_id}).sort([("created_at", ASCENDING)]))
+    pair_query: Dict[str, Any] = {"user_id": user_id}
+    if securities_account_id:
+        pair_query["securities_account_id"] = str(securities_account_id)
+    rows = list(_trades_coll().find(pair_query).sort([("created_at", ASCENDING)]))
     td = compact_trade_date(trade_date)
     rows = [
         row
@@ -638,13 +751,27 @@ def _open_pairs_as_of(user_id: str, trade_date: str) -> List[Dict[str, Any]]:
     return [p for p in _pairs_from_rows(rows, user_id) if p.get("status") == "open"]
 
 
-def list_open_pairs(user_id: str, trade_date: Optional[str] = None) -> List[Dict[str, Any]]:
-    return [p for p in _aggregate_pairs(user_id, trade_date) if p.get("status") == "open"]
+def list_open_pairs(
+    user_id: str,
+    trade_date: Optional[str] = None,
+    securities_account_id: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    return [
+        p
+        for p in _aggregate_pairs(
+            user_id, trade_date, securities_account_id=securities_account_id
+        )
+        if p.get("status") == "open"
+    ]
 
 
-def day_summary(user_id: str, trade_date: Optional[str] = None) -> Dict[str, Any]:
+def day_summary(
+    user_id: str,
+    trade_date: Optional[str] = None,
+    securities_account_id: Optional[str] = None,
+) -> Dict[str, Any]:
     td = compact_trade_date(trade_date)
-    pairs = _aggregate_pairs(user_id, td)
+    pairs = _aggregate_pairs(user_id, td, securities_account_id=securities_account_id)
     closed = [p for p in pairs if p.get("status") == "closed"]
     open_pairs = [p for p in pairs if p.get("status") == "open"]
     net_values = [to_float(p.get("net_pnl")) for p in closed]
@@ -701,13 +828,21 @@ def day_summary(user_id: str, trade_date: Optional[str] = None) -> Dict[str, Any
     }
 
 
-def day_close_check(user_id: str, trade_date: Optional[str] = None) -> Dict[str, Any]:
-    summary = day_summary(user_id, trade_date)
+def day_close_check(
+    user_id: str,
+    trade_date: Optional[str] = None,
+    securities_account_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    summary = day_summary(user_id, trade_date, securities_account_id=securities_account_id)
     # Alerts come from the as-of open list (legs <= trade_date), not from the
     # summary: carry-over pairs opened on earlier days hold overnight risk on
     # this day too, but they have no leg on it and so are absent from summary.
     alerts: List[Dict[str, Any]] = []
-    for pair in _open_pairs_as_of(user_id, summary.get("trade_date") or ""):
+    for pair in _open_pairs_as_of(
+        user_id,
+        summary.get("trade_date") or "",
+        securities_account_id=securities_account_id,
+    ):
         uncovered = to_int(pair.get("uncovered_qty"))
         if uncovered <= 0:
             continue
