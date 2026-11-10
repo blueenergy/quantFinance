@@ -173,6 +173,42 @@ def _user():
     return {"id": "u1", "username": "blue", "service_level": "vip"}
 
 
+def test_explicit_securities_account_binding_is_written(monkeypatch):
+    collections = _install(monkeypatch, strategies=[])
+
+    user_watchlist.set_watchlist_strategy(
+        WatchlistStrategySetRequest(
+            symbol="600114.SH",
+            strategy="daily_sma_cross",
+            params={},
+            enabled=False,
+            securities_account_id="acct-1",
+        ),
+        _user(),
+    )
+
+    update_doc = collections["watchlist_strategies"].updates[-1][1]["$set"]
+    assert update_doc["securities_account_id"] == "acct-1"
+
+
+def test_unknown_securities_account_binding_returns_404(monkeypatch):
+    _install(monkeypatch, strategies=[])
+
+    with pytest.raises(HTTPException) as exc:
+        user_watchlist.set_watchlist_strategy(
+            WatchlistStrategySetRequest(
+                symbol="600114.SH",
+                strategy="daily_sma_cross",
+                params={},
+                enabled=False,
+                securities_account_id="acct-OTHER",
+            ),
+            _user(),
+        )
+
+    assert exc.value.status_code == 404
+
+
 def test_disable_without_position_writes_without_signal(monkeypatch):
     collections = _install(monkeypatch, strategies=[_existing_600150()])
     monkeypatch.setattr(user_watchlist, "fetch_position_guard", lambda *a, **k: _guard(managed=0))

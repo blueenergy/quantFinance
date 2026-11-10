@@ -7,6 +7,7 @@ import logging
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional
+from bson import ObjectId
 from fastapi import APIRouter, Depends, HTTPException
 from models.all_models import (
     WatchlistRequest, WatchlistUpdateRequest, WatchlistStrategySetRequest,
@@ -305,6 +306,7 @@ def get_watchlist_strategies(current_user: dict = Depends(get_current_active_use
             "params": d.get("params", {}),
             "updated_at": d.get("updated_at"),
             "enabled": d.get("enabled", True),
+            "securities_account_id": d.get("securities_account_id"),
         })
     return {"success": True, "data": data}
 
@@ -402,6 +404,26 @@ def set_watchlist_strategy(req: WatchlistStrategySetRequest, current_user: dict 
     strat_col = collections["watchlist_strategies"]
     user_id = get_user_id(current_user)
 
+    # Validate (and normalize) an explicit account binding before writing it.
+    # A user may own several securities accounts; strategies must say which
+    # book they trade, otherwise the orchestrator leaves them signal-only.
+    bound_account_id: Optional[str] = None
+    if req.securities_account_id:
+        accounts_col = collections["securities_accounts"]
+        query_ids: List[Any] = [req.securities_account_id]
+        try:
+            query_ids.insert(0, ObjectId(req.securities_account_id))
+        except Exception:
+            pass
+        account = None
+        for query_id in query_ids:
+            account = accounts_col.find_one({"_id": query_id, "user_id": user_id})
+            if account:
+                break
+        if not account:
+            raise HTTPException(status_code=404, detail="securities account not found")
+        bound_account_id = str(account["_id"])
+
     # VIP-only live deployment restriction for Hidden Dragon strategy
     if req.strategy == "hidden_dragon":
         service_level = current_user.get("service_level", "free")
@@ -456,6 +478,8 @@ def set_watchlist_strategy(req: WatchlistStrategySetRequest, current_user: dict 
         "enabled": enabled,
         "engine": "vnpy",  # 🔥 自动设置 engine 为 vnpy（实盘策略仅支持 vnpy）
     }
+    if bound_account_id:
+        update_doc["securities_account_id"] = bound_account_id
     if enabled is False and was_enabled:
         update_doc["last_disabled_at"] = update_doc["updated_at"]
         update_doc["last_disable_action"] = req.position_action or "keep"

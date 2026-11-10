@@ -103,6 +103,10 @@ class WatchlistStrategySetRequest(BaseModel):
     # 显式要求删除的 params 键；合并语义下，未发送的键默认保留。
     deleted_keys: List[str] = []
     enabled: Optional[bool] = True
+    # Bind the strategy to one securities account.  A user may own several
+    # accounts (personal + strategy); without an explicit binding the
+    # orchestrator only auto-binds when the user has exactly one.
+    securities_account_id: Optional[str] = None
     # Disabling a strategy that still manages shares requires an explicit
     # decision: "clear" flattens the managed sleeve, "keep" leaves it alone.
     position_action: Optional[Literal["clear", "keep"]] = None
