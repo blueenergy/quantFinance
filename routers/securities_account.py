@@ -191,6 +191,20 @@ def create_account(payload: SecuritiesAccountCreate, current_user: dict = Depend
         "created_at": datetime.utcnow(),
         "updated_at": None,
     }
+    if account_type == "real":
+        # Sensible executor defaults so the admin only has to pick the QMT
+        # client (mailbox root).  auto_manage stays off until explicitly set.
+        doc.setdefault("qmt_account_id", account_id)
+        doc["trader_client_id"] = f"quant-trader-{account_id}"
+        doc["trader_container_name"] = f"quant-trader-{account_id}"
+        doc["auto_manage"] = False
+        qmt_clients = collections.get("qmt_clients")
+        if qmt_clients is not None:
+            enabled_clients = list(
+                qmt_clients.find({"broker": broker, "enabled": {"$ne": False}}).limit(2)
+            )
+            if len(enabled_clients) == 1:
+                doc["qmt_mailbox_root"] = enabled_clients[0].get("mailbox_root")
     
     # 模拟账户初始化资金
     if account_type == "simulated":

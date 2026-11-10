@@ -61,6 +61,7 @@ def get_db_collections() -> Dict[str, Collection]:
         "securities_accounts": db["securities_accounts"],
         "brokers": db["brokers"],  # 券商选项（admin 可配置）
         "trader_instance_status": db["trader_instance_status"],  # host reconciler 写回
+        "qmt_clients": db["qmt_clients"],  # QMT 客户端路径注册表
         # Trading
         "trade_executions": db["trade_executions"],  # 交易执行记录
         "trade_signals": db["trade_signals"],  # 交易信号

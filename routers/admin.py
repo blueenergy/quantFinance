@@ -1,7 +1,8 @@
 import os
 from bson import ObjectId
 from fastapi import APIRouter, Depends, Query, HTTPException, Body
-from typing import List
+from typing import List, Optional
+from pathlib import Path
 from auth import get_current_admin_user, log_admin_action, create_admin_user
 from db import get_db_collections, get_analyzer_db, get_data_db
 from datetime import timedelta, datetime, timezone
@@ -16,6 +17,8 @@ from models.all_models import (
     BrokerOptionCreate,
     BrokerOptionUpdate,
     TraderExecutorConfig,
+    QmtClientCreate,
+    QmtClientUpdate,
 )
 from task_router import TaskRouter
 
@@ -1390,3 +1393,107 @@ def list_trader_instances(admin_user: dict = Depends(get_current_admin_user)):
             }
         )
     return {"success": True, "data": data}
+
+
+# ---------------------------------------------------------------------------
+# QMT 客户端注册表（邮箱路径）
+# ---------------------------------------------------------------------------
+
+def _qmt_client_payload(doc: dict) -> dict:
+    return {
+        "id": str(doc["_id"]),
+        "name": doc.get("name"),
+        "broker": doc.get("broker"),
+        "mailbox_root": doc.get("mailbox_root"),
+        "enabled": bool(doc.get("enabled", True)),
+        "sort_order": int(doc.get("sort_order") or 0),
+    }
+
+
+@router.get("/qmt-clients")
+def list_qmt_clients(
+    broker: Optional[str] = Query(None),
+    admin_user: dict = Depends(get_current_admin_user),
+):
+    col = get_db_collections()["qmt_clients"]
+    query = {"broker": broker} if broker else {}
+    docs = list(col.find(query).sort([("sort_order", 1), ("name", 1)]))
+    return {"success": True, "data": [_qmt_client_payload(d) for d in docs]}
+
+
+@router.post("/qmt-clients")
+def create_qmt_client(payload: QmtClientCreate, admin_user: dict = Depends(get_current_admin_user)):
+    name = (payload.name or "").strip()
+    broker = (payload.broker or "").strip()
+    mailbox_root = (payload.mailbox_root or "").strip()
+    if not name or not broker or not mailbox_root:
+        raise HTTPException(status_code=400, detail="name / broker / mailbox_root 均不能为空")
+    col = get_db_collections()["qmt_clients"]
+    if col.find_one({"name": name}):
+        raise HTTPException(status_code=409, detail=f"QMT 客户端已存在：{name}")
+    if not Path(mailbox_root).is_dir():
+        raise HTTPException(status_code=400, detail=f"mailbox_root 在 host 上不存在：{mailbox_root}")
+    order = payload.sort_order
+    if order is None:
+        last = col.find_one({}, sort=[("sort_order", -1)])
+        order = int((last or {}).get("sort_order") or 0) + 10
+    now = datetime.now(timezone.utc)
+    res = col.insert_one(
+        {
+            "name": name,
+            "broker": broker,
+            "mailbox_root": mailbox_root,
+            "enabled": bool(payload.enabled),
+            "sort_order": order,
+            "created_at": now,
+            "updated_at": now,
+        }
+    )
+    return {"success": True, "id": str(res.inserted_id)}
+
+
+@router.put("/qmt-clients/{client_id}")
+def update_qmt_client(
+    client_id: str,
+    payload: QmtClientUpdate,
+    admin_user: dict = Depends(get_current_admin_user),
+):
+    col = get_db_collections()["qmt_clients"]
+    try:
+        oid = ObjectId(client_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid qmt client id")
+    doc = col.find_one({"_id": oid})
+    if not doc:
+        raise HTTPException(status_code=404, detail="QMT 客户端不存在")
+    updates: dict = {"updated_at": datetime.now(timezone.utc)}
+    for field in ("name", "broker", "mailbox_root"):
+        value = getattr(payload, field)
+        if value is not None:
+            text = value.strip()
+            if not text:
+                raise HTTPException(status_code=400, detail=f"{field} 不能为空")
+            updates[field] = text
+    if "mailbox_root" in updates and not Path(updates["mailbox_root"]).is_dir():
+        raise HTTPException(
+            status_code=400, detail=f"mailbox_root 在 host 上不存在：{updates['mailbox_root']}"
+        )
+    if payload.enabled is not None:
+        updates["enabled"] = bool(payload.enabled)
+    if payload.sort_order is not None:
+        updates["sort_order"] = int(payload.sort_order)
+    col.update_one({"_id": oid}, {"$set": updates})
+    return {"success": True, "data": _qmt_client_payload({**doc, **updates})}
+
+
+@router.delete("/qmt-clients/{client_id}")
+def delete_qmt_client(client_id: str, admin_user: dict = Depends(get_current_admin_user)):
+    col = get_db_collections()["qmt_clients"]
+    try:
+        oid = ObjectId(client_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid qmt client id")
+    res = col.delete_one({"_id": oid})
+    if res.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="QMT 客户端不存在")
+    return {"success": True}

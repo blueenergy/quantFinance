@@ -156,6 +156,22 @@ class BrokerOptionUpdate(BaseModel):
     sort_order: Optional[int] = None
 
 
+class QmtClientCreate(BaseModel):
+    name: str
+    broker: str
+    mailbox_root: str
+    enabled: bool = True
+    sort_order: Optional[int] = None
+
+
+class QmtClientUpdate(BaseModel):
+    name: Optional[str] = None
+    broker: Optional[str] = None
+    mailbox_root: Optional[str] = None
+    enabled: Optional[bool] = None
+    sort_order: Optional[int] = None
+
+
 class TraderExecutorConfig(BaseModel):
     qmt_account_id: Optional[str] = None
     qmt_mailbox_root: Optional[str] = None
