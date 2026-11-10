@@ -89,7 +89,10 @@ def _normalize_fee_model(raw: Optional[dict]) -> dict:
 
 @router.get("/broker-options")
 def list_broker_options(current_user: dict = Depends(get_current_active_user)):
-    """用户端券商下拉选项（仅启用的，admin 在 /admin/brokers 维护）。"""
+    """用户端券商下拉选项（仅启用的，admin 在 /admin/brokers 维护）。
+
+    ``qmt_supported`` 决定该券商账户能否开启「接收实盘交易信号」。
+    """
     collections = get_db_collections()
     col: Collection = collections["brokers"]
     docs = list(
@@ -97,8 +100,28 @@ def list_broker_options(current_user: dict = Depends(get_current_active_user)):
     )
     return {
         "success": True,
-        "data": [d.get("name") for d in docs if d.get("name")],
+        "data": [
+            {
+                "name": d.get("name"),
+                "qmt_supported": bool(d.get("qmt_supported", False)),
+            }
+            for d in docs
+            if d.get("name")
+        ],
     }
+
+
+def _broker_qmt_supported(collections, broker: str) -> bool:
+    doc = collections["brokers"].find_one({"name": broker})
+    return bool(doc and doc.get("qmt_supported"))
+
+
+def _require_live_capable_broker(collections, broker: str) -> None:
+    if not _broker_qmt_supported(collections, broker):
+        raise HTTPException(
+            status_code=400,
+            detail=f"券商「{broker}」未接入 QMT，不能开启「接收实盘交易信号」",
+        )
 
 
 @router.get("/securities_accounts", response_model=list[SecuritiesAccountResponse])
@@ -147,13 +170,17 @@ def create_account(payload: SecuritiesAccountCreate, current_user: dict = Depend
         account_id = payload.account_id
         broker = payload.broker
     
+    live_enabled = bool(payload.live_trading_enabled) if account_type == "real" else False
+    if live_enabled:
+        _require_live_capable_broker(collections, broker)
+
     # 准备文档
     doc = {
         "user_id": str(current_user["id"]),
         "broker": broker,
         "account_id": account_id,
         "account_type": account_type,
-        "live_trading_enabled": bool(payload.live_trading_enabled) if account_type == "real" else False,
+        "live_trading_enabled": live_enabled,
         "risk_limits": _normalize_risk_limits(payload.risk_limits),
         "fee_model": _normalize_fee_model(payload.fee_model),
         "created_at": datetime.utcnow(),
@@ -235,7 +262,12 @@ def update_account(id: str, payload: SecuritiesAccountUpdate, current_user: dict
         update["fee_model"] = _normalize_fee_model(payload.fee_model)
     if effective_account_type != "real":
         update["live_trading_enabled"] = False
-    
+
+    effective_broker = str(update.get("broker") or account.get("broker") or "")
+    effective_live = bool(update.get("live_trading_enabled", account.get("live_trading_enabled")))
+    if effective_live:
+        _require_live_capable_broker(collections, effective_broker)
+
     if not update:
         return {"success": True}
     

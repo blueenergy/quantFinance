@@ -145,13 +145,23 @@ class SecuritiesAccountCreate(BaseModel):
 class BrokerOptionCreate(BaseModel):
     name: str
     enabled: bool = True
+    qmt_supported: bool = False
     sort_order: Optional[int] = None
 
 
 class BrokerOptionUpdate(BaseModel):
     name: Optional[str] = None
     enabled: Optional[bool] = None
+    qmt_supported: Optional[bool] = None
     sort_order: Optional[int] = None
+
+
+class TraderExecutorConfig(BaseModel):
+    qmt_account_id: Optional[str] = None
+    qmt_mailbox_root: Optional[str] = None
+    trader_client_id: Optional[str] = None
+    trader_container_name: Optional[str] = None
+    auto_manage: Optional[bool] = None
 
 
 class SecuritiesAccountUpdate(BaseModel):

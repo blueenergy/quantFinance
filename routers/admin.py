@@ -15,6 +15,7 @@ from models.all_models import (
     WorkerGroupsReport,
     BrokerOptionCreate,
     BrokerOptionUpdate,
+    TraderExecutorConfig,
 )
 from task_router import TaskRouter
 
@@ -1183,6 +1184,7 @@ def _broker_payload(doc: dict) -> dict:
         "id": str(doc["_id"]),
         "name": doc.get("name"),
         "enabled": bool(doc.get("enabled", True)),
+        "qmt_supported": bool(doc.get("qmt_supported", False)),
         "sort_order": int(doc.get("sort_order") or 0),
     }
 
@@ -1213,6 +1215,7 @@ def create_broker(payload: BrokerOptionCreate, admin_user: dict = Depends(get_cu
         {
             "name": name,
             "enabled": bool(payload.enabled),
+            "qmt_supported": bool(payload.qmt_supported),
             "sort_order": order,
             "created_at": now,
             "updated_at": now,
@@ -1253,6 +1256,8 @@ def update_broker(
         updates["name"] = name
     if payload.enabled is not None:
         updates["enabled"] = bool(payload.enabled)
+    if payload.qmt_supported is not None:
+        updates["qmt_supported"] = bool(payload.qmt_supported)
     if payload.sort_order is not None:
         updates["sort_order"] = int(payload.sort_order)
 
@@ -1283,3 +1288,105 @@ def delete_broker(broker_id: str, admin_user: dict = Depends(get_current_admin_u
         details=f"Broker: {doc.get('name')}",
     )
     return {"success": True}
+
+
+# ---------------------------------------------------------------------------
+# 交易实例（executor 映射 + 实例状态）
+# ---------------------------------------------------------------------------
+
+_EXECUTOR_FIELDS = (
+    "qmt_account_id",
+    "qmt_mailbox_root",
+    "trader_client_id",
+    "trader_container_name",
+)
+
+
+@router.put("/securities-accounts/{account_id}/executor")
+def update_trader_executor(
+    account_id: str,
+    payload: TraderExecutorConfig,
+    admin_user: dict = Depends(get_current_admin_user),
+):
+    """管理员配置该证券账户的 quantTrader 执行端点（QMT 账户/信箱/client）。"""
+    col = get_db_collections()["securities_accounts"]
+    try:
+        oid = ObjectId(account_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid account id")
+    doc = col.find_one({"_id": oid})
+    if not doc:
+        raise HTTPException(status_code=404, detail="证券账户不存在")
+
+    updates: dict = {}
+    for field in _EXECUTOR_FIELDS:
+        value = getattr(payload, field)
+        if value is not None:
+            updates[field] = (value or "").strip() or None
+    if payload.auto_manage is not None:
+        updates["auto_manage"] = bool(payload.auto_manage)
+    updates["updated_at"] = datetime.now(timezone.utc)
+    col.update_one({"_id": oid}, {"$set": updates})
+    log_admin_action(
+        admin_user=admin_user,
+        action="UPDATE_TRADER_EXECUTOR",
+        details=f"Account: {doc.get('account_id')} -> {sorted(updates)}",
+    )
+    return {"success": True, "data": {**doc, **updates, "_id": str(oid)}}
+
+
+def _mapping_complete(account: dict) -> bool:
+    return bool(
+        account.get("qmt_account_id")
+        and account.get("qmt_mailbox_root")
+        and account.get("trader_client_id")
+    )
+
+
+@router.get("/trader-instances")
+def list_trader_instances(admin_user: dict = Depends(get_current_admin_user)):
+    """账户 + quantTrader 实例状态（由 host reconciler 写回 trader_instance_status）。"""
+    collections = get_db_collections()
+    accounts = list(
+        collections["securities_accounts"].find({"account_type": "real"}).sort("created_at", 1)
+    )
+    status_docs = {
+        str(row.get("securities_account_id")): row
+        for row in collections["trader_instance_status"].find({})
+    }
+    users = {
+        str(row["_id"]): row.get("username")
+        for row in collections["users"].find({}, {"username": 1})
+    }
+    data = []
+    for account in accounts:
+        sec_id = str(account["_id"])
+        status = status_docs.get(sec_id) or {}
+        data.append(
+            {
+                "id": sec_id,
+                "user_id": str(account.get("user_id") or ""),
+                "username": users.get(str(account.get("user_id") or ""), ""),
+                "account_id": account.get("account_id"),
+                "broker": account.get("broker"),
+                "live_trading_enabled": bool(account.get("live_trading_enabled")),
+                "auto_manage": bool(account.get("auto_manage", False)),
+                "qmt_account_id": account.get("qmt_account_id"),
+                "qmt_mailbox_root": account.get("qmt_mailbox_root"),
+                "trader_client_id": account.get("trader_client_id"),
+                "trader_container_name": account.get("trader_container_name"),
+                "mapping_complete": _mapping_complete(account),
+                "desired_running": bool(
+                    account.get("live_trading_enabled")
+                    and account.get("auto_manage", False)
+                    and _mapping_complete(account)
+                ),
+                "container_state": status.get("container_state"),
+                "account_synced_at": status.get("account_synced_at"),
+                "worker_seen_at": status.get("worker_seen_at"),
+                "health": status.get("health"),
+                "health_reason": status.get("health_reason"),
+                "updated_at": status.get("updated_at"),
+            }
+        )
+    return {"success": True, "data": data}
