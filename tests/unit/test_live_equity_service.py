@@ -226,8 +226,8 @@ def _live_account_collections(synced_at, total_asset=100000):
     }
 
 
-def _calendar_collections(trade_date="20261109"):
-    return {"trade_calendar": _Collection([{"exchange": "SSE", "trade_date": trade_date, "is_open": 1}])}
+def _calendar_collections(trade_date="20261109", is_open=1):
+    return {"trade_calendar": _Collection([{"exchange": "SSE", "trade_date": trade_date, "is_open": is_open}])}
 
 
 def test_build_account_equity_live_point_on_trading_day():
@@ -247,6 +247,35 @@ def test_build_account_equity_live_point_on_trading_day():
     assert point["is_intraday"] is True
     assert point["is_stale"] is False
     assert point["live_synced_at"] == source_synced_at
+
+
+def test_build_account_equity_live_point_accepts_string_calendar_flag():
+    """2026-11-10 起 trade_calendar.is_open 存成字符串 "1"，门禁必须兼容。"""
+    now = datetime(2026, 11, 9, 15, 0, tzinfo=SHANGHAI_TZ)
+
+    point = build_account_equity_live_point(
+        _live_account_collections(now.timestamp() - 30),
+        _calendar_collections(is_open="1"),
+        user_id="user-1",
+        securities_account_id="acct-1",
+        now=now,
+    )
+
+    assert point["is_intraday"] is True
+
+
+def test_build_account_equity_live_point_skips_closed_calendar_day():
+    now = datetime(2026, 11, 9, 15, 0, tzinfo=SHANGHAI_TZ)
+
+    point = build_account_equity_live_point(
+        _live_account_collections(now.timestamp() - 30),
+        _calendar_collections(is_open="0"),
+        user_id="user-1",
+        securities_account_id="acct-1",
+        now=now,
+    )
+
+    assert point is None
 
 
 def test_build_account_equity_live_point_skips_non_trading_day():

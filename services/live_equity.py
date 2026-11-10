@@ -12,6 +12,7 @@ from services.trade_ledger import (
     compute_realized_pnl_for_group,
     group_executions_by_order,
 )
+from services.trading_calendar import is_sse_open_day
 
 
 SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
@@ -167,9 +168,7 @@ def build_account_equity_live_point(
 
     snapshot_date = _today_yyyymmdd(now)
     calendar = data_collections["trade_calendar"]
-    if not calendar.find_one(
-        {"exchange": "SSE", "trade_date": snapshot_date, "is_open": 1}
-    ):
+    if not is_sse_open_day(calendar, snapshot_date):
         return None
 
     account = finance_collections["trader_accounts"].find_one(

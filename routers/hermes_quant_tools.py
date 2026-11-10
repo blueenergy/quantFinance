@@ -62,6 +62,7 @@ from routers.portfolio_research import _load_full_result_rows
 from services.analysis_history import build_user_analysis_history_payload
 from services.analysis_tasks import build_task_doc
 from services.backtest_batch_schemas import BacktestBatchCreate, BacktestCombo
+from services.trading_calendar import latest_sse_open_day
 from services.backtest_batch_service import (
     create_batch,
     list_all_batch_result_rows,
@@ -561,12 +562,9 @@ async def hermes_sector_latest(
         from db import get_data_db
 
         today_ymd = datetime.now().strftime("%Y%m%d")
-        cal = get_data_db()["trade_calendar"].find_one(
-            {"exchange": "SSE", "is_open": 1, "trade_date": {"$lte": today_ymd}},
-            projection={"trade_date": 1},
-            sort=[("trade_date", -1)],
+        latest_trade_date = latest_sse_open_day(
+            get_data_db()["trade_calendar"], today_ymd
         )
-        latest_trade_date = str((cal or {}).get("trade_date") or "") or None
     except Exception:
         latest_trade_date = None
 

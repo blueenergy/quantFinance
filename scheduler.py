@@ -7,6 +7,8 @@ import os
 import time
 from pymongo.errors import DuplicateKeyError
 
+from services.trading_calendar import is_sse_open_day
+
 log = logging.getLogger(__name__)
 
 # Define global scheduler
@@ -361,10 +363,7 @@ def generate_iv_analysis_task(job_id: str):
 
     try:
         today_ymd = datetime.now().strftime('%Y%m%d')
-        cal = get_data_db()["trade_calendar"].find_one(
-            {"exchange": "SSE", "trade_date": today_ymd, "is_open": 1}
-        )
-        if not cal:
+        if not is_sse_open_day(get_data_db()["trade_calendar"], today_ymd):
             log.info(f"[IV Analysis] {today_ymd} is not an SSE trading day, skipping.")
             return
 
