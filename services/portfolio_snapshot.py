@@ -185,6 +185,19 @@ def build_portfolio_snapshot(
     if not account:
         return {"success": False, "error": "未找到账户数据", "user_id": user_id}
 
+    # A user may own several securities accounts.  When the caller did not
+    # name one, ``_select_account`` returns the most recently synced account;
+    # surface that so an agent does not silently treat it as the only account.
+    account_count = 1
+    if not securities_account_id:
+        account_count = len(
+            list(
+                finance_collections["trader_accounts"].find(
+                    {"user_id": user_id}, {"_id": 1}
+                )
+            )
+        )
+
     sec_account: Dict[str, Any] = {}
     sec_id = account.get("securities_account_id")
     if sec_id:
@@ -292,6 +305,11 @@ def build_portfolio_snapshot(
     )
 
     warnings: List[str] = []
+    if account_count > 1:
+        warnings.append(
+            f"user has {account_count} synced accounts; returned the latest; "
+            "pass securities_account_id or all_accounts=true to read each account separately"
+        )
     if total_asset_source == 0:
         warnings.append("trader_accounts.total_asset is 0; total_asset computed as market_value + cash")
     if account_sync_is_stale:
@@ -365,39 +383,57 @@ def build_all_portfolio_snapshots(
     data_collections: Dict[str, Any],
     *,
     equity_limit: int = 20,
+    user_id: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Build one snapshot per account owner.
+    """Build one snapshot per securities account.
 
-    The route layer must enforce ``is_admin`` before calling this: it returns
-    every owner's positions and must never be reachable by a normal user.
+    A user may own several accounts, so the unit is ``(user_id,
+    securities_account_id)`` rather than ``user_id``.  ``user_id`` narrows the
+    result to one owner (the route uses it for non-admin self-scope); without
+    it every owner is returned and the route layer must enforce ``is_admin``.
     """
-    user_ids = sorted(
+    query: Dict[str, Any] = {}
+    if user_id:
+        query["user_id"] = str(user_id)
+    account_rows = list(
+        finance_collections["trader_accounts"].find(
+            query, {"user_id": 1, "securities_account_id": 1}
+        )
+    )
+    account_keys = sorted(
         {
-            str(row.get("user_id"))
-            for row in finance_collections["trader_accounts"].find({}, {"user_id": 1})
+            (str(row.get("user_id")), str(row.get("securities_account_id") or ""))
+            for row in account_rows
             if row.get("user_id")
         }
     )
 
     accounts: List[Dict[str, Any]] = []
     errors: List[Dict[str, Any]] = []
-    for user_id in user_ids:
+    for owner_id, sec_id in account_keys:
         snapshot = build_portfolio_snapshot(
-            user_id,
+            owner_id,
             finance_collections,
             data_collections,
+            securities_account_id=sec_id or None,
             equity_limit=equity_limit,
         )
         if not snapshot.get("success"):
-            errors.append({"user_id": user_id, "error": snapshot.get("error")})
+            errors.append(
+                {
+                    "user_id": owner_id,
+                    "securities_account_id": sec_id or None,
+                    "error": snapshot.get("error"),
+                }
+            )
             continue
 
         user_doc: Dict[str, Any] = {}
         try:
-            user_doc = finance_collections["users"].find_one({"_id": ObjectId(user_id)}) or {}
+            user_doc = finance_collections["users"].find_one({"_id": ObjectId(owner_id)}) or {}
         except Exception:
             try:
-                user_doc = finance_collections["users"].find_one({"_id": user_id}) or {}
+                user_doc = finance_collections["users"].find_one({"_id": owner_id}) or {}
             except Exception:
                 user_doc = {}
         snapshot["username"] = user_doc.get("username")

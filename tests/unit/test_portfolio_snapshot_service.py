@@ -332,22 +332,23 @@ def test_build_all_snapshots_returns_each_account_with_username():
     assert len(by_account["62129066"]["positions"]) == 1
 
 
-def test_portfolio_all_accounts_rejects_non_admin(monkeypatch):
+def test_portfolio_all_accounts_is_self_scoped_for_non_admin(monkeypatch):
     finance, data = _two_account_finance()
     monkeypatch.setattr(h, "get_db_collections", lambda: finance)
     monkeypatch.setattr(h, "get_data_db", lambda: data)
 
-    with pytest.raises(HTTPException) as exc:
-        asyncio.run(
-            h.user_portfolio_snapshot(
-                all_accounts=True,
-                equity_limit=20,
-                user={"id": UID_SYSTEM, "is_admin": False},
-                _=True,
-            )
+    result = asyncio.run(
+        h.user_portfolio_snapshot(
+            all_accounts=True,
+            equity_limit=20,
+            user={"id": UID_SYSTEM, "is_admin": False},
+            _=True,
         )
+    )
 
-    assert exc.value.status_code == 403
+    assert result["success"] is True
+    assert result["totals"]["accounts"] == 1
+    assert [item["account"]["account_id"] for item in result["accounts"]] == ["62129066"]
 
 
 def test_portfolio_all_accounts_returns_both_for_admin(monkeypatch):
@@ -370,6 +371,34 @@ def test_portfolio_all_accounts_returns_both_for_admin(monkeypatch):
         "8885156549",
         "62129066",
     }
+
+
+def test_build_all_snapshots_returns_each_account_for_multi_account_user():
+    finance, data = _two_account_finance()
+    finance["trader_accounts"].docs.append(
+        _account(
+            user_id=UID_SYSTEM,
+            securities_account_id="sec-3",
+            account_id="300118",
+            total_asset=100.0,
+            market_value=50.0,
+            cash=50.0,
+        )
+    )
+    finance["trader_positions"].docs.append(
+        _position(
+            "000001.SZ", 5, 10.0, 10.0, 50.0,
+            user_id=UID_SYSTEM, securities_account_id="sec-3",
+        )
+    )
+
+    result = build_all_portfolio_snapshots(finance, data)
+
+    assert result["totals"]["accounts"] == 3
+    by_account = {item["account"]["account_id"]: item for item in result["accounts"]}
+    assert set(by_account) == {"8885156549", "62129066", "300118"}
+    assert by_account["300118"]["username"] == "blue_energy"
+    assert by_account["62129066"]["username"] == "blue_energy"
 
 
 def test_portfolio_single_account_shape_unchanged(monkeypatch):

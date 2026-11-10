@@ -3584,7 +3584,8 @@ async def user_portfolio_snapshot(
     ),
     equity_limit: int = Query(20, ge=1, le=120, description="返回最近 N 个交易日的权益曲线"),
     all_accounts: bool = Query(
-        False, description="仅管理员：返回所有账户的快照（个人 + 系统），每户独立一份"
+        False,
+        description="返回多个账户的快照（每个证券账户独立一份）：管理员=所有账户；普通用户=自己名下账户",
     ),
     user: dict = Depends(get_user_from_header_token),
     _: bool = Depends(require_hermes_quant_internal_key),
@@ -3597,18 +3598,18 @@ async def user_portfolio_snapshot(
     - 账户同步过期
     - 最新 trader_account_equity 与账户快照差异 > 0.5%（16:00 初值 vs 最终 sync）
 
-    `all_accounts=true` 仅管理员可用：返回所有账户的 `accounts[]`，
-    个人与系统策略账户分开列，不合并持仓。
+    `all_accounts=true` 时返回 `accounts[]`，每个证券账户独立一份、不合并持仓：
+    管理员返回所有用户账户；普通用户只返回自己名下的账户（一个用户可以持有多个
+    证券账户，例如个人账户 + 策略账户）。
     """
     if all_accounts:
-        if not user.get("is_admin", False):
-            raise HTTPException(status_code=403, detail="Admin access required for all_accounts")
         from services.portfolio_snapshot import build_all_portfolio_snapshots
 
         return build_all_portfolio_snapshots(
             get_db_collections(),
             get_data_db(),
             equity_limit=equity_limit,
+            user_id=None if user.get("is_admin", False) else str(user["id"]),
         )
 
     from services.portfolio_snapshot import build_portfolio_snapshot
