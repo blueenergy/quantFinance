@@ -87,6 +87,20 @@ def _normalize_fee_model(raw: Optional[dict]) -> dict:
         model[field] = number
     return model
 
+@router.get("/broker-options")
+def list_broker_options(current_user: dict = Depends(get_current_active_user)):
+    """用户端券商下拉选项（仅启用的，admin 在 /admin/brokers 维护）。"""
+    collections = get_db_collections()
+    col: Collection = collections["brokers"]
+    docs = list(
+        col.find({"enabled": {"$ne": False}}).sort([("sort_order", 1), ("name", 1)])
+    )
+    return {
+        "success": True,
+        "data": [d.get("name") for d in docs if d.get("name")],
+    }
+
+
 @router.get("/securities_accounts", response_model=list[SecuritiesAccountResponse])
 def list_accounts(current_user: dict = Depends(get_current_active_user)):
     collections = get_db_collections()

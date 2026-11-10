@@ -142,6 +142,18 @@ class SecuritiesAccountCreate(BaseModel):
     risk_limits: Optional[Dict[str, Any]] = None
     fee_model: Optional[Dict[str, Any]] = None
 
+class BrokerOptionCreate(BaseModel):
+    name: str
+    enabled: bool = True
+    sort_order: Optional[int] = None
+
+
+class BrokerOptionUpdate(BaseModel):
+    name: Optional[str] = None
+    enabled: Optional[bool] = None
+    sort_order: Optional[int] = None
+
+
 class SecuritiesAccountUpdate(BaseModel):
     broker: Optional[str] = None
     account_id: Optional[str] = None

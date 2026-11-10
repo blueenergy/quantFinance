@@ -13,6 +13,8 @@ from models.all_models import (
     WorkerNodeHeartbeat,
     WorkerGroupConfig,
     WorkerGroupsReport,
+    BrokerOptionCreate,
+    BrokerOptionUpdate,
 )
 from task_router import TaskRouter
 
@@ -1171,3 +1173,113 @@ def assign_task_to_specific_node(
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"分配任务失败: {str(e)}")
+
+# ---------------------------------------------------------------------------
+# 券商选项配置（admin 管理，用户端 /user/broker-options 只读）
+# ---------------------------------------------------------------------------
+
+def _broker_payload(doc: dict) -> dict:
+    return {
+        "id": str(doc["_id"]),
+        "name": doc.get("name"),
+        "enabled": bool(doc.get("enabled", True)),
+        "sort_order": int(doc.get("sort_order") or 0),
+    }
+
+
+@router.get("/brokers")
+def list_brokers(admin_user: dict = Depends(get_current_admin_user)):
+    """管理员查看全部券商选项（含停用）。"""
+    col = get_db_collections()["brokers"]
+    docs = list(col.find({}).sort([("sort_order", 1), ("name", 1)]))
+    return {"success": True, "data": [_broker_payload(d) for d in docs]}
+
+
+@router.post("/brokers")
+def create_broker(payload: BrokerOptionCreate, admin_user: dict = Depends(get_current_admin_user)):
+    """新增券商选项。名称唯一；默认排在最后。"""
+    name = (payload.name or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="券商名称不能为空")
+    col = get_db_collections()["brokers"]
+    if col.find_one({"name": name}):
+        raise HTTPException(status_code=409, detail=f"券商已存在：{name}")
+    order = payload.sort_order
+    if order is None:
+        last = col.find_one({}, sort=[("sort_order", -1)])
+        order = int((last or {}).get("sort_order") or 0) + 10
+    now = datetime.now(timezone.utc)
+    res = col.insert_one(
+        {
+            "name": name,
+            "enabled": bool(payload.enabled),
+            "sort_order": order,
+            "created_at": now,
+            "updated_at": now,
+        }
+    )
+    log_admin_action(
+        admin_user=admin_user,
+        action="CREATE_BROKER",
+        details=f"Broker: {name}",
+    )
+    return {"success": True, "id": str(res.inserted_id)}
+
+
+@router.put("/brokers/{broker_id}")
+def update_broker(
+    broker_id: str,
+    payload: BrokerOptionUpdate,
+    admin_user: dict = Depends(get_current_admin_user),
+):
+    """修改券商名称 / 启停 / 排序。"""
+    col = get_db_collections()["brokers"]
+    try:
+        oid = ObjectId(broker_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid broker id")
+    doc = col.find_one({"_id": oid})
+    if not doc:
+        raise HTTPException(status_code=404, detail="券商不存在")
+
+    updates: dict = {"updated_at": datetime.now(timezone.utc)}
+    if payload.name is not None:
+        name = payload.name.strip()
+        if not name:
+            raise HTTPException(status_code=400, detail="券商名称不能为空")
+        other = col.find_one({"name": name, "_id": {"$ne": oid}})
+        if other:
+            raise HTTPException(status_code=409, detail=f"券商已存在：{name}")
+        updates["name"] = name
+    if payload.enabled is not None:
+        updates["enabled"] = bool(payload.enabled)
+    if payload.sort_order is not None:
+        updates["sort_order"] = int(payload.sort_order)
+
+    col.update_one({"_id": oid}, {"$set": updates})
+    log_admin_action(
+        admin_user=admin_user,
+        action="UPDATE_BROKER",
+        details=f"Broker: {doc.get('name')} -> {updates}",
+    )
+    return {"success": True, "data": _broker_payload({**doc, **updates})}
+
+
+@router.delete("/brokers/{broker_id}")
+def delete_broker(broker_id: str, admin_user: dict = Depends(get_current_admin_user)):
+    """删除券商选项；已使用该券商名的证券账户不会被改动。"""
+    col = get_db_collections()["brokers"]
+    try:
+        oid = ObjectId(broker_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid broker id")
+    doc = col.find_one({"_id": oid})
+    if not doc:
+        raise HTTPException(status_code=404, detail="券商不存在")
+    col.delete_one({"_id": oid})
+    log_admin_action(
+        admin_user=admin_user,
+        action="DELETE_BROKER",
+        details=f"Broker: {doc.get('name')}",
+    )
+    return {"success": True}

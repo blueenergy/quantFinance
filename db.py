@@ -59,6 +59,7 @@ def get_db_collections() -> Dict[str, Collection]:
         "user_watchlists": db["user_watchlists"],
         "watchlist_strategies": db["watchlist_strategies"],
         "securities_accounts": db["securities_accounts"],
+        "brokers": db["brokers"],  # 券商选项（admin 可配置）
         # Trading
         "trade_executions": db["trade_executions"],  # 交易执行记录
         "trade_signals": db["trade_signals"],  # 交易信号
