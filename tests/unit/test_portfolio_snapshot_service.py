@@ -401,6 +401,30 @@ def test_build_all_snapshots_returns_each_account_for_multi_account_user():
     assert by_account["62129066"]["username"] == "blue_energy"
 
 
+def test_snapshot_does_not_borrow_from_another_account():
+    finance, data = _two_account_finance()
+    finance["trader_accounts"].docs.append(
+        _account(
+            user_id=UID_SYSTEM,
+            securities_account_id="sec-empty",
+            account_id="300118",
+            total_asset=100.0,
+            market_value=0.0,
+            cash=100.0,
+        )
+    )
+
+    snap = build_portfolio_snapshot(
+        UID_SYSTEM, finance, data, securities_account_id="sec-empty"
+    )
+
+    assert snap["success"] is True
+    # sec-2 has one position and one equity row; an empty account must not
+    # inherit them.
+    assert snap["positions"] == []
+    assert snap["equity_history"] == []
+
+
 def test_portfolio_single_account_shape_unchanged(monkeypatch):
     finance, data = _two_account_finance()
     monkeypatch.setattr(h, "get_db_collections", lambda: finance)

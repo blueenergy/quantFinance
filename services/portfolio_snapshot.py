@@ -104,7 +104,15 @@ def _positions(
         query["securities_account_id"] = str(sec_id)
     rows = list(finance_collections["trader_positions"].find(query))
     if not rows and sec_id:
-        rows = list(finance_collections["trader_positions"].find({"user_id": user_id}))
+        # Legacy rows written before multi-account support have no
+        # ``securities_account_id``.  Only those may be borrowed; falling back
+        # to *all* user positions would show another account's book when the
+        # selected account is legitimately empty.
+        rows = list(
+            finance_collections["trader_positions"].find(
+                {"user_id": user_id, "securities_account_id": None}
+            )
+        )
     return rows
 
 
@@ -121,7 +129,14 @@ def _equity_rows(
     cursor = finance_collections["trader_account_equity"].find(query).sort("date", -1).limit(limit)
     rows = list(cursor)
     if not rows and sec_id:
-        cursor = finance_collections["trader_account_equity"].find({"user_id": user_id}).sort("date", -1).limit(limit)
+        # Same legacy-only rule as ``_positions``: never mix another account's
+        # equity curve into this account's snapshot.
+        cursor = (
+            finance_collections["trader_account_equity"]
+            .find({"user_id": user_id, "securities_account_id": None})
+            .sort("date", -1)
+            .limit(limit)
+        )
         rows = list(cursor)
     return list(reversed(rows))
 
