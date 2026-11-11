@@ -853,15 +853,39 @@ def get_positions(
                 {"symbol": 1, "name": 1}
             ))
             
-            # Create symbol to name mapping
+            # Create symbol to name mapping.  ``stock_info`` only covers A-share
+            # stocks; ETF and HK positions would otherwise render with a blank
+            # name in the account workbench (e.g. 159766.SZ).
             symbol_to_name = {doc["symbol"]: doc.get("name", "") for doc in stock_info_docs}
-            
+            etf_coll = data_collections.get("etf_basic")
+            if etf_coll is not None:
+                for doc in etf_coll.find(
+                    {"ts_code": {"$in": symbols}},
+                    {"_id": 0, "ts_code": 1, "name": 1},
+                ):
+                    code = str(doc.get("ts_code") or "").strip()
+                    if code:
+                        symbol_to_name.setdefault(code, str(doc.get("name") or "").strip())
+            hk_coll = data_collections.get("hk_stock_info")
+            if hk_coll is not None:
+                for doc in hk_coll.find(
+                    {"$or": [{"symbol": {"$in": symbols}}, {"ts_code": {"$in": symbols}}]},
+                    {"_id": 0, "symbol": 1, "ts_code": 1, "name": 1},
+                ):
+                    code = str(doc.get("symbol") or doc.get("ts_code") or "").strip()
+                    if code:
+                        symbol_to_name.setdefault(code, str(doc.get("name") or "").strip())
+
             # Transform field names to match frontend expectations and add stock names
             transformed_positions = []
             for pos in positions:
                 transformed_pos = {
                     "symbol": pos.get("symbol", ""),
-                    "stock_name": symbol_to_name.get(pos.get("symbol"), ""),
+                    "stock_name": (
+                        symbol_to_name.get(pos.get("symbol"))
+                        or pos.get("stock_name")
+                        or ""
+                    ),
                     "quantity": pos.get("qty", 0),  # Map 'qty' to 'quantity'
                     "available_qty": pos.get("can_use_volume", 0),  # Map 'can_use_volume' to 'available_qty'
                     "frozen_qty": pos.get("frozen_volume", 0),  # Map 'frozen_volume' to 'frozen_qty'
