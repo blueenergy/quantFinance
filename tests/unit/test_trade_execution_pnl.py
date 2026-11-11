@@ -254,6 +254,42 @@ def test_create_trader_execution_is_idempotent():
 
 
 @pytest.mark.unit
+def test_upsert_execution_scales_book_attribution_to_filled_size():
+    executions = _FakeWriteCollection()
+    signals = _FakeWriteCollection(
+        [
+            {
+                "order_id": "order-1",
+                "user_id": "user-1",
+                "plan_id": "plan-1",
+                "book_attribution": [
+                    {"params_hash": "h1", "lineage_plan_id": "p1", "filled_size": 3200},
+                    {"params_hash": "h2", "lineage_plan_id": "p2", "filled_size": 600},
+                ],
+            }
+        ]
+    )
+    from services import trader_execution_upload as teu
+
+    teu.upsert_trader_execution(
+        {
+            "order_id": "order-1",
+            "status": "filled",
+            "filled_size": 1900,
+            "filled_price": 10.0,
+            "timestamp": 1000.0,
+        },
+        "user-1",
+        executions_coll=executions,
+        signals_coll=signals,
+    )
+
+    entries = executions.docs[0]["book_attribution"]
+    assert sum(entry["filled_size"] for entry in entries) == 1900
+    assert [entry["filled_size"] for entry in entries] == [1600, 300]
+
+
+@pytest.mark.unit
 def test_upsert_execution_preserves_cancel_requested_against_submitted_poll():
     """quantTrader poll must not clobber cancel_requested via execution upsert."""
     executions = _FakeWriteCollection()

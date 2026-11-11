@@ -2,9 +2,69 @@
 
 from __future__ import annotations
 
+import math
 import time
 from datetime import datetime
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
+
+
+def _scaled_book_attribution(
+    entries: Any, filled_size: Any
+) -> Optional[List[Dict[str, Any]]]:
+    """Scale a signal's intended lineage split to the actual filled quantity.
+
+    An account-basis sell may fill partially. The signal carries the split of
+    the intended size; the execution must carry the same split of what actually
+    filled, or lineage replay would debit more shares than were sold.
+    """
+
+    if not isinstance(entries, list):
+        return None
+    cleaned: List[Dict[str, Any]] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        try:
+            size = int(entry.get("filled_size") or entry.get("size") or 0)
+        except (TypeError, ValueError):
+            size = 0
+        if size <= 0:
+            continue
+        cleaned.append({**entry, "filled_size": size})
+    if not cleaned:
+        return None
+    try:
+        filled = int(filled_size or 0)
+    except (TypeError, ValueError):
+        filled = 0
+    total = sum(int(entry["filled_size"]) for entry in cleaned)
+    if filled <= 0 or total <= 0 or filled == total:
+        return cleaned
+
+    raw = [filled * int(entry["filled_size"]) / total for entry in cleaned]
+    alloc = [int(math.floor(value)) for value in raw]
+    remainder = filled - sum(alloc)
+    order = sorted(
+        range(len(cleaned)),
+        key=lambda i: (raw[i] - alloc[i], int(cleaned[i]["filled_size"])),
+        reverse=True,
+    )
+    while remainder > 0:
+        progressed = False
+        for i in order:
+            if alloc[i] < int(cleaned[i]["filled_size"]):
+                alloc[i] += 1
+                remainder -= 1
+                progressed = True
+                if remainder == 0:
+                    break
+        if not progressed:
+            break
+    return [
+        {**entry, "filled_size": int(alloc[i])}
+        for i, entry in enumerate(cleaned)
+        if int(alloc[i]) > 0
+    ]
 
 
 def upsert_trader_execution(
@@ -56,6 +116,16 @@ def upsert_trader_execution(
         ):
             if signal.get(field) is not None:
                 execution.setdefault(field, signal.get(field))
+
+    attribution = None
+    if signal and signal.get("book_attribution"):
+        attribution = signal.get("book_attribution")
+    elif execution.get("book_attribution"):
+        attribution = execution.get("book_attribution")
+    if attribution:
+        scaled = _scaled_book_attribution(attribution, execution.get("filled_size"))
+        if scaled:
+            execution["book_attribution"] = scaled
 
     if broker_order_id:
         execution["broker_order_id"] = broker_order_id

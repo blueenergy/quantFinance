@@ -54,6 +54,7 @@ EXECUTION_PROJECTION = {
     "timestamp": 1,
     "created_at": 1,
     "updated_at": 1,
+    "book_attribution": 1,
 }
 
 
@@ -142,6 +143,108 @@ def resolve_lineage_account_and_venue(
     return account_id, venue
 
 
+def _book_attribution_entry(
+    execution: Dict[str, Any], params_hash: str
+) -> Optional[Dict[str, Any]]:
+    """The portion of this execution owned by the requested params_hash."""
+
+    for entry in execution.get("book_attribution") or []:
+        if isinstance(entry, dict) and str(entry.get("params_hash") or "") == params_hash:
+            return entry
+    return None
+
+
+def _synthetic_attribution_execution(
+    execution: Dict[str, Any],
+    entry: Dict[str, Any],
+    params_hash: str,
+) -> Optional[Dict[str, Any]]:
+    """A lineage-local copy of a fill that was issued by another plan."""
+
+    order_id = str(execution.get("order_id") or "")
+    symbol = str(execution.get("symbol") or "")
+    try:
+        size = int(entry.get("filled_size") or entry.get("size") or 0)
+    except (TypeError, ValueError):
+        size = 0
+    if size <= 0 or not symbol:
+        return None
+    synthetic_order_id = (
+        f"{order_id}#book:{params_hash}"
+        if order_id
+        else f"attr:{params_hash}:{symbol}:{execution.get('timestamp')}"
+    )
+    row = dict(execution)
+    row.update(
+        {
+            "order_id": synthetic_order_id,
+            "original_order_id": order_id or None,
+            "plan_id": str(entry.get("lineage_plan_id") or execution.get("plan_id") or ""),
+            "book_attribution": [dict(entry)],
+            "execution_source": "book_attribution",
+            "filled_size": size,
+            "quantity": size,
+            "filled_qty": size,
+        }
+    )
+    if row.get("filled_price") is None and row.get("avg_price") is not None:
+        row["filled_price"] = row["avg_price"]
+    return row
+
+
+def _merge_book_attributions(
+    executions: List[Dict[str, Any]],
+    attributed_executions: List[Dict[str, Any]],
+    params_hash: str,
+) -> List[Dict[str, Any]]:
+    """Apply execution-level ``book_attribution`` to this lineage's bundle.
+
+    The account-level ledger keeps reading the raw execution (full filled_size
+    and its single ``plan_id``), so this never double-counts. Only the lineage
+    replay sees the attributed portion.
+    """
+
+    if not attributed_executions or not params_hash:
+        return executions
+    out = list(executions)
+    by_order = {str(row.get("order_id") or ""): row for row in out if row.get("order_id")}
+    seen_orders: set[str] = set()
+    for execution in attributed_executions:
+        status = str(execution.get("status") or "").lower()
+        if status and status not in {
+            "filled",
+            "executed",
+            "partial_filled",
+            "partially_filled",
+        }:
+            continue
+        entry = _book_attribution_entry(execution, params_hash)
+        if entry is None:
+            continue
+        order_id = str(execution.get("order_id") or "")
+        if order_id and order_id in seen_orders:
+            continue
+        if order_id:
+            seen_orders.add(order_id)
+        try:
+            size = int(entry.get("filled_size") or entry.get("size") or 0)
+        except (TypeError, ValueError):
+            size = 0
+        if order_id and order_id in by_order:
+            # The lineage issued the order as well. Keep one execution row and
+            # shrink it to the portion this book actually owned.
+            row = by_order[order_id]
+            row["filled_size"] = size
+            row["quantity"] = size
+            row["filled_qty"] = size
+            row["book_attribution"] = [dict(entry)]
+            continue
+        synthetic = _synthetic_attribution_execution(execution, entry, params_hash)
+        if synthetic is not None:
+            out.append(synthetic)
+    return out
+
+
 def fetch_lineage_live_bundle(
     trading_collections: Dict[str, Any],
     finance_collections: Dict[str, Any],
@@ -150,6 +253,7 @@ def fetch_lineage_live_bundle(
 ) -> Dict[str, Any]:
     """Load live signals + executions for all plans in the same params_hash lineage."""
 
+    params_hash = str(plan.get("params_hash") or "")
     lineage_ids = lineage_plan_ids_for_plan(trading_collections, plan, user_id)
     if not lineage_ids:
         return {
@@ -185,9 +289,19 @@ def fetch_lineage_live_bundle(
             )
             .sort("timestamp", 1)
         )
+    attributed_executions: List[Dict[str, Any]] = []
+    if params_hash:
+        attributed_executions = list(
+            finance_collections["trade_executions"]
+            .find(
+                {"user_id": user_id, "book_attribution.params_hash": params_hash},
+                EXECUTION_PROJECTION,
+            )
+            .sort("timestamp", 1)
+        )
+    executions = _merge_book_attributions(executions, attributed_executions, params_hash)
 
     strategy_template_id = str(plan.get("strategy_template_id") or "")
-    params_hash = str(plan.get("params_hash") or "")
     securities_account_id, execution_venue = resolve_lineage_account_and_venue(
         trading_collections,
         user_id=user_id,

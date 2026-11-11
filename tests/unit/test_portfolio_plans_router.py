@@ -5753,6 +5753,7 @@ def test_live_rebalance_defaults_to_rebalance_plan_type(monkeypatch):
         if p.get("plan_id") == resp["data"]["plan_id"]
     )
     assert plan["plan_type"] == "rebalance"
+    assert plan["basis"] == "lineage"
     assert plan["is_rebalance_day"] is True
 
 
@@ -5776,6 +5777,34 @@ def test_live_rebalance_rejects_unknown_plan_type(monkeypatch):
 
     assert exc.value.status_code == 400
     assert "unsupported plan_type" in exc.value.detail
+
+
+def test_live_rebalance_allows_account_basis_for_t0_and_persists_basis(monkeypatch):
+    """T+0 is the only path allowed to read the whole account basis."""
+    cols, fin, data = _live_rebalance_env()
+    _patch_lineage_live_env(monkeypatch, cols, fin, data)
+    monkeypatch.setattr(portfolio_plans, "schedule_snapshot_rebuild", lambda *a, **k: None)
+
+    resp = asyncio.run(
+        portfolio_plans.live_rebalance_portfolio(
+            "pla",
+            portfolio_plans.LiveRebalanceRequest(
+                securities_account_id="acct-1",
+                targets={"600000.SH": 300},
+                basis="account",
+                plan_type="intraday_t0",
+                dry_run=False,
+            ),
+            current_user={"id": "user-1"},
+        )
+    )
+
+    plan = next(
+        p for p in cols["portfolio_trade_plans"].docs
+        if p.get("plan_id") == resp["data"]["plan_id"]
+    )
+    assert plan["basis"] == "account"
+    assert plan["plan_type"] == "intraday_t0"
 
 
 def test_live_rebalance_rejects_targets_from_a_stale_holdings_read(monkeypatch):
@@ -5937,6 +5966,28 @@ def test_live_rebalance_basis_account_spans_lineages(monkeypatch):
         row["securities_account_id"] = "acct-1"
     # A second lineage's fill on the same account, under a plan that is not in
     # pla's lineage, so the lineage read cannot reach it.
+    cols["portfolio_trade_plans"].docs.append(
+        {
+            "plan_id": "other-plan",
+            "strategy_template_id": "stx",
+            "user_id": "user-1",
+            "params_hash": "hy",
+            "base_date": "20250101",
+            "status": "generated",
+            "strategy_name": "L2",
+            "params_snapshot": {"initial_capital": 1_000_000, "lot_size": 100},
+        }
+    )
+    cols["portfolio_lineage_controls"].docs.append(
+        {
+            "user_id": "user-1",
+            "strategy_template_id": "stx",
+            "params_hash": "hy",
+            "securities_account_id": "acct-1",
+            "execution_venue": "live",
+            "paused": False,
+        }
+    )
     fin["trade_signals"].docs.append(
         {"order_id": "o-buy-2", "user_id": "user-1", "mode": "live", "plan_id": "other-plan", "symbol": "000001.SZ", "name": "平安银行", "created_at": 1}
     )
@@ -5972,6 +6023,14 @@ def test_live_rebalance_basis_account_spans_lineages(monkeypatch):
     data_out = resp["data"]
     assert data_out["changed_symbols"] == ["000001.SZ"]
     assert [signal["size"] for signal in data_out["signals"]] == [300]
+    assert data_out["signals"][0]["book_attribution"] == [
+        {
+            "strategy_template_id": "stx",
+            "params_hash": "hy",
+            "lineage_plan_id": "other-plan",
+            "filled_size": 300,
+        }
+    ]
 
 
 def test_live_rebalance_publish_flags_capped_sell_in_operation_log(monkeypatch):

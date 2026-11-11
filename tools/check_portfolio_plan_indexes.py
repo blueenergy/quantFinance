@@ -319,6 +319,17 @@ def _expected_indexes() -> List[ExpectedIndex]:
         ExpectedIndex(
             "finance",
             "trade_executions",
+            [
+                ("user_id", ASCENDING),
+                ("book_attribution.params_hash", ASCENDING),
+                ("timestamp", ASCENDING),
+            ],
+            "trade_exec_book_attr_user_hash_ts",
+            "lineage replay cross-book attribution lookup",
+        ),
+        ExpectedIndex(
+            "finance",
+            "trade_executions",
             [("user_id", ASCENDING), ("securities_account_id", ASCENDING), ("updated_at", DESCENDING)],
             "trade_exec_user_account_updated_desc",
             "live snapshot stale probe by account updated_at",

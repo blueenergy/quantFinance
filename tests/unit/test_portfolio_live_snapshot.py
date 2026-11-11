@@ -26,6 +26,21 @@ class _Collection:
 
         def _match(doc):
             for key, value in query.items():
+                if "." in key:
+                    head, tail = key.split(".", 1)
+                    candidates = doc.get(head)
+                    if isinstance(candidates, list):
+                        if not any(
+                            isinstance(row, dict) and row.get(tail) == value
+                            for row in candidates
+                        ):
+                            return False
+                    elif isinstance(candidates, dict):
+                        if candidates.get(tail) != value:
+                            return False
+                    else:
+                        return False
+                    continue
                 if key == "$or":
                     if not any(_match({**doc, **branch}) for branch in value):
                         return False
@@ -168,6 +183,115 @@ def test_rebuild_live_snapshot_writes_structural_positions_and_trades():
     assert doc["last_rebuild_reason"] == "execution"
     assert doc["last_rebuild_trigger_order_id"] == "oa"
     assert trading["portfolio_live_snapshots"].docs
+
+
+def test_rebuild_live_snapshot_uses_cross_lineage_book_attribution():
+    """A sell issued by another lineage must debit this lineage's book."""
+    trading = _trading_collections()
+    finance = _finance_collections()
+    plan = trading["portfolio_trade_plans"].docs[0]
+    finance["trade_executions"].docs[0]["filled_size"] = 600
+    finance["trade_executions"].docs.append(
+        {
+            "order_id": "os",
+            "user_id": "user-1",
+            "securities_account_id": "acct-1",
+            "symbol": "000001.SZ",
+            "side": "SELL",
+            "action": "sell",
+            "status": "filled",
+            "filled_size": 600,
+            "filled_price": 12.0,
+            "timestamp": 2.0,
+            "updated_at": "2025-01-02T10:00:00",
+            "book_attribution": [
+                {
+                    "params_hash": "hx",
+                    "lineage_plan_id": "pla",
+                    "source_plan_id": "plb",
+                    "filled_size": 600,
+                }
+            ],
+        }
+    )
+
+    doc = rebuild_live_snapshot(
+        trading,
+        finance,
+        plan,
+        "user-1",
+        anchor_plan_id="pla",
+        reason="book_attribution",
+    )
+
+    assert doc is not None
+    assert not [
+        row
+        for row in doc["positions"]
+        if row["symbol"] == "000001.SZ" and int(row["shares"]) > 0
+    ]
+    assert doc["trades"]
+    assert any(row.get("sell_price") == 12.0 for row in doc["trades"])
+
+
+def test_rebuild_live_snapshot_shrinks_own_execution_to_attributed_size():
+    """When the lineage issued the order, attribution caps its own replay size."""
+    trading = _trading_collections()
+    finance = _finance_collections()
+    plan = trading["portfolio_trade_plans"].docs[0]
+    finance["trade_executions"].docs[0]["filled_size"] = 600
+    finance["trade_signals"].docs.append(
+        {
+            "order_id": "os2",
+            "user_id": "user-1",
+            "mode": "live",
+            "plan_id": "pla",
+            "symbol": "000001.SZ",
+            "name": "Ping",
+            "action": "sell",
+            "size": 1000,
+            "created_at": 2,
+        }
+    )
+    finance["trade_executions"].docs.append(
+        {
+            "order_id": "os2",
+            "user_id": "user-1",
+            "securities_account_id": "acct-1",
+            "symbol": "000001.SZ",
+            "side": "SELL",
+            "action": "sell",
+            "status": "filled",
+            "filled_size": 1000,
+            "filled_price": 12.0,
+            "timestamp": 2.0,
+            "updated_at": "2025-01-02T10:00:00",
+            "book_attribution": [
+                {
+                    "params_hash": "hx",
+                    "lineage_plan_id": "pla",
+                    "source_plan_id": "pla",
+                    "filled_size": 600,
+                }
+            ],
+        }
+    )
+
+    doc = rebuild_live_snapshot(
+        trading,
+        finance,
+        plan,
+        "user-1",
+        anchor_plan_id="pla",
+        reason="book_attribution",
+    )
+
+    assert doc is not None
+    assert not [
+        row
+        for row in doc["positions"]
+        if row["symbol"] == "000001.SZ" and int(row["shares"]) != 0
+    ]
 
 
 def test_terminal_execution_backfill_rebuilds_direct_mongo_snapshot(monkeypatch):

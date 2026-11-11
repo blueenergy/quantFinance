@@ -16,6 +16,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 import logging
+import math
 import time
 import uuid
 
@@ -407,6 +408,159 @@ def _live_signal_is_blocked(item: Dict[str, Any]) -> bool:
     return True
 
 
+def _account_sell_owner_lineages(
+    trading_collections: Dict[str, Any],
+    finance_collections: Dict[str, Any],
+    data_collections: Dict[str, Any],
+    *,
+    plan: Dict[str, Any],
+    user_id: str,
+    securities_account_id: str,
+    symbol: str,
+) -> List[Dict[str, Any]]:
+    """Which live lineages own shares of ``symbol`` in this account.
+
+    Used only for account-basis sells: the order may consume shares from several
+    books, so each owner's portion is written onto the signal as
+    ``book_attribution``. The account-level ledger keeps the original execution.
+    """
+
+    combos: set[tuple[str, str]] = set()
+    controls = trading_collections.get("portfolio_lineage_controls")
+    if controls is not None:
+        for row in controls.find(
+            {
+                "user_id": user_id,
+                "securities_account_id": securities_account_id,
+                "execution_venue": "live",
+            }
+        ):
+            tid = str(row.get("strategy_template_id") or "")
+            params_hash = str(row.get("params_hash") or "")
+            if tid and params_hash:
+                combos.add((tid, params_hash))
+    anchor_tid = str(plan.get("strategy_template_id") or "")
+    anchor_hash = str(plan.get("params_hash") or "")
+    if anchor_tid and anchor_hash:
+        combos.add((anchor_tid, anchor_hash))
+
+    symbol_key = _symbol_key(symbol)
+    owners: List[Dict[str, Any]] = []
+    plans_coll = trading_collections.get("portfolio_trade_plans")
+    for tid, params_hash in sorted(combos):
+        if tid == anchor_tid and params_hash == anchor_hash:
+            owner_plan = plan
+        elif plans_coll is not None:
+            owner_plan = plans_coll.find_one(
+                {
+                    "user_id": user_id,
+                    "strategy_template_id": tid,
+                    "params_hash": params_hash,
+                },
+                sort=[("base_date", -1), ("created_at", -1)],
+            )
+        else:
+            owner_plan = None
+        if not owner_plan:
+            continue
+        try:
+            holdings = _pp._lineage_live_holdings(
+                trading_collections,
+                finance_collections,
+                data_collections,
+                owner_plan,
+                user_id,
+            )
+        except Exception:  # noqa: BLE001
+            log.warning(
+                "account sell attribution: could not read lineage %s/%s",
+                tid,
+                params_hash,
+                exc_info=True,
+            )
+            continue
+        shares = 0
+        for row in holdings:
+            if _symbol_key(row.get("symbol")) == symbol_key:
+                shares = _int_value(row.get("shares"))
+                break
+        if shares <= 0:
+            continue
+        owners.append(
+            {
+                "strategy_template_id": tid,
+                "params_hash": params_hash,
+                "lineage_plan_id": str(owner_plan.get("plan_id") or ""),
+                "shares": shares,
+            }
+        )
+    return owners
+
+
+def _allocate_account_sell_to_lineages(
+    sell_qty: int, owners: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    """Split an account-basis sell across owning lineages, pro-rata.
+
+    An entry with an empty ``params_hash`` holds the manual/unattributed
+    remainder; lineage replay ignores it, so it cannot be booked to a strategy.
+    """
+
+    sell_qty = max(int(sell_qty or 0), 0)
+    if sell_qty <= 0 or not owners:
+        return []
+    shares = [max(int(row.get("shares") or 0), 0) for row in owners]
+    total_owned = sum(shares)
+    if total_owned <= 0:
+        return []
+    target = min(sell_qty, total_owned)
+    if target >= total_owned:
+        alloc = list(shares)
+    else:
+        raw = [target * shares[i] / total_owned for i in range(len(shares))]
+        alloc = [int(math.floor(value)) for value in raw]
+        remainder = target - sum(alloc)
+        order = sorted(
+            range(len(shares)),
+            key=lambda i: (raw[i] - alloc[i], shares[i], owners[i].get("params_hash") or ""),
+            reverse=True,
+        )
+        while remainder > 0:
+            progressed = False
+            for i in order:
+                if alloc[i] < shares[i]:
+                    alloc[i] += 1
+                    remainder -= 1
+                    progressed = True
+                    if remainder == 0:
+                        break
+            if not progressed:
+                break
+
+    entries: List[Dict[str, Any]] = []
+    for owner, qty in zip(owners, alloc):
+        if qty <= 0:
+            continue
+        entries.append(
+            {
+                "strategy_template_id": owner.get("strategy_template_id") or "",
+                "params_hash": owner.get("params_hash") or "",
+                "lineage_plan_id": owner.get("lineage_plan_id") or "",
+                "filled_size": int(qty),
+            }
+        )
+    unattributed = sell_qty - sum(alloc)
+    if unattributed > 0:
+        entries.append(
+            {
+                "params_hash": "",
+                "filled_size": int(unattributed),
+                "reason": "manual_or_unattributed",
+            }
+        )
+    return entries
+
+
 @router.post("/plans/{plan_id}/live-rebalance")
 async def live_rebalance_portfolio(
     plan_id: str,
@@ -438,6 +592,10 @@ async def live_rebalance_portfolio(
             status_code=400,
             detail=f"unsupported plan_type: {requested_plan_type!r}",
         )
+    # Account basis reads the whole securities account, so a sell can consume
+    # shares owned by several lineages. The fill is stamped with
+    # ``book_attribution`` below; lineage replay debits each owner's book while
+    # the account-level ledger still counts the execution once.
     account = _pp._require_securities_account(finance_collections, request.securities_account_id, user_id)
     if not _pp._account_live_enabled(account):
         raise HTTPException(
@@ -640,31 +798,44 @@ async def live_rebalance_portfolio(
             estimated_sell += abs(delta) * float(price or 0)
         if target_shares < current_shares and request.exclude_after:
             manual_exclude_symbols.append(symbol)
-        items.append(
-            {
-                "plan_id": new_plan_id,
-                "strategy_template_id": strategy_template_id,
-                "user_id": user_id,
-                "params_hash": params_hash,
-                "base_date": base_date,
-                "execute_date": base_date,
-                "rank": rank,
-                "symbol": symbol,
-                "name": held.get("name", ""),
-                "action": action,
-                "current_shares": current_shares,
-                "target_shares": target_shares,
-                "delta_shares": delta,
-                "drift_delta_shares": delta,
-                "account_current_shares": account_current_shares,
-                "account_available_shares": account_available_shares,
-                "estimated_price": price,
-                "estimated_amount": abs(delta) * float(price or 0) if price else None,
-                "blockers": item_blockers,
-                "created_at": now,
-                **sellable_meta,
-            }
-        )
+        book_attribution: Optional[List[Dict[str, Any]]] = None
+        if action == "sell" and request.basis == "account":
+            owners = _account_sell_owner_lineages(
+                trading_collections,
+                finance_collections,
+                data_collections,
+                plan=plan,
+                user_id=user_id,
+                securities_account_id=securities_account_id,
+                symbol=symbol,
+            )
+            book_attribution = _allocate_account_sell_to_lineages(abs(delta), owners)
+        item_doc = {
+            "plan_id": new_plan_id,
+            "strategy_template_id": strategy_template_id,
+            "user_id": user_id,
+            "params_hash": params_hash,
+            "base_date": base_date,
+            "execute_date": base_date,
+            "rank": rank,
+            "symbol": symbol,
+            "name": held.get("name", ""),
+            "action": action,
+            "current_shares": current_shares,
+            "target_shares": target_shares,
+            "delta_shares": delta,
+            "drift_delta_shares": delta,
+            "account_current_shares": account_current_shares,
+            "account_available_shares": account_available_shares,
+            "estimated_price": price,
+            "estimated_amount": abs(delta) * float(price or 0) if price else None,
+            "blockers": item_blockers,
+            "created_at": now,
+            **sellable_meta,
+        }
+        if book_attribution:
+            item_doc["book_attribution"] = book_attribution
+        items.append(item_doc)
 
     capped_symbols = sorted(
         {item["symbol"] for item in items if "account_position_capped" in (item.get("blockers") or [])}
@@ -707,6 +878,7 @@ async def live_rebalance_portfolio(
         "base_date": base_date,
         "execute_date": base_date,
         "plan_type": requested_plan_type,
+        "basis": request.basis,
         "record_kind": RECORD_KIND_TRADE_PLAN,
         # origin stays "manual": downstream uses is_strategy_decision() /
         # strategy_decision_mongo_filter() to exclude discretionary plans from
@@ -756,7 +928,10 @@ async def live_rebalance_portfolio(
             )
             continue
         if signal is not None:
-            signals.append(signal.to_mongo())
+            signal_doc = signal.to_mongo()
+            if item.get("book_attribution"):
+                signal_doc["book_attribution"] = item["book_attribution"]
+            signals.append(signal_doc)
 
     t0_signal_id = str(request.t0_signal_id or "").strip()
     if t0_signal_id:
