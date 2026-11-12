@@ -494,7 +494,12 @@ def _lineage_book_vs_account(
         elif lineage_shares > account_shares:
             entry["kind"] = "lineage_excess"
             diffs.append(entry)
-        elif key in strategy_keys:
+        elif lineage_shares > 0 and key in strategy_keys:
+            # A portfolio lineage claims shares here; the account holds more.
+            # That is an unattributed fill/missing attribution and worth an
+            # alarm. When no portfolio lineage claims the symbol at all, the
+            # extra shares belong to a manual or single-stream strategy, not a
+            # portfolio book -- report them as manual, not as lineage drift.
             entry["kind"] = "lineage_short"
             diffs.append(entry)
         else:
