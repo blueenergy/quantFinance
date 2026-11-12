@@ -6334,6 +6334,8 @@ get_portfolio_strategy_realtime_equity = _views.get_portfolio_strategy_realtime_
 reconcile_portfolio_holdings = _ledger.reconcile_portfolio_holdings
 _reconcile_live_holdings = _ledger._reconcile_live_holdings
 _account_level_live_holdings = _ledger._account_level_live_holdings
+_lineage_book_totals = _ledger._lineage_book_totals
+_lineage_book_vs_account = _ledger._lineage_book_vs_account
 _settling_symbol_keys = _ledger._settling_symbol_keys
 _INFLIGHT_SIGNAL_STATUSES = _ledger._INFLIGHT_SIGNAL_STATUSES
 

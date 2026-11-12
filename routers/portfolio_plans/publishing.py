@@ -666,6 +666,14 @@ async def live_rebalance_portfolio(
         user_id=user_id,
         securities_account_id=securities_account_id,
     )
+    book_reconciliation = _pp._lineage_book_vs_account(
+        trading_collections,
+        finance_collections,
+        data_collections,
+        plan=plan,
+        user_id=user_id,
+        securities_account_id=securities_account_id,
+    )
 
     # Resolve a price for every symbol we may trade (held + newly-added targets).
     target_symbols = {str(s) for s in request.targets.keys() if s}
@@ -909,6 +917,12 @@ async def live_rebalance_portfolio(
         },
         "dropped_targets": dropped_targets,
         "capped_symbols": capped_symbols,
+        "book_reconciliation": {
+            "applicable": bool(book_reconciliation.get("applicable", True)),
+            "in_sync": bool(book_reconciliation.get("in_sync", True)),
+            "diff_count": len(book_reconciliation.get("diffs") or []),
+            "diffs": book_reconciliation.get("diffs") or [],
+        },
         "created_at": now,
         "updated_at": now,
     }
@@ -992,6 +1006,7 @@ async def live_rebalance_portfolio(
                     "manual_action": manual_action,
                     "changed_symbols": changed_symbols,
                     "blocked": bool(blocked),
+                    "book_reconciliation": _jsonable(book_reconciliation),
                 }
             ),
         }
@@ -1037,6 +1052,16 @@ async def live_rebalance_portfolio(
             "capped_symbols": capped_symbols,
         },
     )
+    if book_reconciliation.get("applicable") and not book_reconciliation.get("in_sync", True):
+        _pp._append_plan_operation_log(
+            trading_collections,
+            plan_id=new_plan_id,
+            user_id=user_id,
+            operation_type="book_ledger_mismatch",
+            status="warning",
+            message="lineage book sum differs from broker positions before live rebalance",
+            payload=book_reconciliation,
+        )
     _pp.schedule_snapshot_rebuild(
         trading_collections,
         finance_collections,
@@ -1078,6 +1103,7 @@ async def live_rebalance_portfolio(
                 "changed_symbols": changed_symbols,
                 "blocked": bool(blocked),
                 "lineage_effects": lineage_effects,
+                "book_reconciliation": _jsonable(book_reconciliation),
             }
         ),
     }
@@ -1182,6 +1208,14 @@ def publish_portfolio_plan_live_signals(
         user_id=user_id,
         securities_account_id=securities_account_id,
     )
+    book_reconciliation = _pp._lineage_book_vs_account(
+        trading_collections,
+        finance_collections,
+        data_collections,
+        plan=plan,
+        user_id=user_id,
+        securities_account_id=securities_account_id,
+    )
     params_snapshot = plan.get("params_snapshot") or {}
     lot_size = _int_value(params_snapshot.get("lot_size"), 100) or 100
     symbols = sorted({str(item.get("symbol")) for item in items if item.get("symbol")})
@@ -1269,6 +1303,7 @@ def publish_portfolio_plan_live_signals(
                         "existing_count": 0,
                         "publishable_count": 0,
                         "allow_partial": request.allow_partial,
+                        "book_reconciliation": _jsonable(book_reconciliation),
                         "partial": False,
                         "blocked": bool(reprice_summary.get("blockers")),
                     }
@@ -1374,6 +1409,16 @@ def publish_portfolio_plan_live_signals(
                 "publish_duration_ms": round((time.perf_counter() - _publish_started) * 1000.0, 1),
             },
         )
+        if book_reconciliation.get("applicable") and not book_reconciliation.get("in_sync", True):
+            _pp._append_plan_operation_log(
+                trading_collections,
+                plan_id=plan_id,
+                user_id=user_id,
+                operation_type="book_ledger_mismatch",
+                status="warning",
+                message="lineage book sum differs from broker positions before live publish",
+                payload=book_reconciliation,
+            )
         finance_collections["trade_signals"].insert_many(publish_new_signals)
         inserted_count = len(publish_new_signals)
         mark_lineage_live(
@@ -1457,6 +1502,7 @@ def publish_portfolio_plan_live_signals(
                 "allow_partial": request.allow_partial,
                 "partial": partial,
                 "blocked": response_blocked,
+                "book_reconciliation": _jsonable(book_reconciliation),
             }
         ),
     }

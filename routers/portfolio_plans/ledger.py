@@ -311,6 +311,208 @@ def _strategy_attributable_symbol_keys(
     return strategy_keys
 
 
+def _lineage_book_totals(
+    trading_collections: Dict[str, Any],
+    finance_collections: Dict[str, Any],
+    data_collections: Dict[str, Any],
+    *,
+    plan: Dict[str, Any],
+    user_id: str,
+    securities_account_id: str,
+) -> Dict[str, Dict[str, Any]]:
+    """Sum every live lineage book bound to this account, by symbol key.
+
+    This is deliberately separate from the account-level execution ledger: a
+    single account-basis fill is attributed to one ``plan_id`` unless an
+    explicit ``book_attribution`` row splits it. Summing the per-lineage books
+    is how a phantom book (like the 600961 case) becomes visible even when the
+    account-level ledger and broker positions agree.
+    """
+
+    combos: set = set()
+    controls = trading_collections.get("portfolio_lineage_controls")
+    if controls is not None:
+        for row in controls.find(
+            {
+                "user_id": user_id,
+                "securities_account_id": securities_account_id,
+                "execution_venue": "live",
+            }
+        ):
+            tid = str(row.get("strategy_template_id") or "")
+            params_hash = str(row.get("params_hash") or "")
+            if tid and params_hash:
+                combos.add((tid, params_hash))
+    anchor_tid = str(plan.get("strategy_template_id") or "")
+    anchor_hash = str(plan.get("params_hash") or "")
+    if anchor_tid and anchor_hash:
+        combos.add((anchor_tid, anchor_hash))
+
+    totals: Dict[str, Dict[str, Any]] = {}
+    plans_coll = trading_collections.get("portfolio_trade_plans")
+    for tid, params_hash in sorted(combos):
+        if tid == anchor_tid and params_hash == anchor_hash:
+            owner_plan = plan
+        elif plans_coll is not None:
+            owner_plan = plans_coll.find_one(
+                {
+                    "user_id": user_id,
+                    "strategy_template_id": tid,
+                    "params_hash": params_hash,
+                },
+                sort=[("base_date", -1), ("created_at", -1)],
+            )
+        else:
+            owner_plan = None
+        if not owner_plan:
+            continue
+        try:
+            holdings = _pp._lineage_live_holdings(
+                trading_collections,
+                finance_collections,
+                data_collections,
+                owner_plan,
+                user_id,
+            )
+        except Exception:  # noqa: BLE001
+            continue
+        for row in holdings:
+            shares = _int_value(row.get("shares"))
+            if shares <= 0:
+                continue
+            key = _symbol_key(row.get("symbol"))
+            entry = totals.setdefault(
+                key,
+                {
+                    "symbol": row.get("symbol") or key,
+                    "name": row.get("name") or "",
+                    "shares": 0,
+                },
+            )
+            entry["shares"] += shares
+            if not entry["name"] and row.get("name"):
+                entry["name"] = row.get("name")
+    return totals
+
+
+def _lineage_book_vs_account(
+    trading_collections: Dict[str, Any],
+    finance_collections: Dict[str, Any],
+    data_collections: Dict[str, Any],
+    *,
+    plan: Dict[str, Any],
+    user_id: str,
+    securities_account_id: str,
+) -> Dict[str, Any]:
+    """Compare the sum of per-lineage books against broker-synced positions.
+
+    ``diffs`` are real alarms:
+      * ``lineage_excess``: one or more lineage books claim more shares than the
+        broker holds -- a lineage-basis sell could consume another book's
+        shares and leave that book over-counted.
+      * ``lineage_short``: the broker holds more than the lineage books and the
+        symbol has strategy history -- an unattributed fill or missing
+        attribution.
+
+    ``manual_diffs`` are not alarms: the broker holds shares no strategy ever
+    bought. ``settling_diffs`` are in-flight fills the broker snapshot has not
+    caught up with yet.
+    """
+
+    account_by_key, synced = _pp._account_positions_by_symbol(
+        finance_collections,
+        user_id=user_id,
+        securities_account_id=securities_account_id,
+    )
+    if not synced:
+        return {
+            "applicable": False,
+            "in_sync": True,
+            "account_positions_synced": False,
+            "reason": "account positions not synced",
+            "diffs": [],
+            "settling_diffs": [],
+            "manual_diffs": [],
+            "lineage_symbols": 0,
+        }
+
+    account_rows = list(
+        finance_collections["trader_positions"].find(
+            {"user_id": user_id, "securities_account_id": securities_account_id},
+            {"_id": 0},
+        )
+    )
+    synced_at: Optional[float] = None
+    for row in account_rows:
+        ts = row.get("synced_at")
+        if isinstance(ts, (int, float)):
+            synced_at = ts if synced_at is None else max(synced_at, ts)
+
+    totals = _lineage_book_totals(
+        trading_collections,
+        finance_collections,
+        data_collections,
+        plan=plan,
+        user_id=user_id,
+        securities_account_id=securities_account_id,
+    )
+    strategy_keys = _strategy_attributable_symbol_keys(
+        trading_collections,
+        finance_collections,
+        user_id=user_id,
+        securities_account_id=securities_account_id,
+    )
+    settling_keys = _settling_symbol_keys(
+        finance_collections,
+        user_id=user_id,
+        securities_account_id=securities_account_id,
+        account_synced_at=synced_at,
+    )
+
+    diffs: List[Dict[str, Any]] = []
+    settling_diffs: List[Dict[str, Any]] = []
+    manual_diffs: List[Dict[str, Any]] = []
+    for key in sorted({*totals, *account_by_key}):
+        lineage_row = totals.get(key) or {}
+        account_row = account_by_key.get(key) or {}
+        lineage_shares = _int_value(lineage_row.get("shares"))
+        account_shares = _int_value(account_row.get("current"))
+        if lineage_shares == account_shares:
+            continue
+        symbol = lineage_row.get("symbol") or (account_row or {}).get("symbol") or key
+        entry = {
+            "symbol": symbol,
+            "name": lineage_row.get("name") or "",
+            "lineage_shares": lineage_shares,
+            "account_shares": account_shares,
+            "diff": account_shares - lineage_shares,
+        }
+        if key in settling_keys:
+            entry["settling"] = True
+            entry["kind"] = "settling"
+            settling_diffs.append(entry)
+        elif lineage_shares > account_shares:
+            entry["kind"] = "lineage_excess"
+            diffs.append(entry)
+        elif key in strategy_keys:
+            entry["kind"] = "lineage_short"
+            diffs.append(entry)
+        else:
+            entry["kind"] = "lineage_manual"
+            manual_diffs.append(entry)
+
+    return {
+        "applicable": True,
+        "in_sync": not diffs,
+        "account_positions_synced": True,
+        "account_synced_at": synced_at,
+        "lineage_symbols": len(totals),
+        "diffs": diffs,
+        "settling_diffs": settling_diffs,
+        "manual_diffs": manual_diffs,
+    }
+
+
 def _reconcile_live_holdings(
     trading_collections: Dict[str, Any],
     finance_collections: Dict[str, Any],
@@ -450,6 +652,14 @@ def _reconcile_live_holdings(
         else:
             diffs.append(entry)
 
+    lineage_book = _lineage_book_vs_account(
+        trading_collections,
+        finance_collections,
+        data_collections,
+        plan=plan,
+        user_id=user_id,
+        securities_account_id=account_id,
+    )
     return {
         "applicable": True,
         "in_sync": not diffs,
@@ -458,6 +668,12 @@ def _reconcile_live_holdings(
         "diffs": diffs,
         "settling_diffs": settling_diffs,
         "manual_positions": manual_positions,
+        "lineage_book_in_sync": lineage_book.get("in_sync", True),
+        "lineage_book_diffs": lineage_book.get("diffs") or [],
+        "lineage_book_settling_diffs": lineage_book.get("settling_diffs") or [],
+        "lineage_book_manual": lineage_book.get("manual_diffs") or [],
+        "lineage_book_applicable": lineage_book.get("applicable", True),
+        "lineage_book": lineage_book,
     }
 
 

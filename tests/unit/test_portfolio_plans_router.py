@@ -5779,6 +5779,110 @@ def test_live_rebalance_rejects_unknown_plan_type(monkeypatch):
     assert "unsupported plan_type" in exc.value.detail
 
 
+def test_lineage_book_vs_account_flags_excess(monkeypatch):
+    """A lineage book larger than the broker position must raise a diff."""
+    cols, fin, data = _live_rebalance_env()
+    fin["trader_positions"].docs = [
+        {
+            "user_id": "user-1",
+            "securities_account_id": "acct-1",
+            "symbol": "600000.SH",
+            "qty": 400,
+            "can_use_volume": 400,
+        }
+    ]
+    _patch_lineage_live_env(monkeypatch, cols, fin, data)
+
+    check = portfolio_plans._lineage_book_vs_account(
+        cols,
+        fin,
+        data,
+        plan=cols["portfolio_trade_plans"].docs[0],
+        user_id="user-1",
+        securities_account_id="acct-1",
+    )
+
+    assert check["applicable"] is True
+    assert check["in_sync"] is False
+    diff = check["diffs"][0]
+    assert diff["symbol"] == "600000.SH"
+    assert diff["lineage_shares"] == 500
+    assert diff["account_shares"] == 400
+    assert diff["diff"] == -100
+    assert diff["kind"] == "lineage_excess"
+
+
+def test_live_rebalance_returns_lineage_book_warning(monkeypatch):
+    """The dry-run preview carries the pre-order lineage-vs-account check."""
+    cols, fin, data = _live_rebalance_env()
+    fin["trader_positions"].docs = [
+        {
+            "user_id": "user-1",
+            "securities_account_id": "acct-1",
+            "symbol": "600000.SH",
+            "qty": 400,
+            "can_use_volume": 400,
+        }
+    ]
+    _patch_lineage_live_env(monkeypatch, cols, fin, data)
+
+    resp = asyncio.run(
+        portfolio_plans.live_rebalance_portfolio(
+            "pla",
+            portfolio_plans.LiveRebalanceRequest(
+                securities_account_id="acct-1",
+                targets={"600000.SH": 0},
+                dry_run=True,
+            ),
+            current_user={"id": "user-1"},
+        )
+    )
+
+    check = resp["data"]["book_reconciliation"]
+    assert check["in_sync"] is False
+    assert check["diffs"][0]["kind"] == "lineage_excess"
+    assert check["diffs"][0]["lineage_shares"] == 500
+    assert check["diffs"][0]["account_shares"] == 400
+
+
+def test_live_rebalance_logs_lineage_book_mismatch(monkeypatch):
+    """A confirmed order persists a warning operation log for Feishu/audit."""
+    cols, fin, data = _live_rebalance_env()
+    fin["trader_positions"].docs = [
+        {
+            "user_id": "user-1",
+            "securities_account_id": "acct-1",
+            "symbol": "600000.SH",
+            "qty": 400,
+            "can_use_volume": 400,
+        }
+    ]
+    _patch_lineage_live_env(monkeypatch, cols, fin, data)
+    monkeypatch.setattr(portfolio_plans, "schedule_snapshot_rebuild", lambda *a, **k: None)
+
+    resp = asyncio.run(
+        portfolio_plans.live_rebalance_portfolio(
+            "pla",
+            portfolio_plans.LiveRebalanceRequest(
+                securities_account_id="acct-1",
+                targets={"600000.SH": 0},
+                dry_run=False,
+            ),
+            current_user={"id": "user-1"},
+        )
+    )
+
+    assert resp["data"]["book_reconciliation"]["in_sync"] is False
+    mismatch_logs = [
+        row
+        for row in cols["portfolio_plan_operation_logs"].docs
+        if row.get("operation_type") == "book_ledger_mismatch"
+    ]
+    assert len(mismatch_logs) == 1
+    assert mismatch_logs[0]["status"] == "warning"
+    assert mismatch_logs[0]["payload"]["diffs"][0]["kind"] == "lineage_excess"
+
+
 def test_live_rebalance_allows_account_basis_for_t0_and_persists_basis(monkeypatch):
     """T+0 is the only path allowed to read the whole account basis."""
     cols, fin, data = _live_rebalance_env()
