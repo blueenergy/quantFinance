@@ -500,7 +500,7 @@ def equity_snapshot_eod_task():
         data_collections = get_data_db()
         ensure_live_equity_indexes(finance_collections, trading_collections)
         ensure_live_snapshot_indexes(trading_collections, finance_collections)
-        account_result = snapshot_account_equity(finance_collections)
+        account_result = snapshot_account_equity(finance_collections, data_collections)
         plan_result = snapshot_live_plan_equity(trading_collections, finance_collections, data_collections)
         snapshot_result = rebuild_all_live_snapshots(trading_collections, finance_collections)
         log.info(

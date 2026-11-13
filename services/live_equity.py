@@ -85,6 +85,7 @@ def ensure_live_equity_indexes(finance_collections: Dict[str, Any], trading_coll
 
 def snapshot_account_equity(
     finance_collections: Dict[str, Any],
+    data_collections: Optional[Dict[str, Any]] = None,
     *,
     date: Optional[str] = None,
     now: Optional[datetime] = None,
@@ -132,6 +133,16 @@ def snapshot_account_equity(
             "is_stale": is_stale,
             "updated_at": updated_at,
         }
+        if data_collections:
+            row.update(
+                compute_account_position_daily_pnl(
+                    finance_collections,
+                    data_collections,
+                    user_id=user_id,
+                    securities_account_id=securities_account_id,
+                    snapshot_date=snapshot_date,
+                )
+            )
         finance_collections["trader_account_equity"].update_one(
             {"user_id": user_id, "securities_account_id": str(securities_account_id), "date": snapshot_date},
             {"$set": row},
@@ -280,6 +291,115 @@ def _load_latest_close_prices(volume_price: Any, symbols: Iterable[str]) -> Dict
         if price > 0:
             prices[symbol] = price
     return prices
+
+
+def _load_close_pair(
+    data_collections: Dict[str, Any],
+    symbol: str,
+    snapshot_date: str,
+) -> Optional[Tuple[float, float]]:
+    """Return (snapshot-date close, previous trading-day close).
+
+    Only returns a pair when the latest row is exactly ``snapshot_date``. A
+    stale latest row would make a "daily" P&L silently describe an older day.
+    """
+    for collection_name, key in (("volume_price", "symbol"), ("etf_daily", "ts_code")):
+        collection = data_collections.get(collection_name)
+        if collection is None:
+            continue
+        rows = list(
+            collection.find(
+                {key: {"$in": [symbol, _symbol_key(symbol)]}},
+                {"_id": 0, key: 1, "trade_date": 1, "close": 1},
+            ).sort("trade_date", -1)
+        )
+        rows = [row for row in rows if str(row.get("trade_date") or "") <= snapshot_date]
+        if len(rows) < 2:
+            continue
+        latest, previous = rows[0], rows[1]
+        if str(latest.get("trade_date") or "") != snapshot_date:
+            continue
+        today_close = _numeric(latest.get("close"))
+        prev_close = _numeric(previous.get("close"))
+        if today_close > 0 and prev_close > 0:
+            return today_close, prev_close
+    return None
+
+
+def compute_account_position_daily_pnl(
+    finance_collections: Dict[str, Any],
+    data_collections: Dict[str, Any],
+    *,
+    user_id: Any,
+    securities_account_id: Any,
+    snapshot_date: str,
+) -> Dict[str, Any]:
+    """Estimate one account's daily P&L from closing positions and closes.
+
+    The estimate is deterministic price change: ``qty * (close - prev_close)``
+    per position. It excludes fees, dividends and intraday trading effects, so
+    it is marked as an estimate rather than broker-reported daily P&L.
+    """
+    positions = list(
+        finance_collections["trader_positions"].find(
+            {"securities_account_id": str(securities_account_id)}
+        )
+    )
+    positions_snapshot: List[Dict[str, Any]] = []
+    unpriced: List[str] = []
+    daily_pnl = 0.0
+    priced_count = 0
+
+    for position in positions:
+        if user_id and position.get("user_id") and str(position["user_id"]) != str(user_id):
+            continue
+        qty = _numeric(
+            position.get("qty", position.get("quantity", position.get("volume")))
+        )
+        if qty <= 0:
+            continue
+        symbol = str(position.get("symbol") or "")
+        if not symbol:
+            continue
+        closes = _load_close_pair(data_collections, symbol, snapshot_date)
+        if closes is None:
+            unpriced.append(symbol)
+            continue
+        today_close, prev_close = closes
+        daily_pnl += qty * (today_close - prev_close)
+        priced_count += 1
+        positions_snapshot.append({
+            "symbol": symbol,
+            "qty": qty,
+            "close": today_close,
+            "prev_close": prev_close,
+        })
+
+    if not priced_count:
+        return {
+            "daily_pnl": None,
+            "daily_pnl_ratio": None,
+            "daily_pnl_method": "positions_close_estimate",
+            "positions_snapshot": positions_snapshot,
+            "daily_pnl_priced_symbols": priced_count,
+            "daily_pnl_unpriced_symbols": unpriced,
+        }
+
+    equity_col = finance_collections["trader_account_equity"]
+    prior_rows = [
+        row for row in equity_col.find({"securities_account_id": str(securities_account_id)})
+        if str(row.get("date") or "") < snapshot_date
+    ]
+    prior = max(prior_rows, key=lambda row: str(row.get("date") or "")) if prior_rows else None
+    prior_asset = _numeric(prior.get("total_asset")) if prior else 0.0
+    return {
+        "daily_pnl": round(daily_pnl, 2),
+        "daily_pnl_ratio": (daily_pnl / prior_asset) if prior_asset > 0 else None,
+        "daily_pnl_method": "positions_close_estimate",
+        "positions_snapshot": positions_snapshot,
+        "daily_pnl_priced_symbols": priced_count,
+        "daily_pnl_unpriced_symbols": unpriced,
+    }
 
 
 def _load_realtime_prices(volume_price_realtime: Any, symbols: Iterable[str]) -> Tuple[Dict[str, float], Dict[str, Dict[str, Any]]]:

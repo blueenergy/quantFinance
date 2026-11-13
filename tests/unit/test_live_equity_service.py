@@ -318,3 +318,108 @@ def test_build_account_equity_live_point_skips_zero_total_asset():
     )
 
     assert point is None
+
+
+def _account_pnl_collections():
+    return {
+        "trader_accounts": _Collection(
+            [
+                {
+                    "user_id": "user-1",
+                    "securities_account_id": "acct-1",
+                    "total_asset": 100000,
+                    "cash": 20000,
+                    "available_cash": 19000,
+                    "market_value": 80000,
+                    "synced_at": 1,
+                }
+            ]
+        ),
+        "trader_positions": _Collection(
+            [
+                {
+                    "user_id": "user-1",
+                    "securities_account_id": "acct-1",
+                    "symbol": "000001.SZ",
+                    "qty": 1000,
+                }
+            ]
+        ),
+        "trader_account_equity": _Collection(
+            [
+                {
+                    "user_id": "user-1",
+                    "securities_account_id": "acct-1",
+                    "date": "20261111",
+                    "total_asset": 100000,
+                }
+            ]
+        ),
+    }
+
+
+def test_snapshot_account_equity_stores_position_daily_pnl_estimate():
+    collections = _account_pnl_collections()
+    data_collections = {
+        "volume_price": _Collection(
+            [
+                {"symbol": "000001.SZ", "trade_date": "20261111", "close": 10.0},
+                {"symbol": "000001.SZ", "trade_date": "20261112", "close": 9.5},
+            ]
+        )
+    }
+
+    snapshot_account_equity(collections, data_collections, date="20261112", stale_seconds=0)
+
+    row = next(doc for doc in collections["trader_account_equity"].docs if doc["date"] == "20261112")
+    assert row["daily_pnl"] == -500.0
+    assert round(row["daily_pnl_ratio"], 6) == -0.005
+    assert row["daily_pnl_method"] == "positions_close_estimate"
+    assert row["positions_snapshot"] == [
+        {"symbol": "000001.SZ", "qty": 1000.0, "close": 9.5, "prev_close": 10.0}
+    ]
+
+
+def test_snapshot_account_equity_marks_daily_pnl_unknown_without_close_pair():
+    collections = _account_pnl_collections()
+    data_collections = {
+        "volume_price": _Collection(
+            [{"symbol": "000001.SZ", "trade_date": "20261111", "close": 10.0}]
+        )
+    }
+
+    snapshot_account_equity(collections, data_collections, date="20261112", stale_seconds=0)
+
+    row = next(doc for doc in collections["trader_account_equity"].docs if doc["date"] == "20261112")
+    assert row["daily_pnl"] is None
+    assert row["daily_pnl_ratio"] is None
+    assert row["daily_pnl_unpriced_symbols"] == ["000001.SZ"]
+
+
+def test_snapshot_account_equity_uses_etf_daily_for_etf_positions():
+    collections = _account_pnl_collections()
+    collections["trader_positions"] = _Collection(
+        [
+            {
+                "user_id": "user-1",
+                "securities_account_id": "acct-1",
+                "symbol": "510300.SH",
+                "qty": 100,
+            }
+        ]
+    )
+    data_collections = {
+        "etf_daily": _Collection(
+            [
+                {"ts_code": "510300.SH", "trade_date": "20261111", "close": 4.15},
+                {"ts_code": "510300.SH", "trade_date": "20261112", "close": 4.114},
+            ]
+        )
+    }
+
+    snapshot_account_equity(collections, data_collections, date="20261112", stale_seconds=0)
+
+    row = next(doc for doc in collections["trader_account_equity"].docs if doc["date"] == "20261112")
+    assert row["daily_pnl"] == -3.6
+    assert row["positions_snapshot"][0]["symbol"] == "510300.SH"
+
