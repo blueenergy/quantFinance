@@ -23,6 +23,7 @@ from utils.stock_utils import serialize_doc
 from utils.time_display import add_display_time_fields
 from bson import ObjectId
 from services.live_equity import (
+    SHANGHAI_TZ,
     build_account_equity_live_point,
     enrich_account_equity_with_flows,
     list_account_equity,
@@ -849,6 +850,46 @@ def _require_cash_flow_account(collections, user_id: str, securities_account_id:
     return str(sec_id)
 
 
+def _load_previous_close(data_collections, symbol: str, today_key: str) -> Optional[float]:
+    """Return the previous trading-day close for one symbol.
+
+    If today's daily row already landed, the row before it is the previous
+    close; otherwise the latest row is yesterday's close. Missing collections
+    or prices yield ``None`` so the UI can render ``—`` instead of a fake 0%.
+    """
+    base_symbol = symbol.split(".", 1)[0]
+    for collection_name, key in (
+        ("volume_price", "symbol"),
+        ("etf_daily", "ts_code"),
+        ("hk_volume_price", "symbol"),
+        ("us_volume_price", "symbol"),
+    ):
+        collection = data_collections.get(collection_name)
+        if collection is None:
+            continue
+        rows = list(collection.find({key: {"$in": [symbol, base_symbol]}}))
+        rows = [
+            row for row in rows
+            if str(row.get("trade_date") or "") <= today_key
+        ]
+        if not rows:
+            continue
+        rows.sort(key=lambda row: str(row.get("trade_date") or ""), reverse=True)
+        if str(rows[0].get("trade_date") or "") == today_key:
+            if len(rows) < 2:
+                continue
+            previous = rows[1]
+        else:
+            previous = rows[0]
+        try:
+            close = float(previous.get("close") or 0)
+        except (TypeError, ValueError):
+            continue
+        if close > 0:
+            return close
+    return None
+
+
 @router.get("/trader/positions", summary="Get current positions")
 def get_positions(
     securities_account_id: Optional[str] = Query(None, description="Filter by securities account ID"),
@@ -915,9 +956,18 @@ def get_positions(
 
             # Transform field names to match frontend expectations and add stock names
             transformed_positions = []
+            today_key = datetime.now(SHANGHAI_TZ).strftime("%Y%m%d")
             for pos in positions:
+                symbol = pos.get("symbol", "")
+                current_price = float(pos.get("last_price") or 0)
+                prev_close = _load_previous_close(data_collections, symbol, today_key)
+                daily_pnl_ratio = (
+                    round((current_price - prev_close) / prev_close * 100, 2)
+                    if prev_close and current_price > 0
+                    else None
+                )
                 transformed_pos = {
-                    "symbol": pos.get("symbol", ""),
+                    "symbol": symbol,
                     "stock_name": (
                         symbol_to_name.get(pos.get("symbol"))
                         or pos.get("stock_name")
@@ -927,7 +977,9 @@ def get_positions(
                     "available_qty": pos.get("can_use_volume", 0),  # Map 'can_use_volume' to 'available_qty'
                     "frozen_qty": pos.get("frozen_volume", 0),  # Map 'frozen_volume' to 'frozen_qty'
                     "cost_price": pos.get("avg_price", 0.0),  # Map 'avg_price' to 'cost_price'
-                    "current_price": pos.get("last_price", 0.0),  # Map 'last_price' to 'current_price'
+                    "current_price": current_price,  # Map 'last_price' to 'current_price'
+                    "prev_close": prev_close,
+                    "daily_pnl_ratio": daily_pnl_ratio,
                     "market_value": pos.get("market_value", 0.0),
                     "on_road_volume": pos.get("on_road_volume", 0),
                     "timestamp": pos.get("timestamp"),

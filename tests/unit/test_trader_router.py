@@ -887,3 +887,31 @@ class TestMultiAccountScoping:
         )
         assert response.status_code == 200
         assert response.json()["data"]["account_id"] == "62129066"
+
+
+@pytest.mark.unit
+def test_load_previous_close_uses_yesterday_when_today_row_exists():
+    data = {
+        "volume_price": FakeCollection(
+            [
+                {"symbol": "600000.SH", "trade_date": "20261111", "close": 9.8},
+                {"symbol": "600000.SH", "trade_date": "20261112", "close": 10.0},
+            ]
+        )
+    }
+
+    assert trader._load_previous_close(data, "600000.SH", "20261112") == 9.8
+
+
+@pytest.mark.unit
+def test_load_previous_close_uses_latest_row_when_today_missing():
+    data = {
+        "volume_price": FakeCollection(
+            [
+                {"symbol": "600000.SH", "trade_date": "20261111", "close": 9.8},
+                {"symbol": "600000.SH", "trade_date": "20261110", "close": 9.5},
+            ]
+        )
+    }
+
+    assert trader._load_previous_close(data, "600000.SH", "20261113") == 9.8
