@@ -14,6 +14,7 @@ from pydantic import BaseModel, Field
 from typing import List, Optional, Dict, Any
 from datetime import datetime
 import logging
+import math
 import threading
 import time
 from auth import get_current_active_user
@@ -21,7 +22,12 @@ from db import get_db_collections, get_data_db, get_trading_db_collections
 from utils.stock_utils import serialize_doc
 from utils.time_display import add_display_time_fields
 from bson import ObjectId
-from services.live_equity import build_account_equity_live_point, list_account_equity
+from services.live_equity import (
+    build_account_equity_live_point,
+    enrich_account_equity_with_flows,
+    list_account_equity,
+    load_account_cash_flows,
+)
 from services.trade_latency_metrics import build_trade_latency_rollup
 from services.trader_execution_upload import upsert_trader_execution
 from services.portfolio_live_snapshot import rebuild_live_snapshot_for_plan_guarded
@@ -812,6 +818,37 @@ def _resolve_account_scope(
     )
 
 
+class CashFlowCreateRequest(BaseModel):
+    securities_account_id: Optional[str] = None
+    date: str
+    amount: float
+    note: str = ""
+
+
+def _normalize_flow_date(value: str) -> str:
+    text = str(value or "").strip()
+    for fmt in ("%Y%m%d", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(text, fmt).strftime("%Y%m%d")
+        except ValueError:
+            continue
+    raise HTTPException(400, "date 必须是 YYYYMMDD 或 YYYY-MM-DD")
+
+
+def _require_cash_flow_account(collections, user_id: str, securities_account_id: Optional[str]) -> str:
+    sec_id = _resolve_account_scope(collections, user_id, securities_account_id)
+    if not sec_id:
+        raise HTTPException(400, "未找到证券账户")
+    account_coll = collections.get("trader_accounts")
+    if account_coll is not None:
+        owned = account_coll.find_one(
+            {"user_id": user_id, "securities_account_id": str(sec_id)}
+        )
+        if not owned:
+            raise HTTPException(404, "证券账户不存在或无权访问")
+    return str(sec_id)
+
+
 @router.get("/trader/positions", summary="Get current positions")
 def get_positions(
     securities_account_id: Optional[str] = Query(None, description="Filter by securities account ID"),
@@ -1076,11 +1113,89 @@ def get_account_equity(
                 rows = [row for row in rows if row.get("date") != live_date]
                 rows.append(live_point)
                 rows.sort(key=lambda row: str(row.get("date") or ""))
+        if sec_id:
+            rows = enrich_account_equity_with_flows(
+                collections,
+                rows,
+                user_id=user_id,
+                securities_account_id=sec_id,
+            )
         return {"success": True, "data": [serialize_doc(row) for row in rows]}
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to fetch account equity: {str(e)}")
+
+
+@router.get("/trader/cash-flows", summary="List manual external cash flows")
+def list_cash_flows(
+    securities_account_id: Optional[str] = Query(None, description="Filter by securities account ID"),
+    start_date: Optional[str] = Query(None, description="Start date YYYYMMDD or YYYY-MM-DD"),
+    end_date: Optional[str] = Query(None, description="End date YYYYMMDD or YYYY-MM-DD"),
+    current_user: dict = Depends(get_current_active_user),
+):
+    collections = get_db_collections()
+    user_id = current_user["id"]
+    sec_id = _require_cash_flow_account(collections, user_id, securities_account_id)
+    start_ymd = _normalize_flow_date(start_date) if start_date else None
+    end_ymd = _normalize_flow_date(end_date) if end_date else None
+    rows = load_account_cash_flows(
+        collections,
+        user_id=user_id,
+        securities_account_id=sec_id,
+        start_date=start_ymd,
+        end_date=end_ymd,
+    )
+    return {"success": True, "data": [serialize_doc(row) for row in rows]}
+
+
+@router.post("/trader/cash-flows", summary="Create a manual external cash flow")
+def create_cash_flow(
+    request: CashFlowCreateRequest,
+    current_user: dict = Depends(get_current_active_user),
+):
+    collections = get_db_collections()
+    user_id = current_user["id"]
+    sec_id = _require_cash_flow_account(
+        collections, user_id, request.securities_account_id
+    )
+    date_key = _normalize_flow_date(request.date)
+    amount = float(request.amount)
+    if not math.isfinite(amount) or amount == 0:
+        raise HTTPException(400, "amount 必须是非零金额；正数=入金，负数=出金")
+    now = datetime.now()
+    doc = {
+        "user_id": user_id,
+        "securities_account_id": sec_id,
+        "date": date_key,
+        "amount": round(amount, 2),
+        "note": str(request.note or "").strip(),
+        "source": "manual",
+        "created_at": now,
+        "updated_at": now,
+    }
+    result = collections["trader_cash_flows"].insert_one(doc)
+    doc["_id"] = result.inserted_id
+    return {"success": True, "data": serialize_doc(doc)}
+
+
+@router.delete("/trader/cash-flows/{flow_id}", summary="Delete a manual external cash flow")
+def delete_cash_flow(
+    flow_id: str,
+    current_user: dict = Depends(get_current_active_user),
+):
+    collections = get_db_collections()
+    user_id = current_user["id"]
+    try:
+        object_id = ObjectId(flow_id)
+    except Exception:
+        raise HTTPException(400, "Invalid flow_id")
+    result = collections["trader_cash_flows"].delete_one(
+        {"_id": object_id, "user_id": user_id}
+    )
+    if result.deleted_count == 0:
+        raise HTTPException(404, "Cash flow not found")
+    return {"success": True}
 
 
 @router.get("/trader/metrics/latency-rollup", summary="Get live trading latency rollup")

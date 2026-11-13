@@ -69,6 +69,7 @@ def get_db_collections() -> Dict[str, Collection]:
         "trader_positions": db["trader_positions"],  # 实时持仓快照
         "trader_accounts": db["trader_accounts"],  # 账户资金信息
         "trader_account_equity": db["trader_account_equity"],  # 账户级每日资金曲线
+        "trader_cash_flows": db["trader_cash_flows"],  # 手工录入的银证出入金
         "position_snapshots": db["position_snapshots"],  # 历史持仓快照（每日）
         # Intraday T+0 opportunity discovery
         "intraday_t0_mock_positions": db["intraday_t0_mock_positions"],

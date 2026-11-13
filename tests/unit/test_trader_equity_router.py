@@ -1,5 +1,8 @@
 import datetime as _dt
 import time
+from types import SimpleNamespace
+
+from bson import ObjectId
 
 from routers import trader
 from services.live_equity import SHANGHAI_TZ
@@ -24,6 +27,19 @@ class _Collection:
         if sort:
             rows = rows.sort(sort)
         return rows[0] if rows else None
+
+    def insert_one(self, doc):
+        row = dict(doc)
+        row.setdefault("_id", ObjectId())
+        self.docs.append(row)
+        return SimpleNamespace(inserted_id=row["_id"])
+
+    def delete_one(self, query):
+        for index, doc in enumerate(self.docs):
+            if self._matches(doc, query):
+                del self.docs[index]
+                return SimpleNamespace(deleted_count=1)
+        return SimpleNamespace(deleted_count=0)
 
     def _matches(self, doc, query):
         for key, expected in query.items():
@@ -64,9 +80,13 @@ def test_get_account_equity_filters_account_and_dates(monkeypatch):
     )
 
     assert response["success"] is True
-    assert response["data"] == [
-        {"user_id": "user-1", "securities_account_id": "acct-1", "date": "20250604", "total_asset": 100000}
-    ]
+    assert len(response["data"]) == 1
+    row = response["data"][0]
+    assert row["date"] == "20250604"
+    assert row["total_asset"] == 100000
+    assert row["flow_adjusted_equity"] == 100000.0
+    assert row["external_flow"] == 0.0
+    assert row["daily_pnl"] is None
 
 
 def _live_equity_collections():
@@ -134,3 +154,43 @@ def test_get_account_equity_skips_live_point_outside_date_range(monkeypatch):
 
     assert all(row.get("is_intraday") is not True for row in response["data"])
     assert response["data"][-1]["date"] == "20261106"
+
+
+def test_create_list_delete_cash_flow(monkeypatch):
+    collections = {
+        "trader_accounts": _Collection(
+            [{"user_id": "user-1", "securities_account_id": "acct-1"}]
+        ),
+        "trader_cash_flows": _Collection(),
+    }
+    monkeypatch.setattr(trader, "get_db_collections", lambda: collections)
+
+    created = trader.create_cash_flow(
+        trader.CashFlowCreateRequest(
+            securities_account_id="acct-1",
+            date="2026-11-12",
+            amount=30000,
+            note="入金",
+        ),
+        current_user={"id": "user-1"},
+    )
+    assert created["success"] is True
+    assert created["data"]["date"] == "20261112"
+    assert created["data"]["amount"] == 30000
+    assert created["data"]["source"] == "manual"
+
+    listed = trader.list_cash_flows(
+        securities_account_id="acct-1",
+        start_date=None,
+        end_date=None,
+        current_user={"id": "user-1"},
+    )
+    assert len(listed["data"]) == 1
+    assert listed["data"][0]["note"] == "入金"
+
+    deleted = trader.delete_cash_flow(
+        flow_id=created["data"]["_id"],
+        current_user={"id": "user-1"},
+    )
+    assert deleted["success"] is True
+    assert collections["trader_cash_flows"].docs == []

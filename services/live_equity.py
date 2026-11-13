@@ -83,6 +83,147 @@ def ensure_live_equity_indexes(finance_collections: Dict[str, Any], trading_coll
     )
 
 
+def _date_key(value: Any) -> str:
+    return str(value or "").replace("-", "")[:8]
+
+
+def load_account_cash_flows(
+    finance_collections: Dict[str, Any],
+    *,
+    user_id: Any,
+    securities_account_id: Any,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Load manually recorded external cash flows for one account."""
+    collection = finance_collections.get("trader_cash_flows")
+    if collection is None:
+        return []
+    query: Dict[str, Any] = {
+        "user_id": user_id,
+        "securities_account_id": str(securities_account_id),
+    }
+    date_query: Dict[str, str] = {}
+    if start_date:
+        date_query["$gte"] = _date_key(start_date)
+    if end_date:
+        date_query["$lte"] = _date_key(end_date)
+    if date_query:
+        query["date"] = date_query
+    return list(collection.find(query).sort("date", 1))
+
+
+def _external_flow_for_date(
+    finance_collections: Dict[str, Any],
+    *,
+    user_id: Any,
+    securities_account_id: Any,
+    date_key: str,
+) -> float:
+    collection = finance_collections.get("trader_cash_flows")
+    if collection is None:
+        return 0.0
+    rows = collection.find(
+        {
+            "user_id": user_id,
+            "securities_account_id": str(securities_account_id),
+            "date": date_key,
+        }
+    )
+    return round(sum(_numeric(row.get("amount")) for row in rows), 2)
+
+
+def _previous_account_equity_row(
+    finance_collections: Dict[str, Any],
+    *,
+    user_id: Any,
+    securities_account_id: Any,
+    snapshot_date: str,
+) -> Optional[Dict[str, Any]]:
+    rows = [
+        row
+        for row in finance_collections["trader_account_equity"].find(
+            {"user_id": user_id, "securities_account_id": str(securities_account_id)}
+        )
+        if _date_key(row.get("date")) < snapshot_date
+    ]
+    return max(rows, key=lambda row: _date_key(row.get("date"))) if rows else None
+
+
+def enrich_account_equity_with_flows(
+    finance_collections: Dict[str, Any],
+    rows: List[Dict[str, Any]],
+    *,
+    user_id: Any,
+    securities_account_id: Any,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Attach flow-adjusted equity and flow-adjusted daily P&L to equity rows.
+
+    A recorded cash flow is removed from the total-asset change before it is
+    called P&L. If a flow was not recorded, it will still look like P&L; the
+    manual cash-flow ledger is the source of truth for external flows.
+    """
+    if not rows:
+        return rows
+    flows = load_account_cash_flows(
+        finance_collections,
+        user_id=user_id,
+        securities_account_id=securities_account_id,
+        start_date=start_date,
+        end_date=end_date,
+    )
+    flow_by_date: Dict[str, float] = defaultdict(float)
+    for flow in flows:
+        flow_by_date[_date_key(flow.get("date"))] += _numeric(flow.get("amount"))
+    flow_dates = sorted(flow_by_date)
+
+    enriched_rows: List[Dict[str, Any]] = []
+    previous_equity: Optional[float] = None
+    first_adjusted_equity: Optional[float] = None
+    previous_date = ""
+    for row in rows:
+        date_key = _date_key(row.get("date"))
+        equity = _numeric(row.get("total_asset", row.get("equity")))
+        external_flow = round(flow_by_date.get(date_key, 0.0), 2)
+        cumulative_flow = round(
+            sum(flow_by_date[flow_date] for flow_date in flow_dates if flow_date <= date_key),
+            2,
+        )
+        adjusted_equity = round(equity - cumulative_flow, 2)
+        if first_adjusted_equity is None:
+            first_adjusted_equity = adjusted_equity
+        daily_pnl = None
+        daily_pnl_ratio = None
+        if previous_equity is not None:
+            daily_pnl = round(equity - previous_equity - external_flow, 2)
+            daily_pnl_ratio = (daily_pnl / previous_equity) if previous_equity > 0 else None
+        enriched = {
+            **row,
+            "external_flow": external_flow,
+            "cumulative_external_flow": cumulative_flow,
+            "flow_adjusted_equity": adjusted_equity,
+            "flow_adjusted_change_from_start": round(
+                adjusted_equity - first_adjusted_equity, 2
+            ),
+            "daily_pnl": daily_pnl if daily_pnl is not None else row.get("daily_pnl"),
+            "daily_pnl_ratio": (
+                daily_pnl_ratio if daily_pnl_ratio is not None else row.get("daily_pnl_ratio")
+            ),
+            "daily_pnl_method": (
+                "total_asset_delta_minus_external_flow"
+                if daily_pnl is not None
+                else row.get("daily_pnl_method")
+            ),
+            "flow_adjusted_previous_date": previous_date or None,
+        }
+        enriched_rows.append(enriched)
+        previous_equity = equity
+        previous_date = date_key
+    return enriched_rows
+
+
 def snapshot_account_equity(
     finance_collections: Dict[str, Any],
     data_collections: Optional[Dict[str, Any]] = None,
@@ -133,7 +274,28 @@ def snapshot_account_equity(
             "is_stale": is_stale,
             "updated_at": updated_at,
         }
-        if data_collections:
+        previous_row = _previous_account_equity_row(
+            finance_collections,
+            user_id=user_id,
+            securities_account_id=securities_account_id,
+            snapshot_date=snapshot_date,
+        )
+        if previous_row is not None:
+            prior_asset = _numeric(previous_row.get("total_asset"))
+            external_flow = _external_flow_for_date(
+                finance_collections,
+                user_id=user_id,
+                securities_account_id=securities_account_id,
+                date_key=snapshot_date,
+            )
+            daily_pnl = round(total_asset - prior_asset - external_flow, 2)
+            row.update({
+                "external_flow": external_flow,
+                "daily_pnl": daily_pnl,
+                "daily_pnl_ratio": (daily_pnl / prior_asset) if prior_asset > 0 else None,
+                "daily_pnl_method": "total_asset_delta_minus_external_flow",
+            })
+        elif data_collections:
             row.update(
                 compute_account_position_daily_pnl(
                     finance_collections,

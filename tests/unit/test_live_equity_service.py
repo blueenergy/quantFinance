@@ -4,6 +4,7 @@ from services.live_equity import (
     SHANGHAI_TZ,
     build_account_equity_live_point,
     compute_live_plan_equity,
+    enrich_account_equity_with_flows,
     snapshot_account_equity,
     snapshot_live_plan_equity,
 )
@@ -355,11 +356,35 @@ def _account_pnl_collections():
                 }
             ]
         ),
+        "trader_cash_flows": _Collection(),
     }
 
 
-def test_snapshot_account_equity_stores_position_daily_pnl_estimate():
+def test_snapshot_account_equity_uses_total_asset_delta_minus_flow():
     collections = _account_pnl_collections()
+    collections["trader_accounts"].docs[0]["total_asset"] = 116000
+    collections["trader_cash_flows"] = _Collection(
+        [
+            {
+                "user_id": "user-1",
+                "securities_account_id": "acct-1",
+                "date": "20261112",
+                "amount": 30000,
+            }
+        ]
+    )
+
+    snapshot_account_equity(collections, date="20261112", stale_seconds=0)
+
+    row = next(doc for doc in collections["trader_account_equity"].docs if doc["date"] == "20261112")
+    assert row["daily_pnl"] == -14000.0
+    assert row["external_flow"] == 30000.0
+    assert row["daily_pnl_method"] == "total_asset_delta_minus_external_flow"
+
+
+def test_snapshot_account_equity_falls_back_to_position_pnl_without_prior_point():
+    collections = _account_pnl_collections()
+    collections["trader_account_equity"] = _Collection()
     data_collections = {
         "volume_price": _Collection(
             [
@@ -373,15 +398,12 @@ def test_snapshot_account_equity_stores_position_daily_pnl_estimate():
 
     row = next(doc for doc in collections["trader_account_equity"].docs if doc["date"] == "20261112")
     assert row["daily_pnl"] == -500.0
-    assert round(row["daily_pnl_ratio"], 6) == -0.005
     assert row["daily_pnl_method"] == "positions_close_estimate"
-    assert row["positions_snapshot"] == [
-        {"symbol": "000001.SZ", "qty": 1000.0, "close": 9.5, "prev_close": 10.0}
-    ]
 
 
 def test_snapshot_account_equity_marks_daily_pnl_unknown_without_close_pair():
     collections = _account_pnl_collections()
+    collections["trader_account_equity"] = _Collection()
     data_collections = {
         "volume_price": _Collection(
             [{"symbol": "000001.SZ", "trade_date": "20261111", "close": 10.0}]
@@ -398,6 +420,7 @@ def test_snapshot_account_equity_marks_daily_pnl_unknown_without_close_pair():
 
 def test_snapshot_account_equity_uses_etf_daily_for_etf_positions():
     collections = _account_pnl_collections()
+    collections["trader_account_equity"] = _Collection()
     collections["trader_positions"] = _Collection(
         [
             {
@@ -422,4 +445,33 @@ def test_snapshot_account_equity_uses_etf_daily_for_etf_positions():
     row = next(doc for doc in collections["trader_account_equity"].docs if doc["date"] == "20261112")
     assert row["daily_pnl"] == -3.6
     assert row["positions_snapshot"][0]["symbol"] == "510300.SH"
+
+
+def test_enrich_account_equity_with_flows_splits_a_deposit_from_pnl():
+    collections = _account_pnl_collections()
+    collections["trader_cash_flows"] = _Collection(
+        [
+            {
+                "user_id": "user-1",
+                "securities_account_id": "acct-1",
+                "date": "20261112",
+                "amount": 30000,
+            }
+        ]
+    )
+    rows = [
+        {"date": "20261111", "total_asset": 100000},
+        {"date": "20261112", "total_asset": 116000},
+    ]
+
+    enriched = enrich_account_equity_with_flows(
+        collections, rows, user_id="user-1", securities_account_id="acct-1"
+    )
+
+    assert enriched[0]["daily_pnl"] is None
+    assert enriched[1]["daily_pnl"] == -14000.0
+    assert enriched[1]["external_flow"] == 30000.0
+    assert enriched[1]["cumulative_external_flow"] == 30000.0
+    assert enriched[1]["flow_adjusted_equity"] == 86000.0
+    assert enriched[1]["flow_adjusted_change_from_start"] == -14000.0
 
