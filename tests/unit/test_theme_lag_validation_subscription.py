@@ -333,3 +333,133 @@ def test_subscription_scan_skips_when_eval_not_newer(monkeypatch):
 
     tl_task.run_theme_lag_validation_subscription_scan("job-c")
     assert notifications.inserted == []
+
+
+def _run_scan(monkeypatch, tl_task, subs, val, notifications, job_id="job-x"):
+    def fake_get_db_collections():
+        return {
+            "theme_lag_validation_subscriptions": subs,
+            "notifications": notifications,
+            "notification_settings": FakeNotificationSettingsCollection(),
+            "users": UsersStub(),
+        }
+
+    def fake_get_data_db():
+        return {"theme_lag_candidate_validation": val}
+
+    monkeypatch.setattr(tl_task, "_send_optional_theme_lag_email", lambda *a, **k: None)
+    monkeypatch.setattr("db.get_db_collections", fake_get_db_collections)
+    monkeypatch.setattr("db.get_data_db", fake_get_data_db)
+    tl_task.run_theme_lag_validation_subscription_scan(job_id)
+
+
+@pytest.mark.unit
+def test_subscription_scan_skips_pending_window_and_falls_back_to_matured(monkeypatch):
+    """pending_window 不通知；应回退到最近一篇已成熟文档。"""
+    import services.theme_lag_validation_subscription_task as tl_task
+
+    uid = str(ObjectId())
+    subs = FakeSubscriptionsCollection()
+    subs.docs.append(
+        {
+            "_id": ObjectId(),
+            "user_id": uid,
+            "index_store_key": "csi1000",
+            "enabled": True,
+            "last_notified_eval_utc_ts": 0.0,
+        }
+    )
+    val = FakeValidationCollection(
+        [
+            {
+                "index_store_key": "csi1000",
+                "anchor_trade_date": "20260115",
+                "eval_completed_at": 1_700_000_000.0,
+                "run_status": "computed",
+            },
+            {
+                "index_store_key": "csi1000",
+                "anchor_trade_date": "20260116",
+                "eval_completed_at": 1_700_000_100.0,
+                "run_status": "pending_window",
+            },
+        ]
+    )
+    notifications = FakeNotificationsCollection()
+    _run_scan(monkeypatch, tl_task, subs, val, notifications)
+
+    assert len(notifications.inserted) == 1
+    assert notifications.inserted[0]["data"]["anchor_trade_date"] == "20260115"
+    assert subs.docs[0]["last_notified_anchor_trade_date"] == "20260115"
+
+
+@pytest.mark.unit
+def test_subscription_scan_skips_same_anchor_rerun_with_newer_eval(monkeypatch):
+    """回补重算同一锚定日时 eval_ts 会更新，但不应重复通知。"""
+    import services.theme_lag_validation_subscription_task as tl_task
+
+    uid = str(ObjectId())
+    subs = FakeSubscriptionsCollection()
+    subs.docs.append(
+        {
+            "_id": ObjectId(),
+            "user_id": uid,
+            "index_store_key": "csi1000",
+            "enabled": True,
+            "last_notified_eval_utc_ts": 1_700_000_000.0,
+            "last_notified_anchor_trade_date": "20260115",
+        }
+    )
+    val = FakeValidationCollection(
+        [
+            {
+                "index_store_key": "csi1000",
+                "anchor_trade_date": "20260115",
+                "eval_completed_at": 1_700_000_100.0,
+                "run_status": "computed",
+            }
+        ]
+    )
+    notifications = FakeNotificationsCollection()
+    _run_scan(monkeypatch, tl_task, subs, val, notifications)
+
+    assert notifications.inserted == []
+
+
+@pytest.mark.unit
+def test_subscription_scan_notifies_newer_matured_anchor(monkeypatch):
+    import services.theme_lag_validation_subscription_task as tl_task
+
+    uid = str(ObjectId())
+    subs = FakeSubscriptionsCollection()
+    subs.docs.append(
+        {
+            "_id": ObjectId(),
+            "user_id": uid,
+            "index_store_key": "csi1000",
+            "enabled": True,
+            "last_notified_eval_utc_ts": 1_700_000_000.0,
+            "last_notified_anchor_trade_date": "20260115",
+        }
+    )
+    val = FakeValidationCollection(
+        [
+            {
+                "index_store_key": "csi1000",
+                "anchor_trade_date": "20260115",
+                "eval_completed_at": 1_700_000_000.0,
+                "run_status": "computed",
+            },
+            {
+                "index_store_key": "csi1000",
+                "anchor_trade_date": "20260116",
+                "eval_completed_at": 1_700_000_100.0,
+                "run_status": "computed",
+            },
+        ]
+    )
+    notifications = FakeNotificationsCollection()
+    _run_scan(monkeypatch, tl_task, subs, val, notifications)
+
+    assert len(notifications.inserted) == 1
+    assert notifications.inserted[0]["data"]["anchor_trade_date"] == "20260116"

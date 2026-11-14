@@ -6,6 +6,10 @@
 - enabled: bool，默认 true
 - created_at / updated_at: **UTC 的 BSON datetime**（库内可读；API 经 serialize_doc 为 ISO 8601 字符串）
 - last_notified_eval_utc_ts: float，上次已通知的 eval_completed_at（UTC epoch）；缺省视为 0
+- last_notified_anchor_trade_date: str，上次已通知的锚定日；同一锚定日重算不重复通知
+
+只在 ``run_status != pending_window``（窗口已成熟）的文档里取最新锚定日；同一锚定日的
+回补重算不会再次通知，只有锚定日前进（或在 T+2 后首次成熟）时才通知。
 
 纸面 trade_executions 由 quant-data-engine 在验证落库时按订阅用户写入；本任务仅负责站内通知 + 可选邮件。
 """
@@ -112,7 +116,7 @@ def run_theme_lag_validation_subscription_scan(job_id: str) -> None:
                 continue
 
             latest = val_coll.find_one(
-                {"index_store_key": sk},
+                {"index_store_key": sk, "run_status": {"$ne": "pending_window"}},
                 sort=[("anchor_trade_date", -1)],
             )
             if not latest:
@@ -126,7 +130,12 @@ def run_theme_lag_validation_subscription_scan(job_id: str) -> None:
             if ev_ts <= last:
                 continue
 
-            anchor = latest.get("anchor_trade_date", "")
+            anchor = str(latest.get("anchor_trade_date", "") or "")
+            last_anchor = str(sub.get("last_notified_anchor_trade_date") or "").strip()
+            if last_anchor and anchor <= last_anchor:
+                # 同一锚定日的回补重算不重复通知；只有更新锚定日（或首次成熟）才通知
+                continue
+
             run_status = latest.get("run_status", "")
             agg = latest.get("aggregate") or {}
             title = "主题补涨验证已更新"
@@ -169,6 +178,7 @@ def run_theme_lag_validation_subscription_scan(job_id: str) -> None:
                     "$set": {
                         "last_notified_eval_utc_ts": ev_ts,
                         "last_notified_anchor_trade_date": anchor,
+                        "last_notified_run_status": run_status,
                         "updated_at": now_dt,
                     }
                 },
