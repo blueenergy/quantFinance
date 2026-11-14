@@ -131,7 +131,12 @@ async def hermes_ladder_daily(
     date: Optional[str] = Query(None, description="YYYYMMDD，默认今天"),
     _: bool = Depends(require_hermes_quant_internal_key),
 ):
-    """供 Hermes skill / curl 拉取连板天梯 JSON（需 X-Hermes-Quant-Key）。"""
+    """按交易日返回连板天梯明细（涨停/跌停/炸板股与连板高度分布）。
+
+    何时用：需要当日涨停结构、连板高度、晋级率等原始数据时；date 可回看历史交易日。
+    何时不用：需要文字版市场动向总结时用 ladder_narrative（LLM 生成，读缓存）。
+    返回：涨停/跌停/炸板列表、连板分层计数；数据来自已入库日线，非实时行情。
+    """
     return build_daily_ladder_payload(date)
 
 
@@ -326,10 +331,11 @@ async def hermes_get_analysis_history(
     x_user_token: Optional[str] = Header(None, alias="X-User-Token"),
     _: bool = Depends(require_hermes_quant_internal_key),
 ):
-    """
-    查询某股的最新深度分析历史（已完成的任务写入 analysis_history 集合）。
+    """查询某股的深度分析历史（按时间倒序，含分析正文）。
 
-    返回最近 limit 条，含分析正文摘要。
+    何时用：想回看此前对该股的分析结论、或判断是否需要重新分析（今日是否已分析过）时。
+    何时不用：需要最新分析时用 deep_analysis（当日幂等，已有任务会直接复用）。
+    返回：最近 limit 条的创建时间、模型、分析正文；归属由 X-User-Token 决定，未登录回退 hermes-system。
     """
     user = _resolve_user(username, x_user_token)
     payload = build_user_analysis_history_payload(
@@ -421,7 +427,12 @@ async def hermes_market_events_weekly(
     min_importance: int = Query(3, ge=1, le=4),
     _: bool = Depends(require_hermes_quant_internal_key),
 ):
-    """本周/未来两周市场事件日历（宏观 + A股公司事件），供悟空「本周事件」简报。"""
+    """本周/未来两周市场事件日历（宏观数据 + A股公司事件），按日分组。
+
+    何时用：需要「本周盯什么/未来事件」时；可用 min_importance 过滤重要度。
+    何时不用：查历史已发生的事件用 analysis_history 或新闻类工具。
+    返回：按日期分组的 events（事件时间、标题、重要度、影响标的）；读取已入库日历，不触发 LLM。
+    """
     from routers.market_events import query_market_events
 
     payload = query_market_events(min_importance=min_importance, limit=200)
@@ -493,10 +504,11 @@ async def hermes_hot_stock(
 async def hermes_global_market(
     _: bool = Depends(require_hermes_quant_internal_key),
 ):
-    """
-    获取最新全球市场简报（美股、港股、外汇、大宗商品、宏观联动分析）。
+    """获取最新全球市场简报（美股/港股/外汇/大宗商品 + 对 A 股的传导分析）。
 
-    数据由系统自动生成，读取缓存，不触发 LLM 调用。
+    何时用：分析隔夜外盘对 A 股的影响、或需要海外宏观/大宗商品背景时。
+    何时不用：只用 A 股内部数据即可回答时不必调用；需要个股层面结论用 deep_analysis。
+    返回：AI 分析正文与生成时间；读缓存，不触发 LLM，可能滞后于最新行情。
     """
     doc = get_analyzer_db()["global_analysis"].find_one(sort=[("_id", -1)])
     if not doc:
@@ -552,10 +564,11 @@ async def hermes_sector_latest(
     source: str = Query("dc", description="数据源: dc（东方财富，默认）或 ths（同花顺）"),
     _: bool = Depends(require_hermes_quant_internal_key),
 ):
-    """
-    获取最新板块/概念 AI 分析结果，读取缓存，不触发 LLM。
+    """获取最新板块/概念 AI 分析结论（推荐与回避板块 + 理由），读缓存不触发 LLM。
 
-    返回当日热门板块/概念的消内容要和 AI 点评。
+    何时用：需要当日主线板块判断、板块轮动方向、推荐/回避理由时。
+    何时不用：需要板块原始资金流/涨跌幅明细时用行情类工具；数据过期时先看返回的 stale 与 age_days。
+    返回：推荐板块（含领涨股、置信度）、回避板块、主题总结、数据日期与新鲜度标记。
     """
     source = source.lower()
     if source not in ("dc", "ths"):
@@ -4037,7 +4050,12 @@ async def hermes_backtest_strategies(
     x_user_token: str = Header(..., alias="X-User-Token"),
     _: bool = Depends(require_hermes_quant_internal_key),
 ):
-    """List strategies with presets and parameter metadata for sweep planning."""
+    """列出可用于参数扫描的策略、预设参数与参数元数据。
+
+    何时用：准备提交 backtest sweep 前，先确认策略名、可调参数与取值范围。
+    何时不用：只想看历史回测结果时用 backtest_sweep_status。
+    返回：策略列表、预设组合、参数名/类型/默认值；需要有效 X-User-Token。
+    """
     user = _require_mcp_user_token(x_user_token)
     return _build_backtest_strategies_payload(user)
 
@@ -4048,7 +4066,12 @@ async def hermes_submit_backtest_sweep(
     x_user_token: str = Header(..., alias="X-User-Token"),
     _: bool = Depends(require_hermes_quant_internal_key),
 ):
-    """Submit a compare-grid backtest batch and return batch_id immediately."""
+    """提交参数扫描（compare-grid）回测批次，立即返回 batch_id 不等待完成。
+
+    何时用：需要比较一组参数组合的表现时；提交后用 backtest_sweep_status 轮询。
+    何时不用：只想跑单次回测或未确认参数时，先调 backtest_strategies。
+    返回：batch_id、创建的任务数；需要有效 X-User-Token，扫描耗时取决于组合数量。
+    """
     collections = get_db_collections()
     user = _require_mcp_user_token(x_user_token)
     payload = BacktestBatchCreate(**body.model_dump())
@@ -4068,7 +4091,12 @@ async def hermes_backtest_sweep_status(
     x_user_token: str = Header(..., alias="X-User-Token"),
     _: bool = Depends(require_hermes_quant_internal_key),
 ):
-    """Poll compare batch progress and return all completed metric rows."""
+    """轮询参数扫描批次进度，返回已完成组合的指标明细。
+
+    何时用：submit_backtest_sweep 拿到 batch_id 后反复调用，直到 status 为终态。
+    何时不用：没有 batch_id 时；未提交扫描前。
+    返回：批次状态、进度、各组合收益/回撤等指标行；需要有效 X-User-Token。
+    """
     collections = get_db_collections()
     user = _require_mcp_user_token(x_user_token)
     summary = refresh_batch_summary(collections, batch_id, user["id"])
@@ -4720,7 +4748,12 @@ def institutional_holdings_summary(
     top_n: int = Query(20, ge=1, le=100, description="每类 Top 股票/机构数量"),
     _: bool = Depends(require_hermes_quant_internal_key),
 ):
-    """按报告期汇总社保/养老金/险资/外资等前十大流通股东持仓。"""
+    """按报告期汇总社保/养老金/险资/外资/北向等前十大流通股东持仓。
+
+    何时用：需要机构持仓截面（谁在买、新进/增持、行业分布）时；period 必填（YYYYMMDD）。
+    何时不用：需要单只股票的股东明细或质押/解禁信息时用其他个股类工具。
+    返回：各机构类别 Top 持仓股票、新进标的、行业分布；数据来自季报截面，存在披露滞后。
+    """
     return _institutional_holdings_summary_payload(
         period=period,
         categories=categories,
