@@ -238,6 +238,9 @@ def get_data_db():
         "stock_monthly": data_db["stock_monthly"],
         "money_flow": data_db["money_flow"],
         "stk_nineturn": data_db["stk_nineturn"],
+        # 筹码分布：cyq_perf 全市场日频，cyq_chips 逐票（自选+持仓）
+        "cyq_perf": data_db["cyq_perf"],
+        "cyq_chips": data_db["cyq_chips"],
         "minute_bars": data_db["minute_bars"],
         # Limit-up/down ladder
         "daily_limit_up": data_db["daily_limit_up"],

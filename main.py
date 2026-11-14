@@ -105,6 +105,7 @@ from routers.futures import router as futures_router
 from routers.intraday_t0 import router as intraday_t0_router
 from routers.market_insights import router as market_insights_router
 from routers.entropy_ranking import router as entropy_ranking_router
+from routers.chip_monitor import router as chip_monitor_router
 from routers.screeners import router as screeners_router
 from routers.agent_screening_tools import router as agent_screening_tools_router
 from routers.navigation_policy import user_router as navigation_user_router
@@ -244,6 +245,7 @@ app.include_router(futures_router, prefix="/api", tags=["期货"])
 app.include_router(intraday_t0_router, prefix="/api", tags=["日内T+0"])
 app.include_router(market_insights_router, prefix="/api", tags=["火眼金睛"])
 app.include_router(entropy_ranking_router, prefix="/api", tags=["熵值因子排名"])
+app.include_router(chip_monitor_router, prefix="/api", tags=["筹码监控"])
 app.include_router(screeners_router, prefix="/api", tags=["选股筛选"])
 app.include_router(agent_screening_tools_router, prefix="/api", tags=["Agent screening tools"])
 
