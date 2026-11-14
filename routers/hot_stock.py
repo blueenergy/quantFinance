@@ -181,7 +181,16 @@ async def get_today_history(
     if source not in ("ths", "dc"):
         raise HTTPException(400, "source must be 'ths' or 'dc'")
 
-    trade_date = date or datetime.now().strftime("%Y%m%d")
+    # Default to the latest analysis's own trade date, not "today": analyses
+    # are keyed by the trading day of the hot list, so before the 23:05 run
+    # (or on a non-trading day) "today" would return nothing.
+    if date:
+        trade_date = date
+    else:
+        latest = analysis_col.find_one({"source": source}, sort=[("created_at", -1)])
+        trade_date = (
+            latest.get("trade_date") if latest else None
+        ) or datetime.now().strftime("%Y%m%d")
 
     docs = list(
         analysis_col.find(
