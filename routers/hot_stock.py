@@ -269,6 +269,25 @@ async def get_data_status(
     }
 
 
+def _finite_or_none(value):
+    """NaN/Inf are not JSON compliant — FastAPI raises on them."""
+    import math
+
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _text_or_none(value):
+    """pandas NaN reaches Mongo as float('nan'); JSON cannot encode it."""
+    if value is None:
+        return None
+    text = str(value).strip()
+    return None if text.lower() in {"", "nan", "none"} else text
+
+
 @router.get("/hk-execution-hint", summary="港股人气榜次日执行提示")
 async def get_hk_execution_hint(
     top_n: int = Query(20, ge=5, le=50, description="每个榜单取前 N 名"),
@@ -314,14 +333,14 @@ async def get_hk_execution_hint(
                 "ts_code": code,
                 "name": row.get("ts_name") or "",
                 "rank": int(rank),
-                "pct_change": row.get("pct_change"),
-                "concept": row.get("concept"),
+                "pct_change": _finite_or_none(row.get("pct_change")),
+                "concept": _text_or_none(row.get("concept")),
                 "sources": [],
             })
             item["rank"] = min(item["rank"], int(rank))
             item["sources"].append(source)
-            if row.get("concept"):
-                item["concept"] = row.get("concept")
+            if _text_or_none(row.get("concept")):
+                item["concept"] = _text_or_none(row.get("concept"))
 
     rows = sorted(merged.values(), key=lambda x: (x["rank"], x["ts_code"]))
     for item in rows:
