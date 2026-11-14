@@ -47,6 +47,7 @@ _NAV_ROWS: List[Tuple[str, str, int]] = [
     ("data-pulse", "🛰️ 数据脉搏", 8),
     ("market-analysis", "🤖 AI大盘分析", 9),
     ("limit-up-ladder", "📊 连板天梯", 10),
+    ("national-team", "🏛️ 国家队动向", 11),
     ("x-influencer-voices", "🐦 X大V情报", 12),
     ("theme-lag-recommend", "📌 主题补涨", 15),
     ("daily-gold-picks", "⭐ 每日金股", 16),
