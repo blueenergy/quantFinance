@@ -321,8 +321,9 @@ async def hermes_get_task_status(
 @router.get("/analysis/history", operation_id="analysis_history", tags=[MCP_READ_TAG])
 async def hermes_get_analysis_history(
     symbol: str = Query(..., description="股票代码，例如 600519 或 600519.SH"),
-    username: Optional[str] = Query(None, description="归属用户；留空则查 hermes-system"),
+    username: Optional[str] = Query(None, description="归属用户；留空则用 X-User-Token，未登录回退 hermes-system"),
     limit: int = Query(5, ge=1, le=20, description="返回条数"),
+    x_user_token: Optional[str] = Header(None, alias="X-User-Token"),
     _: bool = Depends(require_hermes_quant_internal_key),
 ):
     """
@@ -330,7 +331,7 @@ async def hermes_get_analysis_history(
 
     返回最近 limit 条，含分析正文摘要。
     """
-    user = _resolve_user(username)
+    user = _resolve_user(username, x_user_token)
     payload = build_user_analysis_history_payload(
         user["id"],
         symbol=symbol,
