@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
+
+from utils.symbol_utils import normalize_symbol
 
 
 TERMINAL_STATUSES = {"completed", "failed", "completed_with_parse_error"}
@@ -179,7 +181,7 @@ def build_task_doc(
         "updated_at": now,
     }
     if symbol:
-        task_doc["symbol"] = symbol
+        task_doc["symbol"] = normalize_symbol(symbol)
     if stock_name:
         task_doc["stock_name"] = stock_name
     if provider:
@@ -196,6 +198,87 @@ def build_task_doc(
             if k not in _PROTECTED:
                 task_doc[k] = v
     return task_doc
+
+
+def find_or_create_deep_analysis_task(
+    collections,
+    *,
+    current_user: Optional[Dict[str, Any]],
+    symbol: str,
+    analysis_mode: Any,
+    priority: int = 30,
+    provider: Optional[str] = None,
+    model: Optional[str] = None,
+    source: str = "hermes_mcp",
+    feedback: Optional[str] = None,
+    revision_of: Optional[str] = None,
+    extra_params: Optional[Dict[str, Any]] = None,
+    force: bool = False,
+) -> Tuple[Dict[str, Any], bool]:
+    """Idempotent deep-analysis task creation.
+
+    One task per ``(symbol, date, analysis_mode)``: pending/processing or
+    completed tasks are reused; failed/parse-error tasks do not block a retry.
+    ``force`` (or feedback/revision) creates a new task.
+    """
+    symbol = normalize_symbol(symbol)
+    mode = str(getattr(analysis_mode, "value", analysis_mode))
+    day = datetime.now().strftime("%Y%m%d")
+    tasks = collections["analysis_tasks"]
+
+    if not force:
+        key = {
+            "type": "deep_analysis",
+            "symbol": symbol,
+            "params.date": day,
+            "params.analysis_mode": mode,
+        }
+        existing = tasks.find_one(
+            {**key, "status": {"$in": ["pending", "processing"]}},
+            sort=[("created_at", 1)],
+        )
+        if existing:
+            return existing, True
+        existing = tasks.find_one(
+            {**key, "status": "completed"},
+            sort=[("completed_at", -1)],
+        )
+        if existing:
+            return existing, True
+
+        # Transition fallback: tasks created before params.date was added.
+        day_start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        existing = tasks.find_one(
+            {
+                "type": "deep_analysis",
+                "symbol": symbol,
+                "created_at": {"$gte": day_start},
+                "params.analysis_mode": mode,
+                "status": {"$in": ["pending", "processing", "completed"]},
+            },
+            sort=[("created_at", 1)],
+        )
+        if existing:
+            return existing, True
+
+    params: Dict[str, Any] = {"analysis_mode": mode, "date": day}
+    if extra_params:
+        params.update(extra_params)
+    task_doc = build_task_doc(
+        current_user=current_user,
+        task_type="deep_analysis",
+        priority=priority,
+        symbol=symbol,
+        params=params,
+        provider=provider,
+        model=model,
+        source=source,
+        revision_of=revision_of,
+        feedback=feedback,
+    )
+    result = tasks.insert_one(task_doc)
+    task_doc["_id"] = result.inserted_id
+    return task_doc, False
 
 
 def can_access_task(task: Dict[str, Any], current_user: Dict[str, Any]) -> bool:

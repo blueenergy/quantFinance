@@ -1,8 +1,12 @@
 import pytest
 
+from datetime import datetime
+from types import SimpleNamespace
+
 from services.analysis_tasks import (
     build_task_doc,
     can_access_task,
+    find_or_create_deep_analysis_task,
     infer_task_data_date,
     infer_task_type,
     normalize_task_status,
@@ -27,6 +31,91 @@ def test_build_task_doc_includes_normalized_owner_fields():
     assert doc["created_by_username"] == "alice"
     assert doc["feedback"] == "improve reasons"
     assert doc["params"]["k"] == "v"
+    assert doc["symbol"] == "600000.SH"
+
+
+class _FakeTasks:
+    def __init__(self, docs=None):
+        self.docs = list(docs or [])
+        self.inserted = 0
+
+    @staticmethod
+    def _match(doc, query):
+        for key, expected in query.items():
+            value = (doc.get("params") or {}).get(key.split(".", 1)[1]) if key.startswith("params.") else doc.get(key)
+            if isinstance(expected, dict) and "$in" in expected:
+                if value not in expected["$in"]:
+                    return False
+            elif isinstance(expected, dict) and "$gte" in expected:
+                if not value or value < expected["$gte"]:
+                    return False
+            elif value != expected:
+                return False
+        return True
+
+    def find_one(self, query, sort=None):
+        for doc in self.docs:
+            if self._match(doc, query):
+                return doc
+        return None
+
+    def insert_one(self, doc):
+        self.inserted += 1
+        doc["_id"] = f"id{self.inserted}"
+        self.docs.append(doc)
+        return SimpleNamespace(inserted_id=doc["_id"])
+
+
+def _deep_task(status, mode="classic", symbol="300196.SZ", day=None):
+    return {
+        "type": "deep_analysis",
+        "symbol": symbol,
+        "status": status,
+        "params": {"analysis_mode": mode, "date": day or datetime.now().strftime("%Y%m%d")},
+        "created_at": datetime.now(),
+        "completed_at": datetime.now() if status == "completed" else None,
+    }
+
+
+@pytest.mark.unit
+def test_find_or_create_reuses_completed_task():
+    tasks = _FakeTasks([_deep_task("completed")])
+    doc, reused = find_or_create_deep_analysis_task(
+        {"analysis_tasks": tasks},
+        current_user={"id": "u1", "username": "alice"},
+        symbol="300196",
+        analysis_mode="classic",
+    )
+    assert reused is True
+    assert tasks.inserted == 0
+
+
+@pytest.mark.unit
+def test_find_or_create_force_creates_new_task():
+    tasks = _FakeTasks([_deep_task("completed")])
+    doc, reused = find_or_create_deep_analysis_task(
+        {"analysis_tasks": tasks},
+        current_user={"id": "u1", "username": "alice"},
+        symbol="300196",
+        analysis_mode="classic",
+        force=True,
+    )
+    assert reused is False
+    assert tasks.inserted == 1
+
+
+@pytest.mark.unit
+def test_failed_task_does_not_block_a_new_run():
+    tasks = _FakeTasks([_deep_task("failed")])
+    doc, reused = find_or_create_deep_analysis_task(
+        {"analysis_tasks": tasks},
+        current_user={"id": "u1", "username": "alice"},
+        symbol="300196",
+        analysis_mode="classic",
+    )
+    assert reused is False
+    assert tasks.inserted == 1
+    assert doc["symbol"] == "300196.SZ"
 
 
 @pytest.mark.unit

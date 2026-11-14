@@ -16,6 +16,7 @@ from services.analysis_tasks import (
     compute_queue_ahead,
     estimate_task_duration_seconds,
     estimate_wait_seconds,
+    find_or_create_deep_analysis_task,
     queue_wait_seconds_to_text,
 )
 from services.analysis_history import (
@@ -845,52 +846,63 @@ async def create_deep_analysis_task(
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"ETF任务创建失败: {str(e)}")
 
-    task_doc = build_task_doc(
+    force = bool(request.force or request.feedback or request.revision_of)
+    task_doc, reused = find_or_create_deep_analysis_task(
+        collections,
         current_user=current_user,
-        task_type="deep_analysis",
-        priority=request.priority,
         symbol=request.symbol,
-        params=params if params else {},
+        analysis_mode=params.get("analysis_mode", "classic"),
+        priority=request.priority,
         provider=request.provider,
         model=request.model,
         source="manual_trigger",
-        revision_of=request.revision_of,
         feedback=request.feedback,
+        revision_of=request.revision_of,
+        extra_params={k: v for k, v in params.items() if k != "analysis_mode"},
+        force=force,
     )
-    
+    task_id = str(task_doc["_id"])
+
     try:
-        result = collections["analysis_tasks"].insert_one(task_doc)
-        task_id = str(result.inserted_id)
-        task_doc["_id"] = result.inserted_id
-        
-        # 4. 扣除配额
-        remaining = _consume_quota_after_submit(
+        # Reused tasks have already consumed quota when they were created.
+        remaining = None if reused else _consume_quota_after_submit(
             current_user=current_user,
             entitlement=ent,
             quota_manager=quota_manager,
         )
-        
-        processing_count = collections["analysis_tasks"].count_documents({"status": "processing"})
-        queue_ahead = compute_queue_ahead(collections["analysis_tasks"], task_doc)
-        average_duration = estimate_task_duration_seconds(collections["analysis_tasks"], "deep_analysis")
-        estimated_wait = estimate_wait_seconds(
-            queue_ahead=queue_ahead,
-            processing_count=processing_count,
-            average_duration_seconds=average_duration,
-            estimated_parallelism=ANALYSIS_WORKER_PARALLELISM,
-        )
+
+        status = _normalize_task_status(task_doc.get("status"))
+        if status in ("completed", "failed", "completed_with_parse_error"):
+            queue_ahead = 0
+            estimated_wait = 0
+        else:
+            processing_count = collections["analysis_tasks"].count_documents({"status": "processing"})
+            queue_ahead = compute_queue_ahead(collections["analysis_tasks"], task_doc)
+            average_duration = estimate_task_duration_seconds(collections["analysis_tasks"], "deep_analysis")
+            estimated_wait = estimate_wait_seconds(
+                queue_ahead=queue_ahead,
+                processing_count=processing_count,
+                average_duration_seconds=average_duration,
+                estimated_parallelism=ANALYSIS_WORKER_PARALLELISM,
+            )
 
         return {
             "success": True,
             "task_id": task_id,
-            "status": "pending",
+            "status": status,
             "analysis_mode": params.get("analysis_mode", "classic"),
-            "message": "深度分析任务已提交",
+            "message": (
+                "今日已有该股票的深度分析任务，已复用"
+                if reused
+                else "深度分析任务已提交"
+            ),
             "quota_remaining": remaining,
             "position_in_queue": collections["analysis_tasks"].count_documents({"status": "pending"}),
             "queue_ahead": queue_ahead,
             "estimated_wait_seconds": estimated_wait,
             "wait_hint": queue_wait_seconds_to_text(estimated_wait),
+            "reused": reused,
+            "symbol": task_doc.get("symbol") or request.symbol,
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"任务创建失败: {str(e)}")

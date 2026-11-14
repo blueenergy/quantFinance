@@ -60,7 +60,7 @@ from models.analysis_task import AnalysisMode
 from routers.market import fetch_market_analysis_result
 from routers.portfolio_research import _load_full_result_rows
 from services.analysis_history import build_user_analysis_history_payload
-from services.analysis_tasks import build_task_doc
+from services.analysis_tasks import build_task_doc, find_or_create_deep_analysis_task
 from services.backtest_batch_schemas import BacktestBatchCreate, BacktestCombo
 from services.trading_calendar import latest_sse_open_day
 from services.backtest_batch_service import (
@@ -145,6 +145,7 @@ class DeepAnalysisRequest(BaseModel):
     username: Optional[str] = None  # 归属到哪个用户；留空则用 hermes-system
     provider: Optional[str] = None
     model: Optional[str] = None
+    force: bool = False  # True 时跳过当日幂等，强制新建任务
 
 
 @router.post("/analysis/deep", operation_id="submit_deep", tags=[MCP_ACTION_TAG])
@@ -162,29 +163,34 @@ async def hermes_submit_deep_analysis(
     collections = get_db_collections()
     user = _resolve_user(body.username, x_user_token)
 
-    task_doc = build_task_doc(
+    task, reused = find_or_create_deep_analysis_task(
+        collections,
         current_user=user,
-        task_type="deep_analysis",
-        priority=30,
         symbol=body.symbol,
-        params={"analysis_mode": body.analysis_mode.value},
+        analysis_mode=body.analysis_mode,
+        priority=30,
         provider=body.provider,
         model=body.model,
         source="hermes_mcp",
+        force=body.force,
     )
-    result = collections["analysis_tasks"].insert_one(task_doc)
-    task_id = str(result.inserted_id)
+    task_id = str(task["_id"])
 
     queue_depth = collections["analysis_tasks"].count_documents({"status": "pending"})
     return {
         "success": True,
         "task_id": task_id,
-        "status": "pending",
-        "symbol": body.symbol,
+        "status": _norm_task_status(task.get("status")),
+        "symbol": task.get("symbol") or body.symbol,
         "analysis_mode": body.analysis_mode.value,
-        "attributed_to": user["username"],
+        "attributed_to": task.get("created_by_username") or user["username"],
         "queue_depth": queue_depth,
-        "message": f"深度分析任务已提交，队列中共 {queue_depth} 个待处理任务，通常 30-120 秒完成",
+        "reused": reused,
+        "message": (
+            "今日已有该股票的深度分析任务，已复用"
+            if reused
+            else f"深度分析任务已提交，队列中共 {queue_depth} 个待处理任务，通常 30-120 秒完成"
+        ),
     }
 
 
@@ -204,33 +210,34 @@ async def hermes_deep_analysis_wait(
     collections = get_db_collections()
     user = _resolve_user(body.username, x_user_token)
 
-    task_doc = build_task_doc(
+    task, reused = find_or_create_deep_analysis_task(
+        collections,
         current_user=user,
-        task_type="deep_analysis",
-        priority=30,
         symbol=body.symbol,
-        params={"analysis_mode": body.analysis_mode.value},
+        analysis_mode=body.analysis_mode,
+        priority=30,
         provider=body.provider,
         model=body.model,
         source="hermes_mcp",
+        force=body.force,
     )
-    insert_result = collections["analysis_tasks"].insert_one(task_doc)
-    task_id = str(insert_result.inserted_id)
-    oid = insert_result.inserted_id
+    task_id = str(task["_id"])
+    oid = task["_id"]
 
-    # 服务端轮询直到完成
-    deadline = timeout
+    # 服务端轮询直到完成；复用已终态的任务时直接返回
     elapsed = 0
     poll_interval = 10
-    while elapsed < deadline:
-        await asyncio.sleep(poll_interval)
-        elapsed += poll_interval
-        task = collections["analysis_tasks"].find_one({"_id": oid})
-        if not task:
-            raise HTTPException(status_code=404, detail="任务丢失")
-        status = _norm_task_status(task.get("status"))
-        if status in ("completed", "failed", "completed_with_parse_error"):
-            break
+    status = _norm_task_status(task.get("status"))
+    if not (reused and status in ("completed", "failed", "completed_with_parse_error")):
+        while elapsed < timeout:
+            await asyncio.sleep(poll_interval)
+            elapsed += poll_interval
+            task = collections["analysis_tasks"].find_one({"_id": oid})
+            if not task:
+                raise HTTPException(status_code=404, detail="任务丢失")
+            status = _norm_task_status(task.get("status"))
+            if status in ("completed", "failed", "completed_with_parse_error"):
+                break
 
     task = collections["analysis_tasks"].find_one({"_id": oid})
     status = _norm_task_status(task.get("status"))
@@ -242,28 +249,31 @@ async def hermes_deep_analysis_wait(
         return {
             "success": True,
             "task_id": task_id,
-            "symbol": body.symbol,
+            "symbol": task.get("symbol") or body.symbol,
             "status": "completed",
-            "attributed_to": user["username"],
+            "attributed_to": task.get("created_by_username") or user["username"],
             "analysis": analysis,
             "model": result.get("model"),
             "elapsed_seconds": elapsed,
+            "reused": reused,
         }
     elif status == "failed":
         return {
             "success": False,
             "task_id": task_id,
-            "symbol": body.symbol,
+            "symbol": task.get("symbol") or body.symbol,
             "status": "failed",
             "error": task.get("error", "分析失败"),
+            "reused": reused,
         }
     else:
         return {
             "success": False,
             "task_id": task_id,
-            "symbol": body.symbol,
+            "symbol": task.get("symbol") or body.symbol,
             "status": status,
             "error": f"超时（{timeout}秒内未完成），可用 task_id 继续查询",
+            "reused": reused,
         }
 
 
