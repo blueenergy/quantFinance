@@ -267,3 +267,80 @@ async def get_data_status(
             "is_fresh": freshness_minutes is not None and freshness_minutes < 60,
         }
     }
+
+
+@router.get("/hk-execution-hint", summary="港股人气榜次日执行提示")
+async def get_hk_execution_hint(
+    top_n: int = Query(20, ge=5, le=50, description="每个榜单取前 N 名"),
+):
+    """港股人气榜 → 次日执行提示（只读，不做 LLM 分析）。
+
+    依据 2026-11-14 的 P1 检验（42 个事件日、895 个事件观测）：
+    当日进入港股人气榜前 20 的股票，次日振幅比同流动性对照高 +2.88pp；
+    用个股自身近 20 日振幅做对照后仍有 +1.56pp，即事件本身有增量。
+    这是执行/风控信号，不是选股信号。
+
+    数据来源：quant_data.hot_stock_raw 的 source='ths_hk' / 'dc_hk'
+    （每个交易日 22:50 由 quant-data-engine 同步）。
+    """
+    from db import get_data_db
+
+    collections = get_data_db()
+    raw_col = collections["hot_stock_raw"]
+
+    sources = []
+    merged = {}
+    for source, label in (("ths_hk", "同花顺(港股)"), ("dc_hk", "东方财富(港股)")):
+        # Sort by trade_date, not fetched_at: a historical backfill can write an
+        # older date later, and fetched_at would then win.
+        doc = raw_col.find_one(
+            {"source": source}, sort=[("trade_date", -1), ("rank_time", -1)]
+        )
+        if not doc or not doc.get("rows"):
+            continue
+        sources.append({
+            "source": source,
+            "name": label,
+            "trade_date": doc.get("trade_date"),
+            "rank_time": doc.get("rank_time"),
+            "stock_count": len(doc.get("rows") or []),
+        })
+        for row in doc["rows"]:
+            rank = row.get("rank")
+            code = row.get("ts_code")
+            if not code or not isinstance(rank, (int, float)) or rank > top_n:
+                continue
+            item = merged.setdefault(code, {
+                "ts_code": code,
+                "name": row.get("ts_name") or "",
+                "rank": int(rank),
+                "pct_change": row.get("pct_change"),
+                "concept": row.get("concept"),
+                "sources": [],
+            })
+            item["rank"] = min(item["rank"], int(rank))
+            item["sources"].append(source)
+            if row.get("concept"):
+                item["concept"] = row.get("concept")
+
+    rows = sorted(merged.values(), key=lambda x: (x["rank"], x["ts_code"]))
+    for item in rows:
+        item["in_both"] = len(item["sources"]) > 1
+
+    return {
+        "success": True,
+        "top_n": top_n,
+        "sources": sources,
+        "count": len(rows),
+        "rows": rows,
+        "hint": {
+            "title": "港股人气榜 · 次日执行提示",
+            "detail": (
+                "以下股票当日进入港股人气榜前 {} 名。检验显示其次日振幅系统性偏高，"
+                "建议避开开盘冲击段、拆单或使用限价单。"
+            ).format(top_n),
+            "stats": "P1 检验（2026-11-14，42 个事件日）：次日振幅 +2.88pp（对照同流动性组）、"
+                     "+1.56pp（对照个股自身近 20 日）；这是执行信号，不是选股信号。",
+            "caveat": "样本仅 43 个交易日，跨 regime 外推需谨慎。",
+        },
+    }
