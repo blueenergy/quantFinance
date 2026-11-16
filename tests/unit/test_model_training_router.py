@@ -176,6 +176,11 @@ def test_list_prediction_models_serializes_coverage(monkeypatch):
         "get_ml_db_collections",
         lambda: {"model_predictions": predictions},
     )
+    monkeypatch.setattr(
+        model_training,
+        "get_trading_db_collections",
+        lambda: {"portfolio_strategy_activations": _Collection()},
+    )
 
     response = model_training.list_prediction_models(
         index_code=None,
@@ -195,6 +200,8 @@ def test_list_prediction_models_serializes_coverage(monkeypatch):
         "shadow": False,
         "source": "factor_incremental_experiment",
         "window": "rolling_500",
+        "accepted": False,
+        "accepted_reasons": [],
     }
     # Missing flags mean neither research nor shadow, not None.
     assert response["data"][1]["research"] is False
@@ -211,6 +218,11 @@ def test_list_prediction_models_applies_kind_and_index_filters(monkeypatch):
         model_training,
         "get_ml_db_collections",
         lambda: {"model_predictions": predictions},
+    )
+    monkeypatch.setattr(
+        model_training,
+        "get_trading_db_collections",
+        lambda: {"portfolio_strategy_activations": _Collection()},
     )
 
     model_training.list_prediction_models(
@@ -234,3 +246,114 @@ def test_list_prediction_models_applies_kind_and_index_filters(monkeypatch):
     assert shadow_match["shadow"] is True
     assert "research" not in shadow_match
     assert "index_code" not in shadow_match
+
+
+def test_list_prediction_models_marks_and_filters_accepted(monkeypatch):
+    predictions = _AggregateCollection(
+        [
+            {
+                "_id": "live-model",
+                "index_code": "csi1000",
+                "first_trade_date": "20160413",
+                "last_trade_date": "20261113",
+                "date_count": 128,
+                "prediction_count": 118565,
+                "research": True,
+                "shadow": True,
+            },
+            {
+                "_id": "shadow-only",
+                "index_code": "hs300",
+                "first_trade_date": "20261014",
+                "last_trade_date": "20261113",
+                "date_count": 20,
+                "prediction_count": 6000,
+                "research": False,
+                "shadow": True,
+            },
+            {
+                "_id": "retired",
+                "index_code": "csi500",
+                "first_trade_date": "20261019",
+                "last_trade_date": "20261113",
+                "date_count": 19,
+                "prediction_count": 9489,
+                "research": False,
+                "shadow": True,
+            },
+        ]
+    )
+    shadow_profiles = _Collection()
+    shadow_profiles.docs = [
+        {"model_id": "live-model", "enabled": True},
+        {"profile_id": "p2", "params": {"model_id": "shadow-only"}, "enabled": True},
+        {"model_id": "retired", "enabled": False},
+    ]
+    activations = _Collection()
+    activations.docs = [{"status": "active", "params_override": {"model_id": "live-model"}}]
+    monkeypatch.setattr(
+        model_training,
+        "get_ml_db_collections",
+        lambda: {
+            "model_predictions": predictions,
+            "model_shadow_profiles": shadow_profiles,
+        },
+    )
+    monkeypatch.setattr(
+        model_training,
+        "get_trading_db_collections",
+        lambda: {"portfolio_strategy_activations": activations},
+    )
+
+    response = model_training.list_prediction_models(
+        index_code=None,
+        kind="all",
+        limit=100,
+        current_user={"id": "u1"},
+    )
+    rows = {row["model_id"]: row for row in response["data"]}
+    assert rows["live-model"]["accepted"] is True
+    assert rows["live-model"]["accepted_reasons"] == ["live", "shadow"]
+    assert rows["shadow-only"]["accepted"] is True
+    assert rows["shadow-only"]["accepted_reasons"] == ["shadow"]
+    assert rows["retired"]["accepted"] is False
+    assert rows["retired"]["accepted_reasons"] == []
+
+    accepted_response = model_training.list_prediction_models(
+        index_code=None,
+        kind="all",
+        accepted_only=True,
+        limit=100,
+        current_user={"id": "u1"},
+    )
+    assert {row["model_id"] for row in accepted_response["data"]} == {
+        "live-model",
+        "shadow-only",
+    }
+    assert predictions.pipelines[-1][0]["$match"]["model_id"] == {
+        "$in": ["live-model", "shadow-only"]
+    }
+
+
+def test_list_prediction_models_accepted_only_returns_empty_without_sources(monkeypatch):
+    predictions = _AggregateCollection([])
+    monkeypatch.setattr(
+        model_training,
+        "get_ml_db_collections",
+        lambda: {"model_predictions": predictions},
+    )
+    monkeypatch.setattr(
+        model_training,
+        "get_trading_db_collections",
+        lambda: {"portfolio_strategy_activations": _Collection()},
+    )
+
+    response = model_training.list_prediction_models(
+        index_code=None,
+        kind="all",
+        accepted_only=True,
+        limit=100,
+        current_user={"id": "u1"},
+    )
+    assert response["data"] == []
+    assert predictions.pipelines == []

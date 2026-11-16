@@ -12,7 +12,8 @@ from pydantic import BaseModel, Field
 from pymongo import DESCENDING
 
 from auth import get_current_user
-from db import get_ml_db_collections
+from db import get_ml_db_collections, get_trading_db_collections
+from services.model_scores_daily import accepted_model_reasons
 from services.model_training_promotion import (
     build_promotion_context,
     find_recipe_sibling_jobs,
@@ -112,7 +113,11 @@ def list_dataset_snapshots(
     return {"data": rows}
 
 
-def _serialize_prediction_model_row(doc: Dict[str, Any]) -> Dict[str, Any]:
+def _serialize_prediction_model_row(
+    doc: Dict[str, Any],
+    accepted_reasons: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    reasons = list(accepted_reasons or [])
     return {
         "model_id": doc.get("_id"),
         "index_code": doc.get("index_code"),
@@ -124,6 +129,8 @@ def _serialize_prediction_model_row(doc: Dict[str, Any]) -> Dict[str, Any]:
         "shadow": bool(doc.get("shadow")),
         "source": doc.get("source"),
         "window": doc.get("window"),
+        "accepted": bool(reasons),
+        "accepted_reasons": reasons,
     }
 
 
@@ -131,6 +138,7 @@ def _serialize_prediction_model_row(doc: Dict[str, Any]) -> Dict[str, Any]:
 def list_prediction_models(
     index_code: Optional[UniverseIndex] = Query(default=None),
     kind: Literal["all", "research", "shadow"] = Query(default="all"),
+    accepted_only: bool = False,
     limit: int = Query(default=100, ge=1, le=500),
     current_user: dict = Depends(get_current_user),
 ) -> Dict[str, Any]:
@@ -139,9 +147,26 @@ def list_prediction_models(
     Portfolio research selects a model by ``model_id``; listing training jobs is
     not enough because only materialised / shadowed models have prediction rows,
     and the coverage decides whether a requested backtest window is usable.
+
+    ``accepted_only`` keeps models the platform currently runs: an active
+    strategy activation (live) or an enabled shadow profile. It deliberately
+    does **not** use the training job's ``promotion.passed`` flag: the live
+    csi1000 job is single-pool (``insufficient_universes``), while the only
+    gate-passed jobs are retired shadow profiles. ``accepted`` is the
+    operational definition shared with the model-score tab.
     """
     collections = get_ml_db_collections()
+    trading_collections = get_trading_db_collections()
+    accepted = accepted_model_reasons(
+        collections.get("model_shadow_profiles"),
+        trading_collections.get("portfolio_strategy_activations"),
+    )
+    if accepted_only and not accepted:
+        return {"data": []}
+
     match: Dict[str, Any] = {"model_id": {"$exists": True, "$nin": [None, ""]}}
+    if accepted_only:
+        match["model_id"] = {"$in": sorted(accepted)}
     if index_code:
         match["index_code"] = index_code
     if kind == "research":
@@ -182,9 +207,13 @@ def list_prediction_models(
         {"$limit": limit},
     ]
     rows = [
-        _serialize_prediction_model_row(doc)
+        _serialize_prediction_model_row(doc, accepted.get(doc.get("_id"), []))
         for doc in collections["model_predictions"].aggregate(pipeline)
     ]
+    if accepted_only:
+        # ``$match`` already filters in production; the Python guard keeps the
+        # contract true for test doubles and any pipeline that ignores ``$in``.
+        rows = [row for row in rows if row["accepted"]]
     return {"data": rows}
 
 

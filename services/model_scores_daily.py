@@ -94,6 +94,21 @@ def _live_models(activations) -> set:
     return out
 
 
+def accepted_model_reasons(shadow_profiles=None, activations=None) -> Dict[str, List[str]]:
+    """Model ids the system currently runs, mapped to ``live`` / ``shadow``.
+
+    This is the "platform recognises it" definition used by both the daily
+    model-score catalog and the portfolio-research model picker. A model can
+    be both live and shadow; order is deterministic (``live`` first).
+    """
+    reasons: Dict[str, List[str]] = {}
+    for model_id in sorted(_live_models(activations)):
+        reasons.setdefault(model_id, []).append("live")
+    for model_id in sorted(_shadow_enabled_models(shadow_profiles)):
+        reasons.setdefault(model_id, []).append("shadow")
+    return reasons
+
+
 def list_model_catalog(
     predictions,
     *,
@@ -112,8 +127,7 @@ def list_model_catalog(
     index (model_id, trade_date, ts_code) serves as a prefix scan.
     """
     cutoff = (_date.today() - timedelta(days=int(recent_days))).strftime("%Y%m%d")
-    live_models = _live_models(activations)
-    shadow_models = _shadow_enabled_models(shadow_profiles)
+    accepted = accepted_model_reasons(shadow_profiles, activations)
     rows: List[Dict[str, Any]] = []
     for model_id in sorted(predictions.distinct("model_id") or []):
         if not model_id:
@@ -131,11 +145,7 @@ def list_model_catalog(
         if not first or not last:
             continue
         dates = sorted(predictions.distinct("trade_date", {"model_id": model_id}) or [])
-        reasons = []
-        if model_id in live_models:
-            reasons.append("live")
-        if model_id in shadow_models:
-            reasons.append("shadow")
+        reasons = accepted.get(model_id, [])
         rows.append(
             {
                 "accepted": bool(reasons),
