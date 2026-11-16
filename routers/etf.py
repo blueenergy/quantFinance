@@ -1,8 +1,15 @@
 from fastapi import APIRouter, Query, HTTPException, Depends
 from typing import Any, Dict, List, Optional
 from db import db, data_db, analyzer_db
-import pandas as pd
 from auth import get_current_active_user
+from services.etf_kline import map_etf_daily_row
+from services.kline_resample import (
+    VALID_TF,
+    aggregate_rows,
+    fill_pre_close,
+    normalize_tf,
+)
+from routers.records import _apply_one_symbol
 
 router = APIRouter(prefix="/etf", tags=["etf"])
 
@@ -219,14 +226,19 @@ ETF_KLINE_DAILY_CAP_WITH_DATE_RANGE = 20_000
 
 def _etf_kline_fetch_limit(tf: str, user_limit: int, has_date_filter: bool) -> int:
     """
-    For weekly/monthly bars we need enough daily points before resampling.
-    With an explicit date range, cap raw daily rows; otherwise use heuristics.
+    How many daily rows to pull.
+
+    ``1d`` needs one extra older day to compute ``pre_close``; ``1w`` / ``1m``
+    need enough days for the requested bars plus one extra bucket so the
+    oldest returned bar also has a ``pre_close``.
     """
+    limit = max(int(user_limit), 1)
+    base = limit * 35 + 35 if tf in ("1w", "1m") else limit + 1
     if has_date_filter:
-        return min(ETF_KLINE_DAILY_CAP_WITH_DATE_RANGE, max(int(user_limit) * 35, 800))
-    if tf in ("1w", "1m", "w", "m"):
-        return min(5_000, max(int(user_limit) * 35, 800))
-    return int(user_limit)
+        return min(ETF_KLINE_DAILY_CAP_WITH_DATE_RANGE, max(base, 800))
+    if tf in ("1w", "1m"):
+        return min(5_000 + 35, max(base, 800))
+    return base
 
 
 def _etf_kline_date_truncation_message(
@@ -240,42 +252,50 @@ def _etf_kline_date_truncation_message(
     )
 
 
-def _agg_etf_ohlc_to_df(df: pd.DataFrame, rule: str) -> pd.DataFrame:
+def _num(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        from bson.decimal128 import Decimal128
+
+        if isinstance(value, Decimal128):
+            value = float(str(value))
+    except Exception:
+        pass
+    if hasattr(value, "item"):
+        try:
+            value = value.item()
+        except Exception:
+            pass
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return None if number != number else number
+
+
+def _attach_fd_share(rows: List[Dict[str, Any]], fetch_limit: int, query: Dict[str, Any]) -> None:
+    """Attach ``fd_share`` (万份) to daily rows, carried forward from older days.
+
+    Tushare ``fund_share`` is not published for every ETF every day; showing
+    the last known scale beats a hole in the third grid.
     """
-    Resample pre-adjusted daily rows to week/month.
-    - OHLC + pre_adj_*: first|max|min|last; vol/amount: sum; fd_share: last.
-    - Same as shenwan_index _agg: W-FRI / month-end. Input df: ascending trade_date.
-    """
-    if df is None or df.empty or "trade_date" not in df.columns:
-        return pd.DataFrame()
-    d = df.copy()
-    d["td"] = pd.to_datetime(d["trade_date"].astype(str), format="%Y%m%d", errors="coerce")
-    d = d.dropna(subset=["td"]).set_index("td").sort_index()
-    ag: Dict[str, str] = {"open": "first", "high": "max", "low": "min", "close": "last"}
-    ohlc_cols: Dict[str, str] = {}
-    for c, how in ag.items():
-        if c in d.columns:
-            ohlc_cols[c] = how
-    for base in ("open", "high", "low", "close"):
-        pac = f"pre_adj_{base}"
-        if pac in d.columns and pac not in ohlc_cols:
-            ohlc_cols[pac] = ag[base]
-    if not ohlc_cols:
-        return pd.DataFrame()
-    if rule not in ("1w", "1m"):
-        return pd.DataFrame()
-    rule_s = "W-FRI" if rule == "1w" else "ME"
-    rs_kw = {"label": "right", "closed": "right"}
-    ohlc = d.resample(rule_s, **rs_kw).agg(ohlc_cols)
-    for col, method in (("vol", "sum"), ("amount", "sum"), ("fd_share", "last")):
-        if col not in d.columns:
-            continue
-        s = d[col].resample(rule_s, **rs_kw)
-        ohlc[col] = s.sum() if method == "sum" else s.last()
-    _sub = [c for c in ("close", "pre_adj_close") if c in ohlc.columns]
-    if _sub:
-        ohlc = ohlc.dropna(how="all", subset=_sub)
-    return ohlc
+    share_docs = list(
+        data_db["etf_shares"]
+        .find(query, {"_id": 0, "trade_date": 1, "fd_share": 1})
+        .sort("trade_date", -1)
+        .limit(fetch_limit)
+    )
+    share_by_date = {
+        str(doc.get("trade_date")): _num(doc.get("fd_share")) for doc in share_docs
+    }
+    last_share: Optional[float] = None
+    # rows are newest-first, so walking backwards goes forward in time
+    for row in reversed(rows):
+        value = share_by_date.get(str(row.get("trade_date")))
+        if value is not None:
+            last_share = value
+        row["fd_share"] = last_share
 
 
 def _sanitize_json_value(v: Any) -> Any:
@@ -351,185 +371,84 @@ async def get_etf_heatmap_series(
 
 @router.get("/{symbol}/kline")
 async def get_etf_kline(
-    symbol: str, 
-    start_date: Optional[str] = None, 
+    symbol: str,
+    start_date: Optional[str] = None,
     end_date: Optional[str] = None,
     limit: int = 1000,
     tf: str = Query("1d", description="1d daily, 1w weekly, 1m monthly (from daily bars)"),
+    adjust: str = Query("qfq", description="复权口径: qfq 前复权 / hfq 后复权 / none 不复权"),
 ):
     """
-    Get ETF K-line: daily rows, or weekly/monthly resampled from pre-adjusted dailies.
+    ETF K-line rows shaped like ``/records/``: prices are already in ``adjust`` 口径.
+
+    - ``1d``: ``pre_close`` / ``pct_chg`` vs the previous trading day.
+    - ``1w`` / ``1m``: resampled from adjusted daily bars; the bar's
+      ``trade_date`` is the last trading day inside the period (never a future
+      or non-trading date such as pandas' W-FRI / ME labels).
     """
-    tfc = (tf or "1d").strip().lower()
-    if tfc in ("d",):
-        tfc = "1d"
-    if tfc in ("w",):
-        tfc = "1w"
-    if tfc in ("m",):
-        tfc = "1m"
-    if tfc not in ("1d", "1w", "1m"):
+    tfc = normalize_tf(tf)
+    if tfc not in VALID_TF:
         raise HTTPException(400, "tf must be 1d, 1w, or 1m")
+    adj = str(adjust or "qfq").strip().lower()
+    if adj not in ("qfq", "hfq", "none"):
+        adj = "qfq"
 
     # Base query for the specific ETF
-    query = {"ts_code": symbol}
-    
-    # Add date filters if provided
+    query: Dict[str, Any] = {"ts_code": symbol}
     date_filter: Dict[str, str] = {}
     if start_date:
-        date_filter["$gte"] = start_date.replace('-', '')
+        date_filter["$gte"] = start_date.replace("-", "")
     if end_date:
-        date_filter["$lte"] = end_date.replace('-', '')
-    has_date_filter = bool(date_filter)        
+        date_filter["$lte"] = end_date.replace("-", "")
+    has_date_filter = bool(date_filter)
     if date_filter:
         query["trade_date"] = date_filter
 
     fetch_limit = _etf_kline_fetch_limit(tfc, int(limit), has_date_filter)
-        
-    # Execute queries synchronously (pymongo client is sync)
-    daily_results = list(data_db["etf_daily"].find(query, {"_id": 0}).sort("trade_date", -1).limit(fetch_limit))
-    adj_results = list(data_db["etf_adj_factor"].find(query, {"_id": 0}).sort("trade_date", -1).limit(fetch_limit))
-    share_results = list(data_db["etf_shares"].find(query, {"_id": 0}).sort("trade_date", -1).limit(fetch_limit))
 
+    # Execute queries synchronously (pymongo client is sync)
+    daily_results = list(
+        data_db["etf_daily"].find(query, {"_id": 0}).sort("trade_date", -1).limit(fetch_limit)
+    )
     n_daily = len(daily_results)
     date_trunc_msg = _etf_kline_date_truncation_message(has_date_filter, n_daily, fetch_limit)
-    
-    if not daily_results:
-        out0: Dict[str, Any] = {"success": True, "symbol": symbol, "tf": tfc, "count": 0, "data": []}
-        if date_trunc_msg:
-            out0["message"] = date_trunc_msg
-        return out0
-        
-    # Convert to pandas DataFrames for easy merging and calculation
-    df_daily = pd.DataFrame(daily_results)
-    # Mongo 可能存 Decimal128 / 字符串，与 float 运算会 TypeError → 接口 500
-    for col in ("open", "high", "low", "close", "vol", "amount"):
-        if col in df_daily.columns:
-            df_daily[col] = pd.to_numeric(df_daily[col], errors="coerce")
 
-    # --- 1. Process Adjustment Factors (Pre-adjustment) ---
-    if adj_results:
-        df_adj = pd.DataFrame(adj_results)
-        if "adj_factor" in df_adj.columns:
-            df_adj["adj_factor"] = pd.to_numeric(df_adj["adj_factor"], errors="coerce")
-        # Merge on trade_date
-        df = pd.merge(df_daily, df_adj[["trade_date", "adj_factor"]], on="trade_date", how="left")
-        
-        # Forward fill adj_factors if some days are missing but earlier days exist
-        df["adj_factor"] = df["adj_factor"].ffill().bfill().fillna(1.0)
-        
-        # Calculate pre-adjusted prices
-        # Pre-adjusted price = Current Price * (Current Adj Factor / Latest Adj Factor)
-        # Since we sorted by trade_date descending, the latest available is at index 0
-        latest_adj_factor = df["adj_factor"].iloc[0]
-        if pd.isna(latest_adj_factor) or float(latest_adj_factor) == 0.0:
-            latest_adj_factor = 1.0
-        
-        for col in ['open', 'high', 'low', 'close']:
-            df[f'pre_adj_{col}'] = df[col] * (df['adj_factor'] / latest_adj_factor)
-            # Round to 3 decimal places for ETFs
-            df[f'pre_adj_{col}'] = df[f'pre_adj_{col}'].round(3)
-    else:
-        df = df_daily
-        for col in ['open', 'high', 'low', 'close']:
-            df[f'pre_adj_{col}'] = df[col]
-
-    # --- 2. Process Share Scale ---
-    if share_results:
-        df_share = pd.DataFrame(share_results)
-        if "fd_share" in df_share.columns:
-            df_share["fd_share"] = pd.to_numeric(df_share["fd_share"], errors="coerce")
-        # Tushare fund_share might not be updated daily for all ETFs, typically week/month ends for some, daily for others.
-        # We merge and forward fill the share scale so user always sees the 'latest known' scale.
-        df = pd.merge(df, df_share[["trade_date", "fd_share"]], on="trade_date", how="left")
-        
-        # Need to sort by date ascending to safely forward fill shares into the future
-        df = df.sort_values('trade_date', ascending=True)
-        df["fd_share"] = df["fd_share"].ffill()
-        
-        # Sort back to descending for API output (1d)
-        df = df.sort_values('trade_date', ascending=False)
-    else:
-        df['fd_share'] = None
-
-    import math
-
-    def _rows_to_json(df_in: pd.DataFrame) -> List[Dict[str, Any]]:
-        out: List[Dict[str, Any]] = []
-        for row in df_in.to_dict("records"):
-            clean_row: Dict[str, Any] = {}
-            for k, v in row.items():
-                if k == "td":
-                    continue
-                if pd.isna(v) or (isinstance(v, float) and (math.isnan(v) or math.isinf(v))):
-                    clean_row[k] = None
-                else:
-                    if hasattr(v, "item"):
-                        v = v.item()
-                    clean_row[k] = v
-            out.append(clean_row)
-        return out
-
-    if tfc in ("1w", "1m"):
-        df_asc = df.sort_values("trade_date", ascending=True)
-        ohlc_df = _agg_etf_ohlc_to_df(df_asc, tfc)
-        if ohlc_df is None or ohlc_df.empty:
-            out_emp: Dict[str, Any] = {
-                "success": True,
-                "symbol": symbol,
-                "tf": tfc,
-                "count": 0,
-                "data": [],
-            }
-            if date_trunc_msg:
-                out_emp["message"] = date_trunc_msg
-            return out_emp
-        ohlc_df = ohlc_df.reset_index()
-        time_col = ohlc_df.columns[0]
-        ohlc_df["trade_date"] = pd.to_datetime(ohlc_df[time_col], errors="coerce").map(
-            lambda x: x.strftime("%Y%m%d") if pd.notna(x) else None
-        )
-        ohlc_df = ohlc_df.drop(columns=[time_col], errors="ignore")
-        for _c in ohlc_df.columns:
-            if str(_c).startswith("pre_adj_"):
-                ohlc_df[_c] = ohlc_df[_c].round(3)
-        ohlc_df = ohlc_df.sort_values("trade_date", ascending=True)
-        ohlc_df = ohlc_df.tail(int(limit))
-        ohlc_df = ohlc_df.sort_values("trade_date", ascending=False)
-        merged_data = _rows_to_json(ohlc_df)
-        out_wm: Dict[str, Any] = {
-            "success": True,
-            "symbol": symbol,
-            "tf": tfc,
-            "count": len(merged_data),
-            "data": merged_data,
-        }
-        if date_trunc_msg:
-            out_wm["message"] = date_trunc_msg
-        return out_wm
-
-    merged_data = []
-    for row in df.to_dict('records'):
-        clean_row = {}
-        for k, v in row.items():
-            if pd.isna(v) or (isinstance(v, float) and (math.isnan(v) or math.isinf(v))):
-                clean_row[k] = None
-            else:
-                # specifically convert NumPy floats to regular Python floats
-                if hasattr(v, 'item'):
-                    v = v.item()
-                clean_row[k] = v
-        merged_data.append(clean_row)
-
-    out_d: Dict[str, Any] = {
+    result: Dict[str, Any] = {
         "success": True,
         "symbol": symbol,
         "tf": tfc,
-        "count": len(merged_data),
-        "data": merged_data,
+        "adjust": adj,
+        "count": 0,
+        "data": [],
     }
     if date_trunc_msg:
-        out_d["message"] = date_trunc_msg
-    return out_d
+        result["message"] = date_trunc_msg
+    if not daily_results:
+        return result
+
+    rows = [map_etf_daily_row(doc, symbol=symbol) for doc in daily_results]
+    _attach_fd_share(rows, fetch_limit, query)
+
+    # qfq/hfq/none applied in place to open/high/low/close — the same rule and
+    # the same anchor (latest adj_factor in the collection) as /records/.
+    rows = _apply_one_symbol(rows, symbol, adj, data_db["etf_adj_factor"])
+
+    if tfc == "1d":
+        data = fill_pre_close(rows)[: int(limit)]
+    else:
+        data = aggregate_rows(rows, tfc)[: int(limit)]
+
+    for bar in data:
+        for col in ("open", "high", "low", "close", "pre_close"):
+            value = bar.get(col)
+            if value is not None:
+                bar[col] = round(float(value), 3)
+        if bar.get("pct_chg") is not None:
+            bar["pct_change"] = bar["pct_chg"]
+
+    result["count"] = len(data)
+    result["data"] = _sanitize_json_tree(data)
+    return result
 
 from pydantic import BaseModel
 from auth import get_current_active_user

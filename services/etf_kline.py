@@ -6,7 +6,7 @@ and may contain a stale one-bar Eastmoney leftover for a few ETF codes.
 """
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional
 
 
 def etf_symbol_variants(symbol: str) -> List[str]:
@@ -154,67 +154,6 @@ def load_etf_daily_docs(
         return docs[:cap]
 
 
-def resample_ohlc_rows(rows: Sequence[Dict[str, Any]], tf: str) -> List[Dict[str, Any]]:
-    """Resample daily bars to week/month. Returns newest-first."""
-    import pandas as pd
-
-    tfc = (tf or "").strip().lower()
-    if tfc not in ("1w", "1m") or not rows:
-        return list(rows)
-    frame = pd.DataFrame([dict(row) for row in rows])
-    if frame.empty or "trade_date" not in frame.columns:
-        return []
-    frame["td"] = pd.to_datetime(frame["trade_date"].astype(str), format="%Y%m%d", errors="coerce")
-    frame = frame.dropna(subset=["td"]).set_index("td").sort_index()
-    agg: Dict[str, str] = {}
-    for col, how in (("open", "first"), ("high", "max"), ("low", "min"), ("close", "last")):
-        if col in frame.columns:
-            agg[col] = how
-    if not agg:
-        return []
-    rule = "W-FRI" if tfc == "1w" else "ME"
-    rs_kw = {"label": "right", "closed": "right"}
-    out = frame.resample(rule, **rs_kw).agg(agg)
-    for col, method in (("vol", "sum"), ("volume", "sum"), ("amount", "sum")):
-        if col not in frame.columns:
-            continue
-        series = frame[col].resample(rule, **rs_kw)
-        out[col] = series.sum() if method == "sum" else series.last()
-    if "close" in out.columns:
-        out = out.dropna(subset=["close"])
-    if out.empty:
-        return []
-    out = out.reset_index()
-    time_col = out.columns[0]
-    out["trade_date"] = pd.to_datetime(out[time_col], errors="coerce").map(
-        lambda value: value.strftime("%Y%m%d") if pd.notna(value) else None
-    )
-    out = out.drop(columns=[time_col], errors="ignore")
-    records = out.sort_values("trade_date", ascending=False).to_dict("records")
-    cleaned: List[Dict[str, Any]] = []
-    sample = rows[0] if rows else {}
-    for rec in records:
-        volume = _to_float(rec.get("volume"))
-        if volume is None:
-            volume = _to_float(rec.get("vol"))
-        item = {
-            "symbol": sample.get("symbol") or sample.get("ts_code"),
-            "ts_code": sample.get("ts_code") or sample.get("symbol"),
-            "trade_date": rec.get("trade_date"),
-            "open": _to_float(rec.get("open")),
-            "high": _to_float(rec.get("high")),
-            "low": _to_float(rec.get("low")),
-            "close": _to_float(rec.get("close")),
-            "vol": volume,
-            "volume": volume,
-            "amount": _to_float(rec.get("amount")),
-            "name": sample.get("name") or "",
-            "adjust": sample.get("adjust"),
-        }
-        if item["close"] is None:
-            continue
-        cleaned.append(item)
-    return cleaned
 
 
 def load_etf_kline_rows(

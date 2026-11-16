@@ -12,6 +12,7 @@ from pydantic import BaseModel
 from auth import get_current_active_user
 from db import get_data_db, get_db_collections
 from services.etf_kline import load_etf_kline_rows
+from services.kline_resample import aggregate_rows, fill_pre_close, normalize_tf
 from utils.stock_utils import serialize_doc
 
 try:
@@ -232,6 +233,8 @@ class RecordResponseModel(BaseModel):
     close: Optional[float] = None
     high: Optional[float] = None
     low: Optional[float] = None
+    pre_close: Optional[float] = None
+    pct_chg: Optional[float] = None
     volume: Optional[float] = None
     amount: Optional[float] = None
     volume_unit: Optional[str] = None
@@ -425,25 +428,30 @@ def _etf_records_or_none(
     start_date: Optional[str],
     end_date: Optional[str],
     adjust: str,
+    tf: str = "1d",
 ) -> Optional[List[Dict[str, Any]]]:
     """ETF K-lines from etf_daily. ``None`` = not an ETF; ``[]`` = ETF but no bars."""
     if not symbol:
         return None
+    tfc = normalize_tf(tf)
     start = (start_date or "").replace("-", "")[:8] or None
     end = (end_date or "").replace("-", "")[:8] or None
+    # One extra day/bucket so the oldest returned bar still has pre_close.
+    fetch_limit = limit * 35 + 35 if tfc in ("1w", "1m") else limit + 1
     rows = load_etf_kline_rows(
         etf_basic_collection,
         etf_daily_collection,
         symbol,
         start=start,
         end=end,
-        limit=limit,
+        limit=fetch_limit,
     )
     if rows is None:
         return None
-    return _attach_decision_gs_fields(
-        _apply_records_adjustment(rows, adjust, etf_adj_collection)
-    )
+    adjusted = _apply_records_adjustment(rows, adjust, etf_adj_collection)
+    if tfc in ("1w", "1m"):
+        return aggregate_rows(adjusted, tfc)[: int(limit)]
+    return _attach_decision_gs_fields(fill_pre_close(adjusted)[: int(limit)])
 
 
 def _annotate_kline_units(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -468,12 +476,16 @@ def get_records(
     start_date: Optional[str] = Query(None),
     end_date: Optional[str] = Query(None),
     adjust: str = Query("qfq", description="复权口径: none/hfq/qfq，K线默认前复权"),
+    tf: str = Query("1d", description="K线周期: 1d 日 / 1w 周 / 1m 月（股票与 ETF 同一套聚合规则）"),
     include_scores: bool = Query(
         True,
         description="是否关联 stock_scores 并按根 $lookup stock_info；自选股 K 线浏览应关",
     ),
 ):
-    etf_docs = _etf_records_or_none(symbol, limit, start_date, end_date, adjust)
+    tfc = normalize_tf(tf)
+    if tfc not in ("1d", "1w", "1m"):
+        raise HTTPException(400, "tf must be 1d, 1w, or 1m")
+    etf_docs = _etf_records_or_none(symbol, limit, start_date, end_date, adjust, tfc)
     if etf_docs is not None:
         return _annotate_kline_units(etf_docs)
 
@@ -517,13 +529,15 @@ def get_records(
             match_stage["$lte"] = date_query["$lte"]
         if match_stage:
             pipeline.append({"$match": {"trade_date_str": match_stage}})
+    # 1d pulls one extra older bar so the oldest returned bar still has pre_close.
+    fetch_limit = limit * 35 + 35 if tfc in ("1w", "1m") else limit + 1
     if sort:
         # 支持 '-trade_date' 降序
         field = sort.lstrip('-')
         direction = -1 if sort.startswith('-') else 1
         pipeline.append({"$sort": {field: direction}})
-    pipeline.append({"$limit": limit})
-    if include_scores:
+    pipeline.append({"$limit": fetch_limit})
+    if include_scores and tfc == "1d":
         # stock_info is in quant_data (same db as volume_price). stock_scores is
         # in finance, so scores are attached after this aggregation.
         pipeline.extend(_STOCK_INFO_LOOKUP_STAGES)
@@ -534,11 +548,15 @@ def get_records(
 
     docs = [serialize_doc(doc) for doc in collection.aggregate(pipeline)]
     docs = _apply_records_adjustment(docs, adjust, adj_collection)
+    if tfc in ("1w", "1m"):
+        # Period bars carry no per-day score / G·S overlay; aggregate the
+        # adjusted daily rows with the same rule as ETFs.
+        return _annotate_kline_units(aggregate_rows(docs, tfc)[: int(limit)])
     if include_scores:
         docs = _attach_finance_scores(docs)
     if not include_scores or not any(row.get("name") for row in docs):
         docs = _stamp_kline_name(docs, symbol)
-    return _annotate_kline_units(_attach_decision_gs_fields(docs))
+    return _annotate_kline_units(_attach_decision_gs_fields(fill_pre_close(docs))[: int(limit)])
 
 
 def _attach_decision_gs_fields(docs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:

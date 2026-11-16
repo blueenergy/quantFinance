@@ -22,9 +22,9 @@ from services.analysis_history import build_user_analysis_history_payload
 from services.analysis_tasks import build_task_doc
 from services.etf_kline import (
     map_etf_daily_row,
-    resample_ohlc_rows,
     resolve_etf_ts_code,
 )
+from services.kline_resample import aggregate_rows
 from services.fund_inventory import public_snapshot
 from services.portfolio_symbol_risk import (
     build_workbench_swot_section,
@@ -596,11 +596,17 @@ def _decorate_kline_rows(
     tf: str,
     adj_collection_name: str = "stock_adj_factor",
 ) -> List[Dict[str, Any]]:
-    priced = (
-        _qfq_daily_kline_rows(data, symbol, rows, adj_collection_name=adj_collection_name)
-        if tf == "1d"
-        else rows
-    )
+    # 日/周/月统一前复权（此前只有 1d 复权，周/月直接是 stock_weekly/monthly
+    # 的不复权价，切周期价格会跳）。
+    priced = _qfq_daily_kline_rows(data, symbol, rows, adj_collection_name=adj_collection_name)
+    if tf in ("1w", "1m"):
+        # tushare stock_weekly/monthly 的 pct_chg 是小数（0.0316），与 K 线其他
+        # 表面（ETF、/records/、补出来的当期 bar）的百分数口径不一致；统一成百分数。
+        for row in priced:
+            pre = _to_float(row.get("pre_close"))
+            close = _to_float(row.get("close"))
+            if pre not in (None, 0) and close is not None:
+                row["pct_chg"] = (close - pre) / pre * 100.0
     try:
         return attach_decision_gs(priced)
     except Exception:
@@ -1007,7 +1013,7 @@ def _etf_kline_rows(data: Any, etf_ts: str, tfc: str) -> tuple[List[Dict[str, An
     priced = _qfq_daily_kline_rows(
         data, etf_ts, daily, adj_collection_name="etf_adj_factor"
     )
-    rows = resample_ohlc_rows(priced, tfc)[:limit]
+    rows = aggregate_rows(priced, tfc)[:limit]
     rows = _annotate_kline_amount_unit(rows, tfc)
     try:
         rows = attach_decision_gs(rows)

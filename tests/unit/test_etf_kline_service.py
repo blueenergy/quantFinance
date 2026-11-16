@@ -4,9 +4,9 @@ from services.etf_kline import (
     etf_symbol_variants,
     load_etf_kline_rows,
     map_etf_daily_row,
-    resample_ohlc_rows,
     resolve_etf_ts_code,
 )
+from services.kline_resample import aggregate_rows
 
 
 class _Coll:
@@ -81,8 +81,8 @@ def test_load_etf_kline_rows_none_vs_empty():
     assert rows == []
 
 
-def test_resample_ohlc_rows_weekly_sums_volume():
-    w1 = ["20250331", "20250401", "20250402", "20250403", "20250404"]
+def test_aggregate_rows_weekly_sums_volume_and_labels_last_day():
+    w1 = ["20250331", "20250401", "20250402", "20250403"]
     rows = [
         {
             "ts_code": "510300.SH",
@@ -91,14 +91,37 @@ def test_resample_ohlc_rows_weekly_sums_volume():
             "open": 1.0,
             "high": 1.1,
             "low": 0.9,
-            "close": 2.0 if td == "20250404" else 1.0,
+            "close": 2.0 if td == "20250403" else 1.0,
             "vol": 10.0,
             "volume": 10.0,
+            "fd_share": 100.0,
         }
         for td in w1
     ]
-    weekly = resample_ohlc_rows(rows, "1w")
+    weekly = aggregate_rows(rows, "1w")
     assert len(weekly) == 1
-    assert weekly[0]["trade_date"] == "20250404"
+    # 20250404 是清明假期，组内最后一个交易日是 04-03
+    assert weekly[0]["trade_date"] == "20250403"
     assert weekly[0]["close"] == pytest.approx(2.0)
-    assert weekly[0]["volume"] == pytest.approx(50.0)
+    assert weekly[0]["high"] == pytest.approx(1.1)
+    assert weekly[0]["low"] == pytest.approx(0.9)
+    assert weekly[0]["volume"] == pytest.approx(40.0)
+    assert weekly[0]["fd_share"] == pytest.approx(100.0)
+    assert weekly[0]["pre_close"] is None
+    assert weekly[0]["pct_chg"] is None
+
+
+def test_aggregate_rows_monthly_bar_over_bar_pct():
+    rows = [
+        {"trade_date": "20250102", "open": 1.0, "high": 1.1, "low": 0.9, "close": 1.0, "vol": 1},
+        {"trade_date": "20250128", "open": 1.0, "high": 1.2, "low": 0.8, "close": 1.1, "vol": 1},
+        {"trade_date": "20250210", "open": 2.0, "high": 2.1, "low": 1.9, "close": 2.0, "vol": 2},
+    ]
+    bars = aggregate_rows(rows, "1m")
+    assert [bar["trade_date"] for bar in bars] == ["20250210", "20250128"]
+    newest, older = bars
+    assert older["pre_close"] is None
+    assert newest["pre_close"] == pytest.approx(1.1)
+    assert newest["pct_chg"] == pytest.approx((2.0 - 1.1) / 1.1 * 100.0)
+    # 月度 bar 用月末最后交易日，不是 20250131 / 20250228
+    assert "20250131" not in [bar["trade_date"] for bar in bars]
