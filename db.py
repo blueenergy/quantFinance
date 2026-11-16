@@ -341,6 +341,7 @@ def get_ml_db_collections() -> Dict[str, Collection]:
     return {
         "model_training_jobs": ml_db["model_training_jobs"],
         "model_training_results": ml_db["model_training_results"],
+        "models": ml_db["models"],
         "dataset_manifests": ml_db["dataset_manifests"],
         "model_predictions": ml_db["model_predictions"],
         "model_shadow_jobs": ml_db["model_shadow_jobs"],

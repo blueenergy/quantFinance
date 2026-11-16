@@ -71,6 +71,7 @@ from routers.symbol_opportunity import router as symbol_opportunity_router
 from routers.portfolio_research import router as portfolio_research_router
 from routers.factor_backtest import router as factor_backtest_router
 from routers.model_training import router as model_training_router
+from routers.model_registry import router as model_registry_router
 from routers.model_scores import router as model_scores_router
 from routers.score_audit import router as score_audit_router
 from routers.ops_repair import router as ops_repair_router
@@ -208,6 +209,7 @@ app.include_router(symbol_opportunity_router, prefix="/api", tags=["个股机会
 app.include_router(portfolio_research_router, prefix="/api", tags=["组合研究"])
 app.include_router(factor_backtest_router, prefix="/api", tags=["因子回测"])
 app.include_router(model_training_router, prefix="/api", tags=["模型训练"])
+app.include_router(model_registry_router, prefix="/api", tags=["模型工厂"])
 app.include_router(model_scores_router, prefix="/api", tags=["模型评分"])
 app.include_router(score_audit_router, prefix="/api", tags=["评分自查"])
 app.include_router(ops_repair_router, prefix="/api", tags=["运维修复"])
