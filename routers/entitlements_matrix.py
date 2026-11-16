@@ -70,6 +70,7 @@ _NAV_ROWS: List[Tuple[str, str, int]] = [
     ("factor-backtest", "🧬 因子回测", 96),
     ("portfolio-research", "组合研究", 97),
     ("model-training", "模型训练", 97),
+    ("model-scores", "🧮 模型评分", 71),
     ("portfolio-plans", "📋 组合交易计划", 98),
     ("portfolio-overview", "📊 组合总览(实盘)", 99),
     ("strategies", "策略配置", 100),
