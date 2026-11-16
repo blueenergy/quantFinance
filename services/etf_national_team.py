@@ -367,12 +367,18 @@ def _share_changes(
     Optional[float],
     Optional[float],
     Optional[str],
+    Optional[str],
 ]:
-    """(chg1, chg5, latest, prev, prev_date) for the latest row <= day."""
+    """(chg1, chg5, latest, prev, prev_date, row_date) for the latest row <= day.
+
+    ``row_date`` is the trade_date of the share row actually used; it is older
+    than ``day`` whenever that day's fund_share has not been published yet
+    (T+1), which callers must not present as same-day data.
+    """
     dates, values = series
     idx = bisect.bisect_right(dates, day) - 1
     if idx < 0 or not values[idx]:
-        return None, None, None, None, None
+        return None, None, None, None, None, None
     current = values[idx]
     chg1 = (
         (current / values[idx - 1] - 1) * 100
@@ -386,7 +392,7 @@ def _share_changes(
     )
     prev = values[idx - 1] if idx >= 1 else None
     prev_date = dates[idx - 1] if idx >= 1 else None
-    return chg1, chg5, current, prev, prev_date
+    return chg1, chg5, current, prev, prev_date, dates[idx]
 
 
 def _pool_day_stats(
@@ -497,8 +503,11 @@ def compute_history(
         pool_base = 0.0
         breadth2 = 0
         breadth25 = 0
-        share1_values: List[float] = []
+        share1_sig_values: List[float] = []  # level check: latest known share
+        share1_values: List[float] = []  # display: same-day share only
         share5_values: List[float] = []
+        share_dates: List[str] = []
+        share_covered = 0
         flow_delta = 0.0
         flow_base = 0.0
         flow_abs = 0.0
@@ -524,22 +533,33 @@ def compute_history(
                 latest_share,
                 prev_share,
                 prev_share_date,
+                share_row_date,
             ) = _share_changes(share_series.get(code, ([], [])), day)
             if share1 is not None:
-                share1_values.append(share1)
-            if share5 is not None:
-                share5_values.append(share5)
-            weight_close = (
-                daily_close.get(code, {}).get(prev_share_date)
-                if prev_share_date
-                else None
-            )
-            if latest_share and prev_share and weight_close:
-                base_aum = prev_share * weight_close
-                delta_aum = (latest_share - prev_share) * weight_close
-                flow_base += base_aum
-                flow_delta += delta_aum
-                flow_abs += abs(delta_aum)
+                share1_sig_values.append(share1)
+            if share_row_date:
+                share_dates.append(share_row_date)
+            # Share confirmation is T+1: on the day itself (and until the next
+            # session's sync) the latest row belongs to an older trade date.  It
+            # still feeds the level check exactly as before, but it must not be
+            # displayed as this day's share change.
+            if share_row_date == day:
+                share_covered += 1
+                if share1 is not None:
+                    share1_values.append(share1)
+                if share5 is not None:
+                    share5_values.append(share5)
+                weight_close = (
+                    daily_close.get(code, {}).get(prev_share_date)
+                    if prev_share_date
+                    else None
+                )
+                if latest_share and prev_share and weight_close:
+                    base_aum = prev_share * weight_close
+                    delta_aum = (latest_share - prev_share) * weight_close
+                    flow_base += base_aum
+                    flow_delta += delta_aum
+                    flow_abs += abs(delta_aum)
 
         if as_of_hm > "1430" and pool_cur:
             day_tail_share = sum(tail.values()) / pool_cur
@@ -559,14 +579,20 @@ def compute_history(
             else None
         )
 
+        avg_share1_sig = (
+            statistics.mean(share1_sig_values) if share1_sig_values else None
+        )
         avg_share1 = statistics.mean(share1_values) if share1_values else None
+        avg_share5 = statistics.mean(share5_values) if share5_values else None
         pool_flow = (flow_delta / flow_base * 100) if flow_base else None
         share_rotation = (flow_abs / abs(flow_delta)) if flow_delta else None
+        known_share_date = max(share_dates) if share_dates else None
+        share_stale = bool(known_share_date and known_share_date < day)
         share_direction = _share_direction(pool_flow)
         if (
             breadth25 >= 3
-            and avg_share1 is not None
-            and avg_share1 >= 1
+            and avg_share1_sig is not None
+            and avg_share1_sig >= 1
             and tail_ratio is not None
             and tail_ratio >= 1.3
         ):
@@ -590,13 +616,15 @@ def compute_history(
                 "breadth_25x": breadth25,
                 "tail_ratio": tail_ratio,
                 "share_chg_1d": avg_share1,
-                "share_chg_5d": (
-                    statistics.mean(share5_values) if share5_values else None
-                ),
+                "share_chg_5d": avg_share5,
                 "pool_share_flow": pool_flow,
                 "share_rotation": share_rotation,
                 "direction": share_direction,
                 "direction_label": SHARE_DIRECTION_LABELS[share_direction],
+                "share_date": known_share_date,
+                "share_stale": share_stale,
+                "share_covered": share_covered,
+                "share_total": len(codes),
                 "baseline_days": baseline_days,
                 "partial": bool(last_hm and last_hm < as_of_hm),
             }
@@ -810,6 +838,7 @@ def compute_snapshot(
     breadth25 = 0
     share1_values: List[float] = []
     share5_values: List[float] = []
+    share_covered = 0
     flow_delta = 0.0
     flow_base = 0.0
     flow_abs = 0.0
@@ -852,6 +881,8 @@ def compute_snapshot(
             else None
         )
         share1, share5, share_date = _share_pair(ctx, code)
+        if share_date == today:
+            share_covered += 1
         if share1 is not None:
             share1_values.append(share1)
         if share5 is not None:
@@ -923,6 +954,7 @@ def compute_snapshot(
                 "share_chg_1d": share1,
                 "share_chg_5d": share5,
                 "share_date": share_date,
+                "share_stale": bool(share_date and share_date < today),
                 "signal": level,
                 "signal_label": _label_level(level),
             }
@@ -993,10 +1025,14 @@ def compute_snapshot(
     else:
         level = "calm"
 
-    share_date = next(
+    share_date = max(
         (item.get("share_date") for item in etfs if item.get("share_date")),
-        None,
+        default=None,
     )
+    # fund_share is published T+1, so during (and right after) the session the
+    # newest row belongs to an older trade date.  Values stay available, but the
+    # UI must label them with their own date instead of the snapshot's date.
+    share_stale = bool(share_date and share_date < today)
     return {
         "success": True,
         "trade_date": today,
@@ -1027,6 +1063,9 @@ def compute_snapshot(
             "avg_chg_1d": avg_share1,
             "avg_chg_5d": avg_share5,
             "date": share_date,
+            "stale": share_stale,
+            "covered": share_covered,
+            "total": len(ctx["pool"]),
             "pool_flow": pool_flow,
             "rotation": share_rotation,
             "direction": share_direction,
