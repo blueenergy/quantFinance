@@ -14,6 +14,8 @@ from services.intraday_kline import (
     minute_trade_date_bound,
     resolve_1m_query_day,
 )
+from services.etf_kline import resolve_etf_basic
+from services.intraday_line import build_intraday_line, time_slots
 from stock_data_access.indicators.intraday_resample import normalize_intraday_tf
 from services.trade_ledger import (
     compute_realized_pnl_for_group,
@@ -750,6 +752,122 @@ def get_minute_bars(
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"查询分钟K线失败: {str(e)}")
+
+
+def _num_or_none(value: Any) -> Optional[float]:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return None if number != number else number
+
+
+def _intraday_variants(symbol: str) -> List[str]:
+    raw = [normalize_symbol(symbol), strip_exchange_suffix(symbol)]
+    out: List[str] = []
+    for item in raw:
+        if item and item not in out:
+            out.append(item)
+    return out
+
+
+@router.get("/intraday-line/", summary="获取分时线（价格线 + 均价线）")
+def get_intraday_line(
+    symbol: str = Query(..., description="股票 / ETF 代码"),
+    date: Optional[str] = Query(None, description="交易日 YYYYMMDD，缺省取最新一根分钟线"),
+    current_user: dict = Depends(get_current_active_user),
+):
+    """真正的分时线：241 个分钟点 + 均价线 + 涨跌幅 + 昨收。
+
+    数据源 ``quant_data.minute_bars``（1m，volume=手 / amount=元）。
+    股票与 ETF 用同一套槽位（09:30–11:30 + 13:01–15:00）。
+    """
+    try:
+        data_db = get_data_db()
+        minute_coll = data_db["minute_bars"]
+        variants = _intraday_variants(symbol)
+        if not variants:
+            raise HTTPException(status_code=400, detail="symbol is required")
+
+        day = compact_day(date)
+        if not day:
+            latest = minute_coll.find_one(
+                {"symbol": {"$in": variants}},
+                sort=[("trade_date", -1)],
+                projection={"trade_date": 1},
+            )
+            day = compact_day((latest or {}).get("trade_date"))
+        if not day:
+            return {
+                "success": True,
+                "symbol": symbol,
+                "name": "",
+                "session_date": None,
+                "pre_close": None,
+                "times": time_slots(),
+                "bars": [],
+                "summary": {},
+                "count": 0,
+            }
+
+        rows = [
+            serialize_doc(doc)
+            for doc in minute_coll.find(
+                {
+                    "symbol": {"$in": variants},
+                    "trade_date": {"$gte": f"{day}0930", "$lte": f"{day}1500"},
+                },
+                {"_id": 0},
+            ).sort("trade_date", 1)
+        ]
+
+        etf_basic = data_db.get("etf_basic")
+        etf = resolve_etf_basic(etf_basic, symbol) if etf_basic is not None else None
+        name = (etf or {}).get("name") or ""
+        pre_close: Optional[float] = None
+        if etf:
+            prev = data_db["etf_daily"].find_one(
+                {"ts_code": etf["ts_code"], "trade_date": {"$lt": day}},
+                {"_id": 0, "close": 1},
+                sort=[("trade_date", -1)],
+            )
+            pre_close = _num_or_none((prev or {}).get("close"))
+        else:
+            today_bar = data_db["volume_price"].find_one(
+                {"symbol": {"$in": variants}, "trade_date": day},
+                {"_id": 0, "pre_close": 1, "close": 1},
+            )
+            pre_close = _num_or_none((today_bar or {}).get("pre_close"))
+            if pre_close is None:
+                prev = data_db["volume_price"].find_one(
+                    {"symbol": {"$in": variants}, "trade_date": {"$lt": day}},
+                    {"_id": 0, "close": 1},
+                    sort=[("trade_date", -1)],
+                )
+                pre_close = _num_or_none((prev or {}).get("close"))
+            if not name:
+                info = data_db["stock_info"].find_one(
+                    {"$or": [{"symbol": {"$in": variants}}, {"ts_code": {"$in": variants}}]},
+                    {"_id": 0, "name": 1},
+                )
+                name = (info or {}).get("name") or ""
+
+        line = build_intraday_line(rows, pre_close)
+        return {
+            "success": True,
+            "symbol": symbol,
+            "name": name,
+            "session_date": day,
+            "pre_close": pre_close,
+            "times": line["times"],
+            "bars": line["bars"],
+            "summary": line["summary"],
+            "count": len(rows),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"查询分时线失败: {str(e)}")
 
 
 @router.get("/trade-signals/", summary="获取交易信号记录")
