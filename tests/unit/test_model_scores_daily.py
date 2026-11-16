@@ -199,6 +199,48 @@ def test_catalog_reports_coverage_and_recent_flag():
     assert list(catalog)[0] == "live-model"
 
 
+def test_catalog_marks_accepted_models():
+    db = _db()
+    _seed_predictions(db, "live-model", [("000001.SZ", 0.9)])
+    _seed_predictions(db, "shadow-only", [("000001.SZ", 0.8)])
+    _seed_predictions(db, "retired", [("000001.SZ", 0.7)], trade_date="20240102")
+    db["model_shadow_profiles"].insert_many(
+        [
+            {"model_id": "live-model", "enabled": True},
+            {"profile_id": "p2", "params": {"model_id": "shadow-only"}, "enabled": True},
+            {"model_id": "retired", "enabled": False},
+        ]
+    )
+    db["portfolio_strategy_activations"].insert_one(
+        {"status": "active", "params_override": {"model_id": "live-model"}}
+    )
+
+    catalog = {
+        row["model_id"]: row
+        for row in list_model_catalog(
+            db["model_predictions"],
+            shadow_profiles=db["model_shadow_profiles"],
+            activations=db["portfolio_strategy_activations"],
+        )
+    }
+
+    assert catalog["live-model"]["accepted"] is True
+    assert catalog["live-model"]["accepted_reasons"] == ["live", "shadow"]
+    assert catalog["shadow-only"]["accepted"] is True
+    assert catalog["shadow-only"]["accepted_reasons"] == ["shadow"]
+    assert catalog["retired"]["accepted"] is False
+    assert catalog["retired"]["accepted_reasons"] == []
+
+
+def test_catalog_without_profile_sources_marks_nothing_accepted():
+    db = _db()
+    _seed_predictions(db, "m1", [("000001.SZ", 0.9)])
+
+    row = list_model_catalog(db["model_predictions"])[0]
+
+    assert row["accepted"] is False
+
+
 def test_limit_caps_rows_but_not_comparison_set():
     db = _db()
     _seed_predictions(db, "m1", [(f"00000{i}.SZ", float(i)) for i in range(1, 6)])

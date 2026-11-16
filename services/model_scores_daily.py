@@ -60,13 +60,60 @@ def _round(value: Optional[float], digits: int = 6) -> Optional[float]:
     return round(float(value), digits)
 
 
-def list_model_catalog(predictions, *, recent_days: int = RECENT_DAYS) -> List[Dict[str, Any]]:
+def _shadow_enabled_models(shadow_profiles) -> set:
+    """model ids the shadow pipeline currently produces daily."""
+    if shadow_profiles is None:
+        return set()
+    out = set()
+    try:
+        docs = shadow_profiles.find(
+            {"enabled": {"$ne": False}}, {"_id": 0, "model_id": 1, "params": 1}
+        )
+        for doc in docs:
+            model_id = doc.get("model_id") or (doc.get("params") or {}).get("model_id")
+            if model_id:
+                out.add(str(model_id))
+    except Exception:
+        return set()
+    return out
+
+
+def _live_models(activations) -> set:
+    """model ids referenced by an active strategy activation."""
+    if activations is None:
+        return set()
+    out = set()
+    try:
+        docs = activations.find({"status": "active"}, {"_id": 0, "params_override": 1})
+        for doc in docs:
+            model_id = (doc.get("params_override") or {}).get("model_id")
+            if model_id:
+                out.add(str(model_id))
+    except Exception:
+        return set()
+    return out
+
+
+def list_model_catalog(
+    predictions,
+    *,
+    shadow_profiles=None,
+    activations=None,
+    recent_days: int = RECENT_DAYS,
+) -> List[Dict[str, Any]]:
     """Every ``model_id`` in ``model_predictions`` with its coverage.
+
+    ``accepted`` marks a model the system actually runs: an active strategy
+    activation (live) or an enabled shadow profile. Everything else is a
+    historical research model; the UI hides those by default because 19
+    choices are worse than 2 when most of them are retired.
 
     The count/coverage reads are N+1 by ``model_id``, which the compound
     index (model_id, trade_date, ts_code) serves as a prefix scan.
     """
     cutoff = (_date.today() - timedelta(days=int(recent_days))).strftime("%Y%m%d")
+    live_models = _live_models(activations)
+    shadow_models = _shadow_enabled_models(shadow_profiles)
     rows: List[Dict[str, Any]] = []
     for model_id in sorted(predictions.distinct("model_id") or []):
         if not model_id:
@@ -84,8 +131,15 @@ def list_model_catalog(predictions, *, recent_days: int = RECENT_DAYS) -> List[D
         if not first or not last:
             continue
         dates = sorted(predictions.distinct("trade_date", {"model_id": model_id}) or [])
+        reasons = []
+        if model_id in live_models:
+            reasons.append("live")
+        if model_id in shadow_models:
+            reasons.append("shadow")
         rows.append(
             {
+                "accepted": bool(reasons),
+                "accepted_reasons": reasons,
                 "model_id": model_id,
                 "index_code": (last or {}).get("index_code") or (first or {}).get("index_code"),
                 "first_trade_date": dates[0] if dates else _iso(first.get("trade_date")),

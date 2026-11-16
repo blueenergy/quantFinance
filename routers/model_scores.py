@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 
 from auth import get_current_active_user
-from db import get_db_collections, get_data_db, get_ml_db_collections
+from db import get_db_collections, get_data_db, get_ml_db_collections, get_trading_db_collections
 from services.model_scores_daily import (
     DEFAULT_LIMIT,
     DEFAULT_TOP_N,
@@ -54,8 +54,13 @@ def list_model_score_models(
 ) -> Dict[str, Any]:
     """Model ids in ``model_predictions`` with coverage and recent dates."""
     _ = current_user
-    predictions = get_ml_db_collections()["model_predictions"]
-    return {"success": True, "data": {"models": list_model_catalog(predictions)}}
+    ml = get_ml_db_collections()
+    models = list_model_catalog(
+        ml["model_predictions"],
+        shadow_profiles=ml.get("model_shadow_profiles"),
+        activations=get_trading_db_collections().get("portfolio_strategy_activations"),
+    )
+    return {"success": True, "data": {"models": models}}
 
 
 @router.get("/daily")
