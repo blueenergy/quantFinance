@@ -4,6 +4,9 @@
 """
 
 import logging
+import statistics
+import threading
+import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional
@@ -183,6 +186,303 @@ def _bar_update_time(doc: Optional[Dict[str, Any]]) -> Optional[str]:
     if not td:
         return None
     return f"{td[0:4]}-{td[4:6]}-{td[6:8]}"
+
+
+# ==================== 盘中量比 ====================
+#
+# The exchange-style 量比 divides today's cumulative volume by
+# ``5-day average volume per minute * minutes elapsed``.  Dividing by the
+# *full-day* average makes every morning look quiet (at 10:45 only ~31% of the
+# session has elapsed), which is what the intraday alert used to do.  The
+# primary column here is the stricter "same time of day" ratio:
+# today's cumulative volume at HH:MM / the 20-day median at the same HH:MM.
+
+_VOLUME_RATIO_TTL_SECONDS = 60.0
+_VOLUME_RATIO_MIN_SAMPLES = 10
+_VOLUME_RATIO_EARLY_MINUTES = 5
+_VOLUME_RATIO_FULL_DAY_MINUTES = 240
+_volume_ratio_cache: Dict[Any, Any] = {}
+_volume_ratio_cache_lock = threading.Lock()
+
+
+def _session_volume_clock(now: Optional[datetime] = None) -> Dict[str, Any]:
+    """A-share session phase, elapsed minutes and minute-bar cutoff.
+
+    ``elapsed`` follows the exchange convention: 09:30-11:30 counts 0-120
+    minutes, 13:00-15:00 adds another 0-120 (240 per full day).  ``cutoff`` is
+    the ``HHMM`` suffix used to compare ``minute_bars.trade_date``.
+    """
+    current = now or datetime.now(_CN_TZ)
+    minutes = current.hour * 60 + current.minute
+    hm = current.strftime("%H%M")
+    open_am, close_am, open_pm, close_pm = 570, 690, 780, 900
+    if minutes < open_am:
+        return {"phase": "pre", "elapsed": 0, "cutoff": None}
+    if minutes < close_am:
+        return {"phase": "am", "elapsed": max(1, minutes - open_am), "cutoff": hm}
+    if minutes < open_pm:
+        return {"phase": "lunch", "elapsed": 120, "cutoff": "1130"}
+    if minutes < close_pm:
+        return {"phase": "pm", "elapsed": 120 + max(1, minutes - open_pm), "cutoff": hm}
+    return {"phase": "closed", "elapsed": 240, "cutoff": "1500"}
+
+
+def _same_time_stats(days: Dict[str, float], today: str) -> Dict[str, Any]:
+    """Same-time baselines from prior days' cumulative volumes.
+
+    ``days`` maps ``YYYYMMDD`` to that day's cumulative volume at the same
+    HH:MM (today's entry is ignored — it is the numerator, not the baseline).
+    Fewer than 10 prior observations yields ``median=None`` so callers can fall
+    back to the traditional ratio.
+    """
+    ordered = [float(v) for day, v in sorted(days.items()) if day != today]
+    recent = ordered[-20:]
+    return {
+        "samples": len(recent),
+        "median": statistics.median(recent) if len(recent) >= _VOLUME_RATIO_MIN_SAMPLES else None,
+        "prev": recent[-1] if recent else None,
+        "avg5": statistics.mean(recent[-5:]) if len(recent) >= 5 else None,
+    }
+
+
+def _query_same_time_volume_days(
+    minute_bars_col,
+    symbols: List[str],
+    today: str,
+    cutoff: Optional[str],
+    lookback_days: int = 45,
+) -> Dict[str, Dict[str, float]]:
+    """One aggregation for ``{symbol: {day: cumulative volume at cutoff}}``.
+
+    Includes today so the numerator and the baseline come from the same
+    source (minute bars sum to the daily volume 1:1, and unlike ``volume_price``
+    they also exist for ETFs).
+    """
+    if minute_bars_col is None or not symbols or not cutoff:
+        return {}
+    try:
+        start = (datetime.strptime(today, "%Y%m%d") - timedelta(days=lookback_days)).strftime("%Y%m%d")
+    except ValueError:
+        return {}
+    pipeline = [
+        {
+            "$match": {
+                "symbol": {"$in": list(symbols)},
+                "trade_date": {"$gte": f"{start}0930", "$lte": f"{today}{cutoff}"},
+            }
+        },
+        {
+            "$project": {
+                "symbol": 1,
+                "day": {"$substr": ["$trade_date", 0, 8]},
+                "hm": {"$substr": ["$trade_date", 8, 4]},
+                "volume": 1,
+            }
+        },
+        {"$match": {"hm": {"$lte": cutoff}}},
+        {
+            "$group": {
+                "_id": {"symbol": "$symbol", "day": "$day"},
+                "volume": {"$sum": "$volume"},
+            }
+        },
+    ]
+    try:
+        rows = list(minute_bars_col.aggregate(pipeline))
+    except Exception:
+        logger.warning("same-time minute volume aggregation failed", exc_info=True)
+        return {}
+    out: Dict[str, Dict[str, float]] = defaultdict(dict)
+    for row in rows:
+        key = row.get("_id") or {}
+        symbol = str(key.get("symbol") or "")
+        day = str(key.get("day") or "")
+        if symbol and day:
+            out[symbol][day] = float(row.get("volume") or 0)
+    return out
+
+
+def _same_time_volume_cached(
+    minute_bars_col,
+    symbols: List[str],
+    today: str,
+    cutoff: Optional[str],
+) -> Dict[str, Dict[str, float]]:
+    """Cached ``{symbol: {day: cumulative volume at cutoff}}`` (60s TTL)."""
+    key = (tuple(sorted(symbols)), today, cutoff)
+    now_ts = time.monotonic()
+    with _volume_ratio_cache_lock:
+        hit = _volume_ratio_cache.get(key)
+        if hit and now_ts - hit[0] < _VOLUME_RATIO_TTL_SECONDS:
+            return hit[1]
+    raw = _query_same_time_volume_days(minute_bars_col, list(symbols), today, cutoff)
+    with _volume_ratio_cache_lock:
+        _volume_ratio_cache[key] = (now_ts, raw)
+        if len(_volume_ratio_cache) > 128:
+            stale = sorted(_volume_ratio_cache, key=lambda k: _volume_ratio_cache[k][0])[:64]
+            for stale_key in stale:
+                _volume_ratio_cache.pop(stale_key, None)
+    return raw
+
+
+def _query_recent_daily_volumes(data_collections, symbols: List[str], today: str) -> Dict[str, List[float]]:
+    """Last five completed daily volumes per symbol (stocks + ETFs)."""
+    if not symbols:
+        return {}
+    variant_to_symbol: Dict[str, str] = {}
+    for symbol in symbols:
+        for variant in _symbol_variants(symbol) + _etf_symbol_variants(symbol):
+            variant_to_symbol.setdefault(variant, symbol)
+    variants = list(variant_to_symbol)
+    if not variants:
+        return {}
+    date_key = _trade_date_match_recent(today, max_days=12)
+    by_symbol_day: Dict[str, Dict[str, float]] = defaultdict(dict)
+
+    def collect_vp(collection) -> None:
+        if collection is None:
+            return
+        try:
+            docs = collection.find(
+                {"$or": [{"symbol": {"$in": variants}}, {"ts_code": {"$in": variants}}], "trade_date": date_key},
+                {"_id": 0, "symbol": 1, "ts_code": 1, "trade_date": 1, "volume": 1, "vol": 1},
+            )
+        except Exception:
+            logger.warning("recent daily volume lookup failed", exc_info=True)
+            return
+        for doc in docs:
+            variant = str(doc.get("symbol") or doc.get("ts_code") or "").strip()
+            _record_daily_volume(doc, variant_to_symbol.get(variant))
+
+    def collect_etf(collection) -> None:
+        if collection is None:
+            return
+        try:
+            docs = collection.find(
+                {"ts_code": {"$in": variants}, "trade_date": date_key},
+                {"_id": 0, "ts_code": 1, "trade_date": 1, "vol": 1, "volume": 1},
+            )
+        except Exception:
+            logger.warning("recent ETF daily volume lookup failed", exc_info=True)
+            return
+        for doc in docs:
+            variant = str(doc.get("ts_code") or "").strip()
+            _record_daily_volume(doc, variant_to_symbol.get(variant))
+
+    def _record_daily_volume(doc: Dict[str, Any], symbol: Optional[str]) -> None:
+        if not symbol:
+            return
+        day = _norm_trade_date_to_yyyymmdd(doc.get("trade_date"))
+        if not day or day == today:
+            return
+        value = _bar_volume(doc)
+        if value is None:
+            return
+        try:
+            by_symbol_day[symbol][day] = float(value)
+        except (TypeError, ValueError):
+            return
+
+    collect_vp(data_collections.get("volume_price"))
+    collect_etf(data_collections.get("etf_daily"))
+
+    return {symbol: [days[d] for d in sorted(days)[-5:]] for symbol, days in by_symbol_day.items()}
+
+
+def _traditional_volume_ratio(
+    today_volume: Any,
+    daily_volumes: Optional[List[float]],
+    elapsed_minutes: Optional[int],
+) -> Optional[float]:
+    """Exchange-style 量比: today cumulative / (5-day avg per minute * elapsed)."""
+    if not today_volume or not daily_volumes or not elapsed_minutes or elapsed_minutes < 1:
+        return None
+    base = statistics.mean(daily_volumes[-5:])
+    if base <= 0:
+        return None
+    expected = base / _VOLUME_RATIO_FULL_DAY_MINUTES * elapsed_minutes
+    return float(today_volume) / expected if expected > 0 else None
+
+
+def _positive_number(value: Any) -> bool:
+    try:
+        return float(value) > 0
+    except (TypeError, ValueError):
+        return False
+
+
+def _attach_volume_ratios(rows: List[Dict[str, Any]], data_collections, today: str) -> None:
+    """Annotate realtime rows with intraday volume ratios (never raises).
+
+    The numerator is today's cumulative volume taken from ``minute_bars`` at
+    the same cutoff, so it matches the baseline exactly (no snapshot lag) and
+    also works for ETFs, which have no ``volume_price`` row.
+    """
+    try:
+        clock = _session_volume_clock()
+        cutoff = clock.get("cutoff")
+        at_text = f"{cutoff[:2]}:{cutoff[2:]}" if cutoff else None
+        eligible = [
+            str(row.get("symbol"))
+            for row in rows
+            if row.get("symbol")
+            and _norm_trade_date_to_yyyymmdd(row.get("update_time")) == today
+        ]
+        stats: Dict[str, Dict[str, Any]] = {}
+        today_cum: Dict[str, float] = {}
+        if eligible and cutoff:
+            raw = _same_time_volume_cached(
+                data_collections.get("minute_bars"), sorted(set(eligible)), today, cutoff
+            )
+            today_cum = {sym: float(days.get(today) or 0) for sym, days in raw.items()}
+            stats = {sym: _same_time_stats(days, today) for sym, days in raw.items()}
+        daily_volumes = (
+            _query_recent_daily_volumes(data_collections, sorted(set(eligible)), today)
+            if eligible
+            else {}
+        )
+        elapsed = clock.get("elapsed")
+        for row in rows:
+            symbol = str(row.get("symbol") or "")
+            same = trad = prev_ratio = avg5_ratio = None
+            samples = 0
+            basis = None
+            primary = None
+            if symbol in eligible:
+                stat = stats.get(symbol) or {}
+                samples = int(stat.get("samples") or 0)
+                minute_volume = today_cum.get(symbol) or 0.0
+                snapshot_volume = row.get("volume")
+                today_volume = minute_volume if minute_volume > 0 else (
+                    float(snapshot_volume) if _positive_number(snapshot_volume) else None
+                )
+                if today_volume:
+                    if stat.get("median"):
+                        same = today_volume / float(stat["median"])
+                    if stat.get("prev"):
+                        prev_ratio = today_volume / float(stat["prev"])
+                    if stat.get("avg5"):
+                        avg5_ratio = today_volume / float(stat["avg5"])
+                    trad = _traditional_volume_ratio(today_volume, daily_volumes.get(symbol), elapsed)
+                if elapsed and elapsed >= _VOLUME_RATIO_EARLY_MINUTES:
+                    if same is not None and samples >= _VOLUME_RATIO_MIN_SAMPLES:
+                        primary, basis = same, "same_time"
+                    elif trad is not None:
+                        primary, basis = trad, "traditional"
+            row.update(
+                {
+                    "volume_ratio": _safe_round_price(primary, 2),
+                    "volume_ratio_basis": basis,
+                    "volume_ratio_same_time": _safe_round_price(same, 2),
+                    "volume_ratio_traditional": _safe_round_price(trad, 2),
+                    "volume_ratio_prev_day": _safe_round_price(prev_ratio, 2),
+                    "volume_ratio_avg5": _safe_round_price(avg5_ratio, 2),
+                    "volume_ratio_samples": samples,
+                    "volume_ratio_at": at_text,
+                }
+            )
+    except Exception:
+        logger.warning("attach volume ratios failed", exc_info=True)
 
 
 def _realtime_row_from_bar(
@@ -1428,12 +1728,14 @@ def get_user_watchlist_realtime(current_user: dict = Depends(get_current_active_
                     "change_pct": None,
                     "update_time": None,
                 })
-        
+
+        _attach_volume_ratios(result, data_collections, today)
+
         return {
             "success": True,
             "data": result
         }
-        
+
     except Exception as e:
         import traceback
         traceback.print_exc()

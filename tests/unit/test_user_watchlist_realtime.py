@@ -1,3 +1,5 @@
+from datetime import datetime
+
 import pytest
 
 from routers import user_watchlist
@@ -43,14 +45,18 @@ class _Collection:
     def find(self, query=None, projection=None):
         return _Cursor([doc for doc in self.docs if _matches(doc, query)])
 
-
-class _ExplodingCollection(_Collection):
     def aggregate(self, pipeline):
-        raise AssertionError("minute_bars should not be queried")
+        """Same-time volume aggregation is stubbed out in router tests."""
+        return _Cursor([])
 
 
 def test_watchlist_realtime_uses_volume_price_snapshot(monkeypatch):
     monkeypatch.setattr(user_watchlist, "_cn_calendar_today_yyyymmdd", lambda: "20260701")
+    monkeypatch.setattr(
+        user_watchlist,
+        "_session_volume_clock",
+        lambda now=None: {"phase": "pre", "elapsed": 0, "cutoff": None},
+    )
     monkeypatch.setattr(
         user_watchlist,
         "get_db_collections",
@@ -89,7 +95,7 @@ def test_watchlist_realtime_uses_volume_price_snapshot(monkeypatch):
             "etf_basic": _Collection([]),
             "etf_daily": _Collection([]),
             "sw_index_member": _Collection([]),
-            "minute_bars": _ExplodingCollection([]),
+            "minute_bars": _Collection([]),
         },
     )
 
@@ -111,6 +117,14 @@ def test_watchlist_realtime_uses_volume_price_snapshot(monkeypatch):
             "change": 0.5,
             "change_pct": 5.0,
             "update_time": "2026-07-01 10:15:00",
+            "volume_ratio": None,
+            "volume_ratio_basis": None,
+            "volume_ratio_same_time": None,
+            "volume_ratio_traditional": None,
+            "volume_ratio_prev_day": None,
+            "volume_ratio_avg5": None,
+            "volume_ratio_samples": 0,
+            "volume_ratio_at": None,
         }
     ]
 
@@ -196,7 +210,7 @@ def test_watchlist_realtime_stock_prefers_miniqmt_over_eastmoney(monkeypatch):
             "etf_basic": _Collection([]),
             "etf_daily": _Collection([]),
             "sw_index_member": _Collection([]),
-            "minute_bars": _ExplodingCollection([]),
+            "minute_bars": _Collection([]),
         },
     )
 
@@ -293,7 +307,7 @@ def test_watchlist_realtime_etf_keeps_three_price_decimals(monkeypatch):
                 ]
             ),
             "sw_index_member": _Collection([]),
-            "minute_bars": _ExplodingCollection([]),
+            "minute_bars": _Collection([]),
         },
     )
 
@@ -312,6 +326,11 @@ def test_watchlist_realtime_etf_keeps_three_price_decimals(monkeypatch):
 
 def test_watchlist_realtime_stock_uses_latest_daily_bar_on_weekend(monkeypatch):
     monkeypatch.setattr(user_watchlist, "_cn_calendar_today_yyyymmdd", lambda: "20260905")
+    monkeypatch.setattr(
+        user_watchlist,
+        "_session_volume_clock",
+        lambda now=None: {"phase": "pre", "elapsed": 0, "cutoff": None},
+    )
     monkeypatch.setattr(
         user_watchlist,
         "get_db_collections",
@@ -349,7 +368,7 @@ def test_watchlist_realtime_stock_uses_latest_daily_bar_on_weekend(monkeypatch):
             "etf_basic": _Collection([]),
             "etf_daily": _Collection([]),
             "sw_index_member": _Collection([]),
-            "minute_bars": _ExplodingCollection([]),
+            "minute_bars": _Collection([]),
         },
     )
 
@@ -371,12 +390,25 @@ def test_watchlist_realtime_stock_uses_latest_daily_bar_on_weekend(monkeypatch):
             "change": 0.5,
             "change_pct": 5.0,
             "update_time": "2026-09-04",
+            "volume_ratio": None,
+            "volume_ratio_basis": None,
+            "volume_ratio_same_time": None,
+            "volume_ratio_traditional": None,
+            "volume_ratio_prev_day": None,
+            "volume_ratio_avg5": None,
+            "volume_ratio_samples": 0,
+            "volume_ratio_at": None,
         }
     ]
 
 
-def test_watchlist_realtime_mixed_list_uses_one_find_per_collection(monkeypatch):
+def test_watchlist_realtime_mixed_list_uses_bounded_finds_per_collection(monkeypatch):
     monkeypatch.setattr(user_watchlist, "_cn_calendar_today_yyyymmdd", lambda: "20260701")
+    monkeypatch.setattr(
+        user_watchlist,
+        "_session_volume_clock",
+        lambda now=None: {"phase": "am", "elapsed": 75, "cutoff": "1045"},
+    )
     volume_price = _CountingCollection(
         [
             {
@@ -444,7 +476,7 @@ def test_watchlist_realtime_mixed_list_uses_one_find_per_collection(monkeypatch)
             "etf_basic": etf_basic,
             "etf_daily": etf_daily,
             "sw_index_member": sw_index_member,
-            "minute_bars": _ExplodingCollection([]),
+            "minute_bars": _Collection([]),
         },
     )
 
@@ -454,11 +486,227 @@ def test_watchlist_realtime_mixed_list_uses_one_find_per_collection(monkeypatch)
     assert [row["symbol"] for row in response["data"]] == ["000001.SZ", "510300.SH"]
     assert response["data"][0]["price"] == 10.5
     assert response["data"][1]["price"] == 1.234
-    assert volume_price.find_calls == 1
+    # One bounded recent-window find for the quote/latest rows, plus one for the
+    # five completed daily volumes used by the traditional 量比 fallback.
+    assert volume_price.find_calls == 2
     assert volume_price.find_one_calls == 0
     assert etf_basic.find_calls == 1
-    assert etf_daily.find_calls == 1
+    assert etf_daily.find_calls == 2
     assert etf_daily.find_one_calls == 0
     assert stock_info.find_calls == 1
     assert stock_info.find_one_calls == 0
+
+
+def test_session_volume_clock_phases():
+    def clock(hour, minute):
+        return user_watchlist._session_volume_clock(
+            datetime(2026, 11, 17, hour, minute, tzinfo=user_watchlist._CN_TZ)
+        )
+
+    assert clock(9, 10) == {"phase": "pre", "elapsed": 0, "cutoff": None}
+    assert clock(9, 35) == {"phase": "am", "elapsed": 5, "cutoff": "0935"}
+    assert clock(11, 0) == {"phase": "am", "elapsed": 90, "cutoff": "1100"}
+    assert clock(11, 45) == {"phase": "lunch", "elapsed": 120, "cutoff": "1130"}
+    assert clock(13, 30) == {"phase": "pm", "elapsed": 150, "cutoff": "1330"}
+    assert clock(15, 30) == {"phase": "closed", "elapsed": 240, "cutoff": "1500"}
+
+
+def test_same_time_stats_median_prev_and_avg5():
+    stats = user_watchlist._same_time_stats(
+        {f"202610{i:02d}": float(i) for i in range(1, 21)}, "20261117"
+    )
+    assert stats == {"samples": 20, "median": 10.5, "prev": 20.0, "avg5": 18.0}
+
+
+def test_same_time_stats_excludes_today_from_the_baseline():
+    """Today's cumulative volume is the numerator, never part of the baseline."""
+    stats = user_watchlist._same_time_stats(
+        {f"202610{i:02d}": float(i) for i in range(1, 21)} | {"20261117": 999.0},
+        "20261117",
+    )
+    assert stats["samples"] == 20
+    assert stats["median"] == 10.5
+
+
+def test_same_time_stats_needs_ten_samples_for_median():
+    stats = user_watchlist._same_time_stats(
+        {f"202610{i:02d}": float(i) for i in range(1, 10)}, "20261117"
+    )
+    assert stats["samples"] == 9
+    assert stats["median"] is None
+    assert stats["prev"] == 9.0
+    assert stats["avg5"] == 7.0
+
+
+def test_traditional_volume_ratio_matches_exchange_formula():
+    # 600600 2026-11-17 10:45: today's cumulative 32,959 shares; the previous
+    # five completed daily volumes.  Expected ~1.82x on a 240-minute day.
+    ratio = user_watchlist._traditional_volume_ratio(
+        32959.0,
+        [59253.0, 73939.0, 55559.0, 48278.0, 52706.0],
+        75,
+    )
+    assert ratio == pytest.approx(1.82, abs=0.02)
+
+
+def _realtime_response(
+    monkeypatch,
+    *,
+    symbol,
+    volume,
+    update_time,
+    same_days,
+    daily_volumes,
+):
+    user_watchlist._volume_ratio_cache.clear()
+    monkeypatch.setattr(user_watchlist, "_cn_calendar_today_yyyymmdd", lambda: "20261117")
+    monkeypatch.setattr(
+        user_watchlist,
+        "_session_volume_clock",
+        lambda now=None: {"phase": "am", "elapsed": 75, "cutoff": "1045"},
+    )
+    monkeypatch.setattr(
+        user_watchlist, "_query_same_time_volume_days", lambda *args, **kwargs: same_days
+    )
+    monkeypatch.setattr(
+        user_watchlist, "_query_recent_daily_volumes", lambda *args, **kwargs: daily_volumes
+    )
+    monkeypatch.setattr(
+        user_watchlist,
+        "get_db_collections",
+        lambda: {
+            "user_watchlists": _Collection(
+                [{"user_id": "u1", "symbols": [symbol]}]
+            )
+        },
+    )
+    monkeypatch.setattr(
+        user_watchlist,
+        "get_data_db",
+        lambda: {
+            "volume_price": _Collection(
+                [
+                    {
+                        "symbol": symbol,
+                        "ts_code": symbol,
+                        "trade_date": "20261117",
+                        "source": "miniqmt",
+                        "open": 53.2,
+                        "high": 54.33,
+                        "low": 53.02,
+                        "close": 54.02,
+                        "pre_close": 53.33,
+                        "change": 0.69,
+                        "pct_chg": 1.29,
+                        "volume": volume,
+                        "update_time": update_time,
+                    }
+                ]
+            ),
+            "stock_info": _Collection(
+                [{"symbol": symbol, "name": "测试", "industry": "食品"}]
+            ),
+            "etf_basic": _Collection([]),
+            "etf_daily": _Collection([]),
+            "sw_index_member": _Collection([]),
+            "minute_bars": _Collection([]),
+        },
+    )
+    return user_watchlist.get_user_watchlist_realtime({"id": "u1"})
+
+
+def test_watchlist_realtime_prefers_same_time_volume_ratio(monkeypatch):
+    same_days = {
+        "000001.SZ": {
+            "20261117": 32959.0,
+            "20261116": 24901.0,
+            "20261113": 24000.0,
+            "20261112": 25000.0,
+            "20261111": 24500.0,
+            "20261110": 24800.0,
+            "20261109": 25200.0,
+            "20261106": 24600.0,
+            "20261105": 25050.0,
+            "20261104": 24400.0,
+            "20261103": 24950.0,
+            "20261031": 25100.0,
+            "20261030": 24700.0,
+        }
+    }
+    response = _realtime_response(
+        monkeypatch,
+        symbol="000001.SZ",
+        volume=32959.0,
+        update_time="2026-11-17 10:45:00",
+        same_days=same_days,
+        daily_volumes={"000001.SZ": [59253.0, 73939.0, 55559.0, 48278.0, 52706.0]},
+    )
+
+    row = response["data"][0]
+    assert row["volume_ratio_basis"] == "same_time"
+    assert row["volume_ratio"] == pytest.approx(1.33, abs=0.01)
+    assert row["volume_ratio_same_time"] == pytest.approx(1.33, abs=0.01)
+    assert row["volume_ratio_traditional"] == pytest.approx(1.82, abs=0.02)
+    assert row["volume_ratio_samples"] == 12
+    assert row["volume_ratio_at"] == "10:45"
+
+
+def test_watchlist_realtime_numerator_uses_minute_bars_not_snapshot(monkeypatch):
+    """The numerator comes from minute bars at the cutoff, not the snapshot.
+
+    The realtime snapshot lags the minute bridge by a few minutes; mixing the
+    two would bias the ratio.
+    """
+    same_days = {
+        "000001.SZ": {
+            "20261117": 30000.0,
+            "20261116": 20000.0,
+            "20261113": 20000.0,
+            "20261112": 20000.0,
+            "20261111": 20000.0,
+            "20261110": 20000.0,
+            "20261109": 20000.0,
+            "20261106": 20000.0,
+            "20261105": 20000.0,
+            "20261104": 20000.0,
+            "20261103": 20000.0,
+            "20261031": 20000.0,
+        }
+    }
+    response = _realtime_response(
+        monkeypatch,
+        symbol="000001.SZ",
+        volume=99999.0,
+        update_time="2026-11-17 10:45:00",
+        same_days=same_days,
+        daily_volumes={"000001.SZ": [100000.0] * 5},
+    )
+
+    row = response["data"][0]
+    assert row["volume_ratio"] == pytest.approx(1.5, abs=0.01)
+
+
+def test_watchlist_realtime_falls_back_to_traditional_ratio(monkeypatch):
+    same_days = {
+        "000002.SZ": {
+            "20261117": 20000.0,
+            "20261116": 20000.0,
+            "20261113": 21000.0,
+            "20261112": 19000.0,
+        }
+    }
+    response = _realtime_response(
+        monkeypatch,
+        symbol="000002.SZ",
+        volume=20000.0,
+        update_time="2026-11-17 10:45:00",
+        same_days=same_days,
+        daily_volumes={"000002.SZ": [100000.0] * 5},
+    )
+
+    row = response["data"][0]
+    assert row["volume_ratio_basis"] == "traditional"
+    assert row["volume_ratio"] == pytest.approx(0.64, abs=0.01)
+    assert row["volume_ratio_same_time"] is None
+    assert row["volume_ratio_samples"] == 3
 
