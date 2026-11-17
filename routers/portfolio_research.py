@@ -23,6 +23,7 @@ from pymongo import ASCENDING, DESCENDING
 from auth import get_current_user
 from db import get_db_collections, get_ml_db_collections, get_trading_db_collections
 from services import portfolio_research_s3 as research_s3
+from services.model_registry_lifecycle import transition_model
 
 
 router = APIRouter(prefix="/portfolio-research", tags=["portfolio-research"])
@@ -915,11 +916,12 @@ def _assert_live_candidate(
 
 
 def _require_live_registry_state(candidate: Dict[str, Any]) -> None:
-    """Live activation requires the registry state to be ``live``.
+    """Live activation requires the registry state to be ``live`` or ``shadow``.
 
-    Paper activation may use shadow/validated models for observation; only the
-    live venue is gated. A missing registry document is treated as legacy and
-    allowed, matching the Phase 0 backfill's conservative fallback.
+    A shadow model may be promoted to live by this activation; the activation
+    hook then writes the ``shadow -> live`` transition. Validated/research
+    models must go through shadow observation first. Paper activation may use
+    shadow/validated models for observation; only the live venue is gated.
     """
     model_id = str(candidate.get("model_id") or "").strip()
     if not model_id:
@@ -931,15 +933,93 @@ def _require_live_registry_state(candidate: Dict[str, Any]) -> None:
     if not doc:
         return
     state = str(doc.get("state") or "")
-    if state != "live":
+    if state not in {"live", "shadow"}:
         raise HTTPException(
             status_code=409,
             detail={
-                "message": f"model_id={model_id} is state={state or 'unknown'}; live activation requires state=live",
+                "message": f"model_id={model_id} is state={state or 'unknown'}; live activation requires state=live or shadow",
                 "model_id": model_id,
                 "state": state or "unknown",
             },
         )
+
+
+def _activation_model_id(activation: Dict[str, Any]) -> str:
+    return str((activation.get("params_override") or {}).get("model_id") or "").strip()
+
+
+def _transition_registry_for_activation(
+    activation: Dict[str, Any],
+    target_state: str,
+    *,
+    actor: str,
+    reason: str,
+) -> None:
+    """Best-effort registry transition for a paper/live activation.
+
+    Live activation promotes a shadow model to live; cancellation demotes a
+    live model back to shadow (or validated when no enabled shadow profile
+    exists). Missing registry docs are ignored for legacy deployments.
+    """
+    model_id = _activation_model_id(activation)
+    if not model_id:
+        return
+    ml = get_ml_db_collections() or {}
+    models = ml.get("models")
+    if models is None:
+        return
+    doc = models.find_one({"model_id": model_id}, {"state": 1})
+    if not doc:
+        return
+    if str(doc.get("state") or "") == target_state:
+        return
+    transition_model(
+        models,
+        model_id,
+        target_state,
+        actor=actor,
+        reason=reason,
+        evidence={"activation_id": activation.get("activation_id")},
+        shadow_profiles=ml.get("model_shadow_profiles"),
+        activations=(get_trading_db_collections() or {}).get("portfolio_strategy_activations"),
+    )
+
+
+def _demote_registry_after_activation_cancel(
+    activation: Dict[str, Any],
+    *,
+    actor: str,
+    reason: str,
+) -> None:
+    """Demote a live model after its live activation is cancelled."""
+    model_id = _activation_model_id(activation)
+    if not model_id:
+        return
+    ml = get_ml_db_collections() or {}
+    models = ml.get("models")
+    if models is None:
+        return
+    doc = models.find_one({"model_id": model_id}, {"state": 1, "shadow_profiles": 1})
+    if not doc or str(doc.get("state") or "") != "live":
+        return
+    shadow_enabled = any(
+        profile.get("enabled") is not False
+        for profile in (doc.get("shadow_profiles") or [])
+    )
+    target = "shadow" if shadow_enabled else "validated"
+    transition_model(
+        models,
+        model_id,
+        target,
+        actor=actor,
+        reason=reason,
+        evidence={
+            "activation_id": activation.get("activation_id"),
+            "demotion": True,
+        },
+        shadow_profiles=ml.get("model_shadow_profiles"),
+        activations=(get_trading_db_collections() or {}).get("portfolio_strategy_activations"),
+    )
 
 
 def _load_combo_payload(artifact: Dict[str, Any], combo_key: str) -> Optional[Dict[str, Any]]:
@@ -2347,6 +2427,30 @@ async def activate_portfolio_research_live_preview(
                 {"$set": {"live_activation_status": "active", "updated_at": now}},
             )
 
+    if request.execution_venue == "live":
+        try:
+            _transition_registry_for_activation(
+                activation,
+                "live",
+                actor=str(user_id),
+                reason=f"live activation {activation['activation_id']}",
+            )
+        except Exception:
+            # Keep the activation and registry consistent: a failed
+            # transition must not leave a scheduled live activation behind.
+            collections["portfolio_strategy_activations"].update_one(
+                {"activation_id": activation["activation_id"]},
+                {
+                    "$set": {
+                        "status": "cancelled",
+                        "cancelled_at": now,
+                        "cancelled_by": user_id,
+                        "updated_at": now,
+                    }
+                },
+            )
+            raise
+
     logger.info(
         "portfolio research activation scheduled: user=%s result=%s combo=%s venue=%s effective=%s parity=%s",
         user_id,
@@ -2409,6 +2513,15 @@ async def cancel_portfolio_research_activation(
         {"preset_id": activation.get("preset_id"), "user_id": user_id},
         {"$set": {"activation_status": "cancelled", "updated_at": now}},
     )
+    if activation.get("execution_venue") == "live":
+        try:
+            _demote_registry_after_activation_cancel(
+                activation,
+                actor=str(user_id),
+                reason=f"activation {activation_id} cancelled",
+            )
+        except Exception as exc:
+            logger.warning("registry demotion failed for activation %s: %s", activation_id, exc)
     collections["portfolio_research_reviews"].insert_one(
         {
             "review_id": str(uuid.uuid4()),

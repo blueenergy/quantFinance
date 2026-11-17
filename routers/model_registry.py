@@ -10,19 +10,29 @@ from __future__ import annotations
 
 import re
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.encoders import jsonable_encoder
+from pydantic import BaseModel, Field
 from pymongo import DESCENDING
 
-from auth import get_current_user
-from db import get_ml_db_collections
+from auth import get_current_admin_user, get_current_user
+from db import get_ml_db_collections, get_trading_db_collections
+from services.model_registry_lifecycle import ALLOWED_TRANSITIONS, transition_model
 
 router = APIRouter(prefix="/model-registry", tags=["model-registry"])
 
 STATE_ORDER = ("live", "shadow", "validated", "research", "retired", "rejected")
 STATE_RANK = {name: index for index, name in enumerate(STATE_ORDER)}
+
+
+class ModelTransitionRequest(BaseModel):
+    target_state: Literal["research", "validated", "shadow", "live", "retired", "rejected"]
+    reason: str = Field(min_length=3, max_length=1000)
+    evidence: Optional[Dict[str, Any]] = None
+    expected_state: Optional[str] = None
+    admin_override: bool = False
 
 
 def _models():
@@ -172,3 +182,49 @@ def get_registry_model(
     payload = dict(doc)
     payload.pop("_id", None)
     return {"data": jsonable_encoder(payload)}
+
+
+@router.get("/models/{model_id}/allowed-transitions")
+def get_registry_allowed_transitions(
+    model_id: str,
+    current_user: dict = Depends(get_current_user),
+) -> Dict[str, Any]:
+    doc = _models().find_one({"model_id": model_id}, {"state": 1})
+    if not doc:
+        doc = _models().find_one({"_id": model_id}, {"state": 1})
+    if not doc:
+        raise HTTPException(status_code=404, detail="model not found")
+    state = str(doc.get("state") or "research")
+    return {
+        "data": {
+            "state": state,
+            "allowed": sorted(ALLOWED_TRANSITIONS.get(state, set())),
+            "terminal": state in {"retired", "rejected"},
+        }
+    }
+
+
+@router.post("/models/{model_id}/transition")
+def transition_registry_model(
+    model_id: str,
+    request: ModelTransitionRequest,
+    current_user: dict = Depends(get_current_admin_user),
+) -> Dict[str, Any]:
+    """Apply an audited lifecycle transition (admin only)."""
+    ml = get_ml_db_collections()
+    trading = get_trading_db_collections()
+    doc = transition_model(
+        ml["models"],
+        model_id,
+        request.target_state,
+        actor=str(current_user.get("username") or current_user.get("id") or "admin"),
+        reason=request.reason,
+        evidence=request.evidence,
+        expected_state=request.expected_state,
+        admin_override=request.admin_override,
+        shadow_profiles=ml.get("model_shadow_profiles"),
+        activations=trading.get("portfolio_strategy_activations"),
+    )
+    payload = dict(doc)
+    payload.pop("_id", None)
+    return {"success": True, "data": jsonable_encoder(payload)}

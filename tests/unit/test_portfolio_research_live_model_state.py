@@ -28,6 +28,11 @@ def test_live_registry_state_passes(monkeypatch):
     portfolio_research._require_live_registry_state({"model_id": "m1"})
 
 
+def test_shadow_registry_state_passes_for_live_activation(monkeypatch):
+    _patch_models(monkeypatch, [{"model_id": "m1", "state": "shadow"}])
+    portfolio_research._require_live_registry_state({"model_id": "m1"})
+
+
 def test_validated_registry_state_is_rejected(monkeypatch):
     _patch_models(monkeypatch, [{"model_id": "m1", "state": "validated"}])
     with pytest.raises(HTTPException) as exc_info:
