@@ -416,59 +416,51 @@ def _attach_volume_ratios(rows: List[Dict[str, Any]], data_collections, today: s
 
     The numerator is today's cumulative volume taken from ``minute_bars`` at
     the same cutoff, so it matches the baseline exactly (no snapshot lag) and
-    also works for ETFs, which have no ``volume_price`` row.
+    also works for ETFs, whose realtime row still shows the previous close
+    until the daily sync lands.
     """
     try:
         clock = _session_volume_clock()
         cutoff = clock.get("cutoff")
         at_text = f"{cutoff[:2]}:{cutoff[2:]}" if cutoff else None
-        eligible = [
-            str(row.get("symbol"))
-            for row in rows
-            if row.get("symbol")
-            and _norm_trade_date_to_yyyymmdd(row.get("update_time")) == today
-        ]
-        stats: Dict[str, Dict[str, Any]] = {}
-        today_cum: Dict[str, float] = {}
-        if eligible and cutoff:
+        symbols = sorted({str(row.get("symbol")) for row in rows if row.get("symbol")})
+        raw: Dict[str, Dict[str, float]] = {}
+        if symbols and cutoff:
             raw = _same_time_volume_cached(
-                data_collections.get("minute_bars"), sorted(set(eligible)), today, cutoff
+                data_collections.get("minute_bars"), symbols, today, cutoff
             )
-            today_cum = {sym: float(days.get(today) or 0) for sym, days in raw.items()}
-            stats = {sym: _same_time_stats(days, today) for sym, days in raw.items()}
-        daily_volumes = (
-            _query_recent_daily_volumes(data_collections, sorted(set(eligible)), today)
-            if eligible
-            else {}
-        )
+        daily_volumes = _query_recent_daily_volumes(data_collections, symbols, today) if symbols else {}
         elapsed = clock.get("elapsed")
         for row in rows:
             symbol = str(row.get("symbol") or "")
+            days = raw.get(symbol) or {}
+            minute_cum = days.get(today)
+            stat = _same_time_stats(days, today) if days else {}
+            samples = int(stat.get("samples") or 0)
+            snapshot_is_today = _norm_trade_date_to_yyyymmdd(row.get("update_time")) == today
+            snapshot_volume = row.get("volume")
             same = trad = prev_ratio = avg5_ratio = None
-            samples = 0
             basis = None
             primary = None
-            if symbol in eligible:
-                stat = stats.get(symbol) or {}
-                samples = int(stat.get("samples") or 0)
-                minute_volume = today_cum.get(symbol) or 0.0
-                snapshot_volume = row.get("volume")
-                today_volume = minute_volume if minute_volume > 0 else (
-                    float(snapshot_volume) if _positive_number(snapshot_volume) else None
+            # The same-time ratio needs both sides from minute bars; the
+            # traditional ratio can fall back to the snapshot's own volume.
+            if minute_cum:
+                if stat.get("median"):
+                    same = float(minute_cum) / float(stat["median"])
+                if stat.get("prev"):
+                    prev_ratio = float(minute_cum) / float(stat["prev"])
+                if stat.get("avg5"):
+                    avg5_ratio = float(minute_cum) / float(stat["avg5"])
+                trad = _traditional_volume_ratio(float(minute_cum), daily_volumes.get(symbol), elapsed)
+            elif snapshot_is_today and _positive_number(snapshot_volume):
+                trad = _traditional_volume_ratio(
+                    float(snapshot_volume), daily_volumes.get(symbol), elapsed
                 )
-                if today_volume:
-                    if stat.get("median"):
-                        same = today_volume / float(stat["median"])
-                    if stat.get("prev"):
-                        prev_ratio = today_volume / float(stat["prev"])
-                    if stat.get("avg5"):
-                        avg5_ratio = today_volume / float(stat["avg5"])
-                    trad = _traditional_volume_ratio(today_volume, daily_volumes.get(symbol), elapsed)
-                if elapsed and elapsed >= _VOLUME_RATIO_EARLY_MINUTES:
-                    if same is not None and samples >= _VOLUME_RATIO_MIN_SAMPLES:
-                        primary, basis = same, "same_time"
-                    elif trad is not None:
-                        primary, basis = trad, "traditional"
+            if elapsed and elapsed >= _VOLUME_RATIO_EARLY_MINUTES:
+                if same is not None and samples >= _VOLUME_RATIO_MIN_SAMPLES:
+                    primary, basis = same, "same_time"
+                elif trad is not None:
+                    primary, basis = trad, "traditional"
             row.update(
                 {
                     "volume_ratio": _safe_round_price(primary, 2),
