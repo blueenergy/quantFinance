@@ -33,10 +33,22 @@ class ModelTransitionRequest(BaseModel):
     evidence: Optional[Dict[str, Any]] = None
     expected_state: Optional[str] = None
     admin_override: bool = False
+    disable_shadow_profiles: bool = False
+    cancel_activations: bool = False
 
 
 def _models():
     return get_ml_db_collections()["models"]
+
+
+def _find_model_doc(model_id: str) -> Optional[Dict[str, Any]]:
+    models = _models()
+    doc = models.find_one({"model_id": model_id})
+    if not doc:
+        doc = models.find_one({"_id": model_id})
+    if not doc:
+        doc = models.find_one({"legacy.aliases": model_id})
+    return doc
 
 
 def _parse_states(value: Optional[str]) -> Optional[List[str]]:
@@ -79,6 +91,9 @@ def _list_row(doc: Dict[str, Any]) -> Dict[str, Any]:
             "stale_days": health.get("stale_days"),
             "is_current": bool(health.get("is_current")),
             "active": bool(health.get("active")),
+            "status": health.get("status"),
+            "score_drift_z": health.get("score_drift_z"),
+            "checked_at": health.get("checked_at"),
         },
         "artifact_count": len(doc.get("artifacts") or []),
         "job_count": len(doc.get("training_jobs") or []),
@@ -104,6 +119,7 @@ def model_registry_summary(
     accepted = 0
     active_stale = 0
     latest_backfill = None
+    latest_health_check = None
     for doc in docs:
         state = str(doc.get("state") or "research")
         states[state] = states.get(state, 0) + 1
@@ -115,6 +131,9 @@ def model_registry_summary(
         backfilled_at = doc.get("backfilled_at")
         if backfilled_at and (latest_backfill is None or backfilled_at > latest_backfill):
             latest_backfill = backfilled_at
+        checked_at = (doc.get("health") or {}).get("checked_at")
+        if checked_at and (latest_health_check is None or checked_at > latest_health_check):
+            latest_health_check = checked_at
     return {
         "data": {
             "total": len(docs),
@@ -122,6 +141,7 @@ def model_registry_summary(
             "states": states,
             "active_stale": active_stale,
             "last_backfilled_at": latest_backfill,
+            "last_health_check_at": latest_health_check,
             "generated_at": datetime.utcnow(),
         }
     }
@@ -174,9 +194,7 @@ def get_registry_model(
     model_id: str,
     current_user: dict = Depends(get_current_user),
 ) -> Dict[str, Any]:
-    doc = _models().find_one({"model_id": model_id})
-    if not doc:
-        doc = _models().find_one({"_id": model_id})
+    doc = _find_model_doc(model_id)
     if not doc:
         raise HTTPException(status_code=404, detail="model not found")
     payload = dict(doc)
@@ -184,14 +202,54 @@ def get_registry_model(
     return {"data": jsonable_encoder(payload)}
 
 
+@router.get("/families")
+def list_registry_families(
+    current_user: dict = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """Group model versions by ``family_id`` for lineage-oriented views."""
+    docs = list(
+        _models().find(
+            {},
+            {"model_id": 1, "family_id": 1, "state": 1, "updated_at": 1, "legacy": 1},
+        )
+    )
+    grouped: Dict[str, List[Dict[str, Any]]] = {}
+    for doc in docs:
+        family_id = str(doc.get("family_id") or doc.get("model_id") or doc.get("_id") or "")
+        if not family_id:
+            continue
+        grouped.setdefault(family_id, []).append(
+            {
+                "model_id": doc.get("model_id") or doc.get("_id"),
+                "state": doc.get("state"),
+                "updated_at": doc.get("updated_at"),
+                "legacy_aliases": (doc.get("legacy") or {}).get("aliases") or [],
+            }
+        )
+    families = []
+    for family_id, models in grouped.items():
+        state_counts: Dict[str, int] = {}
+        for model in models:
+            state = str(model.get("state") or "research")
+            state_counts[state] = state_counts.get(state, 0) + 1
+        families.append(
+            {
+                "family_id": family_id,
+                "model_count": len(models),
+                "state_counts": state_counts,
+                "models": sorted(models, key=lambda item: str(item.get("model_id") or "")),
+            }
+        )
+    families.sort(key=lambda item: item["family_id"])
+    return {"data": families}
+
+
 @router.get("/models/{model_id}/allowed-transitions")
 def get_registry_allowed_transitions(
     model_id: str,
     current_user: dict = Depends(get_current_user),
 ) -> Dict[str, Any]:
-    doc = _models().find_one({"model_id": model_id}, {"state": 1})
-    if not doc:
-        doc = _models().find_one({"_id": model_id}, {"state": 1})
+    doc = _find_model_doc(model_id)
     if not doc:
         raise HTTPException(status_code=404, detail="model not found")
     state = str(doc.get("state") or "research")
@@ -224,6 +282,8 @@ def transition_registry_model(
         admin_override=request.admin_override,
         shadow_profiles=ml.get("model_shadow_profiles"),
         activations=trading.get("portfolio_strategy_activations"),
+        disable_shadow_profiles=request.disable_shadow_profiles,
+        cancel_activations=request.cancel_activations,
     )
     payload = dict(doc)
     payload.pop("_id", None)

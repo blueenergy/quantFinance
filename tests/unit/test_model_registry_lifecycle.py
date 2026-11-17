@@ -33,6 +33,14 @@ class _ShadowProfiles:
                 return doc
         return None
 
+    def update_many(self, query, update):
+        count = 0
+        for doc in self.docs:
+            if all(doc.get(key) == value for key, value in query.items()):
+                doc.update(update.get("$set") or {})
+                count += 1
+        return SimpleNamespace(modified_count=count)
+
 
 class _Activations:
     def __init__(self, docs=None):
@@ -43,6 +51,19 @@ class _Activations:
             if all(doc.get(key) == value for key, value in query.items()):
                 return doc
         return None
+
+    def update_many(self, query, update):
+        count = 0
+        model_id = query.get("params_override.model_id")
+        statuses = (query.get("status") or {}).get("$in") or []
+        for doc in self.docs:
+            if (
+                (doc.get("params_override") or {}).get("model_id") == model_id
+                and doc.get("status") in statuses
+            ):
+                doc.update(update.get("$set") or {})
+                count += 1
+        return SimpleNamespace(modified_count=count)
 
 
 def _doc(**overrides):
@@ -173,3 +194,43 @@ def test_terminal_state_requires_admin_override_to_revive():
 
     doc = transition_model(models, "m1", "research", actor="admin", reason="revive", admin_override=True)
     assert doc["state"] == "research"
+
+
+def test_retire_cleanup_disables_profiles_and_cancels_activations():
+    doc = _doc(
+        state="live",
+        accepted=True,
+        accepted_reasons=["live", "shadow"],
+        shadow_profiles=[{"profile_id": "p1", "enabled": True}],
+        state_flags={"live_active": True, "shadow_enabled": True, "shadow_profile_any": True, "validated": True},
+    )
+    models = _Models(doc)
+    profiles = _ShadowProfiles([{"profile_id": "p1", "model_id": "m1", "enabled": True}])
+    activations = _Activations(
+        [
+            {"activation_id": "a1", "status": "active", "params_override": {"model_id": "m1"}},
+            {"activation_id": "a2", "status": "scheduled", "params_override": {"model_id": "m1"}},
+            {"activation_id": "a3", "status": "cancelled", "params_override": {"model_id": "m1"}},
+        ]
+    )
+    updated = transition_model(
+        models,
+        "m1",
+        "retired",
+        actor="admin",
+        reason="retire and clean up",
+        shadow_profiles=profiles,
+        activations=activations,
+        disable_shadow_profiles=True,
+        cancel_activations=True,
+    )
+    assert updated["state"] == "retired"
+    assert updated["accepted"] is False
+    assert updated["shadow_profiles"][0]["enabled"] is False
+    assert profiles.docs[0]["enabled"] is False
+    assert activations.docs[0]["status"] == "cancelled"
+    assert activations.docs[1]["status"] == "cancelled"
+    assert activations.docs[2]["status"] == "cancelled"
+    cleanup = updated["state_history"][-1]["evidence"]["cleanup"]
+    assert cleanup["shadow_profiles_disabled"] == 1
+    assert cleanup["activations_cancelled"] == 2

@@ -40,6 +40,8 @@ def _find_model(models, model_id: str) -> Dict[str, Any]:
     if not doc:
         doc = models.find_one({"_id": model_id})
     if not doc:
+        doc = models.find_one({"legacy.aliases": model_id})
+    if not doc:
         raise HTTPException(status_code=404, detail="model not found")
     return doc
 
@@ -102,6 +104,8 @@ def transition_model(
     admin_override: bool = False,
     shadow_profiles=None,
     activations=None,
+    disable_shadow_profiles: bool = False,
+    cancel_activations: bool = False,
 ) -> Dict[str, Any]:
     """Apply one lifecycle transition and return the updated model document."""
     target = str(target_state or "").strip()
@@ -169,6 +173,36 @@ def transition_model(
             )
 
     now = datetime.utcnow()
+    embedded_profiles = list(doc.get("shadow_profiles") or [])
+    cleanup: Dict[str, Any] = {}
+    if target == "retired":
+        if disable_shadow_profiles:
+            if shadow_profiles is not None:
+                result = shadow_profiles.update_many(
+                    {"model_id": model_id},
+                    {"$set": {"enabled": False, "updated_at": now}},
+                )
+                cleanup["shadow_profiles_disabled"] = int(getattr(result, "modified_count", 0) or 0)
+            embedded_profiles = [{**profile, "enabled": False} for profile in embedded_profiles]
+            cleanup["shadow_profiles_embedded_disabled"] = len(embedded_profiles)
+        if cancel_activations and activations is not None:
+            result = activations.update_many(
+                {
+                    "params_override.model_id": model_id,
+                    "status": {"$in": ["active", "scheduled"]},
+                },
+                {
+                    "$set": {
+                        "status": "cancelled",
+                        "cancelled_at": now,
+                        "cancelled_by": actor,
+                        "updated_at": now,
+                    }
+                },
+            )
+            cleanup["activations_cancelled"] = int(getattr(result, "modified_count", 0) or 0)
+    if cleanup:
+        evidence["cleanup"] = cleanup
     shadow_enabled = _shadow_enabled(doc)
     if target == "shadow":
         shadow_enabled = True
@@ -196,11 +230,13 @@ def transition_model(
         "state_flags": {
             "live_active": live_active,
             "shadow_enabled": shadow_enabled,
-            "shadow_profile_any": bool(doc.get("shadow_profiles")),
+            "shadow_profile_any": bool(embedded_profiles),
             "validated": validated_flag,
         },
         "updated_at": now,
     }
+    if target == "retired" and disable_shadow_profiles:
+        updates["shadow_profiles"] = embedded_profiles
     health = dict(doc.get("health") or {})
     health["active"] = target in ("live", "shadow")
     updates["health"] = health
