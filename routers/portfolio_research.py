@@ -914,6 +914,34 @@ def _assert_live_candidate(
         )
 
 
+def _require_live_registry_state(candidate: Dict[str, Any]) -> None:
+    """Live activation requires the registry state to be ``live``.
+
+    Paper activation may use shadow/validated models for observation; only the
+    live venue is gated. A missing registry document is treated as legacy and
+    allowed, matching the Phase 0 backfill's conservative fallback.
+    """
+    model_id = str(candidate.get("model_id") or "").strip()
+    if not model_id:
+        return
+    models = (get_ml_db_collections() or {}).get("models")
+    if models is None:
+        return
+    doc = models.find_one({"model_id": model_id}, {"state": 1})
+    if not doc:
+        return
+    state = str(doc.get("state") or "")
+    if state != "live":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": f"model_id={model_id} is state={state or 'unknown'}; live activation requires state=live",
+                "model_id": model_id,
+                "state": state or "unknown",
+            },
+        )
+
+
 def _load_combo_payload(artifact: Dict[str, Any], combo_key: str) -> Optional[Dict[str, Any]]:
     """Load one combo detail JSON from the local artifact mount or S3."""
     entry = next(
@@ -2067,6 +2095,8 @@ async def activate_portfolio_research_live_preview(
     if not plan or not candidate:
         raise HTTPException(status_code=409, detail="live preview has no candidate plan")
     _assert_live_candidate(candidate)
+    if request.execution_venue == "live":
+        _require_live_registry_state(candidate)
     _validate_live_model_score(candidate, task.get("base_date") or datetime.utcnow().strftime("%Y%m%d"))
     parity_summary = _compact_parity(preview_result.get("parity"))
     unsupported_features = _unsupported_research_features(task)

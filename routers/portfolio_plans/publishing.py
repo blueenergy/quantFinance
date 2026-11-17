@@ -28,6 +28,7 @@ from stock_data_access.board_lots import (  # pyright: ignore[reportMissingImpor
 )
 
 from auth import get_current_user
+from db import get_ml_db_collections
 from services.trading_readiness import require_trading_ready
 from services.live_trade_signals import (
     ACTIVE_SIGNAL_STATUSES,
@@ -71,6 +72,33 @@ from ._shared import (
 
 router = APIRouter()
 log = logging.getLogger(__name__)
+
+
+def _require_live_model_state(model_id: str) -> None:
+    """Live publish is only allowed for a model whose registry state is ``live``.
+
+    Plans without a model_id (rule-score strategies) are unaffected. A missing
+    registry document is treated as a legacy plan and allowed; the guard is
+    intentionally a no-op until the Phase 0 registry exists.
+    """
+    if not model_id:
+        return
+    models = (get_ml_db_collections() or {}).get("models")
+    if models is None:
+        return
+    doc = models.find_one({"model_id": model_id}, {"state": 1})
+    if not doc:
+        return
+    state = str(doc.get("state") or "")
+    if state != "live":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": f"model_id={model_id} is state={state or 'unknown'}; live publish requires state=live",
+                "model_id": model_id,
+                "state": state or "unknown",
+            },
+        )
 
 
 def _build_live_publish_risk_report(
@@ -1168,6 +1196,9 @@ def publish_portfolio_plan_live_signals(
     plan = _pp._require_plan(trading_collections, plan_id, current_user)
     if plan.get("status") != "approved":
         raise HTTPException(status_code=400, detail="plan must be approved before publishing live signals")
+    _require_live_model_state(
+        str((plan.get("params_snapshot") or {}).get("model_id") or "").strip()
+    )
     if plan.get("paper_executed_at") or trading_collections["portfolio_paper_executions"].find_one({"plan_id": plan_id, "user_id": user_id}):
         raise HTTPException(status_code=400, detail="plan already has paper executions; cannot publish live signals")
     account = _pp._require_securities_account(finance_collections, request.securities_account_id, user_id)

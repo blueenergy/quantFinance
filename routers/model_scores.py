@@ -59,6 +59,7 @@ def list_model_score_models(
         ml["model_predictions"],
         shadow_profiles=ml.get("model_shadow_profiles"),
         activations=get_trading_db_collections().get("portfolio_strategy_activations"),
+        registry=ml.get("models"),
     )
     return {"success": True, "data": {"models": models}}
 

@@ -116,8 +116,12 @@ def list_dataset_snapshots(
 def _serialize_prediction_model_row(
     doc: Dict[str, Any],
     accepted_reasons: Optional[List[str]] = None,
+    registry_doc: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     reasons = list(accepted_reasons or [])
+    state = (registry_doc or {}).get("state")
+    validated = state == "validated"
+    validation = (registry_doc or {}).get("latest_validation") or {}
     return {
         "model_id": doc.get("_id"),
         "index_code": doc.get("index_code"),
@@ -131,6 +135,13 @@ def _serialize_prediction_model_row(
         "window": doc.get("window"),
         "accepted": bool(reasons),
         "accepted_reasons": reasons,
+        "state": state,
+        "validated": validated,
+        "validation": (
+            {"protocol": validation.get("protocol"), "verdict": validation.get("verdict")}
+            if validation
+            else None
+        ),
     }
 
 
@@ -139,6 +150,7 @@ def list_prediction_models(
     index_code: Optional[UniverseIndex] = Query(default=None),
     kind: Literal["all", "research", "shadow"] = Query(default="all"),
     accepted_only: bool = False,
+    include_validated: bool = False,
     limit: int = Query(default=100, ge=1, le=500),
     current_user: dict = Depends(get_current_user),
 ) -> Dict[str, Any]:
@@ -149,24 +161,62 @@ def list_prediction_models(
     and the coverage decides whether a requested backtest window is usable.
 
     ``accepted_only`` keeps models the platform currently runs: an active
-    strategy activation (live) or an enabled shadow profile. It deliberately
-    does **not** use the training job's ``promotion.passed`` flag: the live
-    csi1000 job is single-pool (``insufficient_universes``), while the only
-    gate-passed jobs are retired shadow profiles. ``accepted`` is the
-    operational definition shared with the model-score tab.
+    strategy activation (live) or an enabled shadow profile. ``include_validated``
+    additionally keeps models whose registry state is ``validated`` (research
+    OOS evidence, not live/shadow). The registry in ``quant_ml.models`` is the
+    source of truth; the older profile/activation derivation remains as a
+    fallback for deployments that have not run the Phase 0 backfill.
     """
     collections = get_ml_db_collections()
     trading_collections = get_trading_db_collections()
-    accepted = accepted_model_reasons(
+    fallback_reasons = accepted_model_reasons(
         collections.get("model_shadow_profiles"),
         trading_collections.get("portfolio_strategy_activations"),
     )
-    if accepted_only and not accepted:
-        return {"data": []}
+    registry_docs = {}
+    models_coll = collections.get("models")
+    if models_coll is not None:
+        registry_docs = {
+            str(doc.get("model_id") or doc.get("_id")): doc
+            for doc in models_coll.find(
+                {},
+                {
+                    "model_id": 1,
+                    "state": 1,
+                    "accepted": 1,
+                    "accepted_reasons": 1,
+                    "latest_validation": 1,
+                },
+            )
+            if doc.get("model_id") or doc.get("_id")
+        }
+
+    def reasons_for(model_id: str) -> List[str]:
+        if model_id in registry_docs:
+            return list(registry_docs[model_id].get("accepted_reasons") or [])
+        return list(fallback_reasons.get(model_id, []))
+
+    accepted_ids = {
+        model_id
+        for model_id in set(registry_docs) | set(fallback_reasons)
+        if reasons_for(model_id)
+    }
+    validated_ids = {
+        model_id
+        for model_id, doc in registry_docs.items()
+        if doc.get("state") == "validated"
+    }
+    allowed_ids = None
+    if accepted_only:
+        allowed_ids = set(accepted_ids)
+        if include_validated:
+            allowed_ids |= validated_ids
+        if not allowed_ids:
+            return {"data": []}
 
     match: Dict[str, Any] = {"model_id": {"$exists": True, "$nin": [None, ""]}}
-    if accepted_only:
-        match["model_id"] = {"$in": sorted(accepted)}
+    if allowed_ids is not None:
+        match["model_id"] = {"$in": sorted(allowed_ids)}
     if index_code:
         match["index_code"] = index_code
     if kind == "research":
@@ -207,13 +257,17 @@ def list_prediction_models(
         {"$limit": limit},
     ]
     rows = [
-        _serialize_prediction_model_row(doc, accepted.get(doc.get("_id"), []))
+        _serialize_prediction_model_row(
+            doc,
+            reasons_for(str(doc.get("_id"))),
+            registry_docs.get(str(doc.get("_id"))),
+        )
         for doc in collections["model_predictions"].aggregate(pipeline)
     ]
-    if accepted_only:
+    if allowed_ids is not None:
         # ``$match`` already filters in production; the Python guard keeps the
         # contract true for test doubles and any pipeline that ignores ``$in``.
-        rows = [row for row in rows if row["accepted"]]
+        rows = [row for row in rows if row["model_id"] in allowed_ids]
     return {"data": rows}
 
 

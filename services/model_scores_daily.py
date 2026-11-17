@@ -114,20 +114,43 @@ def list_model_catalog(
     *,
     shadow_profiles=None,
     activations=None,
+    registry=None,
     recent_days: int = RECENT_DAYS,
 ) -> List[Dict[str, Any]]:
     """Every ``model_id`` in ``model_predictions`` with its coverage.
 
     ``accepted`` marks a model the system actually runs: an active strategy
-    activation (live) or an enabled shadow profile. Everything else is a
-    historical research model; the UI hides those by default because 19
-    choices are worse than 2 when most of them are retired.
+    activation (live) or an enabled shadow profile. The registry in
+    ``quant_ml.models`` is the source of truth when available; the profile /
+    activation derivation remains as a fallback for deployments that have not
+    run the Phase 0 backfill. Everything else is a historical research model;
+    the UI hides those by default because 19 choices are worse than 2 when
+    most of them are retired.
 
     The count/coverage reads are N+1 by ``model_id``, which the compound
     index (model_id, trade_date, ts_code) serves as a prefix scan.
     """
     cutoff = (_date.today() - timedelta(days=int(recent_days))).strftime("%Y%m%d")
     accepted = accepted_model_reasons(shadow_profiles, activations)
+    registry_by_model: Dict[str, Dict[str, Any]] = {}
+    if registry is not None:
+        try:
+            registry_by_model = {
+                str(doc.get("model_id") or doc.get("_id")): doc
+                for doc in registry.find(
+                    {},
+                    {
+                        "model_id": 1,
+                        "state": 1,
+                        "accepted": 1,
+                        "accepted_reasons": 1,
+                        "latest_validation": 1,
+                    },
+                )
+                if doc.get("model_id") or doc.get("_id")
+            }
+        except Exception:
+            registry_by_model = {}
     rows: List[Dict[str, Any]] = []
     for model_id in sorted(predictions.distinct("model_id") or []):
         if not model_id:
@@ -145,10 +168,19 @@ def list_model_catalog(
         if not first or not last:
             continue
         dates = sorted(predictions.distinct("trade_date", {"model_id": model_id}) or [])
-        reasons = accepted.get(model_id, [])
+        registry_doc = registry_by_model.get(str(model_id))
+        if registry_doc:
+            reasons = list(registry_doc.get("accepted_reasons") or [])
+            accepted_flag = bool(registry_doc.get("accepted")) or bool(reasons)
+            state = registry_doc.get("state")
+        else:
+            reasons = accepted.get(model_id, [])
+            accepted_flag = bool(reasons)
+            state = "live" if "live" in reasons else "shadow" if "shadow" in reasons else None
+        validation = (registry_doc or {}).get("latest_validation") or {}
         rows.append(
             {
-                "accepted": bool(reasons),
+                "accepted": accepted_flag,
                 "accepted_reasons": reasons,
                 "model_id": model_id,
                 "index_code": (last or {}).get("index_code") or (first or {}).get("index_code"),
@@ -159,6 +191,13 @@ def list_model_catalog(
                 "research": bool((last or {}).get("research")),
                 "shadow": bool((last or {}).get("shadow")),
                 "source": (last or {}).get("source"),
+                "state": state,
+                "validated": state == "validated",
+                "validation": (
+                    {"protocol": validation.get("protocol"), "verdict": validation.get("verdict")}
+                    if validation
+                    else None
+                ),
                 "recent": bool(dates and dates[-1] >= cutoff),
                 "recent_trade_dates": list(reversed(dates[-RECENT_DATES:])),
             }

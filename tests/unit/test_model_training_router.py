@@ -202,6 +202,9 @@ def test_list_prediction_models_serializes_coverage(monkeypatch):
         "window": "rolling_500",
         "accepted": False,
         "accepted_reasons": [],
+        "state": None,
+        "validated": False,
+        "validation": None,
     }
     # Missing flags mean neither research nor shadow, not None.
     assert response["data"][1]["research"] is False
@@ -357,3 +360,106 @@ def test_list_prediction_models_accepted_only_returns_empty_without_sources(monk
     )
     assert response["data"] == []
     assert predictions.pipelines == []
+
+
+def test_list_prediction_models_include_validated_from_registry(monkeypatch):
+    predictions = _AggregateCollection(
+        [
+            {
+                "_id": "live-model",
+                "index_code": "csi1000",
+                "first_trade_date": "20250101",
+                "last_trade_date": "20261116",
+                "date_count": 100,
+                "prediction_count": 10000,
+                "research": True,
+                "shadow": True,
+            },
+            {
+                "_id": "validated-model",
+                "index_code": "csi1000",
+                "first_trade_date": "20250101",
+                "last_trade_date": "20261113",
+                "date_count": 451,
+                "prediction_count": 449413,
+                "research": True,
+                "shadow": False,
+            },
+            {
+                "_id": "raw-model",
+                "index_code": "csi1000",
+                "first_trade_date": "20250101",
+                "last_trade_date": "20261113",
+                "date_count": 20,
+                "prediction_count": 20000,
+                "research": True,
+                "shadow": False,
+            },
+        ]
+    )
+    registry = _Collection()
+    registry.docs = [
+        {
+            "_id": "live-model",
+            "model_id": "live-model",
+            "state": "live",
+            "accepted": True,
+            "accepted_reasons": ["live"],
+            "latest_validation": {"protocol": "portfolio_oos", "verdict": "weak"},
+        },
+        {
+            "_id": "validated-model",
+            "model_id": "validated-model",
+            "state": "validated",
+            "accepted": False,
+            "accepted_reasons": [],
+            "latest_validation": {"protocol": "portfolio_oos", "verdict": "weak"},
+        },
+        {
+            "_id": "raw-model",
+            "model_id": "raw-model",
+            "state": "research",
+            "accepted": False,
+            "accepted_reasons": [],
+            "latest_validation": None,
+        },
+    ]
+    monkeypatch.setattr(
+        model_training,
+        "get_ml_db_collections",
+        lambda: {
+            "model_predictions": predictions,
+            "models": registry,
+        },
+    )
+    monkeypatch.setattr(
+        model_training,
+        "get_trading_db_collections",
+        lambda: {"portfolio_strategy_activations": _Collection()},
+    )
+
+    accepted = model_training.list_prediction_models(
+        index_code=None,
+        kind="all",
+        accepted_only=True,
+        limit=100,
+        current_user={"id": "u1"},
+    )
+    assert {row["model_id"] for row in accepted["data"]} == {"live-model"}
+    assert accepted["data"][0]["state"] == "live"
+    assert accepted["data"][0]["validation"] == {"protocol": "portfolio_oos", "verdict": "weak"}
+
+    with_validated = model_training.list_prediction_models(
+        index_code=None,
+        kind="all",
+        accepted_only=True,
+        include_validated=True,
+        limit=100,
+        current_user={"id": "u1"},
+    )
+    rows = {row["model_id"]: row for row in with_validated["data"]}
+    assert set(rows) == {"live-model", "validated-model"}
+    assert rows["validated-model"]["validated"] is True
+    assert rows["validated-model"]["state"] == "validated"
+    assert rows["validated-model"]["accepted"] is False
+    assert "raw-model" not in rows
