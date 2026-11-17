@@ -40,6 +40,12 @@ class CreateModelTrainingJobRequest(BaseModel):
     train_days: int = Field(default=60, ge=5, le=500)
     test_days: int = Field(default=20, ge=1, le=120)
     purge_days: int = Field(default=60, ge=0, le=120)
+    model_id: Optional[str] = Field(
+        default=None,
+        max_length=200,
+        description="Optional registry model_id; the training worker creates a research-state model entry.",
+    )
+    family_id: Optional[str] = Field(default=None, max_length=200)
 
 
 @router.post("/jobs")
