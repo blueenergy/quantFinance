@@ -1,13 +1,14 @@
-"""Market statistics gallery API — 两融余额 and index PE series."""
+"""Market statistics gallery API — 两融余额, index PE and ETF penetration."""
 from __future__ import annotations
 
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 
 from auth import get_current_active_user
 from db import get_data_db
+from services.etf_penetration import DEFAULT_DAYS, DEFAULT_INDEX, compute_penetration
 from services.market_stats import (
     ALLA_CODE,
     MARGIN_ALL_EXCHANGE,
@@ -120,6 +121,34 @@ async def get_market_stats_overview(
             "series": series,
         }
 
+    return payload
+
+
+@router.get("/etf-penetration", summary="头部宽基 ETF 渗透率（ETF 规模 / 指数流通市值）")
+async def get_etf_penetration(
+    index: str = Query(
+        DEFAULT_INDEX,
+        description="宽基指数 key：hs300 / sse50 / csi500 / csi1000 / gem / star50",
+    ),
+    days: int = Query(
+        DEFAULT_DAYS,
+        ge=0,
+        le=10000,
+        description="返回最近 N 个有效交易日；0 表示全部历史",
+    ),
+    current_user: dict = Depends(get_current_active_user),
+):
+    """Head broad-index ETF AUM as a share of the index float market cap.
+
+    Both sides scale with the index level, so the ratio tracks share
+    creation/redemption rather than price.  Only dates where every ETF in the
+    curated head pool has shares and a close are emitted; the latest point is
+    labelled by its own trade date (share data is T+1).
+    """
+    try:
+        payload = compute_penetration(get_data_db(), index_key=index, days=days)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
     return payload
 
 
