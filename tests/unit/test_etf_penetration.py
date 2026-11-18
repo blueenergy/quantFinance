@@ -67,10 +67,16 @@ def _collections():
         {"ts_code": "TEST.IDX", "trade_date": "20260106", "float_mv": 1.1e11},
         {"ts_code": "TEST.IDX", "trade_date": "20260107", "float_mv": 1.2e11},
     ]
+    prices = [
+        {"ts_code": "TEST.IDX", "trade_date": "20260105", "close": 4000.0},
+        {"ts_code": "TEST.IDX", "trade_date": "20260106", "close": 4100.0},
+        {"ts_code": "TEST.IDX", "trade_date": "20260107", "close": 4200.0},
+    ]
     return {
         "etf_shares": _Coll(shares),
         "etf_daily": _Coll(closes),
         "index_daily_basic": _Coll(basic),
+        "index_prices": _Coll(prices),
     }
 
 
@@ -96,9 +102,11 @@ def test_compute_penetration_requires_full_pool_coverage(monkeypatch):
     assert first["aum_yi"] == pytest.approx(3.0)
     assert first["float_mv_yi"] == pytest.approx(1000.0)
     assert first["ratio_pct"] == pytest.approx(0.3)
+    assert first["index_close"] == pytest.approx(4000.0)
     assert payload["latest"]["trade_date"] == "20260107"
     # (12000 + 6000) * 2 = 3.6 亿元 / 1200 亿元 = 0.3%
     assert payload["latest"]["ratio_pct"] == pytest.approx(0.3)
+    assert payload["latest"]["index_close"] == pytest.approx(4200.0)
 
 
 @pytest.mark.unit

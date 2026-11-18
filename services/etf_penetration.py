@@ -140,6 +140,26 @@ def _load_index_float_mv(coll: Any, index_code: str, start: str) -> Dict[str, fl
     return out
 
 
+def _load_index_close(coll: Any, index_code: str, start: str) -> Dict[str, float]:
+    """Index close for the price-context panel.
+
+    ``index_dailybasic`` does not return ``close`` (Tushare omits it even when
+    requested); the index level lives in ``index_prices`` (``index_daily``).
+    Missing prices simply yield ``index_close=None`` rows in the series.
+    """
+    rows = coll.find(
+        {"ts_code": index_code, "trade_date": {"$gte": start}},
+        {"_id": 0, "trade_date": 1, "close": 1},
+    )
+    out: Dict[str, float] = {}
+    for row in rows:
+        day = _norm_day(row.get("trade_date"))
+        value = _as_float(row.get("close"))
+        if day and value and value > 0:
+            out[day] = value
+    return out
+
+
 def _available_indices() -> List[Dict[str, Any]]:
     return [
         {
@@ -187,6 +207,12 @@ def compute_penetration(data_db: Dict[str, Any], index_key: str = DEFAULT_INDEX,
     shares = _load_series(shares_coll, codes, start, "fd_share")
     closes = _load_series(daily_coll, codes, start, "close")
     float_mv = _load_index_float_mv(basic_coll, profile["index_code"], start)
+    price_coll = data_db.get("index_prices")
+    index_close = (
+        _load_index_close(price_coll, profile["index_code"], start)
+        if price_coll is not None
+        else {}
+    )
 
     rows: List[Dict[str, Any]] = []
     for day in sorted(float_mv):
@@ -212,6 +238,7 @@ def compute_penetration(data_db: Dict[str, Any], index_key: str = DEFAULT_INDEX,
                 "aum_yi": round(aum_yi, 2),
                 "float_mv_yi": round(cap_yi, 2),
                 "ratio_pct": round(aum_yi / cap_yi * 100.0, 4),
+                "index_close": round(index_close[day], 2) if day in index_close else None,
                 "n_funds": covered,
             }
         )
