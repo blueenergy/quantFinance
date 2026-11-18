@@ -11,8 +11,10 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field, field_validator
 from pymongo import DESCENDING
 
-from auth import get_current_user
-from db import get_data_db, get_ml_db_collections, get_trading_db_collections
+from auth import get_current_admin_user, get_current_user
+from db import get_ml_db_collections, get_trading_db_collections
+from services.model_retrain import RetrainError, build_retrain_job_doc
+from services.model_retrain_scheduler import initial_next_run_date, run_due_retrains
 from services.model_scores_daily import accepted_model_reasons
 from services.model_training_promotion import (
     build_promotion_context,
@@ -68,12 +70,25 @@ class RetrainModelTrainingJobRequest(BaseModel):
         return text
 
 
-def _latest_volume_price_date() -> Optional[str]:
-    row = (
-        get_data_db()["volume_price"]
-        .find_one({}, {"trade_date": 1}, sort=[("trade_date", -1)])
-    )
-    return str(row["trade_date"]) if row and row.get("trade_date") else None
+class RetrainScheduleRequest(BaseModel):
+    schedule_id: str = Field(min_length=1, max_length=120)
+    family_id: str = Field(min_length=1, max_length=120)
+    source_job_id: str = Field(min_length=1, max_length=120)
+    cadence: Literal["monthly", "quarterly"]
+    enabled: bool = True
+    model_id_prefix: Optional[str] = Field(default=None, max_length=120)
+    next_run_date: Optional[str] = None
+    user_id: Optional[str] = None
+
+    @field_validator("next_run_date")
+    @classmethod
+    def _normalize_next_run(cls, value: Optional[str]) -> Optional[str]:
+        if value in (None, ""):
+            return None
+        text = str(value).replace("-", "").strip()
+        if len(text) != 8 or not text.isdigit():
+            raise ValueError("date must be YYYYMMDD")
+        return text
 
 
 @router.post("/jobs")
@@ -116,91 +131,83 @@ def retrain_model_training_job(
     )
     if not source:
         raise HTTPException(status_code=404, detail="source training job not found")
-    if source.get("status") != "completed" or not source.get("result_id"):
-        raise HTTPException(status_code=409, detail="source training job must be completed")
-
-    model_id = body.model_id.strip()
-    models = collections.get("models")
-    if models is not None and models.find_one({"model_id": model_id}):
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "message": f"model_id={model_id} already exists; use a new version id",
-                "model_id": model_id,
-            },
+    try:
+        doc = build_retrain_job_doc(
+            collections,
+            source,
+            model_id=body.model_id,
+            start_date=body.start_date,
+            end_date=body.end_date,
+            name=body.name,
+            family_id=body.family_id,
+            parquet_path=body.parquet_path,
+            snapshot_id=body.snapshot_id,
+            user_id=user_id,
         )
-
-    params = dict(source.get("params") or {})
-    start_date = body.start_date or str(params.get("start_date") or "")
-    end_date = body.end_date or _latest_volume_price_date()
-    if not start_date or not end_date:
-        raise HTTPException(
-            status_code=422,
-            detail="retrain requires start_date and end_date (or a source start_date)",
-        )
-    if end_date < start_date:
-        raise HTTPException(status_code=422, detail=f"end_date {end_date} precedes start_date {start_date}")
-
-    data_source = str(params.get("data_source") or "synthetic")
-    parquet_path = body.parquet_path or str(params.get("parquet_path") or "").strip() or None
-    snapshot_id = body.snapshot_id or str(params.get("snapshot_id") or "").strip() or None
-    if not body.parquet_path and not body.snapshot_id:
-        if data_source == "production_scores":
-            # Force a fresh panel to the new end_date instead of reusing an
-            # older fixed parquet path from the source job.
-            parquet_path = None
-            snapshot_id = None
-        elif not parquet_path:
-            raise HTTPException(
-                status_code=422,
-                detail=(
-                    "source job did not use production_scores and has no parquet_path; "
-                    "provide parquet_path/snapshot_id for the retrain"
-                ),
-            )
-
-    name = body.name or f"{source.get('name') or model_id} retrain {end_date}"
-    params.update(
-        {
-            "name": name,
-            "model_id": model_id,
-            "start_date": start_date,
-            "end_date": end_date,
-        }
-    )
-    if body.family_id:
-        params["family_id"] = body.family_id
-    if parquet_path:
-        params["parquet_path"] = parquet_path
-    else:
-        params.pop("parquet_path", None)
-    if snapshot_id:
-        params["snapshot_id"] = snapshot_id
-    else:
-        params.pop("snapshot_id", None)
-
-    new_job_id = str(uuid.uuid4())
-    now = datetime.utcnow()
-    doc = {
-        "job_id": new_job_id,
-        "user_id": user_id,
-        "name": name,
-        "status": "pending",
-        "created_at": now,
-        "params": params,
-        "retrain_of": job_id,
-    }
+    except RetrainError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
     collections["model_training_jobs"].insert_one(doc)
     return {
         "data": {
-            "job_id": new_job_id,
+            "job_id": doc["job_id"],
             "status": "pending",
-            "model_id": model_id,
-            "start_date": start_date,
-            "end_date": end_date,
-            "retrain_of": job_id,
+            "model_id": doc["params"]["model_id"],
+            "start_date": doc["params"]["start_date"],
+            "end_date": doc["params"]["end_date"],
+            "retrain_of": doc["retrain_of"],
         }
     }
+
+
+@router.get("/retrain-schedules")
+def list_retrain_schedules(
+    current_user: dict = Depends(get_current_admin_user),
+) -> Dict[str, Any]:
+    _ = current_user
+    schedules = get_ml_db_collections().get("model_retrain_schedules")
+    if schedules is None:
+        return {"data": []}
+    rows = list(schedules.find({}, {"_id": 0}).sort("schedule_id", 1))
+    return {"data": rows}
+
+
+@router.post("/retrain-schedules")
+def upsert_retrain_schedule(
+    body: RetrainScheduleRequest,
+    current_user: dict = Depends(get_current_admin_user),
+) -> Dict[str, Any]:
+    collections = get_ml_db_collections()
+    schedules = collections.get("model_retrain_schedules")
+    if schedules is None:
+        raise HTTPException(status_code=503, detail="model_retrain_schedules collection unavailable")
+    next_run_date = body.next_run_date or initial_next_run_date(body.cadence)
+    now = datetime.utcnow()
+    doc = {
+        "schedule_id": body.schedule_id,
+        "family_id": body.family_id,
+        "source_job_id": body.source_job_id,
+        "cadence": body.cadence,
+        "enabled": bool(body.enabled),
+        "model_id_prefix": body.model_id_prefix or body.family_id,
+        "next_run_date": next_run_date,
+        "user_id": body.user_id or str(current_user.get("id") or ""),
+        "updated_at": now,
+    }
+    schedules.update_one(
+        {"schedule_id": body.schedule_id},
+        {"$set": doc, "$setOnInsert": {"created_at": now}},
+        upsert=True,
+    )
+    return {"data": doc}
+
+
+@router.post("/retrain-schedules/run-due")
+def run_retrain_schedules(
+    dry_run: bool = Query(default=False),
+    current_user: dict = Depends(get_current_admin_user),
+) -> Dict[str, Any]:
+    _ = current_user
+    return {"data": run_due_retrains(dry_run=dry_run)}
 
 
 def _snapshot_parquet_path(doc: Dict[str, Any]) -> Optional[str]:
