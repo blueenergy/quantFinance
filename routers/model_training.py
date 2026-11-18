@@ -8,11 +8,11 @@ from datetime import datetime
 from typing import Any, Dict, List, Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from pymongo import DESCENDING
 
 from auth import get_current_user
-from db import get_ml_db_collections, get_trading_db_collections
+from db import get_data_db, get_ml_db_collections, get_trading_db_collections
 from services.model_scores_daily import accepted_model_reasons
 from services.model_training_promotion import (
     build_promotion_context,
@@ -48,6 +48,34 @@ class CreateModelTrainingJobRequest(BaseModel):
     family_id: Optional[str] = Field(default=None, max_length=200)
 
 
+class RetrainModelTrainingJobRequest(BaseModel):
+    model_id: str = Field(min_length=1, max_length=200, description="New model version id")
+    family_id: Optional[str] = Field(default=None, max_length=200)
+    start_date: Optional[str] = None
+    end_date: Optional[str] = None
+    name: Optional[str] = Field(default=None, max_length=200)
+    parquet_path: Optional[str] = None
+    snapshot_id: Optional[str] = None
+
+    @field_validator("start_date", "end_date")
+    @classmethod
+    def _normalize_date(cls, value: Optional[str]) -> Optional[str]:
+        if value in (None, ""):
+            return None
+        text = str(value).replace("-", "").strip()
+        if len(text) != 8 or not text.isdigit():
+            raise ValueError("date must be YYYYMMDD")
+        return text
+
+
+def _latest_volume_price_date() -> Optional[str]:
+    row = (
+        get_data_db()["volume_price"]
+        .find_one({}, {"trade_date": 1}, sort=[("trade_date", -1)])
+    )
+    return str(row["trade_date"]) if row and row.get("trade_date") else None
+
+
 @router.post("/jobs")
 def create_model_training_job(
     body: CreateModelTrainingJobRequest,
@@ -66,6 +94,113 @@ def create_model_training_job(
     }
     collections["model_training_jobs"].insert_one(doc)
     return {"data": {"job_id": job_id, "status": "pending"}}
+
+
+@router.post("/jobs/{job_id}/retrain")
+def retrain_model_training_job(
+    job_id: str,
+    body: RetrainModelTrainingJobRequest,
+    current_user: dict = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """Clone a completed job's full recipe into a new version.
+
+    The dashboard rerun form only carries the basic fields; this endpoint copies
+    the stored params (feature_names, model_params, data_source, label_col,
+    walk-forward windows) so a live model can be retrained faithfully. The new
+    job must use a fresh model_id; lifecycle-managed ids are rejected.
+    """
+    collections = get_ml_db_collections()
+    user_id = str(current_user.get("id") or "")
+    source = collections["model_training_jobs"].find_one(
+        {"job_id": job_id, "user_id": user_id},
+    )
+    if not source:
+        raise HTTPException(status_code=404, detail="source training job not found")
+    if source.get("status") != "completed" or not source.get("result_id"):
+        raise HTTPException(status_code=409, detail="source training job must be completed")
+
+    model_id = body.model_id.strip()
+    models = collections.get("models")
+    if models is not None and models.find_one({"model_id": model_id}):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": f"model_id={model_id} already exists; use a new version id",
+                "model_id": model_id,
+            },
+        )
+
+    params = dict(source.get("params") or {})
+    start_date = body.start_date or str(params.get("start_date") or "")
+    end_date = body.end_date or _latest_volume_price_date()
+    if not start_date or not end_date:
+        raise HTTPException(
+            status_code=422,
+            detail="retrain requires start_date and end_date (or a source start_date)",
+        )
+    if end_date < start_date:
+        raise HTTPException(status_code=422, detail=f"end_date {end_date} precedes start_date {start_date}")
+
+    data_source = str(params.get("data_source") or "synthetic")
+    parquet_path = body.parquet_path or str(params.get("parquet_path") or "").strip() or None
+    snapshot_id = body.snapshot_id or str(params.get("snapshot_id") or "").strip() or None
+    if not body.parquet_path and not body.snapshot_id:
+        if data_source == "production_scores":
+            # Force a fresh panel to the new end_date instead of reusing an
+            # older fixed parquet path from the source job.
+            parquet_path = None
+            snapshot_id = None
+        elif not parquet_path:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "source job did not use production_scores and has no parquet_path; "
+                    "provide parquet_path/snapshot_id for the retrain"
+                ),
+            )
+
+    name = body.name or f"{source.get('name') or model_id} retrain {end_date}"
+    params.update(
+        {
+            "name": name,
+            "model_id": model_id,
+            "start_date": start_date,
+            "end_date": end_date,
+        }
+    )
+    if body.family_id:
+        params["family_id"] = body.family_id
+    if parquet_path:
+        params["parquet_path"] = parquet_path
+    else:
+        params.pop("parquet_path", None)
+    if snapshot_id:
+        params["snapshot_id"] = snapshot_id
+    else:
+        params.pop("snapshot_id", None)
+
+    new_job_id = str(uuid.uuid4())
+    now = datetime.utcnow()
+    doc = {
+        "job_id": new_job_id,
+        "user_id": user_id,
+        "name": name,
+        "status": "pending",
+        "created_at": now,
+        "params": params,
+        "retrain_of": job_id,
+    }
+    collections["model_training_jobs"].insert_one(doc)
+    return {
+        "data": {
+            "job_id": new_job_id,
+            "status": "pending",
+            "model_id": model_id,
+            "start_date": start_date,
+            "end_date": end_date,
+            "retrain_of": job_id,
+        }
+    }
 
 
 def _snapshot_parquet_path(doc: Dict[str, Any]) -> Optional[str]:

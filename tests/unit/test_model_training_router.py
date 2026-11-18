@@ -1,5 +1,8 @@
 import asyncio
 
+import pytest
+from fastapi import HTTPException
+
 from routers import model_training
 
 
@@ -463,3 +466,122 @@ def test_list_prediction_models_include_validated_from_registry(monkeypatch):
     assert rows["validated-model"]["state"] == "validated"
     assert rows["validated-model"]["accepted"] is False
     assert "raw-model" not in rows
+
+
+def _retrain_source():
+    return {
+        "job_id": "source-job",
+        "user_id": "u1",
+        "name": "clean-csi1000-raw5-live-20261108",
+        "status": "completed",
+        "result_id": "source-result",
+        "params": {
+            "model_id": "old-model",
+            "index_code": "csi1000",
+            "model_kind": "lightgbm",
+            "data_source": "production_scores",
+            "start_date": "20150130",
+            "end_date": "20261106",
+            "parquet_path": "/data/old-panel.parquet",
+            "feature_names": ["momentum_20d", "momentum_60d", "volatility_20d", "turnover_20d", "log_market_cap"],
+            "model_params": {"num_leaves": 15, "learning_rate": 0.05},
+            "label_col": "label_fwd_20d",
+            "train_days": 500,
+            "test_days": 20,
+            "purge_days": 60,
+            "universe_count": 1,
+        },
+    }
+
+
+def test_retrain_copies_full_recipe_and_overrides_version(monkeypatch):
+    jobs = _Collection()
+    jobs.docs = [_retrain_source()]
+    models = _Collection()
+    models.docs = [{"_id": "live-model", "model_id": "live-model", "state": "live"}]
+    monkeypatch.setattr(
+        model_training,
+        "get_ml_db_collections",
+        lambda: {"model_training_jobs": jobs, "models": models},
+    )
+
+    response = model_training.retrain_model_training_job(
+        "source-job",
+        model_training.RetrainModelTrainingJobRequest(
+            model_id="csi1000-clean-raw5-202612",
+            end_date="20261231",
+        ),
+        current_user={"id": "u1"},
+    )
+    new_job = jobs.docs[-1]
+    assert response["data"]["model_id"] == "csi1000-clean-raw5-202612"
+    assert new_job["status"] == "pending"
+    assert new_job["retrain_of"] == "source-job"
+    assert new_job["params"]["model_id"] == "csi1000-clean-raw5-202612"
+    assert new_job["params"]["end_date"] == "20261231"
+    assert new_job["params"]["feature_names"] == [
+        "momentum_20d",
+        "momentum_60d",
+        "volatility_20d",
+        "turnover_20d",
+        "log_market_cap",
+    ]
+    assert new_job["params"]["model_params"] == {"num_leaves": 15, "learning_rate": 0.05}
+    assert new_job["params"]["data_source"] == "production_scores"
+    assert "parquet_path" not in new_job["params"]
+
+
+def test_retrain_rejects_existing_managed_model_id(monkeypatch):
+    jobs = _Collection()
+    jobs.docs = [_retrain_source()]
+    models = _Collection()
+    models.docs = [{"_id": "live-model", "model_id": "live-model", "state": "live"}]
+    monkeypatch.setattr(
+        model_training,
+        "get_ml_db_collections",
+        lambda: {"model_training_jobs": jobs, "models": models},
+    )
+    with pytest.raises(HTTPException) as exc_info:
+        model_training.retrain_model_training_job(
+            "source-job",
+            model_training.RetrainModelTrainingJobRequest(model_id="live-model", end_date="20261231"),
+            current_user={"id": "u1"},
+        )
+    assert exc_info.value.status_code == 409
+
+
+def test_retrain_requires_completed_source(monkeypatch):
+    jobs = _Collection()
+    jobs.docs = [{**_retrain_source(), "status": "running", "result_id": None}]
+    monkeypatch.setattr(
+        model_training,
+        "get_ml_db_collections",
+        lambda: {"model_training_jobs": jobs, "models": _Collection()},
+    )
+    with pytest.raises(HTTPException) as exc_info:
+        model_training.retrain_model_training_job(
+            "source-job",
+            model_training.RetrainModelTrainingJobRequest(model_id="new-model", end_date="20261231"),
+            current_user={"id": "u1"},
+        )
+    assert exc_info.value.status_code == 409
+
+
+def test_retrain_rejects_synthetic_source_without_panel(monkeypatch):
+    source = _retrain_source()
+    source["params"]["data_source"] = "synthetic"
+    source["params"].pop("parquet_path", None)
+    jobs = _Collection()
+    jobs.docs = [source]
+    monkeypatch.setattr(
+        model_training,
+        "get_ml_db_collections",
+        lambda: {"model_training_jobs": jobs, "models": _Collection()},
+    )
+    with pytest.raises(HTTPException) as exc_info:
+        model_training.retrain_model_training_job(
+            "source-job",
+            model_training.RetrainModelTrainingJobRequest(model_id="new-model", end_date="20261231"),
+            current_user={"id": "u1"},
+        )
+    assert exc_info.value.status_code == 422
