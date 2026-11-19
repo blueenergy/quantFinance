@@ -192,6 +192,9 @@ _TRADER_SIGNAL_STATUS_ALLOWED_FIELDS = frozenset(
         "broker_status_msg",
         "last_status_checked_at",
         "last_market_price",
+        # bid1/ask1 captured at submission (quantTrader book_snapshot); feeds
+        # live fill-rate / slippage review against the L2 research baseline.
+        "book_snapshot",
     }
 )
 
