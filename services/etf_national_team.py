@@ -1117,3 +1117,455 @@ def compute_curve(
         "ratio": ratio,
         "amount_unit": "yuan",
     }
+
+
+# ---------------------------------------------------------------------------
+# Entry ladder
+# ---------------------------------------------------------------------------
+#
+# Daily, study-backed sizing ladder for a discretionary buyer.  It is NOT a
+# standalone alpha strategy: the 2015-2026 costed backtest showed no edge over
+# a constant-exposure benchmark (Sharpe 0.22 for every constant exposure vs
+# -0.04..0.19 for the timing rules), so the card is framed as position
+# discipline.  Frequencies come from the six completed accumulation episodes
+# (2015+), measured with a 120-session window from each episode start; see
+# llm-wiki projects/trading/research/national-team-etf-entry-timing.md.
+
+_LADDER_TTL_SECONDS = 300.0
+_LADDER_LOCK = threading.Lock()
+_LADDER_CACHE: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+
+_LADDER_HISTORY = {
+    "episodes": 6,
+    "regime_a": 3,
+    "regime_b": 3,
+    "median_low": -17.9,
+    "median_days": 74,
+    "median_f60_onset": -3.6,
+    "median_f120_onset": -5.2,
+    "note": "6 个已完成 episode；频数不是精确概率",
+}
+
+_LADDER_TIER_SPECS = [
+    {
+        "id": "T1",
+        "label": "-10%",
+        "drawdown": 0.10,
+        "reach": "4/6",
+        "f60": 7.2,
+        "f120": -8.6,
+        "post_dd": -13.0,
+    },
+    {
+        "id": "T2",
+        "label": "-15%",
+        "drawdown": 0.15,
+        "reach": "3/6",
+        "f60": 7.4,
+        "f120": -10.9,
+        "post_dd": -12.9,
+    },
+    {
+        "id": "T3",
+        "label": "-20%",
+        "drawdown": 0.20,
+        "reach": "3/6",
+        "f60": 11.1,
+        "f120": -4.8,
+        "post_dd": -6.2,
+    },
+]
+
+_LADDER_STATUS_LABELS = {
+    "triggered": "已触发",
+    "pending": "待触发",
+    "unknown": "无数据",
+}
+
+
+def _load_adj_factors(
+    data_db: Any, codes: Sequence[str], days: Sequence[str]
+) -> Dict[str, Dict[str, float]]:
+    out: Dict[str, Dict[str, float]] = {code: {} for code in codes}
+    if not days:
+        return out
+    for doc in data_db["etf_adj_factor"].find(
+        {
+            "ts_code": {"$in": list(codes)},
+            "trade_date": {"$gte": days[0], "$lte": days[-1]},
+        },
+        {"ts_code": 1, "trade_date": 1, "adj_factor": 1, "_id": 0},
+    ):
+        factor = _num(doc.get("adj_factor"))
+        if factor:
+            out.setdefault(doc["ts_code"], {})[_norm_day(doc.get("trade_date"))] = factor
+    return out
+
+
+def _load_index_closes(
+    data_db: Any, code: str, days: Sequence[str]
+) -> Dict[str, float]:
+    out: Dict[str, float] = {}
+    if not days:
+        return out
+    for doc in data_db["index_prices"].find(
+        {
+            "ts_code": code,
+            "trade_date": {"$gte": days[0], "$lte": days[-1]},
+        },
+        {"trade_date": 1, "close": 1, "_id": 0},
+    ):
+        close = _num(doc.get("close"))
+        if close:
+            out[_norm_day(doc.get("trade_date"))] = close
+    return out
+
+
+def _ladder_daily_flows(
+    share_series: Mapping[str, Tuple[Sequence[str], Sequence[float]]],
+    closes: Mapping[str, Mapping[str, float]],
+    adj_factors: Mapping[str, Mapping[str, float]],
+) -> Dict[str, Optional[float]]:
+    """Daily pool net-subscription %, AUM-weighted, corporate actions excluded.
+
+    ``flow = AUM_t - AUM_{t-1} * (1 + adjusted return)``; splits cancel out,
+    and days around a split/merge (share jump within three sessions of an
+    adj-factor change) are dropped instead of being read as a redemption.
+    The first 20 share rows of each ETF are skipped to avoid listing flows.
+    """
+    daily: Dict[str, List[float]] = defaultdict(lambda: [0.0, 0.0])
+    for code, (dates, values) in share_series.items():
+        close_map = closes.get(code) or {}
+        adj_map = adj_factors.get(code) or {}
+        rows = [
+            (str(day), float(share), close_map.get(str(day)), adj_map.get(str(day)))
+            for day, share in zip(dates, values)
+            if close_map.get(str(day)) and adj_map.get(str(day))
+        ]
+        if len(rows) < 21:
+            continue
+        ca_idx = {
+            i
+            for i in range(1, len(rows))
+            if rows[i - 1][3] and abs(rows[i][3] / rows[i - 1][3] - 1) > 0.03
+        }
+        for i in range(1, len(rows)):
+            if i < 20:
+                continue
+            day, share, close, adj = rows[i]
+            prev_day, prev_share, prev_close, prev_adj = rows[i - 1]
+            try:
+                gap = (
+                    datetime.strptime(day, "%Y%m%d")
+                    - datetime.strptime(prev_day, "%Y%m%d")
+                ).days
+            except ValueError:
+                continue
+            if gap > 10:
+                continue
+            share_jump = abs(share / prev_share - 1) if prev_share else 0.0
+            near_ca = any(abs(i - j) <= 3 for j in ca_idx)
+            if i in ca_idx or (share_jump > 0.20 and near_ca):
+                continue
+            adj_return = (close * adj) / (prev_close * prev_adj) - 1
+            prev_aum = prev_share * 1e4 * prev_close
+            flow = share * 1e4 * close - prev_aum * (1 + adj_return)
+            daily[day][0] += flow
+            daily[day][1] += prev_aum
+    return {
+        day: (value[0] / value[1] * 100 if value[1] else None)
+        for day, value in daily.items()
+    }
+
+
+def _rolling_sum(values: Sequence[Optional[float]], window: int, min_periods: int) -> List[Optional[float]]:
+    out: List[Optional[float]] = []
+    for i in range(len(values)):
+        start = max(0, i - window + 1)
+        chunk = [v for v in values[start : i + 1] if v is not None]
+        if i + 1 >= min_periods and len(chunk) >= min_periods:
+            out.append(sum(chunk))
+        else:
+            out.append(None)
+    return out
+
+
+def _ladder_episode(
+    dates: Sequence[str],
+    flow60: Sequence[Optional[float]],
+    hs300: Mapping[str, Optional[float]],
+    today: str,
+) -> Dict[str, Any]:
+    """Causal accumulation episode: flow60>=5 starts, five sessions confirm.
+
+    ``p0`` is the HS300 close on the *raw* start day (the first day of the
+    run), so the displayed drawdown matches the study's episode table.  The
+    episode only becomes ``active`` after the fifth consecutive session;
+    ten consecutive sessions below 5% end it.  After the end we keep the last
+    completed episode so T4 (buy after accumulation ends) can still be shown.
+    """
+    idx_today = -1
+    for i, day in enumerate(dates):
+        if day <= today:
+            idx_today = i
+        else:
+            break
+    if idx_today < 0:
+        return {
+            "active": False,
+            "start": None,
+            "start_idx": None,
+            "p0": None,
+            "days": None,
+            "ended": False,
+            "end": None,
+        }
+    raw = [v is not None and v >= 5 for v in flow60]
+    active = False
+    true_count = 0
+    false_count = 0
+    run_start: Optional[int] = None
+    cur_start: Optional[int] = None
+    cur_p0: Optional[float] = None
+    last_start: Optional[int] = None
+    last_p0: Optional[float] = None
+    last_end: Optional[int] = None
+    for i in range(idx_today + 1):
+        if raw[i]:
+            if run_start is None:
+                run_start = i
+            true_count += 1
+            false_count = 0
+        else:
+            true_count = 0
+            false_count += 1
+            if not active:
+                run_start = None
+        if not active and run_start is not None and true_count >= 5:
+            active = True
+            cur_start = run_start
+            cur_p0 = hs300.get(dates[run_start])
+        if active and false_count >= 10:
+            active = False
+            last_start, last_p0, last_end = cur_start, cur_p0, i
+            run_start = None
+            cur_start = None
+            cur_p0 = None
+    if active:
+        start_idx, p0 = cur_start, cur_p0
+        ended = False
+        end_idx = None
+    else:
+        start_idx, p0 = last_start, last_p0
+        ended = last_end is not None
+        end_idx = last_end
+    return {
+        "active": active,
+        "start": dates[start_idx] if start_idx is not None else None,
+        "start_idx": start_idx,
+        "p0": p0,
+        # Inclusive session count: the start day itself is day 1, matching the
+        # "第 N 日" wording on the dashboard card.
+        "days": (idx_today - start_idx + 1) if start_idx is not None else None,
+        "ended": bool(ended and not active),
+        "end": dates[end_idx] if end_idx is not None else None,
+        "end_days_ago": (idx_today - end_idx) if end_idx is not None else None,
+    }
+
+
+def _ladder_tiers(
+    p0: Optional[float],
+    price: Optional[float],
+    active: bool,
+    ended: bool,
+    t4_recent: bool = False,
+) -> List[Dict[str, Any]]:
+    tiers: List[Dict[str, Any]] = []
+    for spec in _LADDER_TIER_SPECS:
+        target = round(p0 * (1 - spec["drawdown"]), 1) if p0 else None
+        if price is None or target is None:
+            status = "unknown"
+            distance = None
+        elif price <= target:
+            status = "triggered"
+            distance = None
+        else:
+            status = "pending"
+            distance = (target / price - 1) * 100
+        tiers.append(
+            {
+                "id": spec["id"],
+                "label": spec["label"],
+                "price": target,
+                "weight": 0.25,
+                "status": status,
+                "status_label": _LADDER_STATUS_LABELS[status],
+                "distance_pct": distance,
+                "hist_reach": spec["reach"],
+                "hist_f60": spec["f60"],
+                "hist_f120": spec["f120"],
+                "hist_post_dd": spec["post_dd"],
+                "condition": None,
+            }
+        )
+    if active:
+        t4_status = "pending"
+    elif ended and t4_recent:
+        # The "buy after accumulation ends" window is 60 sessions; after that
+        # it is a stale event, not a live trigger.
+        t4_status = "triggered"
+    elif ended:
+        t4_status = "pending"
+    else:
+        t4_status = "unknown"
+    tiers.append(
+        {
+            "id": "T4",
+            "label": "增仓结束",
+            "price": None,
+            "weight": 0.25,
+            "status": t4_status,
+            "status_label": _LADDER_STATUS_LABELS[t4_status],
+            "distance_pct": None,
+            "hist_reach": "6/6",
+            "hist_f60": 0.4,
+            "hist_f120": -3.1,
+            "hist_f250": 3.3,
+            "hist_post_dd": None,
+            "condition": "flow60 < 5%",
+        }
+    )
+    return tiers
+
+
+def compute_entry_ladder(
+    data_db: Any, trade_date: Optional[str] = None
+) -> Dict[str, Any]:
+    """Probability-based buy ladder for the national-team ETF pool.
+
+    Read-only and cached for five minutes: the underlying share data is daily
+    (T+1), so a shorter TTL would only add Mongo scans.
+    """
+    pool = load_pool(data_db)
+    codes = [item["ts_code"] for item in pool]
+    if not codes:
+        raise ValueError("national-team pool is empty")
+    today = _norm_day(trade_date)
+    if not today:
+        doc = data_db["etf_daily"].find_one(
+            {"ts_code": {"$in": codes}},
+            {"trade_date": 1},
+            sort=[("trade_date", -1)],
+        )
+        today = _norm_day(doc.get("trade_date")) if doc else ""
+    if not today:
+        raise ValueError("no etf_daily data for the national-team pool")
+
+    key = f"{id(data_db)}:{today}"
+    now = time.monotonic()
+    with _LADDER_LOCK:
+        cached = _LADDER_CACHE.get(key)
+        if cached and now - cached[0] < _LADDER_TTL_SECONDS:
+            return cached[1]
+
+    start_day = (datetime.strptime(today, "%Y%m%d") - timedelta(days=420)).strftime(
+        "%Y%m%d"
+    )
+    share_series = _load_share_series(data_db, codes, start_day)
+    closes = _load_daily_closes(data_db, codes, [start_day, today])
+    adj_factors = _load_adj_factors(data_db, codes, [start_day, today])
+    flows = _ladder_daily_flows(share_series, closes, adj_factors)
+    dates = sorted(day for day, value in flows.items() if day <= today and value is not None)
+    if not dates:
+        raise ValueError("no share-flow data for the national-team pool")
+    values = [flows[day] for day in dates]
+    flow20 = _rolling_sum(values, 20, 15)
+    flow60 = _rolling_sum(values, 60, 40)
+
+    hs300 = _load_index_closes(data_db, "000300.SH", [start_day, today])
+    hs_dates = sorted(hs300)
+    aligned: Dict[str, Optional[float]] = {}
+    last_hs: Optional[float] = None
+    j = 0
+    for day in dates:
+        while j < len(hs_dates) and hs_dates[j] <= day:
+            last_hs = hs300[hs_dates[j]]
+            j += 1
+        aligned[day] = last_hs
+    episode = _ladder_episode(dates, flow60, aligned, today)
+
+    index_date = max((d for d in hs_dates if d <= today), default=None)
+    current_price = hs300.get(index_date) if index_date else None
+    p0 = episode.get("p0")
+    drawdown = (
+        (current_price / p0 - 1) * 100
+        if current_price is not None and p0
+        else None
+    )
+    active = bool(episode.get("active"))
+    ended = bool(episode.get("ended"))
+    if not active and not ended:
+        regime = "none"
+    elif drawdown is not None and drawdown <= -15:
+        regime = "deep"
+    else:
+        regime = "shallow"
+
+    end_days_ago = episode.get("end_days_ago")
+    t4_recent = ended and end_days_ago is not None and end_days_ago <= 60
+    tiers = _ladder_tiers(
+        p0, current_price, active, ended, t4_recent=t4_recent
+    )
+    suggested = sum(t["weight"] for t in tiers if t["status"] == "triggered")
+    next_tier = next(
+        (t for t in tiers if t["status"] == "pending" and t["price"] is not None),
+        None,
+    )
+
+    negative_days = 0
+    for value in reversed(flow60):
+        if value is not None and value < 0:
+            negative_days += 1
+        else:
+            break
+
+    latest_flow = flow60[-1] if flow60 else None
+    latest_flow20 = flow20[-1] if flow20 else None
+    payload = {
+        "success": True,
+        "trade_date": today,
+        "flow_date": dates[-1],
+        "as_of": "close",
+        "index": {
+            "ts_code": "000300.SH",
+            "name": INDEX_NAMES["000300.SH"],
+            "close": current_price,
+            "date": index_date,
+        },
+        "episode": {
+            "active": active,
+            "start": episode.get("start"),
+            "start_close": p0,
+            "days": episode.get("days"),
+            "ended": ended,
+            "end": episode.get("end"),
+            "flow20": latest_flow20,
+            "flow60": latest_flow,
+            "flow": values[-1] if values else None,
+            "drawdown": drawdown,
+            "regime": regime,
+        },
+        "tiers": tiers,
+        "suggested_position": suggested,
+        "next_tier": next_tier,
+        "invalidation": {
+            "active": negative_days >= 20,
+            "flow60": latest_flow,
+            "negative_days": negative_days,
+            "rule": "flow60 < 0 连续 20 个交易日",
+        },
+        "history": dict(_LADDER_HISTORY),
+    }
+    with _LADDER_LOCK:
+        _LADDER_CACHE[key] = (now, payload)
+    return payload

@@ -9,6 +9,7 @@ from auth import get_current_active_user
 from db import data_db
 from services.etf_national_team import (
     compute_curve,
+    compute_entry_ladder,
     compute_history,
     compute_snapshot,
     list_trade_dates,
@@ -61,6 +62,24 @@ def get_national_team_snapshot(
         raise HTTPException(status_code=404, detail=str(exc))
     except Exception as exc:  # pragma: no cover - defensive surface for the UI
         raise HTTPException(status_code=500, detail=f"national-team snapshot failed: {exc}")
+
+
+@router.get("/entry-ladder", summary="国家队 ETF 分批买点阶梯")
+def get_national_team_entry_ladder(
+    trade_date: Optional[str] = Query(
+        None, description="YYYYMMDD; default latest etf_daily date"
+    ),
+    current_user: dict = Depends(get_current_active_user),
+):
+    """Probability-based sizing ladder from the 2015+ accumulation episodes."""
+    try:
+        return compute_entry_ladder(data_db, trade_date=trade_date)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except Exception as exc:  # pragma: no cover - defensive surface for the UI
+        raise HTTPException(
+            status_code=500, detail=f"national-team entry ladder failed: {exc}"
+        )
 
 
 @router.get("/curve", summary="国家队 ETF 分时累计成交额 vs 20 日基线")
