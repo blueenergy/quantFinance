@@ -124,6 +124,39 @@ def test_every_index_spec_has_full_tier_stats():
         assert {"reach", "f60", "f120", "f250"} <= set(spec["tiers"]["T4"]), code
 
 
+def test_t4_requires_the_study_size_filter():
+    # A real episode: cumulative >= 10% and >= 15 sessions.
+    assert nt._t4_qualified(10.0, 15) is True
+    assert nt._t4_qualified(80.0, 60) is True
+    # The 2025-04 run: flow60 was elevated but the run netted ~0.
+    assert nt._t4_qualified(-0.1, 69) is False
+    assert nt._t4_qualified(9.9, 69) is False
+    assert nt._t4_qualified(50.0, 14) is False
+    assert nt._t4_qualified(None, 69) is False
+
+    # Ended and recent, but not qualified: T4 stays pending instead of firing.
+    tiers = nt._ladder_tiers(
+        p0=100.0,
+        price=88.0,
+        active=False,
+        ended=True,
+        t4_recent=True,
+        t4_qualified=False,
+    )
+    assert tiers[-1]["id"] == "T4"
+    assert tiers[-1]["status"] == "pending"
+
+    tiers = nt._ladder_tiers(
+        p0=100.0,
+        price=88.0,
+        active=False,
+        ended=True,
+        t4_recent=True,
+        t4_qualified=True,
+    )
+    assert tiers[-1]["status"] == "triggered"
+
+
 def test_tier_triggers_carry_the_index_session_date():
     dates = ["20260101", "20260102", "20260105", "20260106"]
     closes = {dates[0]: 100.0, dates[1]: 89.0, dates[2]: 84.0, dates[3]: 79.0}

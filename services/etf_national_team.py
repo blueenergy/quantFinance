@@ -1417,8 +1417,29 @@ def _ladder_episode(
         "days": (idx_today - start_idx + 1) if start_idx is not None else None,
         "ended": bool(ended and not active),
         "end": dates[end_idx] if end_idx is not None else None,
+        "end_idx": end_idx,
         "end_days_ago": (idx_today - end_idx) if end_idx is not None else None,
     }
+
+
+# Study filter for a *real* accumulation episode: cumulative net subscription
+# >= 10% and >= 15 sessions. Weaker runs are window artefacts — the 2025-04
+# run peaked at flow60 +12.6% but its 69 sessions netted -0.1%, and the study's
+# episode table filters it out.
+_T4_MIN_CUM_FLOW = 10.0
+_T4_MIN_SESSIONS = 15
+
+
+def _t4_qualified(
+    cum_flow: Optional[float], sessions: Optional[int]
+) -> bool:
+    """True when the episode meets the study's size filter for T4."""
+    return (
+        cum_flow is not None
+        and sessions is not None
+        and cum_flow >= _T4_MIN_CUM_FLOW
+        and sessions >= _T4_MIN_SESSIONS
+    )
 
 
 def _ladder_tiers(
@@ -1428,6 +1449,7 @@ def _ladder_tiers(
     ended: bool,
     t4_recent: bool = False,
     index_spec: Optional[Mapping[str, Any]] = None,
+    t4_qualified: bool = True,
 ) -> List[Dict[str, Any]]:
     stats = (index_spec or _LADDER_INDEX_SPECS[_LADDER_DEFAULT_INDEX])["tiers"]
     tiers: List[Dict[str, Any]] = []
@@ -1461,9 +1483,10 @@ def _ladder_tiers(
         )
     if active:
         t4_status = "pending"
-    elif ended and t4_recent:
+    elif ended and t4_recent and t4_qualified:
         # The "buy after accumulation ends" window is 60 sessions; after that
-        # it is a stale event, not a live trigger.
+        # it is a stale event, not a live trigger. The study filter keeps
+        # window artefacts (flow60 elevated, cumulative ~0) from triggering.
         t4_status = "triggered"
     elif ended:
         t4_status = "pending"
@@ -1484,7 +1507,7 @@ def _ladder_tiers(
             "hist_f120": t4_hist["f120"],
             "hist_f250": t4_hist["f250"],
             "hist_post_dd": None,
-            "condition": "flow60 < 5%",
+            "condition": "flow60 < 5% 且段内累计 ≥10%",
         }
     )
     return tiers
@@ -1616,6 +1639,23 @@ def compute_entry_ladder(
     else:
         regime = "shallow"
 
+    # Study filter for T4: cumulative net subscription over the episode (sum
+    # of the daily AUM-weighted flows) must clear 10% and the run must last at
+    # least 15 sessions. This keeps window artefacts like the 2025-04 run
+    # (flow60 peaked +12.6%, cumulative -0.1%) from firing a buy tier.
+    start_idx = episode.get("start_idx")
+    end_idx = episode.get("end_idx")
+    cum_flow: Optional[float] = None
+    session_count: Optional[int] = None
+    if start_idx is not None:
+        last_i = end_idx
+        if last_i is None and episode.get("days"):
+            last_i = start_idx + episode["days"] - 1
+        if last_i is not None and last_i >= start_idx:
+            cum_flow = sum(values[start_idx : last_i + 1])
+            session_count = last_i - start_idx + 1
+    t4_qualified = _t4_qualified(cum_flow, session_count)
+
     end_days_ago = episode.get("end_days_ago")
     t4_recent = ended and end_days_ago is not None and end_days_ago <= 60
     tiers = _ladder_tiers(
@@ -1625,6 +1665,7 @@ def compute_entry_ladder(
         ended,
         t4_recent=t4_recent,
         index_spec=index_spec,
+        t4_qualified=t4_qualified,
     )
     _annotate_tier_triggers(
         tiers, hs_dates, index_closes, episode.get("start"), episode
@@ -1662,6 +1703,9 @@ def compute_entry_ladder(
             "days": episode.get("days"),
             "ended": ended,
             "end": episode.get("end"),
+            "cum_flow": cum_flow,
+            "sessions": session_count,
+            "t4_qualified": t4_qualified,
             "flow20": latest_flow20,
             "flow60": latest_flow,
             "flow": values[-1] if values else None,
