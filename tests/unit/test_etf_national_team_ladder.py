@@ -100,3 +100,32 @@ def test_tiers_trigger_at_drawdown_levels_and_keep_t4():
         p0=100.0, price=88.0, active=False, ended=True, t4_recent=False
     )
     assert tiers[-1]["status"] == "pending"
+
+
+def test_tiers_use_the_selected_index_stats():
+    spec = nt._LADDER_INDEX_SPECS["000905.SH"]
+    tiers = nt._ladder_tiers(100.0, 88.0, True, False, index_spec=spec)
+    by_id = {t["id"]: t for t in tiers}
+    # CSI500's own forward path, not the HS300 row.
+    assert by_id["T1"]["hist_reach"] == "4/6"
+    assert by_id["T1"]["hist_f60"] == 1.5
+    assert by_id["T2"]["hist_f60"] == 11.3
+    assert by_id["T3"]["hist_post_dd"] == -5.1
+    assert by_id["T4"]["hist_f250"] == 4.2
+
+
+def test_every_index_spec_has_full_tier_stats():
+    for code, spec in nt._LADDER_INDEX_SPECS.items():
+        assert spec["episodes"] >= 4, code
+        assert spec["regime_a"] + spec["regime_b"] == spec["episodes"], code
+        for tier_id in ("T1", "T2", "T3"):
+            keys = set(spec["tiers"][tier_id])
+            assert {"reach", "f60", "f120", "post_dd"} <= keys, (code, tier_id)
+        assert {"reach", "f60", "f120", "f250"} <= set(spec["tiers"]["T4"]), code
+
+
+def test_ladder_rejects_unknown_index():
+    import pytest
+
+    with pytest.raises(ValueError, match="unsupported index"):
+        nt.compute_entry_ladder(object(), index="000000.SH")

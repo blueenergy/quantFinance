@@ -1135,45 +1135,93 @@ _LADDER_TTL_SECONDS = 300.0
 _LADDER_LOCK = threading.Lock()
 _LADDER_CACHE: Dict[str, Tuple[float, Dict[str, Any]]] = {}
 
-_LADDER_HISTORY = {
-    "episodes": 6,
-    "regime_a": 3,
-    "regime_b": 3,
-    "median_low": -17.9,
-    "median_days": 74,
-    "median_f60_onset": -3.6,
-    "median_f120_onset": -5.2,
-    "note": "6 个已完成 episode；频数不是精确概率",
+_LADDER_DEFAULT_INDEX = "000300.SH"
+
+# Design A (2026-11-21): the accumulation episodes stay pool-wide (the same six
+# used by the study), and each index is anchored to its own close at the raw
+# episode start. Everything below is the forward path *of that index* after the
+# first tier trigger, recomputed from index_prices with the study's method
+# (HS300 reproduces the study row for row). STAR50 has four episodes because
+# 000688.SH only starts on 2019-12-31.
+_LADDER_INDEX_SPECS = {
+    "000300.SH": {
+        "name": "沪深300",
+        "episodes": 6, "regime_a": 3, "regime_b": 3,
+        "median_low": -17.9, "median_days": 75,
+        "median_f60_onset": -3.6, "median_f120_onset": -5.3,
+        "tiers": {
+            "T1": {"reach": "4/6", "f60": 7.2, "f120": -8.6, "post_dd": -13.0},
+            "T2": {"reach": "3/6", "f60": 7.4, "f120": -10.9, "post_dd": -12.9},
+            "T3": {"reach": "3/6", "f60": 11.1, "f120": -4.8, "post_dd": -6.2},
+            "T4": {"reach": "6/6", "f60": 0.4, "f120": -3.1, "f250": 3.3},
+        },
+    },
+    "000016.SH": {
+        "name": "上证50",
+        "episodes": 6, "regime_a": 2, "regime_b": 4,
+        "median_low": -16.7, "median_days": 75,
+        "median_f60_onset": -3.7, "median_f120_onset": -6.2,
+        "tiers": {
+            "T1": {"reach": "4/6", "f60": 4.4, "f120": -7.3, "post_dd": -10.6},
+            "T2": {"reach": "4/6", "f60": 13.8, "f120": -2.9, "post_dd": -4.2},
+            "T3": {"reach": "2/6", "f60": 10.5, "f120": -5.5, "post_dd": -5.9},
+            "T4": {"reach": "6/6", "f60": 0.9, "f120": -1.8, "f250": 4.0},
+        },
+    },
+    "000905.SH": {
+        "name": "中证500",
+        "episodes": 6, "regime_a": 3, "regime_b": 3,
+        "median_low": -15.7, "median_days": 75,
+        "median_f60_onset": -2.6, "median_f120_onset": -1.0,
+        "tiers": {
+            "T1": {"reach": "4/6", "f60": 1.5, "f120": 3.1, "post_dd": -13.3},
+            "T2": {"reach": "3/6", "f60": 11.3, "f120": -14.2, "post_dd": -15.5},
+            "T3": {"reach": "2/6", "f60": 24.2, "f120": 3.6, "post_dd": -5.1},
+            "T4": {"reach": "6/6", "f60": 0.0, "f120": -2.2, "f250": 4.2},
+        },
+    },
+    "000852.SH": {
+        "name": "中证1000",
+        "episodes": 6, "regime_a": 3, "regime_b": 3,
+        "median_low": -17.3, "median_days": 75.5,
+        "median_f60_onset": -2.2, "median_f120_onset": -0.4,
+        "tiers": {
+            "T1": {"reach": "5/6", "f60": 2.8, "f120": 7.6, "post_dd": -15.8},
+            "T2": {"reach": "3/6", "f60": 12.4, "f120": -2.7, "post_dd": -15.5},
+            "T3": {"reach": "3/6", "f60": 20.1, "f120": -0.3, "post_dd": -10.6},
+            "T4": {"reach": "6/6", "f60": 0.5, "f120": 2.0, "f250": 10.8},
+        },
+    },
+    "000688.SH": {
+        "name": "科创50",
+        "episodes": 4, "regime_a": 2, "regime_b": 2,
+        "median_low": -15.1, "median_days": 77,
+        "median_f60_onset": -5.6, "median_f120_onset": -7.4,
+        "tiers": {
+            "T1": {"reach": "3/4", "f60": -1.6, "f120": -12.2, "post_dd": -25.3},
+            "T2": {"reach": "2/4", "f60": -11.1, "f120": -7.8, "post_dd": -23.4},
+            "T3": {"reach": "1/4", "f60": -2.8, "f120": -4.0, "post_dd": -20.6},
+            "T4": {"reach": "4/4", "f60": -2.1, "f120": -4.7, "f250": 11.8},
+        },
+    },
+    "399006.SZ": {
+        "name": "创业板",
+        "episodes": 6, "regime_a": 3, "regime_b": 3,
+        "median_low": -15.0, "median_days": 72.5,
+        "median_f60_onset": -6.5, "median_f120_onset": -8.4,
+        "tiers": {
+            "T1": {"reach": "5/6", "f60": -8.1, "f120": -5.9, "post_dd": -22.9},
+            "T2": {"reach": "3/6", "f60": -8.0, "f120": -5.4, "post_dd": -18.3},
+            "T3": {"reach": "2/6", "f60": 19.7, "f120": 0.3, "post_dd": -14.0},
+            "T4": {"reach": "6/6", "f60": -1.7, "f120": -2.3, "f250": 6.0},
+        },
+    },
 }
 
 _LADDER_TIER_SPECS = [
-    {
-        "id": "T1",
-        "label": "-10%",
-        "drawdown": 0.10,
-        "reach": "4/6",
-        "f60": 7.2,
-        "f120": -8.6,
-        "post_dd": -13.0,
-    },
-    {
-        "id": "T2",
-        "label": "-15%",
-        "drawdown": 0.15,
-        "reach": "3/6",
-        "f60": 7.4,
-        "f120": -10.9,
-        "post_dd": -12.9,
-    },
-    {
-        "id": "T3",
-        "label": "-20%",
-        "drawdown": 0.20,
-        "reach": "3/6",
-        "f60": 11.1,
-        "f120": -4.8,
-        "post_dd": -6.2,
-    },
+    {"id": "T1", "label": "-10%", "drawdown": 0.10},
+    {"id": "T2", "label": "-15%", "drawdown": 0.15},
+    {"id": "T3", "label": "-20%", "drawdown": 0.20},
 ]
 
 _LADDER_STATUS_LABELS = {
@@ -1379,7 +1427,9 @@ def _ladder_tiers(
     active: bool,
     ended: bool,
     t4_recent: bool = False,
+    index_spec: Optional[Mapping[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
+    stats = (index_spec or _LADDER_INDEX_SPECS[_LADDER_DEFAULT_INDEX])["tiers"]
     tiers: List[Dict[str, Any]] = []
     for spec in _LADDER_TIER_SPECS:
         target = round(p0 * (1 - spec["drawdown"]), 1) if p0 else None
@@ -1392,6 +1442,7 @@ def _ladder_tiers(
         else:
             status = "pending"
             distance = (target / price - 1) * 100
+        hist = stats[spec["id"]]
         tiers.append(
             {
                 "id": spec["id"],
@@ -1401,10 +1452,10 @@ def _ladder_tiers(
                 "status": status,
                 "status_label": _LADDER_STATUS_LABELS[status],
                 "distance_pct": distance,
-                "hist_reach": spec["reach"],
-                "hist_f60": spec["f60"],
-                "hist_f120": spec["f120"],
-                "hist_post_dd": spec["post_dd"],
+                "hist_reach": hist["reach"],
+                "hist_f60": hist["f60"],
+                "hist_f120": hist["f120"],
+                "hist_post_dd": hist["post_dd"],
                 "condition": None,
             }
         )
@@ -1418,6 +1469,7 @@ def _ladder_tiers(
         t4_status = "pending"
     else:
         t4_status = "unknown"
+    t4_hist = stats["T4"]
     tiers.append(
         {
             "id": "T4",
@@ -1427,10 +1479,10 @@ def _ladder_tiers(
             "status": t4_status,
             "status_label": _LADDER_STATUS_LABELS[t4_status],
             "distance_pct": None,
-            "hist_reach": "6/6",
-            "hist_f60": 0.4,
-            "hist_f120": -3.1,
-            "hist_f250": 3.3,
+            "hist_reach": t4_hist["reach"],
+            "hist_f60": t4_hist["f60"],
+            "hist_f120": t4_hist["f120"],
+            "hist_f250": t4_hist["f250"],
             "hist_post_dd": None,
             "condition": "flow60 < 5%",
         }
@@ -1439,17 +1491,30 @@ def _ladder_tiers(
 
 
 def compute_entry_ladder(
-    data_db: Any, trade_date: Optional[str] = None
+    data_db: Any,
+    trade_date: Optional[str] = None,
+    index: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Probability-based buy ladder for the national-team ETF pool.
 
     Read-only and cached for five minutes: the underlying share data is daily
     (T+1), so a shorter TTL would only add Mongo scans.
+
+    ``index`` selects the price anchor (000300.SH / 000016.SH / 000905.SH /
+    000852.SH / 000688.SH / 399006.SZ). The accumulation episode itself is
+    pool-wide; see ``_LADDER_INDEX_SPECS``.
     """
     pool = load_pool(data_db)
     codes = [item["ts_code"] for item in pool]
     if not codes:
         raise ValueError("national-team pool is empty")
+    index_code = str(index or _LADDER_DEFAULT_INDEX).strip().upper()
+    index_spec = _LADDER_INDEX_SPECS.get(index_code)
+    if index_spec is None:
+        raise ValueError(
+            f"unsupported index {index_code}; expected one of "
+            + ", ".join(_LADDER_INDEX_SPECS)
+        )
     today = _norm_day(trade_date)
     if not today:
         doc = data_db["etf_daily"].find_one(
@@ -1461,7 +1526,7 @@ def compute_entry_ladder(
     if not today:
         raise ValueError("no etf_daily data for the national-team pool")
 
-    key = f"{id(data_db)}:{today}"
+    key = f"{id(data_db)}:{today}:{index_code}"
     now = time.monotonic()
     with _LADDER_LOCK:
         cached = _LADDER_CACHE.get(key)
@@ -1482,20 +1547,20 @@ def compute_entry_ladder(
     flow20 = _rolling_sum(values, 20, 15)
     flow60 = _rolling_sum(values, 60, 40)
 
-    hs300 = _load_index_closes(data_db, "000300.SH", [start_day, today])
-    hs_dates = sorted(hs300)
+    index_closes = _load_index_closes(data_db, index_code, [start_day, today])
+    hs_dates = sorted(index_closes)
     aligned: Dict[str, Optional[float]] = {}
     last_hs: Optional[float] = None
     j = 0
     for day in dates:
         while j < len(hs_dates) and hs_dates[j] <= day:
-            last_hs = hs300[hs_dates[j]]
+            last_hs = index_closes[hs_dates[j]]
             j += 1
         aligned[day] = last_hs
     episode = _ladder_episode(dates, flow60, aligned, today)
 
     index_date = max((d for d in hs_dates if d <= today), default=None)
-    current_price = hs300.get(index_date) if index_date else None
+    current_price = index_closes.get(index_date) if index_date else None
     p0 = episode.get("p0")
     drawdown = (
         (current_price / p0 - 1) * 100
@@ -1514,7 +1579,12 @@ def compute_entry_ladder(
     end_days_ago = episode.get("end_days_ago")
     t4_recent = ended and end_days_ago is not None and end_days_ago <= 60
     tiers = _ladder_tiers(
-        p0, current_price, active, ended, t4_recent=t4_recent
+        p0,
+        current_price,
+        active,
+        ended,
+        t4_recent=t4_recent,
+        index_spec=index_spec,
     )
     suggested = sum(t["weight"] for t in tiers if t["status"] == "triggered")
     next_tier = next(
@@ -1537,8 +1607,8 @@ def compute_entry_ladder(
         "flow_date": dates[-1],
         "as_of": "close",
         "index": {
-            "ts_code": "000300.SH",
-            "name": INDEX_NAMES["000300.SH"],
+            "ts_code": index_code,
+            "name": index_spec["name"],
             "close": current_price,
             "date": index_date,
         },
@@ -1564,7 +1634,16 @@ def compute_entry_ladder(
             "negative_days": negative_days,
             "rule": "flow60 < 0 连续 20 个交易日",
         },
-        "history": dict(_LADDER_HISTORY),
+        "history": {
+            "episodes": index_spec["episodes"],
+            "regime_a": index_spec["regime_a"],
+            "regime_b": index_spec["regime_b"],
+            "median_low": index_spec["median_low"],
+            "median_days": index_spec["median_days"],
+            "median_f60_onset": index_spec["median_f60_onset"],
+            "median_f120_onset": index_spec["median_f120_onset"],
+            "note": f"{index_spec['episodes']} 个已完成 episode；频数不是精确概率",
+        },
     }
     with _LADDER_LOCK:
         _LADDER_CACHE[key] = (now, payload)
