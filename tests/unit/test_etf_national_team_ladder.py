@@ -124,6 +124,33 @@ def test_every_index_spec_has_full_tier_stats():
         assert {"reach", "f60", "f120", "f250"} <= set(spec["tiers"]["T4"]), code
 
 
+def test_tier_triggers_carry_the_index_session_date():
+    dates = ["20260101", "20260102", "20260105", "20260106"]
+    closes = {dates[0]: 100.0, dates[1]: 89.0, dates[2]: 84.0, dates[3]: 79.0}
+    tiers = nt._ladder_tiers(100.0, 79.0, True, False)
+    nt._annotate_tier_triggers(tiers, dates, closes, dates[0])
+    by_id = {t["id"]: t for t in tiers}
+    assert by_id["T1"]["trigger_date"] == dates[1]
+    assert by_id["T1"]["trigger_days"] == 2
+    assert by_id["T2"]["trigger_date"] == dates[2]
+    assert by_id["T2"]["trigger_days"] == 3
+    assert by_id["T3"]["trigger_date"] == dates[3]
+    assert by_id["T3"]["trigger_days"] == 4
+    assert by_id["T4"]["trigger_date"] is None
+
+    # Pending tiers are never dated.
+    tiers = nt._ladder_tiers(100.0, 95.0, True, False)
+    nt._annotate_tier_triggers(tiers, dates, {d: 95.0 for d in dates}, dates[0])
+    assert all(t["trigger_date"] is None for t in tiers)
+
+    # T4 (buy after accumulation ends) uses the episode end date.
+    tiers = nt._ladder_tiers(100.0, 80.0, False, True, t4_recent=True)
+    nt._annotate_tier_triggers(tiers, dates, closes, dates[0], {"end": dates[2]})
+    assert tiers[-1]["id"] == "T4"
+    assert tiers[-1]["trigger_date"] == dates[2]
+    assert tiers[-1]["trigger_days"] == 3
+
+
 def test_ladder_rejects_unknown_index():
     import pytest
 

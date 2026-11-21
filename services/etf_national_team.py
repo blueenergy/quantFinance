@@ -1490,6 +1490,46 @@ def _ladder_tiers(
     return tiers
 
 
+def _annotate_tier_triggers(
+    tiers: Sequence[Dict[str, Any]],
+    sessions: Sequence[str],
+    closes: Mapping[str, Optional[float]],
+    start_date: Optional[str],
+    episode: Optional[Mapping[str, Any]] = None,
+) -> None:
+    """Attach the first session each price tier was reached after the start.
+
+    ``sessions`` is the index's own trade-date series (not the share dates):
+    the latest index close is usually one session ahead of the T+1 share flow,
+    and a tier can cross on that last session. Pending tiers keep ``None``;
+    T4 (buy after the accumulation ends) uses the episode end date.
+    """
+    session_idx = {day: i for i, day in enumerate(sessions)}
+    start_idx = session_idx.get(start_date) if start_date else None
+    for tier in tiers:
+        tier["trigger_date"] = None
+        tier["trigger_days"] = None
+        if tier["status"] != "triggered":
+            continue
+        if tier["id"] == "T4":
+            end = (episode or {}).get("end")
+            end_idx = session_idx.get(end) if end else None
+            if end_idx is not None:
+                tier["trigger_date"] = end
+                if start_idx is not None:
+                    tier["trigger_days"] = end_idx - start_idx + 1
+            continue
+        target = tier.get("price")
+        if target is None or start_idx is None:
+            continue
+        for k in range(start_idx, len(sessions)):
+            px = closes.get(sessions[k])
+            if px is not None and px <= target:
+                tier["trigger_date"] = sessions[k]
+                tier["trigger_days"] = k - start_idx + 1
+                break
+
+
 def compute_entry_ladder(
     data_db: Any,
     trade_date: Optional[str] = None,
@@ -1585,6 +1625,9 @@ def compute_entry_ladder(
         ended,
         t4_recent=t4_recent,
         index_spec=index_spec,
+    )
+    _annotate_tier_triggers(
+        tiers, hs_dates, index_closes, episode.get("start"), episode
     )
     suggested = sum(t["weight"] for t in tiers if t["status"] == "triggered")
     next_tier = next(
