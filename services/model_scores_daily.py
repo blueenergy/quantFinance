@@ -109,6 +109,40 @@ def accepted_model_reasons(shadow_profiles=None, activations=None) -> Dict[str, 
     return reasons
 
 
+def _prediction_sets(predictions, model_id: str) -> List[Dict[str, Any]]:
+    """Per-kind prediction sets for the research picker.
+
+    A model_id can carry a PIT research backfill and live-artifact shadow rows
+    at the same time; the UI must show the two date ranges separately instead
+    of a misleading union.
+    """
+    sets: List[Dict[str, Any]] = []
+    for kind, flag in (
+        ("research", {"$or": [{"research": True}, {"research": {"$ne": True}, "shadow": {"$ne": True}}]}),
+        ("shadow", {"shadow": True}),
+    ):
+        query = {"model_id": model_id, **flag}
+        dates = sorted(str(value) for value in (predictions.distinct("trade_date", query) or []) if value)
+        if not dates:
+            continue
+        source_doc = predictions.find_one(
+            query,
+            {"_id": 0, "source": 1, "window": 1},
+            sort=[("trade_date", -1)],
+        ) or {}
+        sets.append(
+            {
+                "kind": kind,
+                "first_trade_date": dates[0],
+                "last_trade_date": dates[-1],
+                "date_count": len(dates),
+                "source": source_doc.get("source"),
+                "window": source_doc.get("window"),
+            }
+        )
+    return sets
+
+
 def list_model_catalog(
     predictions,
     *,
@@ -188,6 +222,7 @@ def list_model_catalog(
                 "last_trade_date": dates[-1] if dates else _iso(last.get("trade_date")),
                 "date_count": len(dates),
                 "prediction_count": predictions.count_documents({"model_id": model_id}),
+                "prediction_sets": _prediction_sets(predictions, model_id),
                 "research": bool((last or {}).get("research")),
                 "shadow": bool((last or {}).get("shadow")),
                 "source": (last or {}).get("source"),

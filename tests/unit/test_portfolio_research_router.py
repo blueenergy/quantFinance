@@ -1528,8 +1528,38 @@ def test_create_model_score_job_forces_model_column(monkeypatch):
     assert job["params"]["model_id"] == "research-test-hs300"
     # model_id wins even though score_column kept its rule-score default.
     assert job["params"]["score_column"] == "model_score"
+    assert job["params"]["prediction_kind"] == "research"
     assert "score_specs" not in job["params"]
     assert "growth_cycle_weights" not in job["params"]
+
+
+@pytest.mark.unit
+def test_create_model_score_job_accepts_shadow_stream(monkeypatch):
+    collections = _collections()
+    predictions = _ml_predictions([
+        {"model_id": "shadow-test-hs300", "trade_date": "20250102", "ts_code": "000001.SZ", "score": 0.1, "shadow": True},
+        {"model_id": "shadow-test-hs300", "trade_date": "20250131", "ts_code": "000001.SZ", "score": 0.2, "shadow": True},
+    ])
+    monkeypatch.setattr(portfolio_research, "get_trading_db_collections", lambda: collections)
+    monkeypatch.setattr(portfolio_research, "get_ml_db_collections", lambda: predictions)
+
+    response = asyncio.run(
+        portfolio_research.create_portfolio_research_job(
+            portfolio_research.CreateResearchJobRequest(
+                name="shadow smoke",
+                universe_index="hs300",
+                start_date="2025-01-01",
+                end_date="2025-01-31",
+                model_id="shadow-test-hs300",
+                prediction_kind="shadow",
+            ),
+            current_user={"id": "user-1"},
+        )
+    )
+
+    job = collections["portfolio_research_jobs"].docs[0]
+    assert response["success"] is True
+    assert job["params"]["prediction_kind"] == "shadow"
 
 
 @pytest.mark.unit

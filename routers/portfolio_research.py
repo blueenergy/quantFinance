@@ -160,6 +160,14 @@ class CreateResearchJobRequest(BaseModel):
             "mutually exclusive with score_specs / growth_cycle_weights."
         ),
     )
+    prediction_kind: Optional[Literal["research", "shadow"]] = Field(
+        default=None,
+        description=(
+            "Model prediction stream: research = PIT backfill (research=true); "
+            "shadow = live artifact rows (shadow=true). Defaults to research when "
+            "model_id is set. Legacy jobs without this field keep the old all-rows merge."
+        ),
+    )
     growth_cycle_weights: List[str] = Field(default_factory=lambda: ["30:70"])
     score_specs: Optional[List[ScoreSpec]] = None
     top_n_values: List[int] = Field(default_factory=lambda: [10, 20, 50])
@@ -282,6 +290,8 @@ class CreateResearchJobRequest(BaseModel):
     def _validate_score_inputs(self) -> "CreateResearchJobRequest":
         if self.score_specs and "growth_cycle_weights" in self.model_fields_set and self.growth_cycle_weights:
             raise ValueError("score_specs and growth_cycle_weights are mutually exclusive")
+        if self.prediction_kind and not self.model_id:
+            raise ValueError("prediction_kind requires model_id")
         if self.model_id:
             if self.score_specs is not None:
                 raise ValueError("model_id cannot be combined with score_specs")
@@ -380,6 +390,7 @@ class RerunResearchJobRequest(BaseModel):
     end_date: Optional[str] = None
     score_column: Optional[str] = None
     model_id: Optional[str] = None
+    prediction_kind: Optional[Literal["research", "shadow"]] = None
     growth_cycle_weights: Optional[List[str]] = None
     score_specs: Optional[List[ScoreSpec]] = None
     top_n_values: Optional[List[int]] = None
@@ -567,6 +578,13 @@ def _normalized_watermark(job: Dict[str, Any], result: Optional[Dict[str, Any]],
 
 def _job_summary(job: Dict[str, Any], result: Optional[Dict[str, Any]] = None, stock_scores: Any = None) -> Dict[str, Any]:
     row = dict(job)
+    params = job.get("params") or {}
+    prediction_kind = params.get("prediction_kind")
+    if not prediction_kind and params.get("model_id"):
+        # Pre-P0 ML jobs did not record the stream; label them so the UI does
+        # not imply a precision the row does not have.
+        prediction_kind = "legacy"
+    row["prediction_kind"] = prediction_kind
     row["data_watermark"] = _normalized_watermark(job, result, stock_scores)
     if result:
         row["best_row"] = result.get("best_row")
@@ -1510,42 +1528,65 @@ async def create_portfolio_research_job(request: CreateResearchJobRequest, curre
     return {"success": True, "data": _jsonable(job)}
 
 
-def _validate_model_id_coverage(model_id: str, start_date: str, end_date: str) -> None:
+def _validate_model_id_coverage(
+    model_id: str,
+    start_date: str,
+    end_date: str,
+    prediction_kind: Optional[str] = None,
+) -> None:
     """Reject ML jobs whose model has no predictions in the requested window.
 
-    Without this check ``merge_model_score_into_dataset`` returns an all-NaN
-    model_score for an unknown / out-of-range model_id, and the worker completes
-    the job with no signal. Fail at submission instead.
+    The model_id can carry both research (PIT backfill) and shadow (live
+    artifact) rows. Validate only the requested kind so a model with a shadow
+    stream but no research history fails loudly instead of merging the wrong
+    stream.
     """
     predictions = get_ml_db_collections()["model_predictions"]
     projection = {"_id": 0, "trade_date": 1}
-    first = predictions.find_one({"model_id": model_id}, projection, sort=[("trade_date", 1)])
-    last = predictions.find_one({"model_id": model_id}, projection, sort=[("trade_date", -1)])
-    if not first or not last:
+    if predictions.find_one({"model_id": model_id}, projection) is None:
         raise HTTPException(
             status_code=422,
             detail=f"unknown model_id: {model_id} (no rows in quant_ml.model_predictions)",
         )
+    query: Dict[str, Any] = {"model_id": model_id}
+    if prediction_kind == "research":
+        query["$or"] = [
+            {"research": True},
+            {"research": {"$ne": True}, "shadow": {"$ne": True}},
+        ]
+    elif prediction_kind == "shadow":
+        query["shadow"] = True
+    first = predictions.find_one(query, projection, sort=[("trade_date", 1)])
+    last = predictions.find_one(query, projection, sort=[("trade_date", -1)])
+    kind_label = f" ({prediction_kind} prediction set)" if prediction_kind else ""
+    if not first or not last:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"model_id {model_id} has no{kind_label} rows in "
+                "quant_ml.model_predictions"
+            ),
+        )
     first_date = str(first.get("trade_date") or "")
     last_date = str(last.get("trade_date") or "")
     if not first_date or not last_date:
-        raise HTTPException(status_code=422, detail=f"model_id {model_id} has no trade_date coverage")
+        raise HTTPException(status_code=422, detail=f"model_id {model_id}{kind_label} has no trade_date coverage")
     if last_date < start_date or first_date > end_date:
         raise HTTPException(
             status_code=422,
             detail=(
-                f"model_id {model_id} predictions cover {first_date}..{last_date}, "
+                f"model_id {model_id}{kind_label} predictions cover {first_date}..{last_date}, "
                 f"no overlap with requested {start_date}..{end_date}"
             ),
         )
     in_range = predictions.find_one(
-        {"model_id": model_id, "trade_date": {"$gte": start_date, "$lte": end_date}},
+        {**query, "trade_date": {"$gte": start_date, "$lte": end_date}},
         projection,
     )
     if in_range is None:
         raise HTTPException(
             status_code=422,
-            detail=f"model_id {model_id} has no predictions between {start_date} and {end_date}",
+            detail=f"model_id {model_id}{kind_label} has no predictions between {start_date} and {end_date}",
         )
 
 
@@ -1609,8 +1650,13 @@ def _build_research_job_document(user_id: str, request: CreateResearchJobRequest
         raise HTTPException(status_code=400, detail="start_date must be <= end_date")
 
     model_id = str(request.model_id or "").strip()
+    prediction_kind = request.prediction_kind
     if model_id:
-        _validate_model_id_coverage(model_id, start_date, end_date)
+        # New model jobs default to the PIT research stream. Legacy jobs in the
+        # database have no prediction_kind and the worker keeps their old
+        # all-rows behaviour; only jobs created through this API are stamped.
+        prediction_kind = prediction_kind or "research"
+        _validate_model_id_coverage(model_id, start_date, end_date, prediction_kind)
 
     now = datetime.utcnow()
     params = request.model_dump()
@@ -1618,6 +1664,7 @@ def _build_research_job_document(user_id: str, request: CreateResearchJobRequest
         # model_id is the single source of truth for the ranking column. Clear
         # rule-score inputs so a stale default cannot silently win downstream.
         params["model_id"] = model_id
+        params["prediction_kind"] = prediction_kind
         params["score_column"] = "model_score"
         params.pop("score_specs", None)
         params.pop("growth_cycle_weights", None)

@@ -32,6 +32,14 @@ class _Registry:
 
 def _matches(doc, query):
     for key, value in (query or {}).items():
+        if key == "$or":
+            if not any(_matches(doc, sub) for sub in value):
+                return False
+            continue
+        if isinstance(value, dict) and "$ne" in value:
+            if doc.get(key) == value["$ne"]:
+                return False
+            continue
         if doc.get(key) != value:
             return False
     return True
@@ -91,3 +99,24 @@ def test_catalog_prefers_registry_state_and_validation():
     assert rows["raw-model"]["accepted"] is False
     assert rows["raw-model"]["state"] == "research"
     assert rows["raw-model"]["validated"] is False
+
+
+def _shadow_rows(model_id, dates):
+    return [
+        {"model_id": model_id, "trade_date": date, "ts_code": f"{index:06d}.SZ", "index_code": "csi1000", "research": False, "shadow": True, "source": "shadow_loop"}
+        for index, date in enumerate(dates)
+    ]
+
+
+def test_catalog_exposes_research_and_shadow_sets_separately():
+    predictions = _Predictions(
+        _rows("mixed-model", ["20160413", "20160923"])
+        + _shadow_rows("mixed-model", ["20261119", "20261120"])
+    )
+    row = next(row for row in list_model_catalog(predictions) if row["model_id"] == "mixed-model")
+    sets = {item["kind"]: item for item in row["prediction_sets"]}
+    assert set(sets) == {"research", "shadow"}
+    assert sets["research"]["first_trade_date"] == "20160413"
+    assert sets["research"]["last_trade_date"] == "20160923"
+    assert sets["shadow"]["first_trade_date"] == "20261119"
+    assert sets["shadow"]["last_trade_date"] == "20261120"
