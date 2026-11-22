@@ -142,14 +142,58 @@ def test_promotion_context_endpoint(monkeypatch):
     assert resp["data"]["group"]["passed_pool_count"] == 1
 
 
+def _matches(doc, query):
+    for key, value in query.items():
+        if key == "$or":
+            if not any(_matches(doc, sub) for sub in value):
+                return False
+            continue
+        if isinstance(value, dict):
+            if "$exists" in value:
+                if (key in doc) != bool(value["$exists"]):
+                    return False
+            if "$ne" in value:
+                if doc.get(key) == value["$ne"]:
+                    return False
+            if "$in" in value:
+                if doc.get(key) not in value["$in"]:
+                    return False
+            if "$nin" in value:
+                if doc.get(key) in value["$nin"]:
+                    return False
+            if not set(value) & {"$exists", "$ne", "$in", "$nin"}:
+                return False
+        elif doc.get(key) != value:
+            return False
+    return True
+
+
 class _AggregateCollection:
-    def __init__(self, rows=None):
+    """Aggregate rows plus the raw docs ``_prediction_sets`` reads.
+
+    The endpoint's aggregate returns model-level rows, while the per-kind
+    prediction sets come from ``distinct``/``find_one`` over raw rows. Tests
+    that do not care about sets leave ``docs`` empty.
+    """
+
+    def __init__(self, rows=None, docs=None):
         self.rows = list(rows or [])
+        self.docs = list(docs or [])
         self.pipelines = []
 
     def aggregate(self, pipeline):
         self.pipelines.append(pipeline)
         return iter(self.rows)
+
+    def distinct(self, field, query=None):
+        values = {doc.get(field) for doc in self.docs if _matches(doc, query or {})}
+        return sorted(value for value in values if value)
+
+    def find_one(self, query, projection=None, sort=None):
+        rows = [doc for doc in self.docs if _matches(doc, query or {})]
+        for key, direction in reversed(list(sort or [])):
+            rows.sort(key=lambda doc: doc.get(key) or "", reverse=direction < 0)
+        return rows[0] if rows else None
 
 
 def test_list_prediction_models_serializes_coverage(monkeypatch):
@@ -208,10 +252,12 @@ def test_list_prediction_models_serializes_coverage(monkeypatch):
         "state": None,
         "validated": False,
         "validation": None,
+        "prediction_sets": [],
     }
     # Missing flags mean neither research nor shadow, not None.
     assert response["data"][1]["research"] is False
     assert response["data"][1]["shadow"] is False
+    assert response["data"][1]["prediction_sets"] == []
 
     pipeline = predictions.pipelines[0]
     assert pipeline[0]["$match"] == {"model_id": {"$exists": True, "$nin": [None, ""]}}
@@ -252,6 +298,93 @@ def test_list_prediction_models_applies_kind_and_index_filters(monkeypatch):
     assert shadow_match["shadow"] is True
     assert "research" not in shadow_match
     assert "index_code" not in shadow_match
+
+
+def test_list_prediction_models_returns_per_kind_prediction_sets(monkeypatch):
+    """A model with both streams must not report the union as one set."""
+    model_id = "research-csi1000-clean-raw5"
+    predictions = _AggregateCollection(
+        [
+            {
+                "_id": model_id,
+                "index_code": "csi1000",
+                "first_trade_date": "20160413",
+                "last_trade_date": "20261120",
+                "date_count": 130,
+                "prediction_count": 120565,
+                "research": True,
+                "shadow": True,
+                "source": "factor_incremental_experiment",
+                "window": "expanding",
+            },
+        ],
+        docs=[
+            {
+                "model_id": model_id,
+                "trade_date": "20160413",
+                "research": True,
+                "source": "factor_incremental_experiment",
+                "window": "expanding",
+            },
+            {
+                "model_id": model_id,
+                "trade_date": "20260923",
+                "research": True,
+                "source": "factor_incremental_experiment",
+                "window": "expanding",
+            },
+            {
+                "model_id": model_id,
+                "trade_date": "20261106",
+                "shadow": True,
+                "source": "factor_incremental_experiment",
+                "window": "full_sample_expanding",
+            },
+            {
+                "model_id": model_id,
+                "trade_date": "20261120",
+                "shadow": True,
+                "source": "factor_incremental_experiment",
+                "window": "full_sample_expanding",
+            },
+        ],
+    )
+    monkeypatch.setattr(
+        model_training,
+        "get_ml_db_collections",
+        lambda: {"model_predictions": predictions},
+    )
+    monkeypatch.setattr(
+        model_training,
+        "get_trading_db_collections",
+        lambda: {"portfolio_strategy_activations": _Collection()},
+    )
+
+    response = model_training.list_prediction_models(
+        index_code=None,
+        kind="all",
+        limit=100,
+        current_user={"id": "u1"},
+    )
+
+    assert response["data"][0]["prediction_sets"] == [
+        {
+            "kind": "research",
+            "first_trade_date": "20160413",
+            "last_trade_date": "20260923",
+            "date_count": 2,
+            "source": "factor_incremental_experiment",
+            "window": "expanding",
+        },
+        {
+            "kind": "shadow",
+            "first_trade_date": "20261106",
+            "last_trade_date": "20261120",
+            "date_count": 2,
+            "source": "factor_incremental_experiment",
+            "window": "full_sample_expanding",
+        },
+    ]
 
 
 def test_list_prediction_models_marks_and_filters_accepted(monkeypatch):

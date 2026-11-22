@@ -15,7 +15,7 @@ from auth import get_current_admin_user, get_current_user
 from db import get_ml_db_collections, get_trading_db_collections
 from services.model_retrain import RetrainError, build_retrain_job_doc
 from services.model_retrain_scheduler import initial_next_run_date, run_due_retrains
-from services.model_scores_daily import accepted_model_reasons
+from services.model_scores_daily import accepted_model_reasons, _prediction_sets
 from services.model_training_promotion import (
     build_promotion_context,
     find_recipe_sibling_jobs,
@@ -404,14 +404,17 @@ def list_prediction_models(
         {"$sort": {"last_trade_date": DESCENDING, "_id": 1}},
         {"$limit": limit},
     ]
-    rows = [
-        _serialize_prediction_model_row(
+    rows = []
+    for doc in collections["model_predictions"].aggregate(pipeline):
+        row = _serialize_prediction_model_row(
             doc,
             reasons_for(str(doc.get("_id"))),
             registry_docs.get(str(doc.get("_id"))),
         )
-        for doc in collections["model_predictions"].aggregate(pipeline)
-    ]
+        row["prediction_sets"] = _prediction_sets(
+            collections["model_predictions"], str(row.get("model_id") or "")
+        )
+        rows.append(row)
     if allowed_ids is not None:
         # ``$match`` already filters in production; the Python guard keeps the
         # contract true for test doubles and any pipeline that ignores ``$in``.
