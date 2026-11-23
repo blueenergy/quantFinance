@@ -157,6 +157,7 @@ def factor_detail(factor_id: str, current_user: dict = Depends(get_current_user)
     # results may have been deleted), so ``job_id`` stays absent there.
     result_ids = sorted({test["result_id"] for test in tests if test.get("result_id")})
     job_by_result: Dict[str, str] = {}
+    job_name_by_result: Dict[str, str] = {}
     if result_ids:
         candidate_jobs = {
             str(row["job_id"]): row["result_id"]
@@ -168,18 +169,21 @@ def factor_detail(factor_id: str, current_user: dict = Depends(get_current_user)
         # Only link jobs that still exist; a deleted job leaves its result
         # behind and the link would dead-end at a 404.
         alive = {
-            row["job_id"]
+            row["job_id"]: row.get("name")
             for row in cols["factor_backtest_jobs"].find(
-                {"job_id": {"$in": list(candidate_jobs)}}, {"job_id": 1},
+                {"job_id": {"$in": list(candidate_jobs)}}, {"job_id": 1, "name": 1},
             )
         }
         for job_id, result_id in candidate_jobs.items():
             if job_id in alive:
                 job_by_result[result_id] = job_id
+                job_name_by_result[result_id] = alive[job_id]
     for test in tests:
-        job_id = job_by_result.get(str(test.get("result_id") or ""))
+        result_id = str(test.get("result_id") or "")
+        job_id = job_by_result.get(result_id)
         if job_id:
             test["job_id"] = job_id
+            test["job_name"] = job_name_by_result.get(result_id)
     models = list(get_ml_db_collections()["models"].find(
         {"feature_factors.factor_id": factor_id},
         {"model_id": 1, "display_name": 1, "state": 1, "model_type": 1},
