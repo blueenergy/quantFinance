@@ -77,7 +77,11 @@ def factor_registry_summary(current_user: dict = Depends(get_current_user)) -> D
     return {
         "total": total,
         "tested": tested,
-        "untested": max(total - tested, 0),
+        # ``untested`` is the registry status; ``no_tests`` is the raw
+        # "has zero test rows" count. They differ because a factor can be
+        # deliberately in_use (the raw5 baseline) without an individual test.
+        "untested": statuses.get("untested", 0),
+        "no_tests": max(total - tested, 0),
         "statuses": statuses,
         "sources": sources,
     }
