@@ -123,6 +123,22 @@ def _jsonable(value: Any) -> Any:
     return value
 
 
+def _job_is_shared_evidence(collections, job_id: str) -> bool:
+    """True when this job produced rows in the shared factor ledger.
+
+    ``factor_tests`` is global (system-backfill and other accounts write the
+    bulk of it), so ownership cannot gate *reading* the report it cites.
+    Listing, deletion and every write path stay user-scoped.
+    """
+    result = collections["factor_backtest_results"].find_one(
+        {"job_id": job_id}, {"result_id": 1}
+    )
+    result_id = (result or {}).get("result_id")
+    if not result_id:
+        return False
+    return collections["factor_tests"].find_one({"result_id": result_id}, {"_id": 1}) is not None
+
+
 def _current_user_id(current_user: Dict[str, Any]) -> str:
     user_id = current_user.get("id")
     if not user_id:
@@ -270,6 +286,10 @@ async def get_factor_backtest_job(job_id: str, current_user: dict = Depends(get_
     job = collections["factor_backtest_jobs"].find_one(
         {"job_id": job_id, "user_id": user_id}, FACTOR_JOB_LIST_PROJECTION
     )
+    if not job and _job_is_shared_evidence(collections, job_id):
+        job = collections["factor_backtest_jobs"].find_one(
+            {"job_id": job_id}, FACTOR_JOB_LIST_PROJECTION
+        )
     if not job:
         raise HTTPException(status_code=404, detail="factor backtest job not found")
     return {"success": True, "data": _jsonable(job)}
@@ -281,9 +301,13 @@ async def get_factor_backtest_results(job_id: str, current_user: dict = Depends(
     collections = get_trading_db_collections()
     user_id = _current_user_id(current_user)
     job = collections["factor_backtest_jobs"].find_one({"job_id": job_id, "user_id": user_id}, {"_id": 0, "job_id": 1})
+    if not job and _job_is_shared_evidence(collections, job_id):
+        job = collections["factor_backtest_jobs"].find_one({"job_id": job_id}, {"_id": 0, "job_id": 1})
     if not job:
         raise HTTPException(status_code=404, detail="factor backtest job not found")
     result = collections["factor_backtest_results"].find_one({"job_id": job_id, "user_id": user_id}, {"_id": 0})
+    if not result and _job_is_shared_evidence(collections, job_id):
+        result = collections["factor_backtest_results"].find_one({"job_id": job_id}, {"_id": 0})
     if not result:
         raise HTTPException(status_code=404, detail="factor backtest result not found")
     return {"success": True, "data": _jsonable(result)}

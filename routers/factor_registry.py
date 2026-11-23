@@ -158,11 +158,24 @@ def factor_detail(factor_id: str, current_user: dict = Depends(get_current_user)
     result_ids = sorted({test["result_id"] for test in tests if test.get("result_id")})
     job_by_result: Dict[str, str] = {}
     if result_ids:
-        for row in cols["factor_backtest_results"].find(
-            {"result_id": {"$in": result_ids}}, {"result_id": 1, "job_id": 1},
-        ):
-            if row.get("job_id"):
-                job_by_result[row["result_id"]] = str(row["job_id"])
+        candidate_jobs = {
+            str(row["job_id"]): row["result_id"]
+            for row in cols["factor_backtest_results"].find(
+                {"result_id": {"$in": result_ids}}, {"result_id": 1, "job_id": 1},
+            )
+            if row.get("job_id")
+        }
+        # Only link jobs that still exist; a deleted job leaves its result
+        # behind and the link would dead-end at a 404.
+        alive = {
+            row["job_id"]
+            for row in cols["factor_backtest_jobs"].find(
+                {"job_id": {"$in": list(candidate_jobs)}}, {"job_id": 1},
+            )
+        }
+        for job_id, result_id in candidate_jobs.items():
+            if job_id in alive:
+                job_by_result[result_id] = job_id
     for test in tests:
         job_id = job_by_result.get(str(test.get("result_id") or ""))
         if job_id:
