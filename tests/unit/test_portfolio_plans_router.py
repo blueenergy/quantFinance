@@ -1150,6 +1150,7 @@ def test_list_portfolio_plans_is_scoped_to_current_user(monkeypatch):
 
     response = asyncio.run(
         portfolio_plans.list_portfolio_plans(
+            params_hash=None,
             strategy_template_id=None,
             status=None,
             plan_type=None,
@@ -1169,6 +1170,7 @@ def test_list_portfolio_plans_filters_by_template(monkeypatch):
 
     response = asyncio.run(
         portfolio_plans.list_portfolio_plans(
+            params_hash=None,
             strategy_template_id="s1",
             status=None,
             plan_type=None,
@@ -1180,6 +1182,49 @@ def test_list_portfolio_plans_filters_by_template(monkeypatch):
     )
 
     assert [row["plan_id"] for row in response["data"]] == ["plan-template-1", "plan-user-1"]
+
+
+def test_list_portfolio_plans_filters_by_params_hash(monkeypatch):
+    """Lineage (params_hash) is the only axis that separates the combos: every
+    lineage shares one strategy_template_id, so the template filter has exactly
+    one option and cannot scope the list."""
+    collections = _collections()
+    collections["portfolio_trade_plans"] = _Collection(
+        [
+            {
+                "plan_id": "plan-a",
+                "strategy_template_id": "s1",
+                "params_hash": "hash-a",
+                "user_id": "user-1",
+                "base_date": "20250102",
+                "status": "generated",
+            },
+            {
+                "plan_id": "plan-b",
+                "strategy_template_id": "s1",
+                "params_hash": "hash-b",
+                "user_id": "user-1",
+                "base_date": "20250103",
+                "status": "generated",
+            },
+        ]
+    )
+    monkeypatch.setattr(portfolio_plans, "get_trading_db_collections", lambda: collections)
+
+    response = asyncio.run(
+        portfolio_plans.list_portfolio_plans(
+            params_hash="hash-a",
+            strategy_template_id=None,
+            status=None,
+            plan_type=None,
+            start_date=None,
+            end_date=None,
+            limit=50,
+            current_user={"id": "user-1"},
+        )
+    )
+
+    assert [row["plan_id"] for row in response["data"]] == ["plan-a"]
 
 
 def test_list_portfolio_strategies_returns_global_catalog(monkeypatch):

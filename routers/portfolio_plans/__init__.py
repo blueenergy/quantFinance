@@ -2944,6 +2944,7 @@ async def create_portfolio_parameter_preset(request: ParamPresetRequest, current
 @_offload
 def list_portfolio_plans(
     strategy_template_id: Optional[str] = Query(default=None),
+    params_hash: Optional[str] = Query(default=None),
     status: Optional[str] = Query(default=None),
     plan_type: Optional[str] = Query(default=None),
     start_date: Optional[str] = Query(default=None),
@@ -2955,6 +2956,8 @@ def list_portfolio_plans(
     query: Dict[str, Any] = {"user_id": _current_user_id(current_user)}
     if strategy_template_id:
         query["strategy_template_id"] = strategy_template_id
+    if params_hash:
+        query["params_hash"] = params_hash
     if status:
         query["status"] = status
     if plan_type:
@@ -5503,6 +5506,7 @@ def _list_portfolios_payload(
                 "top_n": params.get("top_n"),
                 "rebalance_days": params.get("rebalance_days"),
                 "construction_mode": params.get("construction_mode"),
+                "model_id": params.get("model_id"),
                 "initial_capital": params.get("initial_capital"),
                 "plan_count": sum(
                     1 for row in all_lineage if _resilient_record_kind(row) == RECORD_KIND_TRADE_PLAN
