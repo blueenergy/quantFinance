@@ -195,6 +195,9 @@ class _AggregateCollection:
             rows.sort(key=lambda doc: doc.get(key) or "", reverse=direction < 0)
         return rows[0] if rows else None
 
+    def count_documents(self, query):
+        return len([doc for doc in self.docs if _matches(doc, query)])
+
 
 def test_list_prediction_models_serializes_coverage(monkeypatch):
     predictions = _AggregateCollection([
@@ -384,6 +387,94 @@ def test_list_prediction_models_returns_per_kind_prediction_sets(monkeypatch):
             "source": "factor_incremental_experiment",
             "window": "full_sample_expanding",
         },
+    ]
+
+
+def test_list_prediction_models_prefers_registry_set_ids(monkeypatch):
+    model_id = "research-clean"
+    predictions = _AggregateCollection(
+        [
+            {
+                "_id": model_id,
+                "index_code": "csi1000",
+                "first_trade_date": "20160413",
+                "last_trade_date": "20260923",
+                "date_count": 2,
+                "prediction_count": 2,
+                "research": True,
+                "shadow": False,
+            }
+        ],
+        docs=[
+            {"model_id": model_id, "prediction_set_id": "ps-test", "trade_date": "20160413", "ts_code": "000001.SZ", "score": 0.1},
+            {"model_id": model_id, "prediction_set_id": "ps-test", "trade_date": "20260923", "ts_code": "000001.SZ", "score": 0.2},
+        ],
+    )
+    sets = _Collection()
+    sets.docs = [
+        {
+            "_id": "ps-test",
+            "prediction_set_id": "ps-test",
+            "model_id": model_id,
+            "kind": "research",
+            "status": "active",
+            "window": "expanding",
+            "first_trade_date": "20160413",
+            "last_trade_date": "20260923",
+            "date_count": 2,
+            "prediction_count": 2,
+            "source_segments": [
+                {
+                    "source": "replay_v24",
+                    "window": "expanding",
+                    "first_trade_date": "20160413",
+                    "last_trade_date": "20260923",
+                    "date_count": 2,
+                    "prediction_count": 2,
+                }
+            ],
+        }
+    ]
+    monkeypatch.setattr(
+        model_training,
+        "get_ml_db_collections",
+        lambda: {"model_predictions": predictions, "prediction_sets": sets},
+    )
+    monkeypatch.setattr(
+        model_training,
+        "get_trading_db_collections",
+        lambda: {"portfolio_strategy_activations": _Collection()},
+    )
+
+    response = model_training.list_prediction_models(
+        index_code=None,
+        kind="all",
+        limit=100,
+        current_user={"id": "u1"},
+    )
+
+    assert response["data"][0]["prediction_sets"] == [
+        {
+            "prediction_set_id": "ps-test",
+            "kind": "research",
+            "status": "active",
+            "first_trade_date": "20160413",
+            "last_trade_date": "20260923",
+            "date_count": 2,
+            "prediction_count": 2,
+            "source": "replay_v24",
+            "window": "expanding",
+            "segments": [
+                {
+                    "source": "replay_v24",
+                    "window": "expanding",
+                    "first_trade_date": "20160413",
+                    "last_trade_date": "20260923",
+                    "date_count": 2,
+                    "prediction_count": 2,
+                }
+            ],
+        }
     ]
 
 

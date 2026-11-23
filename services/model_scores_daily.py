@@ -109,13 +109,62 @@ def accepted_model_reasons(shadow_profiles=None, activations=None) -> Dict[str, 
     return reasons
 
 
-def _prediction_sets(predictions, model_id: str) -> List[Dict[str, Any]]:
+def _prediction_sets(
+    predictions,
+    model_id: str,
+    prediction_sets=None,
+) -> List[Dict[str, Any]]:
     """Per-kind prediction sets for the research picker.
 
     A model_id can carry a PIT research backfill and live-artifact shadow rows
     at the same time; the UI must show the two date ranges separately instead
     of a misleading union.
+
+    When the ``prediction_sets`` registry is available it is the identity
+    source: every set carries a stable ``prediction_set_id`` and its segments.
+    Dates/counts are still read from the rows because the registry is a
+    summary that shadow runs extend daily. Without the registry, fall back to
+    the pre-Step-1 kind-derived shape for old deployments/test doubles.
     """
+    if prediction_sets is not None:
+        try:
+            docs = list(prediction_sets.find({"model_id": model_id}))
+        except Exception:
+            docs = []
+        if docs:
+            rows: List[Dict[str, Any]] = []
+            for doc in docs:
+                set_id = str(doc.get("prediction_set_id") or doc.get("_id") or "")
+                dates = sorted(
+                    str(value)
+                    for value in (
+                        predictions.distinct("trade_date", {"prediction_set_id": set_id}) or []
+                    )
+                    if value
+                )
+                segments = list(doc.get("source_segments") or [])
+                first_segment = segments[0] if segments else {}
+                rows.append(
+                    {
+                        "prediction_set_id": set_id,
+                        "kind": doc.get("kind"),
+                        "status": doc.get("status") or "active",
+                        "first_trade_date": dates[0] if dates else doc.get("first_trade_date"),
+                        "last_trade_date": dates[-1] if dates else doc.get("last_trade_date"),
+                        "date_count": len(dates) if dates else int(doc.get("date_count") or 0),
+                        "prediction_count": (
+                            int(predictions.count_documents({"prediction_set_id": set_id}) or 0)
+                            if dates
+                            else int(doc.get("prediction_count") or 0)
+                        ),
+                        "source": first_segment.get("source"),
+                        "window": doc.get("window") or first_segment.get("window"),
+                        "segments": segments,
+                    }
+                )
+            rows.sort(key=lambda row: (row["status"] != "active", str(row["kind"] or ""), row["first_trade_date"] or ""))
+            return rows
+
     sets: List[Dict[str, Any]] = []
     for kind, flag in (
         ("research", {"$or": [{"research": True}, {"research": {"$ne": True}, "shadow": {"$ne": True}}]}),
@@ -149,6 +198,7 @@ def list_model_catalog(
     shadow_profiles=None,
     activations=None,
     registry=None,
+    prediction_sets=None,
     recent_days: int = RECENT_DAYS,
 ) -> List[Dict[str, Any]]:
     """Every ``model_id`` in ``model_predictions`` with its coverage.
@@ -222,7 +272,9 @@ def list_model_catalog(
                 "last_trade_date": dates[-1] if dates else _iso(last.get("trade_date")),
                 "date_count": len(dates),
                 "prediction_count": predictions.count_documents({"model_id": model_id}),
-                "prediction_sets": _prediction_sets(predictions, model_id),
+                "prediction_sets": _prediction_sets(
+                    predictions, model_id, prediction_sets=prediction_sets
+                ),
                 "research": bool((last or {}).get("research")),
                 "shadow": bool((last or {}).get("shadow")),
                 "source": (last or {}).get("source"),

@@ -412,7 +412,9 @@ def list_prediction_models(
             registry_docs.get(str(doc.get("_id"))),
         )
         row["prediction_sets"] = _prediction_sets(
-            collections["model_predictions"], str(row.get("model_id") or "")
+            collections["model_predictions"],
+            str(row.get("model_id") or ""),
+            prediction_sets=collections.get("prediction_sets"),
         )
         rows.append(row)
     if allowed_ids is not None:
