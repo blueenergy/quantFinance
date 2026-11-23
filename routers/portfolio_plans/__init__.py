@@ -4667,6 +4667,26 @@ PAPER_ACTIVE_STATUSES = frozenset({"executed_paper", "partially_executed"})
 ACTIVE_PLAN_STATUSES = frozenset({"needs_review", "approved"})
 
 
+def _plan_is_paper_activity(row: Dict[str, Any]) -> bool:
+    """Whether a plan proves the lineage is a live paper book.
+
+    ``approved`` has to count. A paper lineage is usually *created* by approving
+    its first rebalance plan; until that plan executes at the next open the
+    lineage has no ``executed_paper`` row, so counting only the executed
+    statuses dropped it from the overview entirely -- and then every deep link
+    from its own plan page failed with "深链指定的组合不在当前列表中".
+    Only ``rolling_paper`` qualifies: an approved plan on an account-equity
+    lineage is still gated on live signals and must not appear as paper.
+    """
+    status = str(row.get("status") or "")
+    if status in PAPER_ACTIVE_STATUSES:
+        return True
+    if status != "approved":
+        return False
+    capital_basis = row.get("capital_basis") or (row.get("params_snapshot") or {}).get("capital_basis")
+    return str(capital_basis or "") == "rolling_paper"
+
+
 def _execution_fill_quantity(execution: Dict[str, Any]) -> float:
     for key in ("filled_size", "quantity", "filled_qty"):
         qty = _numeric(execution.get(key), default=-1.0)
@@ -5352,6 +5372,7 @@ def _list_portfolios_payload(
                 "strategy_name": 1,
                 "status": 1,
                 "plan_type": 1,
+                "capital_basis": 1,
                 "manual_action": 1,
                 "record_kind": 1,
                 "created_at": 1,
@@ -5436,7 +5457,7 @@ def _list_portfolios_payload(
             has_live = venue_by_group[key] == EXECUTION_VENUE_LIVE
         else:
             has_live = any(pid in live_plan_ids for pid in group_plan_ids.get(key, []))
-        has_paper = any(row.get("status") in PAPER_ACTIVE_STATUSES for row in all_lineage)
+        has_paper = any(_plan_is_paper_activity(row) for row in all_lineage)
         if not has_live and not has_paper:
             continue
 
