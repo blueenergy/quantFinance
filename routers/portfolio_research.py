@@ -168,6 +168,15 @@ class CreateResearchJobRequest(BaseModel):
             "model_id is set. Legacy jobs without this field keep the old all-rows merge."
         ),
     )
+    prediction_set_id: Optional[str] = Field(
+        default=None,
+        max_length=200,
+        description=(
+            "Exact prediction_set_id from quant_ml.prediction_sets. When omitted, "
+            "a single active set for model_id + prediction_kind is resolved; "
+            "multiple matches require this field."
+        ),
+    )
     growth_cycle_weights: List[str] = Field(default_factory=lambda: ["30:70"])
     score_specs: Optional[List[ScoreSpec]] = None
     top_n_values: List[int] = Field(default_factory=lambda: [10, 20, 50])
@@ -290,8 +299,13 @@ class CreateResearchJobRequest(BaseModel):
     def _validate_score_inputs(self) -> "CreateResearchJobRequest":
         if self.score_specs and "growth_cycle_weights" in self.model_fields_set and self.growth_cycle_weights:
             raise ValueError("score_specs and growth_cycle_weights are mutually exclusive")
-        if self.prediction_kind and not self.model_id:
-            raise ValueError("prediction_kind requires model_id")
+        if self.prediction_kind and not self.model_id and not self.prediction_set_id:
+            raise ValueError("prediction_kind requires model_id or prediction_set_id")
+        if self.prediction_set_id:
+            if self.score_specs is not None:
+                raise ValueError("prediction_set_id cannot be combined with score_specs")
+            if "growth_cycle_weights" in self.model_fields_set and self.growth_cycle_weights:
+                raise ValueError("prediction_set_id cannot be combined with growth_cycle_weights")
         if self.model_id:
             if self.score_specs is not None:
                 raise ValueError("model_id cannot be combined with score_specs")
@@ -299,8 +313,12 @@ class CreateResearchJobRequest(BaseModel):
                 raise ValueError("model_id cannot be combined with growth_cycle_weights")
             if "score_column" in self.model_fields_set and self.score_column != "model_score":
                 raise ValueError("model_id requires score_column='model_score'")
-        elif "score_column" in self.model_fields_set and self.score_column == "model_score":
-            raise ValueError("score_column='model_score' requires model_id")
+        elif (
+            "score_column" in self.model_fields_set
+            and self.score_column == "model_score"
+            and not self.prediction_set_id
+        ):
+            raise ValueError("score_column='model_score' requires model_id or prediction_set_id")
         if self.selection_mode == "dynamic_score_threshold":
             if len(self.top_n_values) != 1 or self.top_n_values[0] <= 0:
                 raise ValueError("dynamic_score_threshold requires top_n_values to contain exactly one positive integer")
@@ -391,6 +409,7 @@ class RerunResearchJobRequest(BaseModel):
     score_column: Optional[str] = None
     model_id: Optional[str] = None
     prediction_kind: Optional[Literal["research", "shadow"]] = None
+    prediction_set_id: Optional[str] = Field(default=None, max_length=200)
     growth_cycle_weights: Optional[List[str]] = None
     score_specs: Optional[List[ScoreSpec]] = None
     top_n_values: Optional[List[int]] = None
@@ -585,6 +604,7 @@ def _job_summary(job: Dict[str, Any], result: Optional[Dict[str, Any]] = None, s
         # not imply a precision the row does not have.
         prediction_kind = "legacy"
     row["prediction_kind"] = prediction_kind
+    row["prediction_set_id"] = params.get("prediction_set_id")
     row["data_watermark"] = _normalized_watermark(job, result, stock_scores)
     if result:
         row["best_row"] = result.get("best_row")
@@ -1528,6 +1548,98 @@ async def create_portfolio_research_job(request: CreateResearchJobRequest, curre
     return {"success": True, "data": _jsonable(job)}
 
 
+def _resolve_prediction_set(
+    *,
+    model_id: str,
+    prediction_kind: Optional[str],
+    prediction_set_id: Optional[str],
+) -> Optional[Dict[str, Any]]:
+    """Resolve the exact prediction set for a research job.
+
+    A set id wins; otherwise a single active set for model_id + kind is
+    resolved. Zero or multiple active sets are rejected so a model with a
+    segmented or ambiguous stream can never be silently merged.
+    """
+    sets = get_ml_db_collections().get("prediction_sets")
+    if sets is None:
+        if prediction_set_id:
+            raise HTTPException(status_code=422, detail="prediction_sets collection unavailable")
+        return None
+    if prediction_set_id:
+        doc = sets.find_one({"_id": prediction_set_id})
+        if not doc:
+            raise HTTPException(status_code=422, detail=f"unknown prediction_set_id: {prediction_set_id}")
+        status = str(doc.get("status") or "")
+        if status != "active":
+            raise HTTPException(
+                status_code=422,
+                detail=f"prediction_set_id {prediction_set_id} is {status or 'not active'}",
+            )
+        set_model = str(doc.get("model_id") or "")
+        if model_id and set_model and set_model != model_id:
+            raise HTTPException(
+                status_code=422,
+                detail=f"prediction_set_id {prediction_set_id} belongs to {set_model}, not {model_id}",
+            )
+        set_kind = str(doc.get("kind") or "")
+        if prediction_kind and set_kind and set_kind != prediction_kind:
+            raise HTTPException(
+                status_code=422,
+                detail=f"prediction_set_id {prediction_set_id} is kind={set_kind}, not {prediction_kind}",
+            )
+        return doc
+    if not model_id:
+        return None
+    kind = prediction_kind or "research"
+    candidates = list(
+        sets.find({"model_id": model_id, "kind": kind, "status": "active"})
+    )
+    if not candidates:
+        raise HTTPException(
+            status_code=422,
+            detail=f"model_id {model_id} has no active {kind} prediction set",
+        )
+    if len(candidates) > 1:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"model_id {model_id} has {len(candidates)} active {kind} prediction sets; "
+                "pass prediction_set_id"
+            ),
+        )
+    return candidates[0]
+
+
+def _validate_prediction_set_coverage(
+    set_doc: Dict[str, Any],
+    start_date: str,
+    end_date: str,
+) -> None:
+    set_id = str(set_doc.get("prediction_set_id") or set_doc.get("_id") or "")
+    first_date = str(set_doc.get("first_trade_date") or "")
+    last_date = str(set_doc.get("last_trade_date") or "")
+    if not set_id or not first_date or not last_date:
+        raise HTTPException(status_code=422, detail="prediction set has no date coverage")
+    if last_date < start_date or first_date > end_date:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"prediction_set_id {set_id} covers {first_date}..{last_date}, "
+                f"no overlap with requested {start_date}..{end_date}"
+            ),
+        )
+    predictions = get_ml_db_collections()["model_predictions"]
+    in_range = predictions.find_one(
+        {"prediction_set_id": set_id, "trade_date": {"$gte": start_date, "$lte": end_date}},
+        {"_id": 0, "trade_date": 1},
+    )
+    if in_range is None:
+        raise HTTPException(
+            status_code=422,
+            detail=f"prediction_set_id {set_id} has no predictions between {start_date} and {end_date}",
+        )
+
+
 def _validate_model_id_coverage(
     model_id: str,
     start_date: str,
@@ -1651,12 +1763,29 @@ def _build_research_job_document(user_id: str, request: CreateResearchJobRequest
 
     model_id = str(request.model_id or "").strip()
     prediction_kind = request.prediction_kind
-    if model_id:
+    requested_set_id = str(request.prediction_set_id or "").strip() or None
+    set_doc = _resolve_prediction_set(
+        model_id=model_id,
+        prediction_kind=prediction_kind,
+        prediction_set_id=requested_set_id,
+    )
+    if set_doc:
+        model_id = model_id or str(set_doc.get("model_id") or "")
+        prediction_kind = prediction_kind or str(set_doc.get("kind") or "")
+        if prediction_kind not in {"research", "shadow"}:
+            raise HTTPException(
+                status_code=422,
+                detail=f"prediction set kind={prediction_kind!r} cannot be used in research jobs",
+            )
+        _validate_prediction_set_coverage(set_doc, start_date, end_date)
+    elif model_id:
         # New model jobs default to the PIT research stream. Legacy jobs in the
         # database have no prediction_kind and the worker keeps their old
         # all-rows behaviour; only jobs created through this API are stamped.
         prediction_kind = prediction_kind or "research"
         _validate_model_id_coverage(model_id, start_date, end_date, prediction_kind)
+    elif requested_set_id:
+        raise HTTPException(status_code=422, detail=f"unknown prediction_set_id: {requested_set_id}")
 
     now = datetime.utcnow()
     params = request.model_dump()
@@ -1665,6 +1794,12 @@ def _build_research_job_document(user_id: str, request: CreateResearchJobRequest
         # rule-score inputs so a stale default cannot silently win downstream.
         params["model_id"] = model_id
         params["prediction_kind"] = prediction_kind
+        if set_doc:
+            params["prediction_set_id"] = str(
+                set_doc.get("prediction_set_id") or set_doc.get("_id") or ""
+            )
+        else:
+            params.pop("prediction_set_id", None)
         params["score_column"] = "model_score"
         params.pop("score_specs", None)
         params.pop("growth_cycle_weights", None)

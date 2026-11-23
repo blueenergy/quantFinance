@@ -1495,8 +1495,11 @@ def test_create_portfolio_research_job_with_industry_l1_sets_benchmark(monkeypat
     assert job["params"]["index_benchmark_symbol"] == "801730.SI"
 
 
-def _ml_predictions(rows):
-    return {"model_predictions": _Collection(rows)}
+def _ml_predictions(rows, sets=None):
+    out = {"model_predictions": _Collection(rows)}
+    if sets is not None:
+        out["prediction_sets"] = _Collection(sets)
+    return out
 
 
 @pytest.mark.unit
@@ -1560,6 +1563,164 @@ def test_create_model_score_job_accepts_shadow_stream(monkeypatch):
     job = collections["portfolio_research_jobs"].docs[0]
     assert response["success"] is True
     assert job["params"]["prediction_kind"] == "shadow"
+
+
+@pytest.mark.unit
+def test_create_model_job_resolves_single_prediction_set(monkeypatch):
+    collections = _collections()
+    predictions = _ml_predictions(
+        [
+            {"model_id": "research-test-hs300", "prediction_set_id": "ps-test", "trade_date": "20250102", "ts_code": "000001.SZ", "score": 0.1},
+            {"model_id": "research-test-hs300", "prediction_set_id": "ps-test", "trade_date": "20250131", "ts_code": "000001.SZ", "score": 0.2},
+        ],
+        sets=[
+            {
+                "_id": "ps-test",
+                "prediction_set_id": "ps-test",
+                "model_id": "research-test-hs300",
+                "kind": "research",
+                "status": "active",
+                "first_trade_date": "20250102",
+                "last_trade_date": "20250131",
+            }
+        ],
+    )
+    monkeypatch.setattr(portfolio_research, "get_trading_db_collections", lambda: collections)
+    monkeypatch.setattr(portfolio_research, "get_ml_db_collections", lambda: predictions)
+
+    asyncio.run(
+        portfolio_research.create_portfolio_research_job(
+            portfolio_research.CreateResearchJobRequest(
+                name="set resolve smoke",
+                universe_index="hs300",
+                start_date="2025-01-01",
+                end_date="2025-01-31",
+                model_id="research-test-hs300",
+            ),
+            current_user={"id": "user-1"},
+        )
+    )
+
+    job = collections["portfolio_research_jobs"].docs[0]
+    assert job["params"]["prediction_set_id"] == "ps-test"
+    assert job["params"]["prediction_kind"] == "research"
+
+
+@pytest.mark.unit
+def test_create_model_job_accepts_explicit_prediction_set_without_model_id(monkeypatch):
+    collections = _collections()
+    predictions = _ml_predictions(
+        [
+            {"model_id": "research-test-hs300", "prediction_set_id": "ps-test", "trade_date": "20250102", "ts_code": "000001.SZ", "score": 0.1},
+            {"model_id": "research-test-hs300", "prediction_set_id": "ps-test", "trade_date": "20250131", "ts_code": "000001.SZ", "score": 0.2},
+        ],
+        sets=[
+            {
+                "_id": "ps-test",
+                "prediction_set_id": "ps-test",
+                "model_id": "research-test-hs300",
+                "kind": "research",
+                "status": "active",
+                "first_trade_date": "20250102",
+                "last_trade_date": "20250131",
+            }
+        ],
+    )
+    monkeypatch.setattr(portfolio_research, "get_trading_db_collections", lambda: collections)
+    monkeypatch.setattr(portfolio_research, "get_ml_db_collections", lambda: predictions)
+
+    asyncio.run(
+        portfolio_research.create_portfolio_research_job(
+            portfolio_research.CreateResearchJobRequest(
+                name="set only smoke",
+                universe_index="hs300",
+                start_date="2025-01-01",
+                end_date="2025-01-31",
+                prediction_set_id="ps-test",
+            ),
+            current_user={"id": "user-1"},
+        )
+    )
+
+    job = collections["portfolio_research_jobs"].docs[0]
+    assert job["params"]["model_id"] == "research-test-hs300"
+    assert job["params"]["prediction_kind"] == "research"
+    assert job["params"]["prediction_set_id"] == "ps-test"
+
+
+@pytest.mark.unit
+def test_archived_prediction_set_is_rejected(monkeypatch):
+    collections = _collections()
+    predictions = _ml_predictions(
+        [],
+        sets=[
+            {
+                "_id": "ps-old",
+                "prediction_set_id": "ps-old",
+                "model_id": "research-test-hs300",
+                "kind": "research",
+                "status": "archived",
+                "first_trade_date": "20250102",
+                "last_trade_date": "20250131",
+            }
+        ],
+    )
+    monkeypatch.setattr(portfolio_research, "get_trading_db_collections", lambda: collections)
+    monkeypatch.setattr(portfolio_research, "get_ml_db_collections", lambda: predictions)
+
+    with pytest.raises(HTTPException) as exc:
+        portfolio_research._build_research_job_document(
+            "user-1",
+            portfolio_research.CreateResearchJobRequest(
+                start_date="20250101",
+                end_date="20250131",
+                prediction_set_id="ps-old",
+            ),
+        )
+
+    assert exc.value.status_code == 422
+    assert "archived" in exc.value.detail
+
+
+@pytest.mark.unit
+def test_multiple_active_prediction_sets_require_explicit_id(monkeypatch):
+    predictions = _ml_predictions(
+        [],
+        sets=[
+            {
+                "_id": "ps-a",
+                "prediction_set_id": "ps-a",
+                "model_id": "research-test-hs300",
+                "kind": "research",
+                "status": "active",
+                "first_trade_date": "20250102",
+                "last_trade_date": "20250131",
+            },
+            {
+                "_id": "ps-b",
+                "prediction_set_id": "ps-b",
+                "model_id": "research-test-hs300",
+                "kind": "research",
+                "status": "active",
+                "first_trade_date": "20250102",
+                "last_trade_date": "20250131",
+            },
+        ],
+    )
+    monkeypatch.setattr(portfolio_research, "get_ml_db_collections", lambda: predictions)
+
+    with pytest.raises(HTTPException) as exc:
+        portfolio_research._build_research_job_document(
+            "user-1",
+            portfolio_research.CreateResearchJobRequest(
+                start_date="20250101",
+                end_date="20250131",
+                model_id="research-test-hs300",
+            ),
+        )
+
+    assert exc.value.status_code == 422
+    assert "active research prediction sets" in exc.value.detail
 
 
 @pytest.mark.unit
