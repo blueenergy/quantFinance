@@ -70,6 +70,7 @@ from services.backtest_batch_service import (
     refresh_batch_summary,
 )
 from services.holder_taxonomy import ALL_CATEGORIES, parse_categories
+from services.score_dates import pinned_index_score_date
 from services.institutional_holdings import build_institutional_holdings_summary
 from services.ladder_daily import build_daily_ladder_payload
 
@@ -696,48 +697,37 @@ async def hermes_earnings_signals(
 _RANKING_INDEX_CODES = ("hs300", "a500", "csi500", "csi1000", "csi2000", "star50")
 
 
-@router.get("/stock/ranking", operation_id="stock_ranking", tags=[MCP_READ_TAG])
-async def stock_ranking(
-    index_code: str = Query("hs300", description="指数: hs300/a500/csi500/csi1000/csi2000/star50"),
-    top: int = Query(20, ge=1, le=100, description="返回前 N 名，默认 20"),
-    strategy: str = Query("balanced", description="策略: balanced/aggressive/conservative"),
-    _: bool = Depends(require_hermes_quant_internal_key),
-):
-    """
-    获取 A 股量化评分排行榜 Top N（按指数成分筛选）。
+def _stock_ranking_payload(
+    stock_scores: Any,
+    stock_info: Any,
+    index_code: str,
+    top: int,
+    strategy: str,
+) -> Dict[str, Any]:
+    """Build the ranking payload for one index at one pinned score date."""
+    from stock_data_access.score_utils import extract_strategy_score, safe_round
 
-    - index_code: hs300（沪深300）、a500、csi500（中证500）、csi1000、csi2000（中证2000）、star50（科创50）
-    - strategy: balanced（均衡，默认）、aggressive（进取）、conservative（保守）
-    - 返回每只股票的综合评分及六维子评分（周期/价值/基本面/成长/技术/资金流）
-    """
     ic = index_code.strip().lower()
     if ic not in _RANKING_INDEX_CODES:
         return {"success": False, "error": f"不支持的 index_code: {ic}，可选: {', '.join(_RANKING_INDEX_CODES)}"}
 
-    from stock_data_access.score_utils import extract_strategy_score, safe_round
-    db = get_db_collections()
-    stock_scores = db["stock_scores"]
-    stock_info = db["stock_info"]
-
-    # Step 1: get index member symbols from historical index_codes records
-    hs_symbols = list(stock_scores.distinct("symbol", {"index_codes": ic}))
-    if not hs_symbols:
+    # Step 1: pin one score date for the whole ranking.
+    score_date = pinned_index_score_date(stock_scores, ic)
+    if not score_date:
         return {"success": False, "error": f"未找到 {ic} 成分股数据，index_codes 可能尚未回填"}
 
-    # Step 2: get latest score for each member symbol
-    pipeline = [
-        {"$match": {"symbol": {"$in": hs_symbols}}},
-        {"$sort": {"score_date": -1}},
-        {"$group": {"_id": "$symbol", "doc": {"$first": "$$ROOT"}}},
-        {"$replaceRoot": {"newRoot": "$doc"}},
-        {"$project": {
-            "_id": 0, "symbol": 1, "score_date": 1,
-            "composite_score": 1, "cycle_score": 1, "value_score": 1,
-            "fundamental_score": 1, "growth_score": 1, "technical_score": 1,
-            "money_flow_score": 1,
-        }},
-    ]
-    raw = list(stock_scores.aggregate(pipeline))
+    # Step 2: the index members scored on that date
+    raw = list(
+        stock_scores.find(
+            {"index_codes": ic, "score_date": score_date},
+            {
+                "symbol": 1, "score_date": 1,
+                "composite_score": 1, "cycle_score": 1, "value_score": 1,
+                "fundamental_score": 1, "growth_score": 1, "technical_score": 1,
+                "money_flow_score": 1,
+            },
+        )
+    )
     raw.sort(key=lambda d: extract_strategy_score(d.get("composite_score", 0), strategy), reverse=True)
     raw = raw[:top]
 
@@ -777,6 +767,31 @@ async def stock_ranking(
         "count": len(result),
         "ranking": result,
     }
+
+
+@router.get("/stock/ranking", operation_id="stock_ranking", tags=[MCP_READ_TAG])
+async def stock_ranking(
+    index_code: str = Query("csi1000", description="指数: csi1000（唯一每日刷新）/hs300/a500/csi500/csi2000/star50（评分已冻结在 20261123）"),
+    top: int = Query(20, ge=1, le=100, description="返回前 N 名，默认 20"),
+    strategy: str = Query("balanced", description="策略: balanced/aggressive/conservative"),
+    _: bool = Depends(require_hermes_quant_internal_key),
+):
+    """
+    获取 A 股量化评分排行榜 Top N（按指数成分筛选）。
+
+    - index_code: 默认 csi1000（唯一每日刷新的指数）；hs300（沪深300）、a500、csi500（中证500）、
+      csi2000（中证2000）、star50（科创50）的评分自 2026-11-23 起冻结在 20261123，仍可查询
+    - strategy: balanced（均衡，默认）、aggressive（进取）、conservative（保守）
+    - 返回每只股票的综合评分及六维子评分（周期/价值/基本面/成长/技术/资金流）
+    """
+    db = get_db_collections()
+    return _stock_ranking_payload(
+        db["stock_scores"],
+        db["stock_info"],
+        index_code,
+        top,
+        strategy,
+    )
 
 
 # ---------------------------------------------------------------------------

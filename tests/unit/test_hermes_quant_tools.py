@@ -1576,3 +1576,112 @@ def test_axis_marginals_reports_observations_so_truncation_is_visible():
     assert by_value["20"]["observations"] == 1
     # 按均值降序
     assert [entry["value"] for entry in marginal["values"]] == [10, 20]
+
+
+class _ScoreCollection:
+    """stock_scores / stock_info fake: array containment, find_one with sort, counts."""
+
+    def __init__(self, docs=None):
+        self.docs = list(docs or [])
+
+    @staticmethod
+    def _matches(doc, query):
+        for key, expected in (query or {}).items():
+            value = doc.get(key)
+            if isinstance(expected, dict) and "$lt" in expected:
+                if value is None or str(value) >= str(expected["$lt"]):
+                    return False
+            elif isinstance(expected, dict) and "$in" in expected:
+                if value not in expected["$in"]:
+                    return False
+            elif isinstance(value, list):
+                if expected not in value:
+                    return False
+            elif value != expected:
+                return False
+        return True
+
+    def find_one(self, query=None, projection=None, sort=None):
+        rows = [dict(d) for d in self.docs if self._matches(d, query)]
+        for field, direction in reversed(sort or []):
+            rows.sort(key=lambda r: str(r.get(field) or ""), reverse=direction < 0)
+        if not rows:
+            return None
+        doc = rows[0]
+        if projection:
+            keep = {k for k, v in projection.items() if v}
+            return {k: doc.get(k) for k in keep if k in doc}
+        return doc
+
+    def find(self, query=None, projection=None):
+        rows = [dict(d) for d in self.docs if self._matches(d, query)]
+        if projection:
+            keep = {k for k, v in projection.items() if v}
+            rows = [{k: r.get(k) for k in keep if k in r} for r in rows]
+        return rows
+
+    def count_documents(self, query=None):
+        return len([d for d in self.docs if self._matches(d, query)])
+
+
+def test_stock_ranking_ranks_a_single_score_date():
+    """One date for the whole ranking — a stale row must not be mixed in."""
+    from routers.hermes_quant_tools import _stock_ranking_payload
+
+    # csi1000's floor is 800 rows, so the fresh day has to be a full
+    # cross-section for it to be picked at all.
+    scores = _ScoreCollection([
+        {"symbol": f"S{i:03d}.SH", "index_codes": ["csi1000"], "score_date": "20261124",
+         "composite_score": {"balanced": 50 + i}}
+        for i in range(800)
+    ])
+    # AAA also has an older row that scores higher — it belongs to the
+    # previous cross-section, not to this one.
+    scores.docs.append({"symbol": "AAA.SH", "index_codes": ["csi1000"], "score_date": "20261123",
+                         "composite_score": {"balanced": 99}})
+    info = _ScoreCollection([])
+
+    payload = _stock_ranking_payload(scores, info, "csi1000", 10, "balanced")
+    assert payload["success"] is True
+    assert {row["score_date"] for row in payload["ranking"]} == {"20261124"}
+    # the top of the ranking comes from the pinned day, not from the stale row
+    assert payload["ranking"][0]["symbol"] == "S799.SH"
+    assert payload["count"] == 10
+
+
+def test_stock_ranking_skips_a_partial_cross_section():
+    """A day that re-scored only part of an index is not that index's cross-section.
+
+    a500 shares 41 members with csi1000, so those 41 are re-scored every day
+    while the rest of a500 stops moving. Ranking a500 on the fresh day would
+    silently drop the other 459 members.
+    """
+    from routers.hermes_quant_tools import _stock_ranking_payload
+
+    docs = [
+        {"symbol": f"NEW{i:03d}.SH", "index_codes": ["a500", "csi1000"], "score_date": "20261124",
+         "composite_score": {"balanced": 100 - i}}
+        for i in range(41)
+    ]
+    docs += [
+        {"symbol": f"OLD{i:03d}.SH", "index_codes": ["a500"], "score_date": "20261123",
+         "composite_score": {"balanced": 50 - i}}
+        for i in range(400)
+    ]
+    scores = _ScoreCollection(docs)
+    info = _ScoreCollection([])
+
+    payload = _stock_ranking_payload(scores, info, "a500", 100, "balanced")
+    assert payload["success"] is True
+    assert {row["score_date"] for row in payload["ranking"]} == {"20261123"}
+    # the 41 members re-scored on the fresh day are not the ranking
+    assert all(row["symbol"].startswith("OLD") for row in payload["ranking"])
+    assert payload["count"] == 100
+
+
+def test_stock_ranking_rejects_an_unknown_index():
+    from routers.hermes_quant_tools import _stock_ranking_payload
+
+    payload = _stock_ranking_payload(_ScoreCollection([]), _ScoreCollection([]), "nasdaq100", 10, "balanced")
+    assert payload["success"] is False
+    assert "不支持" in payload["error"]

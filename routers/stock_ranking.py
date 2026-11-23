@@ -24,6 +24,7 @@ from calendar import monthrange
 from bson import ObjectId
 from stock_data_access.prices import AdjustedPriceDataAccess
 from services.industry_rs import build_industry_rs_details, normalize_stored_industry_rs_details
+from services.score_dates import pinned_index_score_date
 from services.sw_industry import load_sw_membership, sw_catalog
 from services.score_detail_meta import (
     SCORE_HISTORY_PROJECTION,
@@ -210,7 +211,14 @@ def _latest_score_date(stock_scores: Any, index_code=None) -> Optional[str]:
     ``index_code`` is required in spirit: pass ``None`` for an explicit
     unscoped read. Unscoped reads prefer a tagged row so a later untagged
     partial write cannot pin the market snapshot date.
+
+    A single indexed read pins the newest date that still holds a full
+    cross-section of that index: the nightly scorer no longer refreshes every
+    index, so the newest tagged date can be a partial one (see
+    ``services.score_dates``).
     """
+    if isinstance(index_code, str) and index_code.strip():
+        return pinned_index_score_date(stock_scores, index_code.strip())
     query = dict(score_scope_filter(index_code))
     if index_code is None:
         tagged = stock_scores.find_one(
