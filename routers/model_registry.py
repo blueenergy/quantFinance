@@ -12,7 +12,7 @@ import re
 from datetime import datetime
 from typing import Any, Dict, List, Literal, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException
 from fastapi.encoders import jsonable_encoder
 from pydantic import BaseModel, Field
 from pymongo import DESCENDING
@@ -149,13 +149,14 @@ def model_registry_summary(
 
 @router.get("/models")
 def list_registry_models(
-    state: Optional[str] = Query(default=None, description="Comma-separated state filter, or all"),
-    index_code: Optional[str] = Query(default=None),
-    family_id: Optional[str] = Query(default=None),
-    accepted: Optional[bool] = Query(default=None),
-    q: Optional[str] = Query(default=None, description="model_id / family / display name search"),
-    limit: int = Query(default=100, ge=1, le=500),
-    offset: int = Query(default=0, ge=0),
+    state: Optional[str] = None,
+    index_code: Optional[str] = None,
+    family_id: Optional[str] = None,
+    accepted: Optional[bool] = None,
+    factor: Optional[str] = None,
+    q: Optional[str] = None,
+    limit: int = 100,
+    offset: int = 0,
     current_user: dict = Depends(get_current_user),
 ) -> Dict[str, Any]:
     query: Dict[str, Any] = {}
@@ -168,6 +169,8 @@ def list_registry_models(
         query["family_id"] = str(family_id)
     if accepted is not None:
         query["accepted"] = bool(accepted)
+    if factor and str(factor).strip():
+        query["feature_factors.factor_id"] = str(factor).strip()
     if q and str(q).strip():
         pattern = re.escape(str(q).strip())
         query["$or"] = [
