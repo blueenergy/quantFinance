@@ -152,6 +152,21 @@ def factor_detail(factor_id: str, current_user: dict = Depends(get_current_user)
     if not doc:
         raise HTTPException(status_code=404, detail=f"factor not found: {factor_id}")
     tests = list(cols["factor_tests"].find({"factor_id": factor_id}).sort("as_of", -1).limit(200))
+    # Deep-link evidence rows back to the factor-backtest report that produced
+    # them. Rows written from vault/manual notes carry no result_id (and some
+    # results may have been deleted), so ``job_id`` stays absent there.
+    result_ids = sorted({test["result_id"] for test in tests if test.get("result_id")})
+    job_by_result: Dict[str, str] = {}
+    if result_ids:
+        for row in cols["factor_backtest_results"].find(
+            {"result_id": {"$in": result_ids}}, {"result_id": 1, "job_id": 1},
+        ):
+            if row.get("job_id"):
+                job_by_result[row["result_id"]] = str(row["job_id"])
+    for test in tests:
+        job_id = job_by_result.get(str(test.get("result_id") or ""))
+        if job_id:
+            test["job_id"] = job_id
     models = list(get_ml_db_collections()["models"].find(
         {"feature_factors.factor_id": factor_id},
         {"model_id": 1, "display_name": 1, "state": 1, "model_type": 1},
