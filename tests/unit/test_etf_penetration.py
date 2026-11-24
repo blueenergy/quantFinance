@@ -137,3 +137,86 @@ def test_penetration_router_rejects_unknown_index(monkeypatch):
 
     res = _client().get("/api/market-stats/etf-penetration", params={"index": "nope"})
     assert res.status_code == 400
+
+
+# --------------------------------------------------------------- 阶段判定
+def _series_collections(ratios, index_close=None):
+    """按给定的渗透率序列反推份额，指数市值固定为 1000 亿。
+
+    ratio_pct = aum_yi / 1000 * 100  =>  aum_yi = ratio_pct * 10
+    aum_wan = shares * close，取 close=2，两只有 ETF，故 shares = aum_wan / 4
+    """
+
+    shares, closes, basic, prices = [], [], [], []
+    for i, r in enumerate(ratios):
+        day = f"2026{1 + i // 28:02d}{1 + i % 28:02d}"
+        aum_yi = r * 10.0                 # 亿元
+        total_wan = aum_yi * 1e4          # 万元
+        per_fund_wan = total_wan / 4.0    # close=2, 两只合计 = shares*2*2
+        for code in ("AAA.SH", "BBB.SH"):
+            shares.append({"ts_code": code, "trade_date": day, "fd_share": per_fund_wan / 2.0})
+            closes.append({"ts_code": code, "trade_date": day, "close": 2.0})
+        basic.append({"ts_code": "TEST.IDX", "trade_date": day, "float_mv": 1.0e11})
+        prices.append({"ts_code": "TEST.IDX", "trade_date": day, "close": 4000.0})
+    return {
+        "etf_shares": _Coll(shares),
+        "etf_daily": _Coll(closes),
+        "index_daily_basic": _Coll(basic),
+        "index_prices": _Coll(prices),
+    }
+
+
+@pytest.mark.unit
+def test_phase_helpers_band_and_labels():
+    # ±2% / 20 日是分界；分位 35/65 决定「底部」还是「高位」
+    assert etf_penetration._penetration_phase(5.0, 20.0) == "bottom_refill"
+    assert etf_penetration._penetration_phase(5.0, 60.0) == "inflow"
+    assert etf_penetration._penetration_phase(-5.0, 80.0) == "top_exit"
+    assert etf_penetration._penetration_phase(-5.0, 20.0) == "outflow"
+    assert etf_penetration._penetration_phase(1.0, 50.0) == "flat"
+    assert etf_penetration._penetration_phase(None, 50.0) == "unknown"
+
+
+@pytest.mark.unit
+def test_pctile_rank_averages_ties():
+    assert etf_penetration._pctile_rank([1.0, 2.0, 2.0, 2.0, 5.0], 2.0) == 50.0
+    assert etf_penetration._pctile_rank([], 1.0) is None
+
+
+@pytest.mark.unit
+def test_summary_reports_chg_and_phase_for_rising_series(monkeypatch):
+    monkeypatch.setattr(etf_penetration, "ETF_PENETRATION_POOLS", TEST_POOLS)
+    # 连续上升：第 i 天 = 1.0 * 1.01^i，20 日约 +22%
+    ratios = [1.0 * (1.01 ** i) for i in range(60)]
+    payload = etf_penetration.compute_penetration(_series_collections(ratios), index_key="test", days=0)
+
+    summary = payload["summary"]
+    assert summary is not None
+    assert summary["chg_20d"] == pytest.approx((1.01 ** 20 - 1) * 100, abs=0.05)
+    # 序列单调上升 => 当前值就是最高点，分位接近 100
+    assert summary["pctile_all"] > 95
+    assert summary["phase"] == "inflow"
+    assert summary["phase_label"] == "持续流入"
+    assert summary["peaks"]["max_date"] == payload["series"][-1]["trade_date"]
+
+
+@pytest.mark.unit
+def test_percentiles_use_full_history_not_the_truncated_window(monkeypatch):
+    """days 截断只影响返回的 series，不能影响分位与阶段。
+
+    否则「1 年分位」会退化成「当前窗口内的分位」，换个回看区间结论就变。
+    """
+    monkeypatch.setattr(etf_penetration, "ETF_PENETRATION_POOLS", TEST_POOLS)
+    # 前 250 天在 1.0 附近横盘，最后 20 天拉到 3.0
+    ratios = [1.0] * 250 + [1.0 + 0.1 * i for i in range(1, 21)]
+    full = etf_penetration.compute_penetration(_series_collections(ratios), index_key="test", days=0)
+    short = etf_penetration.compute_penetration(_series_collections(ratios), index_key="test", days=20)
+
+    assert len(short["series"]) == 20
+    assert len(full["series"]) == len(ratios)
+    # 关键：截断后 summary 与全量完全一致
+    assert short["summary"]["pctile_all"] == full["summary"]["pctile_all"]
+    assert short["summary"]["pctile_1y"] == full["summary"]["pctile_1y"]
+    assert short["summary"]["phase"] == full["summary"]["phase"]
+    # 拉高之后应处在全样本高位
+    assert short["summary"]["pctile_all"] > 80

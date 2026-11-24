@@ -89,6 +89,47 @@ DEFAULT_INDEX = "hs300"
 DEFAULT_DAYS = 2500
 ALL_START = "20100101"
 
+# 阶段标签：渗透率的变化率 ≈ 份额申赎的变化率（分子 ETF 价格与分母指数市值同向，
+# 价格部分基本抵消），因此判据可以直接用「20 日相对变化 × 历史分位」。
+# 阈值 ±2%/20 日 与 35/65 分位沿用 national-team 那一套，保持两个页面口径一致。
+PHASE_LABELS: Dict[str, str] = {
+    "bottom_refill": "底部回补",
+    "inflow": "持续流入",
+    "top_exit": "高位撤离",
+    "outflow": "持续流出",
+    "flat": "平稳",
+    "unknown": "未知",
+}
+
+
+def _pctile_rank(values: List[float], value: float) -> Optional[float]:
+    """``value`` 在 ``values`` 中的百分位（0-100），并列取区间中点。"""
+    if not values or value is None:
+        return None
+    below = sum(1 for v in values if v < value)
+    equal = sum(1 for v in values if v == value)
+    return round((below + 0.5 * equal) / len(values) * 100.0, 1)
+
+
+def _penetration_phase(chg20: Optional[float], pctile: Optional[float]) -> str:
+    """20 日相对变化 × 历史分位 → 阶段。"""
+    if chg20 is None or pctile is None:
+        return "unknown"
+    if chg20 >= 2.0:
+        return "bottom_refill" if pctile <= 35 else "inflow"
+    if chg20 <= -2.0:
+        return "top_exit" if pctile >= 65 else "outflow"
+    return "flat"
+
+
+def _relative_change(values: List[float], i: int, n: int) -> Optional[float]:
+    if i - n < 0:
+        return None
+    base = values[i - n]
+    if not base:
+        return None
+    return round((values[i] / base - 1.0) * 100.0, 2)
+
 
 def _norm_day(value: Any) -> Optional[str]:
     if value is None:
@@ -185,8 +226,10 @@ def compute_penetration(data_db: Dict[str, Any], index_key: str = DEFAULT_INDEX,
 
     funds = profile["funds"]
     codes = [fund["ts_code"] for fund in funds]
-    today = datetime.today().strftime("%Y%m%d")
-    start = lookback_start(today, days) if days and days > 0 else ALL_START
+    # 数据永远全量加载：days 只控制「返回多少行」给图表，绝不能参与分位与阶段的计算。
+    # 否则「5年」档位的 1 年分位只基于 5 年数据、「全部」档位基于 13 年数据，
+    # 同一个时点切档位会看到两个不同的分位——这是用户已经会踩到的坑。
+    start = ALL_START
 
     empty = {
         "success": True,
@@ -243,6 +286,57 @@ def compute_penetration(data_db: Dict[str, Any], index_key: str = DEFAULT_INDEX,
             }
         )
 
+    # 阶段与分位必须在按 days 截断前、基于完整序列计算，否则「1 年分位」
+    # 会退化成「当前窗口内的分位」，换个回看区间结论就变。
+    ratios = [row["ratio_pct"] for row in rows]
+    for i, row in enumerate(rows):
+        row["chg_1d"] = _relative_change(ratios, i, 1)
+        row["chg_5d"] = _relative_change(ratios, i, 5)
+        row["chg_20d"] = _relative_change(ratios, i, 20)
+
+    summary: Optional[Dict[str, Any]] = None
+    if rows:
+        latest_ratio = ratios[-1]
+        window_1y = ratios[-250:]
+        pctile_1y = _pctile_rank(window_1y, latest_ratio)
+        pctile_all = _pctile_rank(ratios, latest_ratio)
+        phase = _penetration_phase(rows[-1].get("chg_20d"), pctile_1y)
+        recent = [
+            _penetration_phase(row.get("chg_20d"), _pctile_rank(window_1y, row["ratio_pct"]))
+            for row in rows[-20:]
+        ]
+        summary = {
+            "ratio_pct": latest_ratio,
+            "chg_1d": rows[-1].get("chg_1d"),
+            "chg_5d": rows[-1].get("chg_5d"),
+            "chg_20d": rows[-1].get("chg_20d"),
+            "pctile_1y": pctile_1y,
+            # 全样本分位只作参考：13 年分布与最近一年分布讲的是不同的故事，
+            # 阶段判定仍用 1 年分位，否则阈值要重新校准。
+            "pctile_all": pctile_all,
+            "phase": phase,
+            "phase_label": PHASE_LABELS.get(phase, phase),
+            "recent_phases": sorted(set(recent)),
+            # 两个分位必须一起看：科创50 在 2026-11 的 1 年分位是 99.8%，
+            # 但全样本只有 56%——因为 2024-10 曾到过 10.11%，现在 5.32% 只是当年一半。
+            # 只看 1 年会误判成「历史新高」。
+            "note": (
+                "阶段用 1 年分位判定（衡量近期位置）；pctile_all 是全样本分位。"
+                "两者差距大时，说明当前位置相对长期仍有空间或已透支。"
+            ),
+            "peaks": {
+                "max_ratio_pct": round(max(ratios), 4),
+                "max_date": rows[ratios.index(max(ratios))]["trade_date"],
+                "min_ratio_pct": round(min(ratios), 4),
+                "min_date": rows[ratios.index(min(ratios))]["trade_date"],
+            },
+        }
+
+    # 真实起点（全量）与本次返回区间起点要分开：前端文案「头部池全部成立后起」
+    # 讲的是前者，切到「5年」档位不该把这句话改成 5 年前。
+    first_full_date = rows[0]["trade_date"] if rows else None
+    last_date = rows[-1]["trade_date"] if rows else None
+
     if days and days > 0:
         rows = rows[-days:]
 
@@ -254,10 +348,13 @@ def compute_penetration(data_db: Dict[str, Any], index_key: str = DEFAULT_INDEX,
         "days": days,
         "series": rows,
         "latest": latest,
+        "summary": summary,
         "coverage": {
             "fund_count": len(funds),
-            "first_full_date": rows[0]["trade_date"] if rows else None,
-            "last_date": rows[-1]["trade_date"] if rows else None,
+            "first_full_date": first_full_date,
+            "last_date": last_date,
+            "series_start": rows[0]["trade_date"] if rows else None,
+            "total_points": len(ratios),
         },
     }
 
