@@ -1019,8 +1019,8 @@ _KLINE_AVAILABLE_SYMBOLS = {
     "ARKK",
     # Volatility + rates
     "^VIX", "^TNX", "^TYX",
-    # USD index
-    "DX-Y.NYB",
+    # USD index + offshore RMB
+    "DX-Y.NYB", "USDCNH=X",
     # Global indices
     "^N225", "^HSI", "000001.SS", "FXI", "EWJ", "EWG", "EWY",
     # Commodities
