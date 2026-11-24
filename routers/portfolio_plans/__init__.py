@@ -5507,6 +5507,9 @@ def _list_portfolios_payload(
                 "rebalance_days": params.get("rebalance_days"),
                 "construction_mode": params.get("construction_mode"),
                 "model_id": params.get("model_id"),
+                # Why this lineage exists: written by hand into
+                # portfolio_lineage_controls, not derived from params.
+                "narrative": lineage_control.get("narrative") or None,
                 "initial_capital": params.get("initial_capital"),
                 "plan_count": sum(
                     1 for row in all_lineage if _resilient_record_kind(row) == RECORD_KIND_TRADE_PLAN
