@@ -1071,6 +1071,66 @@ def _resample_global_ohlcv(rows: List[Dict[str, Any]], rule: str) -> List[Dict[s
     return list(reversed(out))
 
 
+def _safe_num(v: Any) -> Optional[float]:
+    """Coerce to a finite float, or ``None``."""
+    if v is None:
+        return None
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    if f != f:  # NaN
+        return None
+    return round(f, 4)
+
+
+def _read_global_forming_bar(symbol: str, last_trade_date: str) -> Optional[Dict[str, Any]]:
+    """Return the bar of the session that is still open, when it is the newest one.
+
+    ``global_market_daily`` only ever holds **closed** sessions — it is written
+    by the 06:30 Beijing-time sync, i.e. after the US close.  While a market is
+    open the quote sync also publishes the running session's bar, and that is
+    what lets the chart show today instead of stopping at the previous close.
+
+    The date is Yahoo's own daily-bar label, identical to the one the 06:30
+    sync will write for the same session, so the forming candle is replaced
+    (not duplicated) once the session closes.
+    """
+    try:
+        doc = get_data_db()["global_market_quotes"].find_one({"symbol": symbol})
+    except Exception as exc:  # a missing collection must not break the chart
+        log.warning("global forming bar lookup failed for %s: %s", symbol, exc)
+        return None
+    if not doc:
+        return None
+
+    forming = doc.get("forming")
+    if not isinstance(forming, Mapping):
+        return None
+    trade_date = str(forming.get("date") or "")
+    if len(trade_date) != 8:
+        return None
+    # Only when it is newer than the newest closed bar — otherwise it is the
+    # very session the daily sync already stored.
+    if last_trade_date and trade_date <= last_trade_date:
+        return None
+    close = _safe_num(forming.get("close"))
+    if close is None:
+        return None
+    try:
+        volume = int(forming.get("volume") or 0)
+    except (TypeError, ValueError):
+        volume = 0
+    return {
+        "trade_date": trade_date,
+        "open":   _safe_num(forming.get("open")),
+        "high":   _safe_num(forming.get("high")),
+        "low":    _safe_num(forming.get("low")),
+        "close":  close,
+        "volume": volume,
+    }
+
+
 # NOTE: this route must be declared BEFORE the parameterised /{symbol}/kline
 # route so FastAPI does not match "kline-symbols" as a symbol value.
 @router.get("/global-market/kline-symbols")
@@ -1122,29 +1182,25 @@ async def get_global_market_kline(
         .limit(fetch_limit)
     )
 
-    if not raw:
-        return {"success": True, "symbol": symbol, "tf": tfc, "count": 0, "data": []}
-
     # Normalise: rename date → trade_date, cast numerics
     rows = []
     for doc in raw:
-        def _safe(v):
-            if v is None:
-                return None
-            try:
-                f = float(v)
-                return None if _math.isnan(f) else round(f, 4)
-            except (TypeError, ValueError):
-                return None
-
         rows.append({
             "trade_date": doc.get("date", ""),
-            "open":   _safe(doc.get("open")),
-            "high":   _safe(doc.get("high")),
-            "low":    _safe(doc.get("low")),
-            "close":  _safe(doc.get("close")),
+            "open":   _safe_num(doc.get("open")),
+            "high":   _safe_num(doc.get("high")),
+            "low":    _safe_num(doc.get("low")),
+            "close":  _safe_num(doc.get("close")),
             "volume": int(doc["volume"]) if doc.get("volume") is not None else 0,
         })
+
+    # The session that is still open (if any) is newer than every closed bar.
+    forming = _read_global_forming_bar(symbol, rows[0]["trade_date"] if rows else "")
+    if forming:
+        rows.insert(0, forming)  # rows are newest-first
+
+    if not rows:
+        return {"success": True, "symbol": symbol, "tf": tfc, "count": 0, "data": []}
 
     if tfc in ("1w", "1m"):
         rows = _resample_global_ohlcv(list(reversed(rows)), tfc)
@@ -1156,6 +1212,7 @@ async def get_global_market_kline(
         "tf": tfc,
         "count": len(rows),
         "data": rows,
+        "forming_trade_date": forming["trade_date"] if forming else None,
     }
 
 
