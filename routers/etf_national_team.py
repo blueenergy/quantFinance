@@ -10,6 +10,7 @@ from db import data_db
 from services.etf_national_team import (
     compute_curve,
     compute_entry_ladder,
+    compute_exposure,
     compute_history,
     compute_snapshot,
     list_trade_dates,
@@ -86,6 +87,24 @@ def get_national_team_entry_ladder(
     except Exception as exc:  # pragma: no cover - defensive surface for the UI
         raise HTTPException(
             status_code=500, detail=f"national-team entry ladder failed: {exc}"
+        )
+
+
+@router.get("/exposure", summary="国家队 ETF 敞口方向与历史分位")
+def get_national_team_exposure(
+    days: int = Query(750, ge=60, le=2000, description="回看的交易日数"),
+    current_user: dict = Depends(get_current_active_user),
+):
+    """池内合计份额时间轴 + 1 年分位 + 阶段判定（慢变量，日频）。
+
+    只使用「池内全部 ETF 都有份额数据」的交易日，避免分母漂移；
+    20220728 起连续全覆盖。
+    """
+    try:
+        return compute_exposure(data_db, days=days)
+    except Exception as exc:  # pragma: no cover
+        raise HTTPException(
+            status_code=500, detail=f"national-team exposure failed: {exc}"
         )
 
 
