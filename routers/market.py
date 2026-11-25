@@ -384,10 +384,18 @@ _DASHBOARD_MARKET_SYMBOLS: Dict[str, List[str]] = {
     "us_index_futures": ["NQ=F", "ES=F", "YM=F", "RTY=F"],
     "china_concepts": ["FXI", "2823.HK", "PGJ", "BABA", "PDD", "JD", "NIO"],
     "tech_giants": ["NVDA", "TSLA", "AAPL", "MSFT", "GOOG", "META", "AMZN", "AMD", "INTC"],
-    "commodities": ["GC=F", "SI=F", "CL=F"],
-    "forex": ["USDCNH=X", "DX-Y.NYB"],
+    "commodities": ["GC=F", "SI=F", "CL=F", "BZ=F"],
+    "forex": ["USDCNH=X", "DX-Y.NYB", "USDJPY=X"],
     "bonds": ["^TNX"],
     "crypto": ["BTC-USD", "ETH-USD"],
+    # 港股/亚洲隔夜 —— 对 A 股开盘传导最直接的一组
+    "hk_asia": ["^HSI", "HSTECH.HK", "^HSCE", "^KS11", "^TWII"],
+    # 半导体龙头 —— A 股半导体/算力链的隔夜锚点
+    "semis_leaders": ["TSM", "ASML", "MU", "AVGO", "ARM"],
+    # AI 主题（ANT = Anthropic，2026-11-19 纳斯达克上市）
+    "ai_theme": ["ANT", "AIQ", "CHAT", "BOTZ", "ARKW"],
+    # AI 软件/算力
+    "ai_software": ["ORCL", "CRM", "PLTR", "NOW", "SNOW"],
 }
 
 # 与 quant_analyzer GlobalMarketService.TICKERS 中仪表盘用到的名称对齐（供前端展示）
@@ -425,10 +433,42 @@ _DASHBOARD_SYMBOL_NAMES: Dict[str, Dict[str, str]] = {
         "META": "Meta",
         "AMZN": "Amazon",
     },
-    "commodities": {"GC=F": "Gold", "SI=F": "Silver", "CL=F": "WTI Crude Oil"},
-    "forex": {"DX-Y.NYB": "USD Index", "USDCNH=X": "USD/CNH (Offshore)"},
+    "commodities": {
+        "GC=F": "Gold", "SI=F": "Silver", "CL=F": "WTI Crude Oil", "BZ=F": "Brent Crude Oil",
+    },
+    "forex": {
+        "DX-Y.NYB": "USD Index", "USDCNH=X": "USD/CNH (Offshore)", "USDJPY=X": "USD/JPY",
+    },
     "bonds": {"^TNX": "US 10Y Treasury Yield"},
     "crypto": {"BTC-USD": "Bitcoin", "ETH-USD": "Ethereum"},
+    "hk_asia": {
+        "^HSI": "Hang Seng",
+        "HSTECH.HK": "Hang Seng TECH",
+        "^HSCE": "Hang Seng China Enterprises",
+        "^KS11": "KOSPI",
+        "^TWII": "Taiwan Weighted",
+    },
+    "semis_leaders": {
+        "TSM": "TSMC ADR",
+        "ASML": "ASML",
+        "MU": "Micron",
+        "AVGO": "Broadcom",
+        "ARM": "Arm Holdings",
+    },
+    "ai_theme": {
+        "ANT": "Anthropic",
+        "AIQ": "Global X AI & Tech ETF",
+        "CHAT": "Roundhill AI Tech & Power ETF",
+        "BOTZ": "ROBO Global AI ETF",
+        "ARKW": "ARK Next Gen Internet ETF",
+    },
+    "ai_software": {
+        "ORCL": "Oracle",
+        "CRM": "Salesforce",
+        "PLTR": "Palantir",
+        "NOW": "ServiceNow",
+        "SNOW": "Snowflake",
+    },
 }
 
 
@@ -1023,18 +1063,27 @@ _KLINE_AVAILABLE_SYMBOLS = {
     "DX-Y.NYB", "USDCNH=X",
     # Global indices
     "^N225", "^HSI", "000001.SS", "FXI", "EWJ", "EWG", "EWY",
+    # HK / Asia overnight — HSTECH.HK's bars come from tushare index_global
+    "^HSCE", "^KS11", "^TWII", "HSTECH.HK",
     # Commodities
-    "GC=F", "CL=F", "SI=F",
+    "GC=F", "CL=F", "BZ=F", "SI=F", "HG=F", "ALI=F",
     # Crypto
     "BTC-USD", "ETH-USD",
     # US index futures
     "ES=F", "NQ=F",
     # Tech giants
     "NVDA", "AMD", "AAPL", "MSFT", "TSLA", "GOOG", "META", "AMZN", "INTC",
+    # Semiconductor leaders — A-share semis overnight anchors
+    "TSM", "ASML", "MU", "AVGO", "ARM",
+    # AI theme (ANT = Anthropic, Nasdaq 2026-11-19) + AI software
+    "ANT", "AIQ", "CHAT", "BOTZ", "ARKW",
+    "ORCL", "CRM", "PLTR", "NOW", "SNOW",
     # China concepts
     "BABA", "PDD", "JD", "NIO", "2823.HK", "PGJ",
     # US index futures (additional)
     "YM=F", "RTY=F",
+    # Forex
+    "USDJPY=X", "CNY=X",
 }
 
 
