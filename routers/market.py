@@ -384,12 +384,12 @@ _DASHBOARD_MARKET_SYMBOLS: Dict[str, List[str]] = {
     "us_index_futures": ["NQ=F", "ES=F", "YM=F", "RTY=F"],
     "china_concepts": ["FXI", "2823.HK", "PGJ", "BABA", "PDD", "JD", "NIO"],
     "tech_giants": ["NVDA", "TSLA", "AAPL", "MSFT", "GOOG", "META", "AMZN", "AMD", "INTC"],
-    "commodities": ["GC=F", "SI=F", "CL=F", "BZ=F"],
+    "commodities": ["GC=F", "SI=F", "HG=F", "CL=F", "BZ=F"],
     "forex": ["USDCNH=X", "DX-Y.NYB", "USDJPY=X"],
     "bonds": ["^TNX"],
     "crypto": ["BTC-USD", "ETH-USD"],
     # 港股/亚洲隔夜 —— 对 A 股开盘传导最直接的一组
-    "hk_asia": ["^HSI", "HSTECH.HK", "^HSCE", "^KS11", "^TWII"],
+    "hk_asia": ["^HSI", "HSTECH.HK", "^HSCE", "^KS11", "^TWII", "^N225"],
     # 半导体龙头 —— A 股半导体/算力链的隔夜锚点
     "semis_leaders": ["TSM", "ASML", "MU", "AVGO", "ARM"],
     # AI 主题（ANT = Anthropic，2026-11-19 纳斯达克上市）
@@ -434,7 +434,8 @@ _DASHBOARD_SYMBOL_NAMES: Dict[str, Dict[str, str]] = {
         "AMZN": "Amazon",
     },
     "commodities": {
-        "GC=F": "Gold", "SI=F": "Silver", "CL=F": "WTI Crude Oil", "BZ=F": "Brent Crude Oil",
+        "GC=F": "Gold", "SI=F": "Silver", "HG=F": "Copper", "CL=F": "WTI Crude Oil",
+        "BZ=F": "Brent Crude Oil",
     },
     "forex": {
         "DX-Y.NYB": "USD Index", "USDCNH=X": "USD/CNH (Offshore)", "USDJPY=X": "USD/JPY",
@@ -447,6 +448,7 @@ _DASHBOARD_SYMBOL_NAMES: Dict[str, Dict[str, str]] = {
         "^HSCE": "Hang Seng China Enterprises",
         "^KS11": "KOSPI",
         "^TWII": "Taiwan Weighted",
+        "^N225": "Nikkei 225",
     },
     "semis_leaders": {
         "TSM": "TSMC ADR",
