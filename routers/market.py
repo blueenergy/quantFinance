@@ -392,10 +392,11 @@ _DASHBOARD_MARKET_SYMBOLS: Dict[str, List[str]] = {
     "hk_asia": ["^HSI", "HSTECH.HK", "^HSCE", "^KS11", "^TWII", "^N225"],
     # 半导体龙头 —— A 股半导体/算力链的隔夜锚点
     "semis_leaders": ["TSM", "ASML", "MU", "AVGO", "ARM"],
-    # AI 主题（ANT = Anthropic，2026-11-19 纳斯达克上市）
-    "ai_theme": ["ANT", "AIQ", "CHAT", "BOTZ", "ARKW"],
-    # AI 软件/算力
-    "ai_software": ["ORCL", "CRM", "PLTR", "NOW", "SNOW"],
+    # 主题科技：只有 ANT 是 AI 原生公司，其余是各自主题的 ETF（BOTZ 以机器人为主、
+    # ARKW 是宽口径颠覆性科技）。实测控制 QQQ 后对 A 股次日无增量解释力，只作情绪背景。
+    "thematic_tech": ["ANT", "AIQ", "CHAT", "BOTZ", "ARKW"],
+    # 企业软件：有 AI 产品线的软件/云公司，不是 AI 原生公司
+    "enterprise_software": ["ORCL", "CRM", "PLTR", "NOW", "SNOW"],
 }
 
 # 与 quant_analyzer GlobalMarketService.TICKERS 中仪表盘用到的名称对齐（供前端展示）
@@ -457,19 +458,21 @@ _DASHBOARD_SYMBOL_NAMES: Dict[str, Dict[str, str]] = {
         "AVGO": "Broadcom",
         "ARM": "Arm Holdings",
     },
-    "ai_theme": {
-        "ANT": "Anthropic",
-        "AIQ": "Global X AI & Tech ETF",
-        "CHAT": "Roundhill AI Tech & Power ETF",
-        "BOTZ": "ROBO Global AI ETF",
-        "ARKW": "ARK Next Gen Internet ETF",
+    # 名称即说明：括号里是「这家公司/这只 ETF 到底是什么」，
+    # 官方全名以 Yahoo 元数据为准（2026-11-26 核实）。
+    "thematic_tech": {
+        "ANT": "Anthropic（AI模型公司）",
+        "AIQ": "AI主题ETF（宽口径）",
+        "CHAT": "生成式AI主题ETF",
+        "BOTZ": "机器人&AI ETF（工业机器人为主）",
+        "ARKW": "颠覆性科技ETF（含加密）",
     },
-    "ai_software": {
-        "ORCL": "Oracle",
-        "CRM": "Salesforce",
-        "PLTR": "Palantir",
-        "NOW": "ServiceNow",
-        "SNOW": "Snowflake",
+    "enterprise_software": {
+        "ORCL": "Oracle（数据库/云）",
+        "CRM": "Salesforce（SaaS CRM）",
+        "PLTR": "Palantir（数据决策平台）",
+        "NOW": "ServiceNow（企业工作流）",
+        "SNOW": "Snowflake（数据云）",
     },
 }
 
