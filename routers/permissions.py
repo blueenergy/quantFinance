@@ -4,10 +4,17 @@ from db import get_db_collections
 from datetime import datetime
 from bson import ObjectId
 
+from auth import get_current_active_user, get_current_admin_user, log_admin_action
+
 router = APIRouter(prefix="/permissions", tags=["permissions"])
 
+VALID_SERVICE_LEVELS = ["free", "basic", "vip", "premium"]
+
 @router.get("/user/{user_identifier}")
-def get_user_permissions(user_identifier: str) -> Dict[str, Any]:
+def get_user_permissions(
+    user_identifier: str,
+    current_user: dict = Depends(get_current_admin_user),
+) -> Dict[str, Any]:
     """Get user's service level and permissions by username or user_id."""
     collections = get_db_collections()
     user_col = collections.get("users")
@@ -38,31 +45,43 @@ def get_user_permissions(user_identifier: str) -> Dict[str, Any]:
 
 
 @router.put("/user/{user_identifier}")
-def update_user_permissions(user_identifier: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+def update_user_permissions(
+    user_identifier: str,
+    payload: Dict[str, Any],
+    current_user: dict = Depends(get_current_admin_user),
+) -> Dict[str, Any]:
     """Update user's service level and permissions by username or user_id."""
     collections = get_db_collections()
     user_col = collections.get("users")
-    
+
     if user_col is None:
         raise HTTPException(status_code=500, detail="Users collection not available")
-    
+
     # Try to find user by username first, then by user_id
     user = user_col.find_one({"username": user_identifier})
     if not user:
         # If not found by username, try to find by user_id
         user = user_col.find_one({"_id": user_identifier})
-    
+
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
-    
-    # Prepare update data
-    update_data = {
-        "service_level": payload.get("service_level", "free"),
-        "features": payload.get("features", {}),
-        "permissions": payload.get("permissions", {}),
-        "updated_at": datetime.utcnow()
-    }
-    
+
+    # Only write the keys the caller actually sent. A partial payload used to
+    # silently reset features/permissions to {}.
+    update_data: Dict[str, Any] = {"updated_at": datetime.utcnow()}
+    if "service_level" in payload:
+        service_level = payload["service_level"]
+        if service_level not in VALID_SERVICE_LEVELS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid service level. Valid values: {VALID_SERVICE_LEVELS}",
+            )
+        update_data["service_level"] = service_level
+    if "features" in payload:
+        update_data["features"] = payload["features"]
+    if "permissions" in payload:
+        update_data["permissions"] = payload["permissions"]
+
     # Update user by username or _id
     if user.get("username") == user_identifier:
         result = user_col.update_one(
@@ -74,15 +93,28 @@ def update_user_permissions(user_identifier: str, payload: Dict[str, Any]) -> Di
             {"_id": user_identifier},
             {"$set": update_data}
         )
-    
+
     if result.modified_count == 0:
         raise HTTPException(status_code=500, detail="Failed to update user permissions")
-    
+
+    log_admin_action(
+        current_user,
+        "update_user_permissions",
+        target_username=user_identifier,
+        details=(
+            f"service_level: {user.get('service_level', 'free')} -> "
+            f"{update_data.get('service_level', user.get('service_level', 'free'))}; "
+            f"fields={sorted(k for k in update_data if k != 'updated_at')}"
+        ),
+    )
+
     return {"ok": True, "message": f"User {user_identifier} permissions updated successfully"}
 
 
 @router.get("/strategies")
-def get_strategy_permissions() -> Dict[str, Any]:
+def get_strategy_permissions(
+    current_user: dict = Depends(get_current_admin_user),
+) -> Dict[str, Any]:
     """Get all strategies and their service level requirements."""
     collections = get_db_collections()
     strategy_col = collections.get("strategy_metadata")
@@ -96,41 +128,55 @@ def get_strategy_permissions() -> Dict[str, Any]:
 
 
 @router.put("/strategy/{strategy_key}")
-def update_strategy_permissions(strategy_key: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+def update_strategy_permissions(
+    strategy_key: str,
+    payload: Dict[str, Any],
+    current_user: dict = Depends(get_current_admin_user),
+) -> Dict[str, Any]:
     """Update a strategy's service level requirement."""
     collections = get_db_collections()
     strategy_col = collections.get("strategy_metadata")
-    
+
     if strategy_col is None:
         raise HTTPException(status_code=500, detail="Strategy metadata collection not available")
-    
+
     # Check if strategy exists
     strategy = strategy_col.find_one({"key": strategy_key})
     if not strategy:
         raise HTTPException(status_code=404, detail="Strategy not found")
-    
+
     # Prepare update data
     min_service_level = payload.get("min_service_level", "free")
-    
+
     # Validate service level
-    valid_levels = ["free", "basic", "vip", "premium"]
-    if min_service_level not in valid_levels:
-        raise HTTPException(status_code=400, detail=f"Invalid service level. Valid values: {valid_levels}")
-    
+    if min_service_level not in VALID_SERVICE_LEVELS:
+        raise HTTPException(status_code=400, detail=f"Invalid service level. Valid values: {VALID_SERVICE_LEVELS}")
+
     # Update strategy
     result = strategy_col.update_one(
         {"key": strategy_key},
         {"$set": {"min_service_level": min_service_level, "updated_at": datetime.utcnow()}}
     )
-    
+
     if result.modified_count == 0:
         raise HTTPException(status_code=500, detail="Failed to update strategy permissions")
-    
+
+    log_admin_action(
+        current_user,
+        "update_strategy_permissions",
+        details=(
+            f"strategy={strategy_key}; "
+            f"min_service_level: {strategy.get('min_service_level', 'free')} -> {min_service_level}"
+        ),
+    )
+
     return {"ok": True, "message": f"Strategy {strategy_key} permissions updated to {min_service_level}"}
 
 
 @router.get("/service-levels")
-def get_service_levels() -> Dict[str, Any]:
+def get_service_levels(
+    current_user: dict = Depends(get_current_active_user),
+) -> Dict[str, Any]:
     """Get all available service levels and their features."""
     # Define service levels with their features
     service_levels = {
@@ -186,43 +232,55 @@ def get_service_levels() -> Dict[str, Any]:
 
 
 @router.post("/upgrade-requests")
-def submit_upgrade_request(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """Submit a service level upgrade request for a user."""
+def submit_upgrade_request(
+    payload: Dict[str, Any],
+    current_user: dict = Depends(get_current_active_user),
+) -> Dict[str, Any]:
+    """Submit a service level upgrade request for the current user."""
     collections = get_db_collections()
     upgrade_requests_col = collections.get("upgrade_requests")
     users_col = collections.get("users")
-    
+
     if upgrade_requests_col is None or users_col is None:
         raise HTTPException(status_code=500, detail="Collections not available")
-    
+
+    # Never trust payload["username"]: a user may only request an upgrade for
+    # their own account.
+    requesting_username = payload.get("username")
+    token_username = current_user.get("username")
+    if requesting_username and requesting_username != token_username:
+        raise HTTPException(
+            status_code=403,
+            detail="Cannot submit an upgrade request for another user",
+        )
+
     # Verify user exists
-    user = users_col.find_one({"username": payload["username"]})
+    user = users_col.find_one({"username": token_username})
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
-    
+
     # Validate target service level
-    valid_levels = ["free", "basic", "vip", "premium"]
     target_level = payload.get("target_service_level", "basic")
-    if target_level not in valid_levels:
-        raise HTTPException(status_code=400, detail=f"Invalid service level. Valid values: {valid_levels}")
-    
+    if target_level not in VALID_SERVICE_LEVELS:
+        raise HTTPException(status_code=400, detail=f"Invalid service level. Valid values: {VALID_SERVICE_LEVELS}")
+
     # Check if user already has this level or higher
     current_level = user.get("service_level", "free")
     level_priority = {"free": 0, "basic": 1, "vip": 2, "premium": 3}
     if level_priority.get(current_level, 0) >= level_priority.get(target_level, 0):
         raise HTTPException(status_code=400, detail="User already has this service level or higher")
-    
+
     # Check if there's already a pending request
     existing_request = upgrade_requests_col.find_one({
-        "username": payload["username"],
+        "username": token_username,
         "status": "pending"
     })
     if existing_request:
         raise HTTPException(status_code=400, detail="User already has a pending upgrade request")
-    
+
     # Create the upgrade request
     request_data = {
-        "username": payload["username"],
+        "username": token_username,
         "current_service_level": current_level,
         "target_service_level": target_level,
         "reason": payload.get("reason", ""),
@@ -237,28 +295,38 @@ def submit_upgrade_request(payload: Dict[str, Any]) -> Dict[str, Any]:
         raise HTTPException(status_code=500, detail="Failed to create upgrade request")
     
     return {
-        "ok": True, 
-        "message": f"Upgrade request submitted for user {payload['username']} to {target_level}",
+        "ok": True,
+        "message": f"Upgrade request submitted for user {token_username} to {target_level}",
         "request_id": str(result.inserted_id)
     }
 
 
 @router.get("/upgrade-requests")
-def get_upgrade_requests() -> Dict[str, Any]:
-    """Get all upgrade requests (for admin use)."""
+def get_upgrade_requests(
+    current_user: dict = Depends(get_current_active_user),
+) -> Dict[str, Any]:
+    """Get upgrade requests.
+
+    Admins see every request; a normal user sees only their own — the response
+    used to expose all users' upgrade requests to any authenticated caller.
+    """
     try:
         collections = get_db_collections()
         upgrade_requests_col = collections.get("upgrade_requests")
-        
+
         if upgrade_requests_col is None:
             raise HTTPException(status_code=500, detail="Upgrade requests collection not available")
-        
-        requests = list(upgrade_requests_col.find({}, {"_id": 1, "username": 1, 
-                                               "current_service_level": 1, 
-                                               "target_service_level": 1, 
-                                               "reason": 1, 
-                                               "status": 1, 
-                                               "created_at": 1, 
+
+        query: Dict[str, Any] = {}
+        if not current_user.get("is_admin"):
+            query["username"] = current_user.get("username")
+
+        requests = list(upgrade_requests_col.find(query, {"_id": 1, "username": 1,
+                                               "current_service_level": 1,
+                                               "target_service_level": 1,
+                                               "reason": 1,
+                                               "status": 1,
+                                               "created_at": 1,
                                                "updated_at": 1}))
         
         # Convert ObjectId to string
@@ -277,7 +345,11 @@ def get_upgrade_requests() -> Dict[str, Any]:
 
 
 @router.put("/upgrade-requests/{request_id}")
-def update_upgrade_request(request_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+def update_upgrade_request(
+    request_id: str,
+    payload: Dict[str, Any],
+    current_user: dict = Depends(get_current_admin_user),
+) -> Dict[str, Any]:
     """Approve or reject an upgrade request (for admin use)."""
     collections = get_db_collections()
     upgrade_requests_col = collections.get("upgrade_requests")
@@ -308,7 +380,8 @@ def update_upgrade_request(request_id: str, payload: Dict[str, Any]) -> Dict[str
     update_data = {
         "status": new_status,
         "updated_at": datetime.utcnow(),
-        "processed_by": payload.get("processed_by", "admin")
+        # Record who actually acted, from the verified token — not the payload.
+        "processed_by": current_user.get("username", "admin")
     }
     
     result = upgrade_requests_col.update_one(
@@ -344,9 +417,19 @@ def update_upgrade_request(request_id: str, payload: Dict[str, Any]) -> Dict[str
         # 验证更新
         updated_user = users_col.find_one({"username": request["username"]})
         print(f"[验证更新] 更新后的service_level={updated_user.get('service_level')}")
-    
+
+    log_admin_action(
+        current_user,
+        "update_upgrade_request",
+        target_username=request["username"],
+        details=(
+            f"request_id={request_id}; status={new_status}; "
+            f"target_service_level={request.get('target_service_level')}"
+        ),
+    )
+
     return {
-        "ok": True, 
+        "ok": True,
         "message": f"Upgrade request {new_status} for user {request['username']}",
         "status": new_status
     }
