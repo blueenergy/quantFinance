@@ -23,7 +23,17 @@ _etf_daily = data_db["etf_daily"]
 _etf_adj_factor = data_db["etf_adj_factor"]
 _fut_daily = data_db["fut_daily"]
 
-_PROJ = {"_id": 0, "trade_date": 1, "open": 1, "high": 1, "low": 1, "close": 1, "volume": 1}
+_PROJ = {
+    "_id": 0,
+    "trade_date": 1,
+    "open": 1,
+    "high": 1,
+    "low": 1,
+    "close": 1,
+    "volume": 1,
+    "vol": 1,
+    "amount": 1,
+}
 _FUT_PROJ = {
     "_id": 0,
     "trade_date": 1,
@@ -124,9 +134,9 @@ def get_kline_series(
             "low": d.get("low"),
             "close": d.get("close"),
             "volume": d.get("volume") if d.get("volume") is not None else d.get("vol"),
+            "amount": d.get("amount"),
             **(
                 {
-                    "amount": d.get("amount"),
                     "oi": d.get("oi"),
                     "contract": d.get("contract"),
                     "pct_chg": d.get("pct_chg"),

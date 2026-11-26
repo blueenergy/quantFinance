@@ -97,6 +97,35 @@ def test_kline_series_index_branch_ignores_adjust(monkeypatch, authed_client):
     assert body["data"][0]["close"] == 100.5
 
 
+@pytest.mark.unit
+def test_kline_series_index_maps_vol_and_amount(monkeypatch, authed_client):
+    """index_prices stores vol/amount; the API must expose them as volume/amount."""
+
+    class _IdxColl:
+        def find(self, flt, proj):
+            return _EmptyMongoCursor(
+                [
+                    {
+                        "trade_date": "20240101",
+                        "open": 100,
+                        "high": 101,
+                        "low": 99,
+                        "close": 100.5,
+                        "vol": 12345,
+                        "amount": 6789.0,
+                    }
+                ]
+            )
+
+    monkeypatch.setattr(kline_series, "_index_prices", _IdxColl())
+
+    resp = authed_client.get("/api/kline-series", params={"symbol": "000300.SH"})
+    assert resp.status_code == 200
+    row = resp.json()["data"][0]
+    assert row["volume"] == 12345
+    assert row["amount"] == 6789.0
+
+
 class _EtfColl:
     def __init__(self, docs):
         self.docs = list(docs)
