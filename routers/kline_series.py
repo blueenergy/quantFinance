@@ -91,7 +91,10 @@ def get_kline_series(
     flt: dict = {"ts_code": symbol}
     if date_flt:
         flt["trade_date"] = date_flt
-    docs = list(_index_prices.find(flt, _PROJ).sort("trade_date", 1).limit(limit))
+    # limit 表示「最近 N 根」：降序取再反转，否则长历史（如沪深300 5317 根）
+    # 会被截掉最新的一段，图上停在一年前。
+    docs = list(_index_prices.find(flt, _PROJ).sort("trade_date", -1).limit(limit))
+    docs.reverse()
     source = "index_prices"
     used_adjust = "none"
 
@@ -119,7 +122,8 @@ def get_kline_series(
         flt_fut: dict = {"ts_code": symbol}
         if date_flt:
             flt_fut["trade_date"] = date_flt
-        docs = list(_fut_daily.find(flt_fut, _FUT_PROJ).sort("trade_date", 1).limit(limit))
+        docs = list(_fut_daily.find(flt_fut, _FUT_PROJ).sort("trade_date", -1).limit(limit))
+        docs.reverse()
         if docs:
             source = "fut_daily"
             used_adjust = "none"
@@ -131,14 +135,17 @@ def get_kline_series(
             df = adj_dao.load_adjusted_ohlc(symbol, sd, ed, adjust=adjust)
             if not df.empty:
                 df = df.reset_index(drop=True)
-                docs = df.to_dict("records")[:limit]
+                rows = df.to_dict("records")
+                rows.sort(key=lambda row: str(row.get("trade_date") or ""))
+                docs = rows[-limit:] if len(rows) > limit else rows
             else:
                 docs = []
         else:
             flt2: dict = {"symbol": symbol}
             if date_flt:
                 flt2["trade_date"] = date_flt
-            docs = list(_volume_price.find(flt2, _PROJ).sort("trade_date", 1).limit(limit))
+            docs = list(_volume_price.find(flt2, _PROJ).sort("trade_date", -1).limit(limit))
+            docs.reverse()
         source = "volume_price"
         used_adjust = adjust
 

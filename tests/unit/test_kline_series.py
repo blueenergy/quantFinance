@@ -132,17 +132,10 @@ def test_kline_series_index_sanitizes_nan_base_row(monkeypatch, authed_client):
 
     class _IdxColl:
         def find(self, flt, proj):
+            # The router queries newest-first then reverses; the stub ignores
+            # sort(), so feed the rows in the order Mongo would return them.
             return _EmptyMongoCursor(
                 [
-                    {
-                        "trade_date": "20100531",
-                        "open": float("nan"),
-                        "high": float("nan"),
-                        "low": float("nan"),
-                        "close": 1000.0,
-                        "vol": 0.0,
-                        "amount": 0.0,
-                    },
                     {
                         "trade_date": "20100601",
                         "open": 1000.0,
@@ -151,6 +144,15 @@ def test_kline_series_index_sanitizes_nan_base_row(monkeypatch, authed_client):
                         "close": 1005.0,
                         "vol": 123.0,
                         "amount": 456.0,
+                    },
+                    {
+                        "trade_date": "20100531",
+                        "open": float("nan"),
+                        "high": float("nan"),
+                        "low": float("nan"),
+                        "close": 1000.0,
+                        "vol": 0.0,
+                        "amount": 0.0,
                     },
                 ]
             )
