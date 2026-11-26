@@ -83,9 +83,48 @@ def test_snapshot_account_equity_upserts_latest_account_point():
     assert len(collections["trader_account_equity"].docs) == 1
     row = collections["trader_account_equity"].docs[0]
     assert row["date"] == "20250604"
+    # No broker field -> legacy assumption: the broker total already includes
+    # cash, so equity is the total as-is.
     assert row["total_asset"] == 100000
+    assert row["broker_total_asset"] == 100000
     assert row["market_value"] == 80000
     assert row["is_stale"] is False
+
+
+def test_snapshot_account_equity_adds_cash_only_for_brokers_that_exclude_it():
+    """Guosen's account total leaves the day's available cash out.
+
+    Measured 2026-11-26 13:42: balance 346471.62, available 53155.92,
+    marketvalue 346461.45 -- the 53k is outside the balance and QMT cannot
+    see it once the broker sweeps it into overnight reverse repo.  Guojin's
+    total, by contrast, equals marketvalue + available exactly, so its cash
+    must NOT be added twice.
+    """
+    def _make(broker):
+        return {
+            "trader_accounts": _Collection(
+                [
+                    {
+                        "user_id": "user-1",
+                        "securities_account_id": "acct-1",
+                        "broker": broker,
+                        "total_asset": 346831.41,
+                        "cash": 53155.92,
+                        "market_value": 235410.0,
+                        "synced_at": 1,
+                    }
+                ]
+            ),
+            "trader_account_equity": _Collection(),
+        }
+
+    guosen = _make("国信证券")
+    snapshot_account_equity(guosen, date="20261126", stale_seconds=10**12)
+    assert guosen["trader_account_equity"].docs[0]["total_asset"] == 399987.33
+
+    guojin = _make("国金证券")
+    snapshot_account_equity(guojin, date="20261126", stale_seconds=10**12)
+    assert guojin["trader_account_equity"].docs[0]["total_asset"] == 346831.41
 
 
 def test_snapshot_account_equity_skips_stale_account():
@@ -170,6 +209,48 @@ def test_snapshot_account_equity_falls_back_when_total_asset_is_zero():
     assert row["total_asset"] == 467457.54
     assert row["market_value"] == 411110.40
     assert row["cash"] == 56347.14
+
+
+def test_snapshot_account_equity_only_if_absent_keeps_close_time_row():
+    """The 16:00/21:30 runs are gap-fillers.
+
+    They must not overwrite the 15:05 close-time row with a post-sweep
+    reading: the broker moves idle cash into overnight reverse repo around
+    20:40-20:50 and that balance is invisible to QMT, so cash reads ~0.
+    """
+    collections = {
+        "trader_accounts": _Collection(
+            [
+                {
+                    "user_id": "user-1",
+                    "securities_account_id": "acct-1",
+                    "total_asset": 100000,
+                    "cash": 0,
+                    "market_value": 100000,
+                    "synced_at": 1,
+                }
+            ]
+        ),
+        "trader_account_equity": _Collection(
+            [
+                {
+                    "user_id": "user-1",
+                    "securities_account_id": "acct-1",
+                    "date": "20261126",
+                    "total_asset": 153155.92,
+                    "cash": 53155.92,
+                }
+            ]
+        ),
+    }
+
+    result = snapshot_account_equity(
+        collections, date="20261126", stale_seconds=10**12, only_if_absent=True
+    )
+
+    assert result["written"] == 0
+    assert result["present_skipped"] == 1
+    assert collections["trader_account_equity"].docs[0]["total_asset"] == 153155.92
 
 
 def test_compute_live_plan_equity_uses_plan_executions_and_fees():
@@ -303,7 +384,9 @@ def test_build_account_equity_live_point_on_trading_day():
     )
 
     assert point["date"] == "20261109"
+    # No broker field -> legacy assumption: total already includes cash.
     assert point["total_asset"] == 100000
+    assert point["broker_total_asset"] == 100000
     assert point["is_intraday"] is True
     assert point["is_stale"] is False
     assert point["live_synced_at"] == source_synced_at
@@ -411,6 +494,7 @@ def _account_pnl_collections():
                     "user_id": "user-1",
                     "securities_account_id": "acct-1",
                     "date": "20261111",
+                    # No broker field on the account -> cash is not added.
                     "total_asset": 100000,
                 }
             ]

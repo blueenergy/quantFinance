@@ -137,7 +137,9 @@ def test_get_account_equity_appends_live_intraday_point(monkeypatch):
     assert response["success"] is True
     assert response["data"][-1]["date"] == today
     assert response["data"][-1]["is_intraday"] is True
+    # No broker field -> legacy assumption: the total already includes cash.
     assert response["data"][-1]["total_asset"] == 95000
+    assert response["data"][-1]["broker_total_asset"] == 95000
 
 
 def test_get_account_equity_skips_live_point_outside_date_range(monkeypatch):

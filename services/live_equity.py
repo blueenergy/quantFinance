@@ -18,6 +18,20 @@ from services.trading_calendar import is_sse_open_day
 SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
 DEFAULT_INITIAL_CAPITAL = 1_000_000.0
 ACCOUNT_SNAPSHOT_STALE_SECONDS = 6 * 60 * 60
+
+# Brokers whose account-level ``total_asset`` leaves the day's available cash
+# out.  Measured 2026-11-26 on the two live accounts:
+#
+#   Guojin  22:08  balance 422907.57  available 47703.67  marketvalue 375203.90
+#                  balance - marketvalue == available exactly -> cash included
+#   Guosen  13:42  balance 346471.62  available 53155.92  marketvalue 346461.45
+#                  balance - marketvalue == 10.17 -> the 53k available sits
+#                  outside the balance and is invisible to QMT once the broker
+#                  sweeps it into overnight reverse repo (~20:40-20:50)
+#
+# Anything not listed keeps the legacy assumption (total already includes
+# cash), so adding a broker cannot silently inflate an existing curve.
+BROKER_TOTAL_EXCLUDES_CASH = {"国信证券"}
 # Trader pushes account data every ~60s; five minutes tolerates a missed cycle
 # without letting a dead QMT connection masquerade as today's live point.
 LIVE_EQUITY_POINT_MAX_AGE_SECONDS = 5 * 60
@@ -231,14 +245,21 @@ def snapshot_account_equity(
     date: Optional[str] = None,
     now: Optional[datetime] = None,
     stale_seconds: int = ACCOUNT_SNAPSHOT_STALE_SECONDS,
+    only_if_absent: bool = False,
 ) -> Dict[str, Any]:
-    """Persist one account-level equity point per account for the given date."""
+    """Persist one account-level equity point per account for the given date.
+
+    ``only_if_absent`` makes the run a gap-filler: it writes only when the
+    account has no row for that date yet.  The close-time run owns the value;
+    later runs must not overwrite it with a post-reverse-repo reading.
+    """
     snapshot_date = date or _today_yyyymmdd(now)
     updated_at = _utc_now()
     written = 0
     skipped = 0
     stale_skipped = 0
     empty_skipped = 0
+    present_skipped = 0
     rows = list(finance_collections["trader_accounts"].find({}))
 
     for account in rows:
@@ -248,19 +269,41 @@ def snapshot_account_equity(
             skipped += 1
             continue
 
+        if only_if_absent and finance_collections["trader_account_equity"].find_one(
+            {
+                "user_id": user_id,
+                "securities_account_id": str(securities_account_id),
+                "date": snapshot_date,
+            }
+        ):
+            present_skipped += 1
+            continue
+
         source_synced_at = account.get("synced_at")
         source_ts = _timestamp(source_synced_at)
         age_seconds = (time.time() - source_ts) if source_ts is not None else None
         is_stale = bool(age_seconds is None or age_seconds > stale_seconds)
         market_value = _numeric(account.get("market_value"))
         cash = _numeric(account.get("cash"))
-        total_asset_source = _numeric(
+        broker_total_asset = _numeric(
             account.get("total_asset", account.get("total_assets"))
         )
+        # Some brokers leave the day's available cash out of their account
+        # total (see BROKER_TOTAL_EXCLUDES_CASH); equity has to add it back,
+        # otherwise buying with cash reads as a gain and selling as a loss.
         # QMT occasionally reports total_asset=0 while cash/market_value are
         # valid. Fall back like portfolio_snapshot does, otherwise the equity
         # curve silently records a zero point for that day.
-        total_asset = round(total_asset_source or (market_value + cash), 2)
+        cash_outside_total = (
+            cash
+            if str(account.get("broker") or "").strip() in BROKER_TOTAL_EXCLUDES_CASH
+            else 0
+        )
+        total_asset = round(
+            (broker_total_asset + cash_outside_total) if broker_total_asset > 0
+            else (market_value + cash),
+            2,
+        )
         if is_stale:
             # Never re-publish an old snapshot as today's equity. Repeating the
             # last known value builds a flat fake curve, and when the feed
@@ -281,6 +324,7 @@ def snapshot_account_equity(
             "securities_account_id": str(securities_account_id),
             "date": snapshot_date,
             "total_asset": total_asset,
+            "broker_total_asset": broker_total_asset,
             "cash": cash,
             "available_cash": _numeric(account.get("available_cash")),
             "market_value": market_value,
@@ -335,6 +379,7 @@ def snapshot_account_equity(
         "skipped": skipped,
         "stale_skipped": stale_skipped,
         "empty_skipped": empty_skipped,
+        "present_skipped": present_skipped,
     }
 
 
@@ -385,16 +430,27 @@ def build_account_equity_live_point(
     if age_seconds < 0 or age_seconds > max_age_seconds:
         return None
 
-    total_asset = _numeric(account.get("total_asset"))
-    if total_asset <= 0:
+    broker_total_asset = _numeric(account.get("total_asset"))
+    if broker_total_asset <= 0:
         return None
+    cash = _numeric(account.get("cash"))
+    # Same definition as the EOD row (see BROKER_TOTAL_EXCLUDES_CASH); two
+    # definitions would make the curve jump when the intraday point is
+    # replaced by the persisted row.
+    cash_outside_total = (
+        cash
+        if str(account.get("broker") or "").strip() in BROKER_TOTAL_EXCLUDES_CASH
+        else 0
+    )
+    total_asset = broker_total_asset + cash_outside_total
 
     return {
         "user_id": user_id,
         "securities_account_id": str(securities_account_id),
         "date": snapshot_date,
         "total_asset": round(total_asset, 2),
-        "cash": _numeric(account.get("cash")),
+        "broker_total_asset": round(broker_total_asset, 2),
+        "cash": cash,
         "available_cash": _numeric(account.get("available_cash")),
         "market_value": _numeric(account.get("market_value")),
         "account_id": account.get("account_id"),

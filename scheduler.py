@@ -484,8 +484,15 @@ def t0_signal_evaluation_task():
         _release_scheduler_job_lock(job_id)
 
 
-def equity_snapshot_eod_task():
-    """Persist account-level and live plan-level EOD equity snapshots."""
+def equity_snapshot_eod_task(account_only_if_absent: bool = False):
+    """Persist account-level and live plan-level EOD equity snapshots.
+
+    ``account_only_if_absent`` keeps these later runs from overwriting the
+    close-time account row: the broker sweeps idle cash into overnight reverse
+    repo around 20:40-20:50 (measured 2026-11-26), and that balance is not
+    visible to QMT at all, so a post-sweep reading understates equity by the
+    swept amount.
+    """
     from db import get_data_db, get_db_collections, get_trading_db_collections
     from services.live_equity import ensure_live_equity_indexes, snapshot_account_equity, snapshot_live_plan_equity
     from services.portfolio_live_snapshot import ensure_live_snapshot_indexes, rebuild_all_live_snapshots
@@ -500,7 +507,9 @@ def equity_snapshot_eod_task():
         data_collections = get_data_db()
         ensure_live_equity_indexes(finance_collections, trading_collections)
         ensure_live_snapshot_indexes(trading_collections, finance_collections)
-        account_result = snapshot_account_equity(finance_collections, data_collections)
+        account_result = snapshot_account_equity(
+            finance_collections, data_collections, only_if_absent=account_only_if_absent
+        )
         plan_result = snapshot_live_plan_equity(trading_collections, finance_collections, data_collections)
         snapshot_result = rebuild_all_live_snapshots(trading_collections, finance_collections)
         log.info(
@@ -511,6 +520,33 @@ def equity_snapshot_eod_task():
         )
     except Exception as exc:
         log.error("[EquitySnapshot] failed: %s", exc, exc_info=True)
+    finally:
+        _release_scheduler_job_lock(job_id)
+
+
+def equity_snapshot_close_task():
+    """Persist the account equity point right after the close.
+
+    This is the authoritative account row for the day: it runs before the
+    broker's overnight reverse-repo sweep, while cash is still visible.  The
+    16:00 and 21:30 runs only fill a gap if this one missed.
+    """
+    from db import get_data_db, get_db_collections, get_trading_db_collections
+    from services.live_equity import ensure_live_equity_indexes, snapshot_account_equity
+
+    job_id = "equity_snapshot_close"
+    if not _acquire_scheduler_job_lock(job_id):
+        log.info("[EquitySnapshotClose] Another scheduler instance owns the lock, skipping.")
+        return
+    try:
+        finance_collections = get_db_collections()
+        trading_collections = get_trading_db_collections()
+        data_collections = get_data_db()
+        ensure_live_equity_indexes(finance_collections, trading_collections)
+        account_result = snapshot_account_equity(finance_collections, data_collections)
+        log.info("[EquitySnapshotClose] account=%s", account_result)
+    except Exception as exc:
+        log.error("[EquitySnapshotClose] failed: %s", exc, exc_info=True)
     finally:
         _release_scheduler_job_lock(job_id)
 
@@ -832,8 +868,9 @@ TASK_MAP = {
     'market_insight_focus_review_1530': market_insight_focus_review_task,
     'strategy_lab_loop_tick': strategy_lab_loop_tick_task,
     't0_signal_evaluation': t0_signal_evaluation_task,
-    'equity_snapshot_eod': equity_snapshot_eod_task,
-    'equity_snapshot_final': equity_snapshot_eod_task,
+    'equity_snapshot_close': equity_snapshot_close_task,
+    'equity_snapshot_eod': lambda: equity_snapshot_eod_task(account_only_if_absent=True),
+    'equity_snapshot_final': lambda: equity_snapshot_eod_task(account_only_if_absent=True),
     'live_snapshot_intraday': live_snapshot_intraday_task,
     'live_snapshot_reconcile_intraday': live_snapshot_reconcile_task,
     'live_snapshot_execution_backfill': live_snapshot_execution_backfill_task,
@@ -939,6 +976,14 @@ DEFAULT_SCHEDULES = {
         'type': "cron",
         'hour': 16,
         'minute': 15,
+        'day_of_week': 'mon-fri',
+        'is_active': True,
+    },
+    'equity_snapshot_close': {
+        'name': "实盘资金曲线收盘快照 (15:05, 逆回购扫款前)",
+        'type': "cron",
+        'hour': 15,
+        'minute': 5,
         'day_of_week': 'mon-fri',
         'is_active': True,
     },
