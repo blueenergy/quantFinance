@@ -126,6 +126,48 @@ def test_kline_series_index_maps_vol_and_amount(monkeypatch, authed_client):
     assert row["amount"] == 6789.0
 
 
+@pytest.mark.unit
+def test_kline_series_index_sanitizes_nan_base_row(monkeypatch, authed_client):
+    """The index base date has NaN OHLC; it must serialize as null, not 500."""
+
+    class _IdxColl:
+        def find(self, flt, proj):
+            return _EmptyMongoCursor(
+                [
+                    {
+                        "trade_date": "20100531",
+                        "open": float("nan"),
+                        "high": float("nan"),
+                        "low": float("nan"),
+                        "close": 1000.0,
+                        "vol": 0.0,
+                        "amount": 0.0,
+                    },
+                    {
+                        "trade_date": "20100601",
+                        "open": 1000.0,
+                        "high": 1010.0,
+                        "low": 990.0,
+                        "close": 1005.0,
+                        "vol": 123.0,
+                        "amount": 456.0,
+                    },
+                ]
+            )
+
+    monkeypatch.setattr(kline_series, "_index_prices", _IdxColl())
+
+    resp = authed_client.get("/api/kline-series", params={"symbol": "399006.SZ"})
+    assert resp.status_code == 200
+    rows = resp.json()["data"]
+    assert len(rows) == 2
+    assert rows[0]["open"] is None
+    assert rows[0]["high"] is None
+    assert rows[0]["low"] is None
+    assert rows[0]["close"] == 1000.0
+    assert rows[1]["close"] == 1005.0
+
+
 class _EtfColl:
     def __init__(self, docs):
         self.docs = list(docs)

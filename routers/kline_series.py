@@ -6,6 +6,7 @@
 期货 fut_daily 不复权。
 """
 from __future__ import annotations
+import math
 from typing import Optional
 from fastapi import APIRouter, Query, Depends
 from auth import get_current_active_user
@@ -48,6 +49,21 @@ _FUT_PROJ = {
     "oi": 1,
     "contract": 1,
 }
+
+
+def _finite_or_none(value):
+    """NaN/inf are not valid JSON.
+
+    index_prices keeps the index base date as a synthetic row with close=1000
+    but NaN open/high/low; serializing it would 500 the whole series.
+    """
+    if value is None:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
 
 
 @router.get("/kline-series")
@@ -126,29 +142,31 @@ def get_kline_series(
         source = "volume_price"
         used_adjust = adjust
 
-    result = [
-        {
+    result = []
+    for d in docs:
+        close = _finite_or_none(d.get("close"))
+        if close is None:
+            continue
+        volume = d.get("volume")
+        if volume is None:
+            volume = d.get("vol")
+        row = {
             "trade_date": d.get("trade_date"),
-            "open": d.get("open"),
-            "high": d.get("high"),
-            "low": d.get("low"),
-            "close": d.get("close"),
-            "volume": d.get("volume") if d.get("volume") is not None else d.get("vol"),
-            "amount": d.get("amount"),
-            **(
-                {
-                    "oi": d.get("oi"),
-                    "contract": d.get("contract"),
-                    "pct_chg": d.get("pct_chg"),
-                    "change": d.get("change"),
-                }
-                if source == "fut_daily"
-                else {}
-            ),
+            "open": _finite_or_none(d.get("open")),
+            "high": _finite_or_none(d.get("high")),
+            "low": _finite_or_none(d.get("low")),
+            "close": close,
+            "volume": _finite_or_none(volume),
+            "amount": _finite_or_none(d.get("amount")),
         }
-        for d in docs
-        if d.get("close") is not None
-    ]
+        if source == "fut_daily":
+            row.update({
+                "oi": _finite_or_none(d.get("oi")),
+                "contract": d.get("contract"),
+                "pct_chg": _finite_or_none(d.get("pct_chg")),
+                "change": _finite_or_none(d.get("change")),
+            })
+        result.append(row)
 
     return {
         "success": True,
