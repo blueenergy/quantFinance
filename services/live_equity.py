@@ -237,6 +237,8 @@ def snapshot_account_equity(
     updated_at = _utc_now()
     written = 0
     skipped = 0
+    stale_skipped = 0
+    empty_skipped = 0
     rows = list(finance_collections["trader_accounts"].find({}))
 
     for account in rows:
@@ -259,6 +261,21 @@ def snapshot_account_equity(
         # valid. Fall back like portfolio_snapshot does, otherwise the equity
         # curve silently records a zero point for that day.
         total_asset = round(total_asset_source or (market_value + cash), 2)
+        if is_stale:
+            # Never re-publish an old snapshot as today's equity. Repeating the
+            # last known value builds a flat fake curve, and when the feed
+            # recovers the whole gap collapses into a single "daily" move.
+            # That is how the Guosen account got nine rows of 420164 from a
+            # manual entry and then a fabricated -74197.20 daily P&L.
+            # Skipping leaves a gap in the series; a gap is honest.
+            stale_skipped += 1
+            continue
+        if total_asset <= 0:
+            # Same class of defect: a zero here means "no data", not "worth
+            # zero". Writing it would turn the next real point into a huge
+            # fake P&L against 0.
+            empty_skipped += 1
+            continue
         row = {
             "user_id": user_id,
             "securities_account_id": str(securities_account_id),
@@ -312,7 +329,13 @@ def snapshot_account_equity(
         )
         written += 1
 
-    return {"date": snapshot_date, "written": written, "skipped": skipped}
+    return {
+        "date": snapshot_date,
+        "written": written,
+        "skipped": skipped,
+        "stale_skipped": stale_skipped,
+        "empty_skipped": empty_skipped,
+    }
 
 
 def build_account_equity_live_point(

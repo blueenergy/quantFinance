@@ -75,8 +75,8 @@ def test_snapshot_account_equity_upserts_latest_account_point():
         "trader_account_equity": _Collection(),
     }
 
-    first = snapshot_account_equity(collections, date="20250604", stale_seconds=0)
-    second = snapshot_account_equity(collections, date="20250604", stale_seconds=0)
+    first = snapshot_account_equity(collections, date="20250604", stale_seconds=10**12)
+    second = snapshot_account_equity(collections, date="20250604", stale_seconds=10**12)
 
     assert first["written"] == 1
     assert second["written"] == 1
@@ -85,7 +85,66 @@ def test_snapshot_account_equity_upserts_latest_account_point():
     assert row["date"] == "20250604"
     assert row["total_asset"] == 100000
     assert row["market_value"] == 80000
-    assert row["is_stale"] is True
+    assert row["is_stale"] is False
+
+
+def test_snapshot_account_equity_skips_stale_account():
+    """A dead feed must not be re-published as today's equity.
+
+    Regression: the Guosen account was manually seeded on 2026-11-11 with
+    420164, and every trading day after that got a row with the same value
+    because the snapshot job wrote stale sources anyway.  Nine fake flat
+    points later the dashboard showed a fabricated -74197.20 daily P&L.
+    """
+    collections = {
+        "trader_accounts": _Collection(
+            [
+                {
+                    "user_id": "user-1",
+                    "securities_account_id": "acct-1",
+                    "total_asset": 420164,
+                    "cash": 94239,
+                    "available_cash": 94239,
+                    "market_value": 325925,
+                    "synced_at": 1,
+                }
+            ]
+        ),
+        "trader_account_equity": _Collection(),
+    }
+
+    result = snapshot_account_equity(collections, date="20261125", stale_seconds=60)
+
+    assert result["written"] == 0
+    assert result["stale_skipped"] == 1
+    assert collections["trader_account_equity"].docs == []
+
+
+def test_snapshot_account_equity_skips_zero_value_account():
+    """All-zero means "no data", not "worth zero"; a zero row would turn the
+    next real point into a huge fake P&L."""
+    collections = {
+        "trader_accounts": _Collection(
+            [
+                {
+                    "user_id": "user-1",
+                    "securities_account_id": "acct-1",
+                    "total_asset": 0,
+                    "cash": 0,
+                    "available_cash": 0,
+                    "market_value": 0,
+                    "synced_at": 1,
+                }
+            ]
+        ),
+        "trader_account_equity": _Collection(),
+    }
+
+    result = snapshot_account_equity(collections, date="20261126", stale_seconds=10**12)
+
+    assert result["written"] == 0
+    assert result["empty_skipped"] == 1
+    assert collections["trader_account_equity"].docs == []
 
 
 def test_snapshot_account_equity_falls_back_when_total_asset_is_zero():
@@ -106,7 +165,7 @@ def test_snapshot_account_equity_falls_back_when_total_asset_is_zero():
         "trader_account_equity": _Collection(),
     }
 
-    snapshot_account_equity(collections, date="20261106", stale_seconds=0)
+    snapshot_account_equity(collections, date="20261106", stale_seconds=10**12)
     row = collections["trader_account_equity"].docs[0]
     assert row["total_asset"] == 467457.54
     assert row["market_value"] == 411110.40
@@ -374,7 +433,7 @@ def test_snapshot_account_equity_uses_total_asset_delta_minus_flow():
         ]
     )
 
-    snapshot_account_equity(collections, date="20261112", stale_seconds=0)
+    snapshot_account_equity(collections, date="20261112", stale_seconds=10**12)
 
     row = next(doc for doc in collections["trader_account_equity"].docs if doc["date"] == "20261112")
     assert row["daily_pnl"] == -14000.0
@@ -394,7 +453,7 @@ def test_snapshot_account_equity_falls_back_to_position_pnl_without_prior_point(
         )
     }
 
-    snapshot_account_equity(collections, data_collections, date="20261112", stale_seconds=0)
+    snapshot_account_equity(collections, data_collections, date="20261112", stale_seconds=10**12)
 
     row = next(doc for doc in collections["trader_account_equity"].docs if doc["date"] == "20261112")
     assert row["daily_pnl"] == -500.0
@@ -410,7 +469,7 @@ def test_snapshot_account_equity_marks_daily_pnl_unknown_without_close_pair():
         )
     }
 
-    snapshot_account_equity(collections, data_collections, date="20261112", stale_seconds=0)
+    snapshot_account_equity(collections, data_collections, date="20261112", stale_seconds=10**12)
 
     row = next(doc for doc in collections["trader_account_equity"].docs if doc["date"] == "20261112")
     assert row["daily_pnl"] is None
@@ -440,7 +499,7 @@ def test_snapshot_account_equity_uses_etf_daily_for_etf_positions():
         )
     }
 
-    snapshot_account_equity(collections, data_collections, date="20261112", stale_seconds=0)
+    snapshot_account_equity(collections, data_collections, date="20261112", stale_seconds=10**12)
 
     row = next(doc for doc in collections["trader_account_equity"].docs if doc["date"] == "20261112")
     assert row["daily_pnl"] == -3.6
