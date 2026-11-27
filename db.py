@@ -260,6 +260,9 @@ def get_data_db():
         "market_spectrum_minute": data_db["market_spectrum_minute"],
         "market_spectrum_realtime_daily": realtime_db["market_spectrum_realtime_daily"],
         "realtime_sector_strength": realtime_db["realtime_sector_strength"],
+        # 成交额水位：日频分板块（quant_data）+ 盘中快照（quant_realtime）
+        "market_turnover_daily": data_db["market_turnover_daily"],
+        "market_turnover_intraday": realtime_db["market_turnover_intraday"],
         # ETF data
         "etf_prices": data_db["etf_prices"],
         "etf_basic": data_db["etf_basic"],
