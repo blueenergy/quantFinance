@@ -272,7 +272,9 @@ def compute_turnover_outlook(
     frame["peak250"] = frame["close"].rolling(250, min_periods=120).max()
     frame["drawdown"] = frame["close"] / frame["peak250"] - 1
     frame["fwd"] = frame["close"].shift(-FORWARD_WINDOW) / frame["close"] - 1
-    completed = frame.dropna(subset=["ratio", "drawdown", "fwd"]).reset_index(drop=True)
+    # 放量档不依赖回撤，用全样本；回撤档才要求 250 日窗口有效。
+    completed = frame.dropna(subset=["ratio", "fwd"]).reset_index(drop=True)
+    with_drawdown = completed.dropna(subset=["drawdown"]).reset_index(drop=True)
     if completed.empty:
         return None
     baseline = float(completed["fwd"].mean())
@@ -311,17 +313,17 @@ def compute_turnover_outlook(
     for threshold in DRAWDOWN_THRESHOLDS:
         if -live_dd <= threshold:
             continue
-        mask = (completed["ratio"] > ratio_threshold) & (completed["drawdown"] < -threshold)
-        rows = completed[mask]
+        mask = (with_drawdown["ratio"] > ratio_threshold) & (with_drawdown["drawdown"] < -threshold)
+        rows = with_drawdown[mask]
         row = _summarize(rows, baseline)
         row["threshold"] = -threshold
         row["post2018"] = _summarize(rows[rows["trade_date"] >= POST_2018], None)
         years = rows["trade_date"].str[:4].value_counts().head(3)
         row["years"] = [{"year": str(year), "n": int(count)} for year, count in years.items()]
         row["bootstrap_ci"] = _block_bootstrap_excess(
-            completed["drawdown"].to_numpy(),
-            completed["ratio"].to_numpy(),
-            completed["fwd"].to_numpy(),
+            with_drawdown["drawdown"].to_numpy(),
+            with_drawdown["ratio"].to_numpy(),
+            with_drawdown["fwd"].to_numpy(),
             threshold,
             ratio_threshold,
         )
