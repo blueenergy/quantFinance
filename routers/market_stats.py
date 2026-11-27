@@ -13,6 +13,9 @@ from services.market_turnover import (
     BOARDS,
     ETF_TYPES,
     MA_WINDOW,
+    OUTLOOK_INDICES,
+    compute_turnover_outlook,
+    get_cached_outlook,
     attach_ma_and_ratio,
     build_intraday_profile,
     profile_fraction,
@@ -327,6 +330,47 @@ async def get_market_turnover_intraday(
         },
         "boards": boards,
     }
+
+
+@router.get("/turnover-outlook", summary="放量之后的历史前向收益（无条件 + 叠加深跌）")
+async def get_turnover_outlook(
+    index: str = Query("csi1000", description="指数：csi1000 / gem / hs300"),
+    current_user: dict = Depends(get_current_active_user),
+):
+    """Forward 20-day returns after days whose turnover exceeded its 20-day mean.
+
+    Conditional cells are always reported with their sample size, the number of
+    separate bursts, and the year concentration — the deep-drawdown bucket is
+    carried by a handful of bear-market bottoms and must not be read as a
+    probability.
+    """
+    spec = next((item for item in OUTLOOK_INDICES if item["key"] == index), None)
+    if spec is None:
+        raise HTTPException(status_code=400, detail=f"unknown index {index!r}")
+
+    data = get_data_db()
+    latest = data["market_turnover_daily"].find_one({}, {"trade_date": 1}, sort=[("trade_date", -1)])
+    if not latest:
+        raise HTTPException(status_code=404, detail="market_turnover_daily is empty")
+
+    def build():
+        turnover = list(
+            data["market_turnover_daily"]
+            .find({}, {"_id": 0, "trade_date": 1, "stock_total": 1})
+            .sort("trade_date", 1)
+        )
+        prices = list(
+            data["index_prices"]
+            .find({"ts_code": spec["code"]}, {"_id": 0, "trade_date": 1, "close": 1})
+            .sort("trade_date", 1)
+        )
+        payload = compute_turnover_outlook(turnover, prices) or {}
+        payload["index"] = spec
+        payload["available_indices"] = OUTLOOK_INDICES
+        return payload
+
+    payload = get_cached_outlook((spec["code"], latest["trade_date"]), build)
+    return payload or {}
 
 
 __all__ = ["router"]

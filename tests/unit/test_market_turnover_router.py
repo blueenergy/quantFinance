@@ -51,6 +51,13 @@ class _Coll:
     def find(self, query=None, _projection=None):
         return _Cursor([dict(doc) for doc in self.docs if self._match(doc, query or {})])
 
+    def find_one(self, query=None, projection=None, sort=None):
+        docs = [dict(doc) for doc in self.docs if self._match(doc, query or {})]
+        if sort:
+            key, direction = sort[0]
+            docs.sort(key=lambda d: d.get(key, ""), reverse=(direction == -1))
+        return docs[0] if docs else None
+
     def distinct(self, field):
         return sorted({doc.get(field) for doc in self.docs if doc.get(field) is not None})
 
@@ -217,3 +224,91 @@ def test_turnover_intraday_accepts_a_historical_session(monkeypatch):
     assert payload["available_dates"][0] == "2026-11-25"
     # the baseline must come from earlier sessions only
     assert payload["baseline"]["profile_days"] == 2
+
+
+def _series(n, *, spikes=None):
+    """n consecutive trade dates with a flat 100 亿 turnover and a flat index.
+
+    ``spikes`` maps a positional index to that day's turnover.
+    """
+    import datetime as dt
+
+    start = dt.date(2026, 1, 5)
+    turnover, prices, day = [], [], start
+    while len(turnover) < n:
+        if day.weekday() < 5:
+            value = (spikes or {}).get(len(turnover), 100.0)
+            turnover.append({"trade_date": day.strftime("%Y%m%d"), "stock_total": value})
+            prices.append({"trade_date": day.strftime("%Y%m%d"), "close": 1000.0})
+        day += dt.timedelta(days=1)
+    return turnover, prices
+
+
+@pytest.mark.unit
+def test_outlook_uses_trailing_mean_only():
+    from services.market_turnover import compute_turnover_outlook
+
+    turnover, prices = _series(200, spikes={199: 200.0})
+    payload = compute_turnover_outlook(turnover, prices)
+    # 200 / 前 20 日均值 100 = 2.0；若把当天算进均线只会得到 200/105 ≈ 1.90
+    assert payload["current"]["ratio"] == pytest.approx(2.0, abs=1e-6)
+
+
+@pytest.mark.unit
+def test_outlook_ladder_counts_and_merges_bursts():
+    from services.market_turnover import compute_turnover_outlook
+
+    # 最后一天也是放量日，否则 live_ratio 太低、阶梯为空
+    turnover, prices = _series(200, spikes={150: 200.0, 151: 200.0, 190: 200.0, 199: 200.0})
+    payload = compute_turnover_outlook(turnover, prices)
+    top = payload["ratio_ladder"][-1]
+    assert top["threshold"] == 1.3
+    # 190 / 199 距序列末尾不足 20 个交易日，没有前向收益，不进统计
+    assert top["n"] == 2
+    assert top["episodes"] == 1
+
+
+@pytest.mark.unit
+def test_outlook_episode_counting_merges_consecutive_days():
+    from services.market_turnover import _episodes
+
+    # 连续 / 间隔 1 天算一段；跨 30 天以上算两段
+    assert _episodes(["20260105", "20260106", "20260107"]) == 1
+    assert _episodes(["20260105", "20260107"]) == 1
+    assert _episodes(["20260105", "20260305"]) == 2
+    assert _episodes([]) == 0
+
+
+@pytest.mark.unit
+def test_outlook_endpoint_returns_ladders(monkeypatch):
+    import datetime as dt
+
+    turnover, prices = _series(200)
+    daily_docs = [dict(row, **{"sh": 0, "sz": 0, "cx": 0, "star": 0, "bse": 0}) for row in turnover]
+    price_docs = [dict(row, ts_code="000852.SH") for row in prices]
+    monkeypatch.setattr(
+        market_stats,
+        "get_data_db",
+        lambda: {
+            "market_turnover_daily": _Coll(daily_docs),
+            "index_prices": _Coll(price_docs),
+        },
+    )
+    response = _client().get("/api/market-stats/turnover-outlook", params={"index": "csi1000"})
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["index"]["code"] == "000852.SH"
+    assert payload["baseline"]["window"] == 20
+    assert isinstance(payload["ratio_ladder"], list)
+    assert isinstance(payload["drawdown_ladder"], list)
+
+
+@pytest.mark.unit
+def test_outlook_endpoint_rejects_unknown_index(monkeypatch):
+    monkeypatch.setattr(
+        market_stats,
+        "get_data_db",
+        lambda: {"market_turnover_daily": _Coll([]), "index_prices": _Coll([])},
+    )
+    response = _client().get("/api/market-stats/turnover-outlook", params={"index": "nope"})
+    assert response.status_code == 400
