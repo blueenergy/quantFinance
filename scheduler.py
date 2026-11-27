@@ -1,7 +1,7 @@
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import logging
 import os
 import time
@@ -306,6 +306,75 @@ def generate_sector_concept_analysis_task(job_id: str):
         )
     except Exception as e:
         log.error("[Sector Concept] Scheduling failed: %s", e, exc_info=True)
+
+
+
+def hot_topic_tree_intraday_task(job_id: str = None):
+    """热点题材树 —— 盘中快照（每 15 分钟，仅交易时段）。
+
+    只读 quant_data，无外部调用；快照落 finance.hot_topic_tree，
+    与收盘定稿（eod）并存以便比对。
+    """
+    try:
+        from db import get_data_db
+        from services.trading_calendar import is_sse_open_day
+
+        now = datetime.now()
+        minutes = now.hour * 60 + now.minute
+        in_morning = (9 * 60 + 35) <= minutes <= (11 * 60 + 30)
+        in_afternoon = (13 * 60 + 5) <= minutes <= (15 * 60 + 5)
+        if not (in_morning or in_afternoon):
+            return
+
+        trade_date = now.strftime("%Y%m%d")
+        if not is_sse_open_day(get_data_db()["trade_calendar"], trade_date):
+            return
+
+        from services.hot_topic_tree import build_intraday_tree, save_tree
+
+        tree = build_intraday_tree(trade_date)
+        if tree:
+            save_tree(tree)
+        else:
+            log.info("[HotTopicTree] 盘中快照跳过：%s 暂无涨停天梯数据", trade_date)
+    except Exception as e:
+        log.error("[HotTopicTree] 盘中快照失败: %s", e, exc_info=True)
+
+
+def hot_topic_tree_eod_task(job_id: str = None):
+    """热点题材树 —— 收盘定稿（Tushare 东财概念口径）。
+
+    Tushare 的概念板块/资金流在收盘后约 15:30 才发布，16:20 跑一次；
+    数据未到时登记一个 15 分钟后的单次重试，不阻塞调度线程。
+    """
+    try:
+        from db import get_data_db
+        from services.trading_calendar import is_sse_open_day
+
+        now = datetime.now()
+        trade_date = now.strftime("%Y%m%d")
+        if not is_sse_open_day(get_data_db()["trade_calendar"], trade_date):
+            return
+
+        from services.hot_topic_tree import build_eod_tree, save_tree
+
+        tree = build_eod_tree(trade_date)
+        if tree:
+            save_tree(tree)
+            return
+
+        log.warning("[HotTopicTree] %s 收盘数据尚未发布，登记 15 分钟后重试", trade_date)
+        run_at = datetime.now() + timedelta(minutes=15)
+        scheduler.add_job(
+            hot_topic_tree_eod_task,
+            trigger="date",
+            run_date=run_at,
+            id="hot_topic_tree_eod_retry",
+            name="热点题材树收盘定稿重试",
+            replace_existing=True,
+        )
+    except Exception as e:
+        log.error("[HotTopicTree] 收盘定稿失败: %s", e, exc_info=True)
 
 
 def generate_global_analysis_task(job_id: str):
@@ -857,6 +926,8 @@ TASK_MAP = {
     'global_analysis_0830': generate_global_analysis_task,
     'iv_analysis_1510': generate_iv_analysis_task,
     'sector_concept_analysis_dc': generate_sector_concept_analysis_task,
+    'hot_topic_tree_intraday': hot_topic_tree_intraday_task,
+    'hot_topic_tree_eod': hot_topic_tree_eod_task,
     'hot_stock_poll_ths': lambda: hot_stock_poll_task('ths'),
     'hot_stock_poll_dc': lambda: hot_stock_poll_task('dc'),
     'theme_lag_validation_subscribe_1530': lambda: theme_lag_validation_subscription_scan_task(
@@ -922,6 +993,21 @@ DEFAULT_SCHEDULES = {
         'type': "cron",
         'hour': 16,
         'minute': 10,
+        'day_of_week': 'mon-fri',
+        'is_active': True,
+    },
+    'hot_topic_tree_intraday': {
+        'name': "热点题材树盘中快照 (每15分钟)",
+        'type': "cron",
+        'hour': '9-11,13-15',
+        'minute': '*/15',
+        'is_active': True,
+    },
+    'hot_topic_tree_eod': {
+        'name': "热点题材树收盘定稿 (16:20)",
+        'type': "cron",
+        'hour': 16,
+        'minute': 20,
         'day_of_week': 'mon-fri',
         'is_active': True,
     },

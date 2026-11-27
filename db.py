@@ -115,6 +115,8 @@ def get_db_collections() -> Dict[str, Collection]:
         "market_insight_global_quality": db["market_insight_global_quality"],
         # 主题补涨验证订阅（物化/通知水位线；见 theme_lag_validation_subscription_task）
         "theme_lag_validation_subscriptions": db["theme_lag_validation_subscriptions"],
+        # 热点题材树快照（intraday 每个时点一份 + eod 每天一份；见 services/hot_topic_tree.py）
+        "hot_topic_tree": db["hot_topic_tree"],
         "app_settings": db["app_settings"],  # 全局可配置项（如主导航按等级可见性）
         # 评分等仍落在主库；AI/分析结果请用 get_analyzer_db()
         "stock_scores": db["stock_scores"],

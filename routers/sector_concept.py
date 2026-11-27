@@ -187,3 +187,106 @@ async def get_latest_analysis(
         "data_summary": doc.get("data_summary"),
         "created_at": doc.get("created_at").isoformat() if doc.get("created_at") else None,
     }
+
+
+@router.get("/tree", summary="获取热点题材树")
+async def get_hot_topic_tree(
+    mode: str = Query("auto", description="口径: auto / intraday / eod"),
+    date: str = Query(None, description="交易日期 YYYYMMDD，不传则取最近交易日"),
+    current_user: dict = Depends(get_current_active_user),
+):
+    """热点题材树：父层(申万一级) -> 叶子(题材) -> 催化事件。
+
+    口径：
+    - ``intraday``：盘中实时，来自 quant_data 的涨停天梯快照，申万行业聚类；
+    - ``eod``：收盘定稿，来自 Tushare 东财概念板块（定时任务预生成，本接口只读）；
+    - ``auto``：优先 eod，没有就降级 intraday，并在响应里标明降级原因。
+
+    盘中与收盘两份都保留，可通过 ``GET /sector-concept/tree/snapshots`` 比对。
+    """
+    from services.hot_topic_tree import (
+        build_intraday_tree,
+        list_snapshots,
+        load_latest_available,
+        load_tree,
+    )
+
+    mode = (mode or "auto").lower()
+    if mode not in ("auto", "intraday", "eod"):
+        raise HTTPException(400, "mode must be 'auto', 'intraday' or 'eod'")
+
+    trade_date = (date or "").replace("-", "")
+
+    # 未指定日期时，取最近的交易日（有快照的那个）
+    if not trade_date:
+        today = datetime.now().strftime("%Y%m%d")
+        from db import get_data_db
+
+        cal = get_data_db()["trade_calendar"]
+        try:
+            from utils.latest_sse_open_day import latest_sse_open_day
+
+            trade_date = latest_sse_open_day(cal, today)
+        except Exception:
+            trade_date = today
+
+    fallback_reason = ""
+    tree = None
+    if mode in ("auto", "eod"):
+        tree = load_tree("eod", trade_date)
+        if tree is None and mode == "eod":
+            return {
+                "success": False,
+                "error": f"{trade_date} 暂无收盘口径题材树（定时任务 16:20 生成）",
+                "trade_date": trade_date,
+                "mode": "eod",
+            }
+        if tree is None:
+            fallback_reason = "收盘口径尚未生成，先用盘中口径"
+
+    if tree is None:
+        tree = build_intraday_tree(trade_date)
+        if tree is None:
+            # 当天没有（可能选到非交易日，或盘中快照还没落库）→ 回退到最近一份
+            tree = load_latest_available("intraday", trade_date)
+            if tree is None:
+                return {
+                    "success": False,
+                    "error": f"{trade_date} 暂无题材树数据",
+                    "trade_date": trade_date,
+                    "mode": mode,
+                }
+            fallback_reason = f"{trade_date} 无数据，显示最近一份（{tree.get('trade_date')}）"
+            tree = {**tree, "meta": {**(tree.get("meta") or {}), "trade_date": tree.get("trade_date")}}
+            trade_date = tree.get("trade_date") or trade_date
+        else:
+            tree = {**tree, "meta": {**(tree.get("meta") or {}), "trade_date": trade_date}}
+
+    meta = tree.get("meta") or {}
+    return {
+        "success": True,
+        "mode": meta.get("mode"),
+        "trade_date": meta.get("trade_date") or trade_date,
+        "branches": tree.get("branches") or [],
+        "stats": tree.get("stats") or {},
+        "meta": meta,
+        "generated_at": tree.get("generated_at"),
+        "fallback_reason": fallback_reason,
+        "snapshots": list_snapshots(trade_date),
+    }
+
+
+@router.get("/tree/snapshots", summary="列出当日题材树快照")
+async def get_hot_topic_tree_snapshots(
+    date: str = Query(None, description="交易日期 YYYYMMDD，不传则取今天"),
+    current_user: dict = Depends(get_current_active_user),
+):
+    """列出某日已有的题材树快照（盘中各时点 + 收盘定稿），用于切换与比对。"""
+    from services.hot_topic_tree import list_snapshots
+
+    trade_date = (date or datetime.now().strftime("%Y%m%d")).replace("-", "")
+    return {
+        "success": True,
+        "trade_date": trade_date,
+        "snapshots": list_snapshots(trade_date),
+    }
